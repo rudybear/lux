@@ -75,6 +75,11 @@ def compile_source(
     # Resolve imports before type checking
     _resolve_imports(module, source_dir)
 
+    # Expand surface/geometry/pipeline declarations into stage blocks
+    if module.surfaces or module.pipelines:
+        from luxc.expansion.surface_expander import expand_surfaces
+        expand_surfaces(module)
+
     if dump_ast:
         _dump_ast(module)
         return

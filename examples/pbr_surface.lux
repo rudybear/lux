@@ -1,0 +1,33 @@
+// PBR material using declarative surface syntax
+// This is the v0.2 math-first approach: describe the material,
+// the compiler generates the shaders.
+
+import brdf;
+import color;
+
+// Declare vertex transform pipeline
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+// Declare material — just math, no boilerplate
+surface CopperMetal {
+    brdf: pbr(vec3(0.95, 0.64, 0.54), 0.3, 0.9),
+}
+
+// Tie them together — compiler generates both vertex + fragment SPIR-V
+pipeline PBRForward {
+    geometry: StandardMesh,
+    surface: CopperMetal,
+}

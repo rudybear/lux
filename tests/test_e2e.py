@@ -273,3 +273,82 @@ class TestImportSystem:
         """
         compile_source(src, "alias_import", tmp_path, validate=True)
         assert (tmp_path / "alias_import.frag.spv").exists()
+
+
+@requires_spirv_tools
+class TestSurfaceExpansion:
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def test_surface_lambert(self, tmp_path):
+        """Standalone surface with lambert BRDF generates fragment shader."""
+        src = """
+        import brdf;
+        surface RedMatte {
+            brdf: lambert(vec3(0.8, 0.2, 0.1)),
+        }
+        """
+        compile_source(src, "surface_lambert", tmp_path, validate=True)
+        assert (tmp_path / "surface_lambert.frag.spv").exists()
+
+    def test_surface_pbr(self, tmp_path):
+        """Surface with full PBR BRDF."""
+        src = """
+        import brdf;
+        surface Metal {
+            brdf: pbr(vec3(0.95, 0.64, 0.54), 0.3, 0.9),
+        }
+        """
+        compile_source(src, "surface_pbr", tmp_path, validate=True)
+        assert (tmp_path / "surface_pbr.frag.spv").exists()
+
+    def test_surface_microfacet(self, tmp_path):
+        """Surface with microfacet GGX specular only."""
+        src = """
+        import brdf;
+        surface GlossyPlastic {
+            brdf: microfacet_ggx(0.1, vec3(0.04)),
+        }
+        """
+        compile_source(src, "surface_specular", tmp_path, validate=True)
+        assert (tmp_path / "surface_specular.frag.spv").exists()
+
+    def test_full_pipeline(self, tmp_path):
+        """Full pipeline: geometry + surface generates vertex + fragment."""
+        src = """
+        import brdf;
+        geometry Mesh {
+            position: vec3,
+            normal: vec3,
+            transform: MVP {
+                model: mat4,
+                view: mat4,
+                projection: mat4,
+            }
+            outputs {
+                world_pos: (model * vec4(position, 1.0)).xyz,
+                world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+                clip_pos: projection * view * model * vec4(position, 1.0),
+            }
+        }
+        surface Material {
+            brdf: pbr(vec3(0.8, 0.2, 0.1), 0.4, 0.0),
+        }
+        pipeline Forward {
+            geometry: Mesh,
+            surface: Material,
+        }
+        """
+        compile_source(src, "full_pipeline", tmp_path, validate=True)
+        assert (tmp_path / "full_pipeline.vert.spv").exists()
+        assert (tmp_path / "full_pipeline.frag.spv").exists()
+
+    def test_pbr_surface_example(self, tmp_path):
+        """Compile the pbr_surface.lux example file."""
+        src = (Path(__file__).parent.parent / "examples" / "pbr_surface.lux").read_text()
+        compile_source(src, "pbr_surface", tmp_path, validate=True)
+        assert (tmp_path / "pbr_surface.vert.spv").exists()
+        assert (tmp_path / "pbr_surface.frag.spv").exists()
