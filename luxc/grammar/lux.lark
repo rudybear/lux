@@ -1,0 +1,138 @@
+// Lux shader language grammar
+
+start: module_item*
+
+?module_item: const_decl
+            | function_def
+            | stage_block
+            | struct_def
+
+// --- Top-level declarations ---
+
+const_decl: "const" IDENT ":" type "=" expr ";"
+
+struct_def: "struct" IDENT "{" struct_field ("," struct_field)* ","? "}"
+
+struct_field: IDENT ":" type
+
+// --- Stage blocks ---
+
+stage_block: STAGE_TYPE "{" stage_item* "}"
+
+STAGE_TYPE: "vertex" | "fragment"
+
+?stage_item: in_decl
+           | out_decl
+           | uniform_block
+           | push_block
+           | sampler_decl
+           | function_def
+
+in_decl: "in" IDENT ":" type ";"
+out_decl: "out" IDENT ":" type ";"
+
+uniform_block: "uniform" IDENT "{" block_field ("," block_field)* ","? "}"
+push_block: "push" IDENT "{" block_field ("," block_field)* ","? "}"
+
+block_field: IDENT ":" type
+
+sampler_decl: "sampler2d" IDENT ";"
+
+// --- Functions ---
+
+function_def: "fn" IDENT "(" param_list? ")" ("->" type)? "{" statement* "}"
+
+param_list: param ("," param)*
+param: IDENT ":" type
+
+// --- Statements ---
+
+?statement: let_stmt
+          | assign_stmt
+          | return_stmt
+          | if_stmt
+          | expr_stmt
+
+let_stmt: "let" IDENT ":" type "=" expr ";"
+assign_stmt: assign_target "=" expr ";"
+return_stmt: "return" expr ";"
+if_stmt: "if" "(" expr ")" "{" statement* "}" ("else" "{" statement* "}")?
+
+expr_stmt: expr ";"
+
+?assign_target: swizzle_access -> assign_swizzle
+              | field_access   -> assign_field
+              | index_access   -> assign_index
+              | IDENT          -> assign_ident
+
+// --- Types ---
+
+?type: base_type
+
+base_type: TYPE_NAME
+
+TYPE_NAME: "scalar" | "int" | "uint" | "bool"
+         | "vec2" | "vec3" | "vec4"
+         | "ivec2" | "ivec3" | "ivec4"
+         | "uvec2" | "uvec3" | "uvec4"
+         | "mat2" | "mat3" | "mat4"
+         | "sampler2d" | "void"
+         | IDENT
+
+// --- Expressions (precedence climbing) ---
+
+?expr: ternary_expr
+
+?ternary_expr: or_expr ("?" expr ":" ternary_expr)?
+
+?or_expr: and_expr ("||" and_expr)*
+?and_expr: equality_expr ("&&" equality_expr)*
+?equality_expr: comparison_expr (EQUALITY_OP comparison_expr)*
+?comparison_expr: additive_expr (COMPARISON_OP additive_expr)*
+?additive_expr: multiplicative_expr (ADD_OP multiplicative_expr)*
+?multiplicative_expr: unary_expr (MUL_OP unary_expr)*
+
+EQUALITY_OP: "==" | "!="
+COMPARISON_OP: "<=" | ">=" | "<" | ">"
+ADD_OP: "+" | "-"
+MUL_OP: "*" | "/" | "%"
+
+?unary_expr: UNARY_OP unary_expr -> unary
+           | postfix_expr
+
+UNARY_OP: "-" | "!"
+
+?postfix_expr: primary
+             | call_expr
+             | constructor_expr
+             | swizzle_access
+             | field_access
+             | index_access
+
+call_expr: postfix_expr "(" arg_list? ")"
+constructor_expr: TYPE_CONSTRUCTOR "(" arg_list? ")"
+swizzle_access: postfix_expr "." SWIZZLE
+field_access: postfix_expr "." IDENT
+index_access: postfix_expr "[" expr "]"
+
+TYPE_CONSTRUCTOR: "vec2" | "vec3" | "vec4"
+                | "ivec2" | "ivec3" | "ivec4"
+                | "uvec2" | "uvec3" | "uvec4"
+                | "mat2" | "mat3" | "mat4"
+
+arg_list: expr ("," expr)*
+
+// Swizzle: 1-4 components from {x,y,z,w} or {r,g,b,a}
+SWIZZLE: /[xyzw]{1,4}/ | /[rgba]{1,4}/
+
+?primary: NUMBER -> number_lit
+        | "true"  -> bool_true
+        | "false" -> bool_false
+        | IDENT   -> var_ref
+        | "(" expr ")"
+
+NUMBER: /[0-9]+\.[0-9]*([eE][+-]?[0-9]+)?/ | /[0-9]+[eE][+-]?[0-9]+/ | /[0-9]*\.[0-9]+([eE][+-]?[0-9]+)?/ | /[0-9]+/
+IDENT: /[a-zA-Z_][a-zA-Z0-9_]*/
+
+%ignore /\/\/.*/          // line comments
+%ignore /[ \t\f\r\n]+/   // whitespace

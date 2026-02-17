@@ -1,0 +1,11 @@
+vertex {
+    in position: vec3;
+    in color: vec3;
+
+    out frag_color: vec3;
+
+    fn main() {
+        frag_color = color;
+        builtin_position = vec4(position, 1.0);
+    }
+}

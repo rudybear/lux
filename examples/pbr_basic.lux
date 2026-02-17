@@ -1,0 +1,70 @@
+// PBR Basic — diffuse + specular lighting to demonstrate math-first design
+// Uses Blinn-Phong as a stepping stone toward full PBR
+
+const PI: scalar = 3.14159265;
+
+fn fresnel_schlick(cos_theta: scalar, f0: vec3) -> vec3 {
+    return f0 + (vec3(1.0) - f0) * pow(1.0 - cos_theta, 5.0);
+}
+
+vertex {
+    in position: vec3;
+    in normal: vec3;
+    in uv: vec2;
+
+    out frag_normal: vec3;
+    out frag_pos: vec3;
+    out frag_uv: vec2;
+
+    uniform MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+
+    fn main() {
+        let world_pos: vec4 = model * vec4(position, 1.0);
+        frag_pos = world_pos.xyz;
+        frag_normal = normalize((model * vec4(normal, 0.0)).xyz);
+        frag_uv = uv;
+        builtin_position = projection * view * world_pos;
+    }
+}
+
+fragment {
+    in frag_normal: vec3;
+    in frag_pos: vec3;
+    in frag_uv: vec2;
+
+    out color: vec4;
+
+    push Lighting {
+        light_dir: vec3,
+        view_pos: vec3,
+    }
+
+    sampler2d albedo_tex;
+
+    fn main() {
+        let albedo: vec4 = sample(albedo_tex, frag_uv);
+        let n: vec3 = normalize(frag_normal);
+        let l: vec3 = normalize(light_dir);
+        let v: vec3 = normalize(view_pos - frag_pos);
+        let h: vec3 = normalize(l + v);
+
+        // Diffuse (Lambert)
+        let n_dot_l: scalar = max(dot(n, l), 0.0);
+        let diffuse: vec3 = albedo.xyz * n_dot_l;
+
+        // Specular (Blinn-Phong)
+        let n_dot_h: scalar = max(dot(n, h), 0.0);
+        let specular: vec3 = vec3(pow(n_dot_h, 64.0));
+
+        // Fresnel
+        let f0: vec3 = vec3(0.04);
+        let f: vec3 = fresnel_schlick(max(dot(h, v), 0.0), f0);
+
+        let result: vec3 = diffuse + specular * f;
+        color = vec4(result, 1.0);
+    }
+}

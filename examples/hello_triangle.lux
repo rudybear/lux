@@ -1,0 +1,23 @@
+// Hello Triangle — simplest working Lux program
+// Produces a colored triangle with per-vertex colors
+
+vertex {
+    in position: vec3;
+    in color: vec3;
+
+    out frag_color: vec3;
+
+    fn main() {
+        frag_color = color;
+        builtin_position = vec4(position, 1.0);
+    }
+}
+
+fragment {
+    in frag_color: vec3;
+    out color: vec4;
+
+    fn main() {
+        color = vec4(frag_color, 1.0);
+    }
+}

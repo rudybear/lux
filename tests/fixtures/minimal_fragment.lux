@@ -1,0 +1,8 @@
+fragment {
+    in frag_color: vec3;
+    out color: vec4;
+
+    fn main() {
+        color = vec4(frag_color, 1.0);
+    }
+}

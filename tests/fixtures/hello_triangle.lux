@@ -1,0 +1,28 @@
+vertex {
+    in position: vec3;
+    in normal: vec3;
+
+    out frag_normal: vec3;
+
+    uniform MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+
+    fn main() {
+        let world_pos: vec4 = model * vec4(position, 1.0);
+        frag_normal = normalize((model * vec4(normal, 0.0)).xyz);
+        builtin_position = projection * view * world_pos;
+    }
+}
+
+fragment {
+    in frag_normal: vec3;
+    out color: vec4;
+
+    fn main() {
+        let n: vec3 = normalize(frag_normal);
+        color = vec4(n * 0.5 + vec3(0.5), 1.0);
+    }
+}
