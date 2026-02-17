@@ -138,6 +138,9 @@ class TypeRegistry:
     # --- Helpers ---
 
     def lux_type_to_spirv(self, type_name: str) -> str:
+        from luxc.builtins.types import resolve_alias_chain
+        # Resolve type aliases before mapping to SPIR-V
+        resolved = resolve_alias_chain(type_name)
         mapping = {
             "void": self.void,
             "bool": self.bool_type,
@@ -158,9 +161,9 @@ class TypeRegistry:
             "mat4": lambda: self.mat(4),
             "sampler2d": self.sampled_image_type,
         }
-        factory = mapping.get(type_name)
+        factory = mapping.get(resolved)
         if factory is None:
-            raise ValueError(f"Unknown Lux type: {type_name}")
+            raise ValueError(f"Unknown Lux type: {type_name} (resolved to: {resolved})")
         return factory()
 
     def emit_declarations(self) -> list[str]:

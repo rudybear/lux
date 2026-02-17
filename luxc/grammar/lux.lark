@@ -6,6 +6,11 @@ start: module_item*
             | function_def
             | stage_block
             | struct_def
+            | type_alias
+            | import_decl
+            | surface_decl
+            | geometry_decl
+            | pipeline_decl
 
 // --- Top-level declarations ---
 
@@ -14,6 +19,36 @@ const_decl: "const" IDENT ":" type "=" expr ";"
 struct_def: "struct" IDENT "{" struct_field ("," struct_field)* ","? "}"
 
 struct_field: IDENT ":" type
+
+type_alias: "type" IDENT "=" type ";"
+
+import_decl: "import" IDENT ";"
+
+// --- Surface declarations ---
+
+surface_decl: "surface" IDENT "{" surface_member ("," surface_member)* ","? "}"
+
+surface_member: IDENT ":" expr
+
+// --- Geometry declarations ---
+
+geometry_decl: "geometry" IDENT "{" geometry_item* "}"
+
+?geometry_item: geometry_field
+              | geometry_transform
+              | geometry_outputs
+
+geometry_field: IDENT ":" type ","
+geometry_transform: "transform" ":" IDENT "{" block_field ("," block_field)* ","? "}"
+geometry_outputs: "outputs" "{" output_binding ("," output_binding)* ","? "}"
+
+output_binding: IDENT ":" expr
+
+// --- Pipeline declarations ---
+
+pipeline_decl: "pipeline" IDENT "{" pipeline_member ("," pipeline_member)* ","? "}"
+
+pipeline_member: IDENT ":" expr
 
 // --- Stage blocks ---
 

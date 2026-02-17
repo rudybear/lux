@@ -6,11 +6,13 @@ from luxc.parser.ast_nodes import (
     IfStmt, ExprStmt, NumberLit, BoolLit, VarRef, BinaryOp, UnaryOp,
     CallExpr, ConstructorExpr, FieldAccess, SwizzleAccess, IndexAccess,
     TernaryExpr, AssignTarget,
+    TypeAlias, ImportDecl, SurfaceDecl, GeometryDecl, PipelineDecl,
 )
 from luxc.builtins.types import (
     LuxType, resolve_type, TYPE_MAP, SCALAR, BOOL, VOID,
     VEC2, VEC3, VEC4, MAT2, MAT3, MAT4,
     VectorType, MatrixType, ScalarType, is_numeric,
+    register_type_alias, clear_type_aliases,
 )
 from luxc.builtins.functions import lookup_builtin
 from luxc.analysis.symbols import Scope, Symbol
@@ -31,7 +33,16 @@ class TypeChecker:
         self.global_scope = Scope()
         self.current_scope: Scope = self.global_scope
         self.current_stage: StageBlock | None = None
+        self._register_type_aliases()
         self._register_constants()
+
+    def _register_type_aliases(self):
+        for ta in self.module.type_aliases:
+            # Verify the target type resolves
+            t = resolve_type(ta.target_type)
+            if t is None:
+                raise TypeCheckError(f"Unknown target type '{ta.target_type}' in type alias '{ta.name}'")
+            register_type_alias(ta.name, ta.target_type)
 
     def _register_constants(self):
         for c in self.module.constants:

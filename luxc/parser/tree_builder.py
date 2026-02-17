@@ -11,6 +11,10 @@ from luxc.parser.ast_nodes import (
     NumberLit, BoolLit, VarRef, BinaryOp, UnaryOp, CallExpr,
     ConstructorExpr, FieldAccess, SwizzleAccess, IndexAccess, TernaryExpr,
     AssignTarget, SourceLocation,
+    TypeAlias, ImportDecl,
+    SurfaceDecl, SurfaceMember,
+    GeometryDecl, GeometryField, GeometryTransform, GeometryOutputs, OutputBinding,
+    PipelineDecl, PipelineMember,
 )
 
 _CONSTRUCTOR_TYPES = frozenset({
@@ -55,6 +59,16 @@ class LuxTransformer(Transformer):
                 mod.structs.append(item)
             elif isinstance(item, StageBlock):
                 mod.stages.append(item)
+            elif isinstance(item, TypeAlias):
+                mod.type_aliases.append(item)
+            elif isinstance(item, ImportDecl):
+                mod.imports.append(item)
+            elif isinstance(item, SurfaceDecl):
+                mod.surfaces.append(item)
+            elif isinstance(item, GeometryDecl):
+                mod.geometries.append(item)
+            elif isinstance(item, PipelineDecl):
+                mod.pipelines.append(item)
         return mod
 
     # --- Top-level declarations ---
@@ -70,6 +84,66 @@ class LuxTransformer(Transformer):
 
     def struct_field(self, args):
         return StructField(str(args[0]), _extract_type(args[1]))
+
+    def type_alias(self, args):
+        name = args[0]
+        target = _extract_type(args[1])
+        return TypeAlias(str(name), target, _tok_loc(name))
+
+    def import_decl(self, args):
+        name = args[0]
+        return ImportDecl(str(name), _tok_loc(name))
+
+    # --- Surface declarations ---
+
+    def surface_decl(self, args):
+        name = args[0]
+        members = [a for a in args[1:] if isinstance(a, SurfaceMember)]
+        return SurfaceDecl(str(name), members, _tok_loc(name))
+
+    def surface_member(self, args):
+        return SurfaceMember(str(args[0]), args[1])
+
+    # --- Geometry declarations ---
+
+    def geometry_decl(self, args):
+        name = args[0]
+        fields = []
+        transform = None
+        outputs = None
+        for a in args[1:]:
+            if isinstance(a, GeometryField):
+                fields.append(a)
+            elif isinstance(a, GeometryTransform):
+                transform = a
+            elif isinstance(a, GeometryOutputs):
+                outputs = a
+        return GeometryDecl(str(name), fields, transform, outputs, _tok_loc(name))
+
+    def geometry_field(self, args):
+        return GeometryField(str(args[0]), _extract_type(args[1]))
+
+    def geometry_transform(self, args):
+        name = args[0]
+        fields = [a for a in args[1:] if isinstance(a, BlockField)]
+        return GeometryTransform(str(name), fields)
+
+    def geometry_outputs(self, args):
+        bindings = [a for a in args if isinstance(a, OutputBinding)]
+        return GeometryOutputs(bindings)
+
+    def output_binding(self, args):
+        return OutputBinding(str(args[0]), args[1])
+
+    # --- Pipeline declarations ---
+
+    def pipeline_decl(self, args):
+        name = args[0]
+        members = [a for a in args[1:] if isinstance(a, PipelineMember)]
+        return PipelineDecl(str(name), members, _tok_loc(name))
+
+    def pipeline_member(self, args):
+        return PipelineMember(str(args[0]), args[1])
 
     # --- Stage blocks ---
 

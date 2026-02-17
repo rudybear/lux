@@ -83,8 +83,47 @@ TYPE_MAP: dict[str, LuxType] = {
 }
 
 
+# User-defined type aliases: name -> target type name
+_type_aliases: dict[str, str] = {}
+
+
+def register_type_alias(alias_name: str, target_name: str) -> None:
+    """Register a user-defined type alias (e.g., Radiance -> vec3)."""
+    _type_aliases[alias_name] = target_name
+
+
+def clear_type_aliases() -> None:
+    """Clear all user-defined type aliases (for test isolation)."""
+    _type_aliases.clear()
+
+
 def resolve_type(name: str) -> LuxType | None:
-    return TYPE_MAP.get(name)
+    # Check built-in types first
+    t = TYPE_MAP.get(name)
+    if t is not None:
+        return t
+    # Check user-defined type aliases (resolve transitively)
+    seen = set()
+    current = name
+    while current in _type_aliases and current not in seen:
+        seen.add(current)
+        current = _type_aliases[current]
+    return TYPE_MAP.get(current)
+
+
+def resolve_alias_chain(name: str) -> str:
+    """Resolve a type alias chain to the final built-in type name."""
+    seen = set()
+    current = name
+    while current in _type_aliases and current not in seen:
+        seen.add(current)
+        current = _type_aliases[current]
+    return current
+
+
+def is_type_alias(name: str) -> bool:
+    """Check if a name is a registered type alias."""
+    return name in _type_aliases
 
 
 def vector_component_type(vt: VectorType) -> LuxType:

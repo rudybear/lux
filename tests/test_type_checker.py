@@ -4,6 +4,7 @@ import pytest
 from luxc.parser.tree_builder import parse_lux
 from luxc.analysis.type_checker import type_check, TypeCheckError
 from luxc.analysis.layout_assigner import assign_layouts
+from luxc.builtins.types import clear_type_aliases
 
 
 class TestTypeCheckPositive:
@@ -182,6 +183,104 @@ class TestTypeCheckNegative:
         m = parse_lux(src)
         with pytest.raises(TypeCheckError, match="No matching overload"):
             type_check(m)
+
+
+class TestTypeAliases:
+    """Tests for radiometric type aliases."""
+
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def test_type_alias_resolves(self):
+        src = """
+        type Radiance = vec3;
+        fragment {
+            out color: vec4;
+            fn main() {
+                let light: Radiance = vec3(1.0, 0.9, 0.8);
+                color = vec4(light, 1.0);
+            }
+        }
+        """
+        m = parse_lux(src)
+        type_check(m)  # should not raise
+
+    def test_type_alias_in_io(self):
+        src = """
+        type Radiance = vec3;
+        vertex {
+            in position: vec3;
+            out light_out: Radiance;
+            fn main() {
+                light_out = vec3(1.0, 0.9, 0.8);
+                builtin_position = vec4(position, 1.0);
+            }
+        }
+        """
+        m = parse_lux(src)
+        type_check(m)
+
+    def test_type_alias_compatibility(self):
+        """Radiance (=vec3) can be assigned to vec3 output."""
+        src = """
+        type Radiance = vec3;
+        fragment {
+            in light: Radiance;
+            out color: vec4;
+            fn main() {
+                let normalized: vec3 = normalize(light);
+                color = vec4(normalized, 1.0);
+            }
+        }
+        """
+        m = parse_lux(src)
+        type_check(m)
+
+    def test_multiple_aliases_same_base(self):
+        src = """
+        type Radiance = vec3;
+        type Reflectance = vec3;
+        type Direction = vec3;
+        type Normal = vec3;
+        fragment {
+            in light_dir: Direction;
+            in n: Normal;
+            out color: vec4;
+            fn main() {
+                let d: scalar = dot(light_dir, n);
+                color = vec4(d, d, d, 1.0);
+            }
+        }
+        """
+        m = parse_lux(src)
+        type_check(m)
+
+    def test_unknown_alias_target_rejected(self):
+        src = "type Bad = nonexistent_type;"
+        m = parse_lux(src)
+        with pytest.raises(TypeCheckError, match="Unknown target type"):
+            type_check(m)
+
+    def test_alias_in_function_param(self):
+        src = """
+        type Direction = vec3;
+        fn helper(d: Direction) -> scalar {
+            return length(d);
+        }
+        fragment {
+            in n: vec3;
+            out color: vec4;
+            fn main() {
+                let l: scalar = helper(n);
+                color = vec4(l, l, l, 1.0);
+            }
+        }
+        """
+        m = parse_lux(src)
+        type_check(m)
 
 
 class TestLayoutAssigner:

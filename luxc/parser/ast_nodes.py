@@ -19,6 +19,11 @@ class Module:
     functions: list[FunctionDef] = field(default_factory=list)
     structs: list[StructDef] = field(default_factory=list)
     stages: list[StageBlock] = field(default_factory=list)
+    type_aliases: list[TypeAlias] = field(default_factory=list)
+    imports: list[ImportDecl] = field(default_factory=list)
+    surfaces: list[SurfaceDecl] = field(default_factory=list)
+    geometries: list[GeometryDecl] = field(default_factory=list)
+    pipelines: list[PipelineDecl] = field(default_factory=list)
 
 
 # --- Top-level declarations ---
@@ -42,6 +47,83 @@ class StructDef:
 class StructField:
     name: str
     type_name: str
+
+
+@dataclass
+class TypeAlias:
+    name: str
+    target_type: str
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class ImportDecl:
+    module_name: str
+    loc: Optional[SourceLocation] = None
+
+
+# --- Surface declarations ---
+
+@dataclass
+class SurfaceDecl:
+    name: str
+    members: list[SurfaceMember]
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class SurfaceMember:
+    name: str
+    value: Expr
+
+
+# --- Geometry declarations ---
+
+@dataclass
+class GeometryDecl:
+    name: str
+    fields: list[GeometryField]
+    transform: Optional[GeometryTransform] = None
+    outputs: Optional[GeometryOutputs] = None
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class GeometryField:
+    name: str
+    type_name: str
+
+
+@dataclass
+class GeometryTransform:
+    name: str
+    fields: list[BlockField]
+
+
+@dataclass
+class GeometryOutputs:
+    bindings: list[OutputBinding]
+
+
+@dataclass
+class OutputBinding:
+    name: str
+    value: Expr
+
+
+# --- Pipeline declarations ---
+
+@dataclass
+class PipelineDecl:
+    name: str
+    members: list[PipelineMember]
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class PipelineMember:
+    name: str
+    value: Expr
 
 
 # --- Stage blocks ---
