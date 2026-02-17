@@ -52,6 +52,7 @@ def main(argv: list[str] | None = None) -> None:
             source=source,
             stem=stem,
             output_dir=output_dir,
+            source_dir=input_path.parent,
             dump_ast=args.dump_ast,
             emit_asm=args.emit_asm,
             validate=not args.no_validate,

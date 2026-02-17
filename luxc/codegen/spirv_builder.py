@@ -518,12 +518,34 @@ class SpvGenerator:
 
         # Arithmetic ops
         spv_op = self._select_arith_op(op, lt, rt)
+
+        # Handle mixed vec/scalar for +, -, /, % by splatting scalar to vec
+        from luxc.builtins.types import resolve_alias_chain
+        lt_resolved = resolve_alias_chain(lt)
+        rt_resolved = resolve_alias_chain(rt)
+        lt_type = resolve_type(lt_resolved)
+        rt_type = resolve_type(rt_resolved)
+        if op in ("+", "-", "/", "%"):
+            if isinstance(lt_type, VectorType) and isinstance(rt_type, ScalarType):
+                splat_id = self.reg.next_id()
+                vec_type = self.reg.lux_type_to_spirv(lt_resolved)
+                components = " ".join([right_id] * lt_type.size)
+                lines.append(f"{splat_id} = OpCompositeConstruct {vec_type} {components}")
+                right_id = splat_id
+            elif isinstance(lt_type, ScalarType) and isinstance(rt_type, VectorType):
+                splat_id = self.reg.next_id()
+                vec_type = self.reg.lux_type_to_spirv(rt_resolved)
+                components = " ".join([left_id] * rt_type.size)
+                lines.append(f"{splat_id} = OpCompositeConstruct {vec_type} {components}")
+                left_id = splat_id
+
         lines.append(f"{result} = {spv_op} {result_type} {left_id} {right_id}")
         return result, lines
 
     def _select_arith_op(self, op: str, lt: str, rt: str) -> str:
-        lt_type = resolve_type(lt)
-        rt_type = resolve_type(rt)
+        from luxc.builtins.types import resolve_alias_chain
+        lt_type = resolve_type(resolve_alias_chain(lt))
+        rt_type = resolve_type(resolve_alias_chain(rt))
 
         if op == "+":
             return "OpFAdd"
