@@ -11,6 +11,7 @@ start: module_item*
             | surface_decl
             | geometry_decl
             | pipeline_decl
+            | schedule_decl
 
 // --- Top-level declarations ---
 
@@ -52,6 +53,11 @@ pipeline_decl: "pipeline" IDENT "{" pipeline_member ("," pipeline_member)* ","? 
 
 pipeline_member: IDENT ":" expr
 
+// --- Schedule declarations ---
+
+schedule_decl: "schedule" IDENT "{" schedule_member ("," schedule_member)* ","? "}"
+schedule_member: IDENT ":" IDENT
+
 // --- Stage blocks ---
 
 stage_block: STAGE_TYPE "{" stage_item* "}"
@@ -77,7 +83,8 @@ sampler_decl: "sampler2d" IDENT ";"
 
 // --- Functions ---
 
-function_def: "fn" IDENT "(" param_list? ")" ("->" type)? "{" statement* "}"
+function_def: attribute* "fn" IDENT "(" param_list? ")" ("->" type)? "{" statement* "}"
+attribute: "@" IDENT
 
 param_list: param ("," param)*
 param: IDENT ":" type

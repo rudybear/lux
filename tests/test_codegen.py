@@ -3,14 +3,16 @@
 import pytest
 from luxc.parser.tree_builder import parse_lux
 from luxc.analysis.type_checker import type_check
+from luxc.optimization.const_fold import constant_fold
 from luxc.analysis.layout_assigner import assign_layouts
 from luxc.codegen.spirv_builder import generate_spirv
 
 
 def _compile_stage(src: str, stage_idx: int = 0) -> str:
-    """Parse, type-check, and generate SPIR-V assembly for a stage."""
+    """Parse, type-check, constant-fold, and generate SPIR-V assembly for a stage."""
     m = parse_lux(src)
     type_check(m)
+    constant_fold(m)
     assign_layouts(m)
     return generate_spirv(m, m.stages[stage_idx])
 
@@ -229,3 +231,36 @@ class TestSwizzle:
         }
         """)
         assert "OpCompositeExtract" in asm
+
+
+class TestConstantFolding:
+    def test_literal_arithmetic_folded(self):
+        """1.0 + 2.0 should be folded to a constant 3.0 in SPIR-V."""
+        asm = _compile_stage("""
+        fragment {
+            out color: vec4;
+            fn main() {
+                let v: scalar = 1.0 + 2.0;
+                color = vec4(v, v, v, 1.0);
+            }
+        }
+        """)
+        # After folding, the literal 3.0 should appear as a constant
+        assert "OpConstant" in asm and "3.0" in asm
+        # No OpFAdd needed — the addition was folded at compile time
+        assert "OpFAdd" not in asm
+
+    def test_constant_reference_inlined(self):
+        """Module-level const should be inlined as a literal."""
+        asm = _compile_stage("""
+        const HALF: scalar = 0.5;
+        fragment {
+            out color: vec4;
+            fn main() {
+                let v: scalar = HALF;
+                color = vec4(v, v, v, 1.0);
+            }
+        }
+        """)
+        # HALF should be inlined to 0.5 constant
+        assert "OpConstant" in asm and "0.5" in asm

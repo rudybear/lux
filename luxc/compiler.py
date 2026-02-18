@@ -3,6 +3,7 @@
 from pathlib import Path
 from luxc.parser.tree_builder import parse_lux
 from luxc.analysis.type_checker import type_check
+from luxc.optimization.const_fold import constant_fold
 from luxc.analysis.layout_assigner import assign_layouts
 from luxc.codegen.spirv_builder import generate_spirv
 from luxc.codegen.spv_assembler import assemble_and_validate
@@ -45,10 +46,11 @@ def _resolve_imports(module, source_dir: Path | None = None):
         imported_source = found.read_text(encoding="utf-8")
         imported = parse_lux(imported_source)
 
-        # Merge: type aliases, constants, functions (but not stages, surfaces, etc.)
+        # Merge: type aliases, constants, functions, schedules (but not stages, surfaces, etc.)
         module.type_aliases.extend(imported.type_aliases)
         module.constants.extend(imported.constants)
         module.functions.extend(imported.functions)
+        module.schedules.extend(imported.schedules)
 
         # Recursively resolve imports from the imported module
         if imported.imports:
@@ -80,11 +82,16 @@ def compile_source(
         from luxc.expansion.surface_expander import expand_surfaces
         expand_surfaces(module)
 
+    # Expand @differentiable functions into gradient functions
+    from luxc.autodiff.forward_diff import autodiff_expand
+    autodiff_expand(module)
+
     if dump_ast:
         _dump_ast(module)
         return
 
     type_check(module)
+    constant_fold(module)
     assign_layouts(module)
 
     output_dir.mkdir(parents=True, exist_ok=True)

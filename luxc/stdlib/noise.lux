@@ -1,0 +1,312 @@
+// Lux Standard Library: Procedural Noise
+// Hash functions, value noise, gradient noise, FBM, and Voronoi
+// Uses sin-based hashing (no bitwise ops required)
+
+// --- Hash Functions ---
+// Sin-based arithmetic hashing
+
+fn hash21(p: vec2) -> scalar {
+    let q: vec3 = fract(vec3(p.x, p.y, p.x) * vec3(0.1031, 0.1030, 0.0973));
+    let d: scalar = dot(q, vec3(33.33, 33.33, 33.33) + vec3(q.y, q.z, q.x));
+    return fract((q.x + q.y) * (q.z + d));
+}
+
+fn hash22(p: vec2) -> vec2 {
+    let q: vec3 = fract(vec3(p.x, p.y, p.x) * vec3(0.1031, 0.1030, 0.0973));
+    let r: vec3 = q + vec3(dot(q, vec3(q.y, q.z, q.x) + vec3(33.33)));
+    return fract(vec2((r.x + r.y) * r.z, (r.x + r.z) * r.y));
+}
+
+fn hash31(p: vec3) -> scalar {
+    let q: vec3 = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    let d: scalar = dot(q, vec3(q.y, q.z, q.x) + vec3(33.33));
+    return fract((q.x + q.y + q.z) * d);
+}
+
+fn hash33(p: vec3) -> vec3 {
+    let q: vec3 = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    let d: scalar = dot(q, vec3(q.y, q.z, q.x) + vec3(33.33));
+    return fract((vec3(q.x, q.y, q.z) + vec3(q.y, q.z, q.x)) * d);
+}
+
+// --- Value Noise ---
+
+fn value_noise2d(p: vec2) -> scalar {
+    let i: vec2 = floor(p);
+    let f: vec2 = fract(p);
+    let u: vec2 = f * f * (vec2(3.0) - vec2(2.0) * f);
+
+    let v00: scalar = hash21(i + vec2(0.0, 0.0));
+    let v10: scalar = hash21(i + vec2(1.0, 0.0));
+    let v01: scalar = hash21(i + vec2(0.0, 1.0));
+    let v11: scalar = hash21(i + vec2(1.0, 1.0));
+
+    let mx0: scalar = mix(v00, v10, u.x);
+    let mx1: scalar = mix(v01, v11, u.x);
+    return mix(mx0, mx1, u.y);
+}
+
+fn value_noise3d(p: vec3) -> scalar {
+    let i: vec3 = floor(p);
+    let f: vec3 = fract(p);
+    let u: vec3 = f * f * (vec3(3.0) - vec3(2.0) * f);
+
+    let v000: scalar = hash31(i + vec3(0.0, 0.0, 0.0));
+    let v100: scalar = hash31(i + vec3(1.0, 0.0, 0.0));
+    let v010: scalar = hash31(i + vec3(0.0, 1.0, 0.0));
+    let v110: scalar = hash31(i + vec3(1.0, 1.0, 0.0));
+    let v001: scalar = hash31(i + vec3(0.0, 0.0, 1.0));
+    let v101: scalar = hash31(i + vec3(1.0, 0.0, 1.0));
+    let v011: scalar = hash31(i + vec3(0.0, 1.0, 1.0));
+    let v111: scalar = hash31(i + vec3(1.0, 1.0, 1.0));
+
+    let mx00: scalar = mix(v000, v100, u.x);
+    let mx10: scalar = mix(v010, v110, u.x);
+    let mx01: scalar = mix(v001, v101, u.x);
+    let mx11: scalar = mix(v011, v111, u.x);
+
+    let my0: scalar = mix(mx00, mx10, u.y);
+    let my1: scalar = mix(mx01, mx11, u.y);
+
+    return mix(my0, my1, u.z);
+}
+
+// --- Gradient Noise (Perlin-style) ---
+
+fn gradient_noise2d(p: vec2) -> scalar {
+    let i: vec2 = floor(p);
+    let f: vec2 = fract(p);
+    let u: vec2 = f * f * (vec2(3.0) - vec2(2.0) * f);
+
+    let g00: vec2 = hash22(i + vec2(0.0, 0.0)) * 2.0 - vec2(1.0);
+    let g10: vec2 = hash22(i + vec2(1.0, 0.0)) * 2.0 - vec2(1.0);
+    let g01: vec2 = hash22(i + vec2(0.0, 1.0)) * 2.0 - vec2(1.0);
+    let g11: vec2 = hash22(i + vec2(1.0, 1.0)) * 2.0 - vec2(1.0);
+
+    let d00: scalar = dot(g00, f - vec2(0.0, 0.0));
+    let d10: scalar = dot(g10, f - vec2(1.0, 0.0));
+    let d01: scalar = dot(g01, f - vec2(0.0, 1.0));
+    let d11: scalar = dot(g11, f - vec2(1.0, 1.0));
+
+    let mx0: scalar = mix(d00, d10, u.x);
+    let mx1: scalar = mix(d01, d11, u.x);
+    return mix(mx0, mx1, u.y);
+}
+
+fn gradient_noise3d(p: vec3) -> scalar {
+    let i: vec3 = floor(p);
+    let f: vec3 = fract(p);
+    let u: vec3 = f * f * (vec3(3.0) - vec3(2.0) * f);
+
+    let g000: vec3 = hash33(i + vec3(0.0, 0.0, 0.0)) * 2.0 - vec3(1.0);
+    let g100: vec3 = hash33(i + vec3(1.0, 0.0, 0.0)) * 2.0 - vec3(1.0);
+    let g010: vec3 = hash33(i + vec3(0.0, 1.0, 0.0)) * 2.0 - vec3(1.0);
+    let g110: vec3 = hash33(i + vec3(1.0, 1.0, 0.0)) * 2.0 - vec3(1.0);
+    let g001: vec3 = hash33(i + vec3(0.0, 0.0, 1.0)) * 2.0 - vec3(1.0);
+    let g101: vec3 = hash33(i + vec3(1.0, 0.0, 1.0)) * 2.0 - vec3(1.0);
+    let g011: vec3 = hash33(i + vec3(0.0, 1.0, 1.0)) * 2.0 - vec3(1.0);
+    let g111: vec3 = hash33(i + vec3(1.0, 1.0, 1.0)) * 2.0 - vec3(1.0);
+
+    let d000: scalar = dot(g000, f - vec3(0.0, 0.0, 0.0));
+    let d100: scalar = dot(g100, f - vec3(1.0, 0.0, 0.0));
+    let d010: scalar = dot(g010, f - vec3(0.0, 1.0, 0.0));
+    let d110: scalar = dot(g110, f - vec3(1.0, 1.0, 0.0));
+    let d001: scalar = dot(g001, f - vec3(0.0, 0.0, 1.0));
+    let d101: scalar = dot(g101, f - vec3(1.0, 0.0, 1.0));
+    let d011: scalar = dot(g011, f - vec3(0.0, 1.0, 1.0));
+    let d111: scalar = dot(g111, f - vec3(1.0, 1.0, 1.0));
+
+    let mx00: scalar = mix(d000, d100, u.x);
+    let mx10: scalar = mix(d010, d110, u.x);
+    let mx01: scalar = mix(d001, d101, u.x);
+    let mx11: scalar = mix(d011, d111, u.x);
+
+    let my0: scalar = mix(mx00, mx10, u.y);
+    let my1: scalar = mix(mx01, mx11, u.y);
+
+    return mix(my0, my1, u.z);
+}
+
+// --- FBM (Fractal Brownian Motion) ---
+// Fixed octave counts (no loops in Lux)
+
+fn fbm2d_4(p: vec2, lacunarity: scalar, gain: scalar) -> scalar {
+    let amp0: scalar = 1.0;
+    let freq0: scalar = 1.0;
+    let v0: scalar = amp0 * value_noise2d(p * freq0);
+
+    let amp1: scalar = amp0 * gain;
+    let freq1: scalar = freq0 * lacunarity;
+    let v1: scalar = amp1 * value_noise2d(p * freq1);
+
+    let amp2: scalar = amp1 * gain;
+    let freq2: scalar = freq1 * lacunarity;
+    let v2: scalar = amp2 * value_noise2d(p * freq2);
+
+    let amp3: scalar = amp2 * gain;
+    let freq3: scalar = freq2 * lacunarity;
+    let v3: scalar = amp3 * value_noise2d(p * freq3);
+
+    return v0 + v1 + v2 + v3;
+}
+
+fn fbm2d_6(p: vec2, lacunarity: scalar, gain: scalar) -> scalar {
+    let amp0: scalar = 1.0;
+    let freq0: scalar = 1.0;
+    let v0: scalar = amp0 * value_noise2d(p * freq0);
+
+    let amp1: scalar = amp0 * gain;
+    let freq1: scalar = freq0 * lacunarity;
+    let v1: scalar = amp1 * value_noise2d(p * freq1);
+
+    let amp2: scalar = amp1 * gain;
+    let freq2: scalar = freq1 * lacunarity;
+    let v2: scalar = amp2 * value_noise2d(p * freq2);
+
+    let amp3: scalar = amp2 * gain;
+    let freq3: scalar = freq2 * lacunarity;
+    let v3: scalar = amp3 * value_noise2d(p * freq3);
+
+    let amp4: scalar = amp3 * gain;
+    let freq4: scalar = freq3 * lacunarity;
+    let v4: scalar = amp4 * value_noise2d(p * freq4);
+
+    let amp5: scalar = amp4 * gain;
+    let freq5: scalar = freq4 * lacunarity;
+    let v5: scalar = amp5 * value_noise2d(p * freq5);
+
+    return v0 + v1 + v2 + v3 + v4 + v5;
+}
+
+fn fbm3d_4(p: vec3, lacunarity: scalar, gain: scalar) -> scalar {
+    let amp0: scalar = 1.0;
+    let freq0: scalar = 1.0;
+    let v0: scalar = amp0 * value_noise3d(p * freq0);
+
+    let amp1: scalar = amp0 * gain;
+    let freq1: scalar = freq0 * lacunarity;
+    let v1: scalar = amp1 * value_noise3d(p * freq1);
+
+    let amp2: scalar = amp1 * gain;
+    let freq2: scalar = freq1 * lacunarity;
+    let v2: scalar = amp2 * value_noise3d(p * freq2);
+
+    let amp3: scalar = amp2 * gain;
+    let freq3: scalar = freq2 * lacunarity;
+    let v3: scalar = amp3 * value_noise3d(p * freq3);
+
+    return v0 + v1 + v2 + v3;
+}
+
+fn fbm3d_6(p: vec3, lacunarity: scalar, gain: scalar) -> scalar {
+    let amp0: scalar = 1.0;
+    let freq0: scalar = 1.0;
+    let v0: scalar = amp0 * value_noise3d(p * freq0);
+
+    let amp1: scalar = amp0 * gain;
+    let freq1: scalar = freq0 * lacunarity;
+    let v1: scalar = amp1 * value_noise3d(p * freq1);
+
+    let amp2: scalar = amp1 * gain;
+    let freq2: scalar = freq1 * lacunarity;
+    let v2: scalar = amp2 * value_noise3d(p * freq2);
+
+    let amp3: scalar = amp2 * gain;
+    let freq3: scalar = freq2 * lacunarity;
+    let v3: scalar = amp3 * value_noise3d(p * freq3);
+
+    let amp4: scalar = amp3 * gain;
+    let freq4: scalar = freq3 * lacunarity;
+    let v4: scalar = amp4 * value_noise3d(p * freq4);
+
+    let amp5: scalar = amp4 * gain;
+    let freq5: scalar = freq4 * lacunarity;
+    let v5: scalar = amp5 * value_noise3d(p * freq5);
+
+    return v0 + v1 + v2 + v3 + v4 + v5;
+}
+
+// --- Voronoi ---
+// Unrolled 3x3 grid search, returns vec2(cell_distance, edge_distance)
+
+fn voronoi2d(p: vec2) -> vec2 {
+    let i: vec2 = floor(p);
+    let f: vec2 = fract(p);
+
+    let min_dist: scalar = 8.0;
+    let second_dist: scalar = 8.0;
+
+    // Cell (-1, -1)
+    let o_n1n1: vec2 = hash22(i + vec2(-1.0, -1.0));
+    let d_n1n1: scalar = length(vec2(-1.0, -1.0) + o_n1n1 - f);
+    let sec_00: scalar = min_dist;
+    let mn_00: scalar = min(min_dist, d_n1n1);
+    let sx_00: scalar = max(sec_00, d_n1n1);
+    let s_00: scalar = min(sx_00, max(mn_00, sec_00));
+
+    // Cell (0, -1)
+    let o_0n1: vec2 = hash22(i + vec2(0.0, -1.0));
+    let d_0n1: scalar = length(vec2(0.0, -1.0) + o_0n1 - f);
+    let sec_01: scalar = s_00;
+    let mn_01: scalar = min(mn_00, d_0n1);
+    let sx_01: scalar = max(sec_01, d_0n1);
+    let s_01: scalar = min(sx_01, max(mn_01, sec_01));
+
+    // Cell (1, -1)
+    let o_1n1: vec2 = hash22(i + vec2(1.0, -1.0));
+    let d_1n1: scalar = length(vec2(1.0, -1.0) + o_1n1 - f);
+    let sec_02: scalar = s_01;
+    let mn_02: scalar = min(mn_01, d_1n1);
+    let sx_02: scalar = max(sec_02, d_1n1);
+    let s_02: scalar = min(sx_02, max(mn_02, sec_02));
+
+    // Cell (-1, 0)
+    let o_n10: vec2 = hash22(i + vec2(-1.0, 0.0));
+    let d_n10: scalar = length(vec2(-1.0, 0.0) + o_n10 - f);
+    let sec_10: scalar = s_02;
+    let mn_10: scalar = min(mn_02, d_n10);
+    let sx_10: scalar = max(sec_10, d_n10);
+    let s_10: scalar = min(sx_10, max(mn_10, sec_10));
+
+    // Cell (0, 0)
+    let o_00: vec2 = hash22(i + vec2(0.0, 0.0));
+    let d_00: scalar = length(vec2(0.0, 0.0) + o_00 - f);
+    let sec_11: scalar = s_10;
+    let mn_11: scalar = min(mn_10, d_00);
+    let sx_11: scalar = max(sec_11, d_00);
+    let s_11: scalar = min(sx_11, max(mn_11, sec_11));
+
+    // Cell (1, 0)
+    let o_10: vec2 = hash22(i + vec2(1.0, 0.0));
+    let d_10: scalar = length(vec2(1.0, 0.0) + o_10 - f);
+    let sec_12: scalar = s_11;
+    let mn_12: scalar = min(mn_11, d_10);
+    let sx_12: scalar = max(sec_12, d_10);
+    let s_12: scalar = min(sx_12, max(mn_12, sec_12));
+
+    // Cell (-1, 1)
+    let o_n11: vec2 = hash22(i + vec2(-1.0, 1.0));
+    let d_n11: scalar = length(vec2(-1.0, 1.0) + o_n11 - f);
+    let sec_20: scalar = s_12;
+    let mn_20: scalar = min(mn_12, d_n11);
+    let sx_20: scalar = max(sec_20, d_n11);
+    let s_20: scalar = min(sx_20, max(mn_20, sec_20));
+
+    // Cell (0, 1)
+    let o_01: vec2 = hash22(i + vec2(0.0, 1.0));
+    let d_01: scalar = length(vec2(0.0, 1.0) + o_01 - f);
+    let sec_21: scalar = s_20;
+    let mn_21: scalar = min(mn_20, d_01);
+    let sx_21: scalar = max(sec_21, d_01);
+    let s_21: scalar = min(sx_21, max(mn_21, sec_21));
+
+    // Cell (1, 1)
+    let o_11: vec2 = hash22(i + vec2(1.0, 1.0));
+    let d_11: scalar = length(vec2(1.0, 1.0) + o_11 - f);
+    let sec_22: scalar = s_21;
+    let mn_22: scalar = min(mn_21, d_11);
+    let sx_22: scalar = max(sec_22, d_11);
+    let s_22: scalar = min(sx_22, max(mn_22, sec_22));
+
+    return vec2(mn_22, s_22);
+}

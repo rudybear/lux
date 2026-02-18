@@ -19,7 +19,48 @@ from luxc.parser.ast_nodes import (
     NumberLit, VarRef, BinaryOp, CallExpr, ConstructorExpr,
     SwizzleAccess,
     AssignTarget, SurfaceDecl, GeometryDecl, PipelineDecl,
+    ScheduleDecl,
 )
+
+
+# --- Schedule strategy tables ---
+
+_DEFAULT_STRATEGIES = {
+    "fresnel": "schlick",
+    "distribution": "ggx",
+    "geometry_term": "smith_ggx",
+    "tonemap": "none",
+}
+
+_STRATEGY_FUNCTIONS = {
+    ("fresnel", "schlick"): "fresnel_schlick",
+    ("fresnel", "schlick_roughness"): "fresnel_schlick_roughness",
+    ("distribution", "ggx"): "ggx_ndf",
+    ("distribution", "ggx_fast"): "ggx_ndf_fast",
+    ("geometry_term", "smith_ggx"): "smith_ggx",
+    ("geometry_term", "smith_ggx_fast"): "smith_ggx_fast",
+    ("tonemap", "aces"): "tonemap_aces",
+    ("tonemap", "reinhard"): "tonemap_reinhard",
+    ("tonemap", "none"): None,
+}
+
+_VALID_SLOTS = set(_DEFAULT_STRATEGIES.keys())
+
+
+def _resolve_schedule(module: Module, name: str) -> dict[str, str]:
+    """Resolve a schedule name to a strategy dict."""
+    for sched in module.schedules:
+        if sched.name == name:
+            strategies = dict(_DEFAULT_STRATEGIES)
+            for member in sched.members:
+                if member.name not in _VALID_SLOTS:
+                    raise ValueError(
+                        f"Unknown schedule slot '{member.name}' in schedule '{name}'. "
+                        f"Valid slots: {sorted(_VALID_SLOTS)}"
+                    )
+                strategies[member.name] = member.value
+            return strategies
+    raise ValueError(f"Schedule '{name}' not found")
 
 
 def expand_surfaces(module: Module) -> None:
@@ -36,6 +77,7 @@ def expand_surfaces(module: Module) -> None:
     for pipeline in module.pipelines:
         geo_name = None
         surf_name = None
+        schedule_name = None
         for member in pipeline.members:
             if member.name == "geometry":
                 if isinstance(member.value, VarRef):
@@ -43,11 +85,19 @@ def expand_surfaces(module: Module) -> None:
             elif member.name == "surface":
                 if isinstance(member.value, VarRef):
                     surf_name = member.value.name
+            elif member.name == "schedule":
+                if isinstance(member.value, VarRef):
+                    schedule_name = member.value.name
+
+        # Resolve schedule if specified
+        schedule = None
+        if schedule_name:
+            schedule = _resolve_schedule(module, schedule_name)
 
         if surf_name and surf_name in surfaces:
             surface = surfaces[surf_name]
             geometry = geometries.get(geo_name) if geo_name else None
-            stages = _expand_pipeline(surface, geometry, module)
+            stages = _expand_pipeline(surface, geometry, module, schedule)
             # Tag fragment stages with set offset so uniforms don't clash
             # with vertex uniforms when combined in a pipeline
             for s in stages:
@@ -72,6 +122,7 @@ def _expand_pipeline(
     surface: SurfaceDecl,
     geometry: GeometryDecl | None,
     module: Module,
+    schedule: dict[str, str] | None = None,
 ) -> list[StageBlock]:
     """Generate vertex and fragment stages from surface + geometry."""
     stages = []
@@ -80,7 +131,7 @@ def _expand_pipeline(
         vert = _expand_geometry_to_vertex(geometry)
         stages.append(vert)
 
-    frag = _expand_surface_to_fragment(surface, module, geometry)
+    frag = _expand_surface_to_fragment(surface, module, geometry, schedule)
     stages.append(frag)
     return stages
 
@@ -138,6 +189,7 @@ def _expand_surface_to_fragment(
     surface: SurfaceDecl,
     module: Module,
     geometry: GeometryDecl | None = None,
+    schedule: dict[str, str] | None = None,
 ) -> StageBlock:
     """Generate a fragment stage from a surface declaration.
 
@@ -191,7 +243,7 @@ def _expand_surface_to_fragment(
         stage.samplers.append(SamplerDecl(sam_name))
 
     # Generate main function body
-    body = _generate_surface_main(surface, frag_inputs)
+    body = _generate_surface_main(surface, frag_inputs, schedule)
     stage.functions.append(FunctionDef("main", [], None, body))
 
     return stage
@@ -200,6 +252,7 @@ def _expand_surface_to_fragment(
 def _generate_surface_main(
     surface: SurfaceDecl,
     frag_inputs: list[tuple[str, str]],
+    schedule: dict[str, str] | None = None,
 ) -> list:
     """Generate the main() body for a surface-expanded fragment shader."""
     body = []
@@ -235,7 +288,7 @@ def _generate_surface_main(
         # The BRDF expression is a call like `lambert(albedo)` or
         # `fresnel_blend(spec, diff)`. We evaluate it by calling
         # the appropriate function with n, v, l added.
-        result_expr = _expand_brdf_call(brdf_expr)
+        result_expr = _expand_brdf_call(brdf_expr, schedule)
         body.append(LetStmt("result", "vec3", result_expr))
     else:
         # Default: simple lambert with white albedo
@@ -263,20 +316,36 @@ def _generate_surface_main(
         NumberLit("2.5"),
     )))
 
+    # Apply tonemap from schedule if specified
+    tonemap_strategy = schedule.get("tonemap", "none") if schedule else "none"
+    if tonemap_strategy == "aces":
+        body.append(LetStmt("tonemapped", "vec3",
+            CallExpr(VarRef("tonemap_aces"), [VarRef("final_color")])))
+        output_color_var = "tonemapped"
+    elif tonemap_strategy == "reinhard":
+        body.append(LetStmt("tonemapped", "vec3",
+            CallExpr(VarRef("tonemap_reinhard"), [VarRef("final_color")])))
+        output_color_var = "tonemapped"
+    else:
+        output_color_var = "final_color"
+
     # Output final color
     body.append(AssignStmt(
         AssignTarget(VarRef("color")),
-        ConstructorExpr("vec4", [VarRef("final_color"), NumberLit("1.0")]),
+        ConstructorExpr("vec4", [VarRef(output_color_var), NumberLit("1.0")]),
     ))
 
     return body
 
 
-def _expand_brdf_call(expr) -> any:
+def _expand_brdf_call(expr, schedule: dict[str, str] | None = None) -> any:
     """Expand a BRDF expression from surface declaration into concrete calls.
 
     Surface BRDF expressions like `lambert(albedo: vec3(0.8))` get expanded
     to full evaluation calls: `lambert_brdf(vec3(0.8), max(dot(n, l), 0.0))`.
+
+    If a schedule is provided, selects fast/alternative BRDF implementations
+    based on the strategy choices (distribution, geometry_term, fresnel).
     """
     if isinstance(expr, CallExpr) and isinstance(expr.func, VarRef):
         fname = expr.func.name
@@ -291,18 +360,40 @@ def _expand_brdf_call(expr) -> any:
                 ]),
             ])
         elif fname == "microfacet_ggx":
-            # microfacet_ggx(roughness, f0) -> microfacet_brdf(n, v, l, roughness, f0)
             roughness = expr.args[0] if len(expr.args) > 0 else NumberLit("0.5")
             f0 = expr.args[1] if len(expr.args) > 1 else ConstructorExpr("vec3", [NumberLit("0.04")])
+            # Choose variant based on schedule
+            if schedule:
+                dist = schedule.get("distribution", "ggx")
+                geom = schedule.get("geometry_term", "smith_ggx")
+                fresnel = schedule.get("fresnel", "schlick")
+                if dist == "ggx_fast" or geom == "smith_ggx_fast":
+                    return CallExpr(VarRef("microfacet_brdf_fast"), [
+                        VarRef("n"), VarRef("v"), VarRef("l"),
+                        roughness, f0,
+                    ])
+                if fresnel == "schlick_roughness":
+                    return CallExpr(VarRef("microfacet_brdf_roughness"), [
+                        VarRef("n"), VarRef("v"), VarRef("l"),
+                        roughness, f0,
+                    ])
             return CallExpr(VarRef("microfacet_brdf"), [
                 VarRef("n"), VarRef("v"), VarRef("l"),
                 roughness, f0,
             ])
         elif fname == "pbr":
-            # pbr(albedo, roughness, metallic) -> pbr_brdf(n, v, l, albedo, roughness, metallic)
             albedo = expr.args[0] if len(expr.args) > 0 else ConstructorExpr("vec3", [NumberLit("0.5")])
             roughness = expr.args[1] if len(expr.args) > 1 else NumberLit("0.5")
             metallic = expr.args[2] if len(expr.args) > 2 else NumberLit("0.0")
+            # Choose variant based on schedule
+            if schedule:
+                dist = schedule.get("distribution", "ggx")
+                geom = schedule.get("geometry_term", "smith_ggx")
+                if dist == "ggx_fast" or geom == "smith_ggx_fast":
+                    return CallExpr(VarRef("pbr_brdf_fast"), [
+                        VarRef("n"), VarRef("v"), VarRef("l"),
+                        albedo, roughness, metallic,
+                    ])
             return CallExpr(VarRef("pbr_brdf"), [
                 VarRef("n"), VarRef("v"), VarRef("l"),
                 albedo, roughness, metallic,

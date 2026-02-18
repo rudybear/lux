@@ -9,6 +9,7 @@ from luxc.parser.ast_nodes import (
     TypeAlias, ImportDecl, SurfaceDecl, SurfaceMember,
     GeometryDecl, GeometryField, GeometryTransform, GeometryOutputs,
     PipelineDecl, PipelineMember,
+    ScheduleDecl, ScheduleMember,
 )
 
 
@@ -406,3 +407,57 @@ class TestPipelineDecl:
         assert len(p.members) == 2
         assert p.members[0].name == "geometry"
         assert p.members[1].name == "surface"
+
+
+class TestScheduleDecl:
+    def test_simple_schedule(self):
+        src = """
+        schedule Mobile {
+            distribution: ggx_fast,
+            geometry_term: smith_ggx_fast,
+        }
+        """
+        m = parse_lux(src)
+        assert len(m.schedules) == 1
+        s = m.schedules[0]
+        assert isinstance(s, ScheduleDecl)
+        assert s.name == "Mobile"
+        assert len(s.members) == 2
+        assert s.members[0].name == "distribution"
+        assert s.members[0].value == "ggx_fast"
+        assert s.members[1].name == "geometry_term"
+        assert s.members[1].value == "smith_ggx_fast"
+
+    def test_multiple_schedules(self):
+        src = """
+        schedule HighQuality {
+            fresnel: schlick_roughness,
+            tonemap: aces,
+        }
+        schedule Mobile {
+            distribution: ggx_fast,
+            geometry_term: smith_ggx_fast,
+        }
+        """
+        m = parse_lux(src)
+        assert len(m.schedules) == 2
+        assert m.schedules[0].name == "HighQuality"
+        assert m.schedules[1].name == "Mobile"
+
+    def test_schedule_with_pipeline(self):
+        src = """
+        schedule Fast {
+            distribution: ggx_fast,
+        }
+        pipeline Forward {
+            geometry: Mesh,
+            surface: Material,
+            schedule: Fast,
+        }
+        """
+        m = parse_lux(src)
+        assert len(m.schedules) == 1
+        assert len(m.pipelines) == 1
+        # The pipeline should have a schedule member
+        sched_member = [mm for mm in m.pipelines[0].members if mm.name == "schedule"]
+        assert len(sched_member) == 1

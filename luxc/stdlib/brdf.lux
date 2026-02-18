@@ -68,6 +68,68 @@ fn microfacet_brdf(n: vec3, v: vec3, l: vec3, roughness: scalar, f0: vec3) -> ve
     return numerator / denominator;
 }
 
+// --- Fast / Approximate Variants ---
+
+fn ggx_ndf_fast(n_dot_h: scalar, roughness: scalar) -> scalar {
+    let a: scalar = roughness * roughness;
+    let d: scalar = n_dot_h * n_dot_h * (a - 1.0) + 1.0;
+    return a * INV_PI / (d * d + EPSILON);
+}
+
+fn smith_ggx_fast(n_dot_v: scalar, n_dot_l: scalar, roughness: scalar) -> scalar {
+    let a: scalar = roughness * roughness;
+    let ggxv: scalar = n_dot_l * (n_dot_v * (1.0 - a) + a);
+    let ggxl: scalar = n_dot_v * (n_dot_l * (1.0 - a) + a);
+    return 0.5 / (ggxv + ggxl + EPSILON);
+}
+
+fn microfacet_brdf_fast(n: vec3, v: vec3, l: vec3, roughness: scalar, f0: vec3) -> vec3 {
+    let h: vec3 = normalize(v + l);
+    let n_dot_h: scalar = max(dot(n, h), 0.0);
+    let n_dot_v: scalar = max(dot(n, v), 0.0);
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let h_dot_v: scalar = max(dot(h, v), 0.0);
+
+    let d: scalar = ggx_ndf_fast(n_dot_h, roughness);
+    let g: scalar = smith_ggx_fast(n_dot_v, n_dot_l, roughness);
+    let f: vec3 = fresnel_schlick(h_dot_v, f0);
+
+    return f * d * g;
+}
+
+fn microfacet_brdf_roughness(n: vec3, v: vec3, l: vec3, roughness: scalar, f0: vec3) -> vec3 {
+    let h: vec3 = normalize(v + l);
+    let n_dot_h: scalar = max(dot(n, h), 0.0);
+    let n_dot_v: scalar = max(dot(n, v), 0.0);
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let h_dot_v: scalar = max(dot(h, v), 0.0);
+
+    let d: scalar = ggx_ndf(n_dot_h, roughness);
+    let g: scalar = smith_ggx(n_dot_v, n_dot_l, roughness);
+    let f: vec3 = fresnel_schlick_roughness(h_dot_v, f0, roughness);
+
+    let numerator: vec3 = f * d * g;
+    let denominator: scalar = 4.0 * n_dot_v * n_dot_l + EPSILON;
+    return numerator / denominator;
+}
+
+fn pbr_brdf_fast(n: vec3, v: vec3, l: vec3, albedo: vec3, roughness: scalar, metallic: scalar) -> vec3 {
+    let f0_dielectric: vec3 = vec3(0.04);
+    let f0: vec3 = mix(f0_dielectric, albedo, vec3(metallic));
+
+    let h: vec3 = normalize(v + l);
+    let h_dot_v: scalar = max(dot(h, v), 0.0);
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+
+    let f: vec3 = fresnel_schlick(h_dot_v, f0);
+    let kd: vec3 = (vec3(1.0) - f) * (1.0 - metallic);
+
+    let diffuse: vec3 = kd * albedo * INV_PI;
+    let specular: vec3 = microfacet_brdf_fast(n, v, l, roughness, f0);
+
+    return (diffuse + specular) * n_dot_l;
+}
+
 // --- Composite BRDF ---
 
 fn pbr_brdf(n: vec3, v: vec3, l: vec3, albedo: vec3, roughness: scalar, metallic: scalar) -> vec3 {

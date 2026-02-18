@@ -15,6 +15,7 @@ from luxc.parser.ast_nodes import (
     SurfaceDecl, SurfaceMember,
     GeometryDecl, GeometryField, GeometryTransform, GeometryOutputs, OutputBinding,
     PipelineDecl, PipelineMember,
+    ScheduleDecl, ScheduleMember,
 )
 
 _CONSTRUCTOR_TYPES = frozenset({
@@ -45,6 +46,12 @@ def _tok_loc(tok: Token) -> SourceLocation | None:
     return None
 
 
+class _Attribute:
+    """Sentinel for parsed @attribute annotations."""
+    def __init__(self, name: str):
+        self.name = name
+
+
 class LuxTransformer(Transformer):
     # --- Module ---
 
@@ -69,6 +76,8 @@ class LuxTransformer(Transformer):
                 mod.geometries.append(item)
             elif isinstance(item, PipelineDecl):
                 mod.pipelines.append(item)
+            elif isinstance(item, ScheduleDecl):
+                mod.schedules.append(item)
         return mod
 
     # --- Top-level declarations ---
@@ -151,6 +160,16 @@ class LuxTransformer(Transformer):
     def pipeline_member(self, args):
         return PipelineMember(str(args[0]), args[1])
 
+    # --- Schedule declarations ---
+
+    def schedule_decl(self, args):
+        name = args[0]
+        members = [a for a in args[1:] if isinstance(a, ScheduleMember)]
+        return ScheduleDecl(str(name), members, _tok_loc(name))
+
+    def schedule_member(self, args):
+        return ScheduleMember(str(args[0]), str(args[1]))
+
     # --- Stage blocks ---
 
     def stage_block(self, args):
@@ -202,9 +221,17 @@ class LuxTransformer(Transformer):
 
     # --- Functions ---
 
+    def attribute(self, args):
+        return _Attribute(str(args[0]))
+
     def function_def(self, args):
-        name = args[0]
-        idx = 1
+        attributes = []
+        idx = 0
+        while idx < len(args) and isinstance(args[idx], _Attribute):
+            attributes.append(args[idx].name)
+            idx += 1
+        name = args[idx]
+        idx += 1
         params = []
         if idx < len(args) and isinstance(args[idx], list):
             params = args[idx]
@@ -214,7 +241,7 @@ class LuxTransformer(Transformer):
             ret_type = args[idx]
             idx += 1
         body = list(args[idx:])
-        return FunctionDef(str(name), params, ret_type, body, _tok_loc(name))
+        return FunctionDef(str(name), params, ret_type, body, _tok_loc(name), attributes=attributes)
 
     def param_list(self, args):
         return list(args)

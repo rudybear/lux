@@ -1,0 +1,17 @@
+// Differentiable Rendering — forward-mode automatic differentiation
+// The compiler generates energy_d_x() from the @differentiable annotation
+
+@differentiable
+fn energy(x: scalar) -> scalar {
+    return x * x + sin(x);
+}
+
+fragment {
+    in param: scalar;
+    out color: vec4;
+    fn main() {
+        let val: scalar = energy(param);
+        let grad: scalar = energy_d_x(param);
+        color = vec4(val, grad, 0.0, 1.0);
+    }
+}

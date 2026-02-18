@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+ai = ["anthropic>=0.30"]
 
 [project.scripts]
 luxc = "luxc.cli:main"

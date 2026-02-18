@@ -1,0 +1,41 @@
+// SDF Shapes — render a 2D cross-section of combined SDF primitives
+// Uses UV-mapped fullscreen quad, evaluates SDFs, colors by distance
+
+import sdf;
+
+fragment {
+    in uv: vec2;
+    out color: vec4;
+
+    fn main() {
+        // Map UV [0,1] to centered coordinates [-2, 2]
+        let p: vec3 = vec3((uv - vec2(0.5)) * 4.0, 0.0);
+
+        // Sphere at origin
+        let d_sphere: scalar = sdf_sphere(p, 0.8);
+
+        // Box offset to the right
+        let p_box: vec3 = sdf_translate(p, vec3(1.2, 0.0, 0.0));
+        let d_box: scalar = sdf_box(p_box, vec3(0.5, 0.5, 0.5));
+
+        // Torus offset to the left
+        let p_torus: vec3 = sdf_translate(p, vec3(-1.2, 0.0, 0.0));
+        let d_torus: scalar = sdf_torus(p_torus, 0.5, 0.2);
+
+        // Combine with smooth union
+        let d_combined: scalar = sdf_smooth_union(d_sphere, d_box, 0.3);
+        let d_final: scalar = sdf_smooth_union(d_combined, d_torus, 0.3);
+
+        // Round the result
+        let d_rounded: scalar = sdf_round(d_final, 0.02);
+
+        // Color based on distance: inside = warm, outside = cool
+        let inside: scalar = smoothstep(0.01, 0.0, d_rounded);
+        let band: scalar = smoothstep(0.02, 0.0, abs(d_rounded));
+        let warm: vec3 = vec3(0.9, 0.4, 0.1) * inside;
+        let cool: vec3 = vec3(0.1, 0.2, 0.4) * (1.0 - inside);
+        let edge: vec3 = vec3(1.0) * band;
+
+        color = vec4(warm + cool + edge, 1.0);
+    }
+}

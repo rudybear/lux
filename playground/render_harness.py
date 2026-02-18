@@ -236,6 +236,135 @@ def render_triangle(
     return arr
 
 
+# ---------------------------------------------------------------------------
+# Fullscreen quad rendering (fragment-only shaders)
+# ---------------------------------------------------------------------------
+
+# Built-in WGSL vertex shader for fullscreen coverage.
+# Draws a single triangle that covers the entire screen and passes
+# UV coordinates (0,0)-(1,1) to the fragment shader at location 0.
+_FULLSCREEN_VERT_WGSL = """
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    // Fullscreen triangle: 3 vertices that cover [-1,1] clip space
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0),
+    );
+    let p = positions[idx];
+    var out: VertexOutput;
+    out.position = vec4<f32>(p, 0.0, 1.0);
+    // Map clip coords to UV: [-1,1] -> [0,1], with Y flipped so
+    // UV (0,0) = top-left to match Vulkan/wgpu convention
+    out.uv = vec2<f32>(p.x * 0.5 + 0.5, 1.0 - (p.y * 0.5 + 0.5));
+    return out;
+}
+"""
+
+
+def render_fullscreen(
+    frag_spv_path: Path,
+    width: int = 512,
+    height: int = 512,
+) -> np.ndarray:
+    """Render a fullscreen quad with the given fragment shader.
+
+    The fragment shader must accept `in uv: vec2` at location 0.
+    Returns an (H, W, 4) uint8 RGBA numpy array.
+    """
+
+    # --- GPU setup ---
+    adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+    if adapter is None:
+        raise RuntimeError("No suitable GPU adapter found")
+    device = adapter.request_device_sync()
+
+    # --- Shaders ---
+    vert_module = device.create_shader_module(code=_FULLSCREEN_VERT_WGSL)
+    frag_module = load_shader_module(device, frag_spv_path)
+
+    # --- Render target texture ---
+    texture = device.create_texture(
+        size=(width, height, 1),
+        format=wgpu.TextureFormat.rgba8unorm,
+        usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.COPY_SRC,
+    )
+    texture_view = texture.create_view()
+
+    # --- Render pipeline (no vertex buffers needed) ---
+    pipeline = device.create_render_pipeline(
+        layout="auto",
+        vertex=wgpu.VertexState(
+            module=vert_module,
+            entry_point="main",
+            buffers=[],
+        ),
+        primitive=wgpu.PrimitiveState(
+            topology=wgpu.PrimitiveTopology.triangle_list,
+        ),
+        multisample=wgpu.MultisampleState(count=1, mask=0xFFFFFFFF),
+        fragment=wgpu.FragmentState(
+            module=frag_module,
+            entry_point="main",
+            targets=[
+                wgpu.ColorTargetState(format=wgpu.TextureFormat.rgba8unorm),
+            ],
+        ),
+    )
+
+    # --- Encode render pass ---
+    encoder = device.create_command_encoder()
+    render_pass = encoder.begin_render_pass(
+        color_attachments=[
+            wgpu.RenderPassColorAttachment(
+                view=texture_view,
+                load_op=wgpu.LoadOp.clear,
+                store_op=wgpu.StoreOp.store,
+                clear_value=(0.0, 0.0, 0.0, 1.0),
+            )
+        ],
+    )
+    render_pass.set_pipeline(pipeline)
+    render_pass.draw(3)  # 3 vertices for fullscreen triangle
+    render_pass.end()
+
+    # --- Readback: copy texture -> buffer ---
+    bytes_per_row = width * 4
+    bytes_per_row_aligned = (bytes_per_row + 255) & ~255
+
+    readback_buffer = device.create_buffer(
+        size=bytes_per_row_aligned * height,
+        usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
+    )
+    encoder.copy_texture_to_buffer(
+        wgpu.TexelCopyTextureInfo(texture=texture),
+        wgpu.TexelCopyBufferInfo(
+            buffer=readback_buffer,
+            offset=0,
+            bytes_per_row=bytes_per_row_aligned,
+            rows_per_image=height,
+        ),
+        (width, height, 1),
+    )
+    device.queue.submit([encoder.finish()])
+
+    # --- Map buffer and extract pixels ---
+    readback_buffer.map_sync(wgpu.MapMode.READ)
+    raw = readback_buffer.read_mapped()
+
+    arr = np.frombuffer(raw, dtype=np.uint8).reshape(height, bytes_per_row_aligned)
+    arr = arr[:, : width * 4].reshape(height, width, 4).copy()
+
+    readback_buffer.unmap()
+    return arr
+
+
 def save_png(pixels: np.ndarray, output_path: Path) -> None:
     """Save an (H, W, 4) uint8 RGBA array as a PNG file."""
     img = Image.fromarray(pixels, "RGBA")

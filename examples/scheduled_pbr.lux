@@ -1,0 +1,52 @@
+// Scheduled PBR: Algorithm/schedule separation demo
+// The same surface material compiled with different quality strategies.
+
+import brdf;
+import color;
+
+// --- Geometry ---
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+// --- Surface (the "what") ---
+
+surface CopperMetal {
+    brdf: pbr(vec3(0.95, 0.64, 0.54), 0.3, 0.9),
+}
+
+// --- Schedules (the "how") ---
+
+schedule HighQuality {
+    fresnel: schlick,
+    distribution: ggx,
+    geometry_term: smith_ggx,
+    tonemap: aces,
+}
+
+schedule Mobile {
+    distribution: ggx_fast,
+    geometry_term: smith_ggx_fast,
+    tonemap: reinhard,
+}
+
+// --- Pipelines ---
+// Same geometry + surface, different schedules produce different shader code.
+
+pipeline DesktopForward {
+    geometry: StandardMesh,
+    surface: CopperMetal,
+    schedule: HighQuality,
+}

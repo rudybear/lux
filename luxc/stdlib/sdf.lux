@@ -1,0 +1,94 @@
+// Lux Standard Library: Signed Distance Fields
+// Primitives, CSG operators, transforms, and utilities
+
+// --- SDF Primitives ---
+// All take p: vec3 as first argument, return scalar distance
+
+fn sdf_sphere(p: vec3, radius: scalar) -> scalar {
+    return length(p) - radius;
+}
+
+fn sdf_box(p: vec3, half_extents: vec3) -> scalar {
+    let q: vec3 = abs(p) - half_extents;
+    return length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+fn sdf_round_box(p: vec3, half_extents: vec3, radius: scalar) -> scalar {
+    let q: vec3 = abs(p) - half_extents + vec3(radius);
+    return length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - radius;
+}
+
+fn sdf_plane(p: vec3, normal: vec3, offset: scalar) -> scalar {
+    return dot(p, normal) + offset;
+}
+
+fn sdf_torus(p: vec3, major: scalar, minor: scalar) -> scalar {
+    let q: vec2 = vec2(length(p.xz) - major, p.y);
+    return length(q) - minor;
+}
+
+fn sdf_cylinder(p: vec3, radius: scalar, height: scalar) -> scalar {
+    let d: vec2 = abs(vec2(length(p.xz), p.y)) - vec2(radius, height);
+    return min(max(d.x, d.y), 0.0) + length(max(d, vec2(0.0)));
+}
+
+fn sdf_capsule(p: vec3, a: vec3, b: vec3, radius: scalar) -> scalar {
+    let ab: vec3 = b - a;
+    let ap: vec3 = p - a;
+    let t: scalar = clamp(dot(ap, ab) / dot(ab, ab), 0.0, 1.0);
+    return length(ap - ab * t) - radius;
+}
+
+// --- CSG Operators ---
+// Combine two distance values
+
+fn sdf_union(d1: scalar, d2: scalar) -> scalar {
+    return min(d1, d2);
+}
+
+fn sdf_intersection(d1: scalar, d2: scalar) -> scalar {
+    return max(d1, d2);
+}
+
+fn sdf_subtraction(d1: scalar, d2: scalar) -> scalar {
+    return max(0.0 - d1, d2);
+}
+
+fn sdf_smooth_union(d1: scalar, d2: scalar, k: scalar) -> scalar {
+    let h: scalar = clamp(0.5 + 0.5 * (d2 - d1) / k, 0.0, 1.0);
+    return mix(d2, d1, h) - k * h * (1.0 - h);
+}
+
+fn sdf_smooth_subtraction(d1: scalar, d2: scalar, k: scalar) -> scalar {
+    let h: scalar = clamp(0.5 - 0.5 * (d2 + d1) / k, 0.0, 1.0);
+    return mix(d2, 0.0 - d1, h) + k * h * (1.0 - h);
+}
+
+// --- Transform Helpers ---
+// Transform the input point, return vec3
+
+fn sdf_translate(p: vec3, offset: vec3) -> vec3 {
+    return p - offset;
+}
+
+fn sdf_scale(p: vec3, factor: scalar) -> vec3 {
+    return p / factor;
+}
+
+fn sdf_repeat(p: vec3, spacing: vec3) -> vec3 {
+    return p - spacing * floor(p / spacing + vec3(0.5));
+}
+
+// --- Utilities ---
+
+fn sdf_round(d: scalar, radius: scalar) -> scalar {
+    return d - radius;
+}
+
+fn sdf_onion(d: scalar, thickness: scalar) -> scalar {
+    return abs(d) - thickness;
+}
+
+fn sdf_elongate(p: vec3, h: vec3) -> vec3 {
+    return p - clamp(p, vec3(0.0) - h, h);
+}

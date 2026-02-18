@@ -352,3 +352,240 @@ class TestSurfaceExpansion:
         compile_source(src, "pbr_surface", tmp_path, validate=True)
         assert (tmp_path / "pbr_surface.vert.spv").exists()
         assert (tmp_path / "pbr_surface.frag.spv").exists()
+
+
+@requires_spirv_tools
+class TestSDFStdlib:
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def test_import_sdf(self, tmp_path):
+        """Compile a fragment shader using SDF primitives and CSG."""
+        src = """
+        import sdf;
+
+        fragment {
+            in uv: vec2;
+            out color: vec4;
+            fn main() {
+                let p: vec3 = vec3(uv - vec2(0.5), 0.0);
+                let d1: scalar = sdf_sphere(p, 0.3);
+                let d2: scalar = sdf_box(sdf_translate(p, vec3(0.2, 0.0, 0.0)), vec3(0.15, 0.15, 0.15));
+                let d: scalar = sdf_smooth_union(d1, d2, 0.1);
+                let c: scalar = smoothstep(0.01, 0.0, d);
+                color = vec4(vec3(c), 1.0);
+            }
+        }
+        """
+        compile_source(src, "import_sdf", tmp_path, validate=True)
+        assert (tmp_path / "import_sdf.frag.spv").exists()
+
+    def test_sdf_example(self, tmp_path):
+        """Compile the sdf_shapes.lux example file."""
+        src = (Path(__file__).parent.parent / "examples" / "sdf_shapes.lux").read_text()
+        compile_source(src, "sdf_shapes", tmp_path, validate=True)
+        assert (tmp_path / "sdf_shapes.frag.spv").exists()
+
+
+@requires_spirv_tools
+class TestNoiseStdlib:
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def test_import_noise(self, tmp_path):
+        """Compile a fragment shader using noise functions."""
+        src = """
+        import noise;
+
+        fragment {
+            in uv: vec2;
+            out color: vec4;
+            fn main() {
+                let n: scalar = fbm2d_4(uv * 8.0, 2.0, 0.5);
+                let c: scalar = clamp(n + 0.5, 0.0, 1.0);
+                color = vec4(vec3(c), 1.0);
+            }
+        }
+        """
+        compile_source(src, "import_noise", tmp_path, validate=True)
+        assert (tmp_path / "import_noise.frag.spv").exists()
+
+    def test_noise_example(self, tmp_path):
+        """Compile the procedural_noise.lux example file."""
+        src = (Path(__file__).parent.parent / "examples" / "procedural_noise.lux").read_text()
+        compile_source(src, "procedural_noise", tmp_path, validate=True)
+        assert (tmp_path / "procedural_noise.frag.spv").exists()
+
+
+@requires_spirv_tools
+class TestScheduleSystem:
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def test_schedule_default(self, tmp_path):
+        """Pipeline without schedule compiles with default behavior."""
+        src = """
+        import brdf;
+        geometry Mesh {
+            position: vec3,
+            normal: vec3,
+            transform: MVP {
+                model: mat4,
+                view: mat4,
+                projection: mat4,
+            }
+            outputs {
+                world_pos: (model * vec4(position, 1.0)).xyz,
+                world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+                clip_pos: projection * view * model * vec4(position, 1.0),
+            }
+        }
+        surface Material {
+            brdf: pbr(vec3(0.8, 0.2, 0.1), 0.4, 0.0),
+        }
+        pipeline Forward {
+            geometry: Mesh,
+            surface: Material,
+        }
+        """
+        compile_source(src, "sched_default", tmp_path, validate=True)
+        assert (tmp_path / "sched_default.vert.spv").exists()
+        assert (tmp_path / "sched_default.frag.spv").exists()
+
+    def test_schedule_mobile(self, tmp_path):
+        """Pipeline with fast distribution/geometry schedule compiles."""
+        src = """
+        import brdf;
+        schedule Mobile {
+            distribution: ggx_fast,
+            geometry_term: smith_ggx_fast,
+        }
+        geometry Mesh {
+            position: vec3,
+            normal: vec3,
+            transform: MVP {
+                model: mat4,
+                view: mat4,
+                projection: mat4,
+            }
+            outputs {
+                world_pos: (model * vec4(position, 1.0)).xyz,
+                world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+                clip_pos: projection * view * model * vec4(position, 1.0),
+            }
+        }
+        surface Material {
+            brdf: pbr(vec3(0.8, 0.2, 0.1), 0.4, 0.0),
+        }
+        pipeline Forward {
+            geometry: Mesh,
+            surface: Material,
+            schedule: Mobile,
+        }
+        """
+        compile_source(src, "sched_mobile", tmp_path, validate=True)
+        assert (tmp_path / "sched_mobile.vert.spv").exists()
+        assert (tmp_path / "sched_mobile.frag.spv").exists()
+
+    def test_schedule_high_quality(self, tmp_path):
+        """Pipeline with schlick_roughness fresnel schedule compiles."""
+        src = """
+        import brdf;
+        schedule HighQuality {
+            fresnel: schlick_roughness,
+        }
+        geometry Mesh {
+            position: vec3,
+            normal: vec3,
+            transform: MVP {
+                model: mat4,
+                view: mat4,
+                projection: mat4,
+            }
+            outputs {
+                world_pos: (model * vec4(position, 1.0)).xyz,
+                world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+                clip_pos: projection * view * model * vec4(position, 1.0),
+            }
+        }
+        surface Material {
+            brdf: microfacet_ggx(0.3, vec3(0.04)),
+        }
+        pipeline Forward {
+            geometry: Mesh,
+            surface: Material,
+            schedule: HighQuality,
+        }
+        """
+        compile_source(src, "sched_hq", tmp_path, validate=True)
+        assert (tmp_path / "sched_hq.vert.spv").exists()
+        assert (tmp_path / "sched_hq.frag.spv").exists()
+
+    def test_scheduled_pbr_example(self, tmp_path):
+        """Compile the scheduled_pbr.lux example file."""
+        src = (Path(__file__).parent.parent / "examples" / "scheduled_pbr.lux").read_text()
+        compile_source(src, "scheduled_pbr", tmp_path, validate=True)
+        assert (tmp_path / "scheduled_pbr.vert.spv").exists()
+        assert (tmp_path / "scheduled_pbr.frag.spv").exists()
+
+
+@requires_spirv_tools
+class TestConstantFolding:
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def test_arithmetic_folding(self, tmp_path):
+        """Shader with 1.0 + 2.0 compiles (folded to 3.0)."""
+        src = """
+        fragment {
+            out color: vec4;
+            fn main() {
+                let v: scalar = 1.0 + 2.0;
+                color = vec4(v, v, v, 1.0);
+            }
+        }
+        """
+        compile_source(src, "fold_arith", tmp_path, validate=True)
+        assert (tmp_path / "fold_arith.frag.spv").exists()
+
+    def test_const_reference_folding(self, tmp_path):
+        """Module const inlined and folded in shader."""
+        src = """
+        const HALF: scalar = 0.5;
+        fragment {
+            out color: vec4;
+            fn main() {
+                let v: scalar = HALF + HALF;
+                color = vec4(v, v, v, 1.0);
+            }
+        }
+        """
+        compile_source(src, "fold_const", tmp_path, validate=True)
+        assert (tmp_path / "fold_const.frag.spv").exists()
+
+    def test_builtin_math_folding(self, tmp_path):
+        """Builtin math calls on literals compile (folded)."""
+        src = """
+        fragment {
+            out color: vec4;
+            fn main() {
+                let a: scalar = sin(0.0);
+                let b: scalar = max(1.0, 2.0);
+                color = vec4(a, b, 0.0, 1.0);
+            }
+        }
+        """
+        compile_source(src, "fold_builtin", tmp_path, validate=True)
+        assert (tmp_path / "fold_builtin.frag.spv").exists()

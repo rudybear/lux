@@ -24,6 +24,7 @@ class Module:
     surfaces: list[SurfaceDecl] = field(default_factory=list)
     geometries: list[GeometryDecl] = field(default_factory=list)
     pipelines: list[PipelineDecl] = field(default_factory=list)
+    schedules: list[ScheduleDecl] = field(default_factory=list)
 
 
 # --- Top-level declarations ---
@@ -127,6 +128,21 @@ class PipelineMember:
     value: Expr
 
 
+# --- Schedule declarations ---
+
+@dataclass
+class ScheduleDecl:
+    name: str
+    members: list[ScheduleMember]
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class ScheduleMember:
+    name: str
+    value: str
+
+
 # --- Stage blocks ---
 
 @dataclass
@@ -189,6 +205,7 @@ class FunctionDef:
     return_type: Optional[str]
     body: list[Stmt]
     loc: Optional[SourceLocation] = None
+    attributes: list[str] = field(default_factory=list)
 
 
 @dataclass

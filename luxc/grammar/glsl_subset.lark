@@ -1,0 +1,161 @@
+// GLSL subset grammar for transpilation to Lux
+// Supports: declarations, functions, expressions, basic statements
+// Does NOT support: arrays, custom structs, geometry/tessellation
+
+start: top_level_item*
+
+?top_level_item: version_directive
+               | precision_decl
+               | layout_decl
+               | global_var_decl
+               | function_def
+               | preprocessor_line
+
+// --- Preprocessor & directives ---
+
+version_directive: "#version" VERSION_NUM PROFILE?
+VERSION_NUM: /[0-9]+/
+PROFILE: "core" | "es" | "compatibility"
+
+precision_decl: "precision" PRECISION_QUAL glsl_type ";"
+PRECISION_QUAL: "highp" | "mediump" | "lowp"
+
+preprocessor_line: /\#(?!version)[^\n]*/
+
+// --- Layout / qualifier declarations ---
+
+layout_decl: layout_qualifier? io_qualifier glsl_type IDENT ";"
+           | layout_qualifier? "uniform" glsl_type IDENT ";"
+
+layout_qualifier: "layout" "(" layout_param ("," layout_param)* ")"
+layout_param: IDENT "=" INT_LIT
+
+io_qualifier: QUALIFIER_WORD+
+QUALIFIER_WORD: "in" | "out" | "varying" | "attribute" | "flat" | "smooth" | "noperspective"
+
+// --- Global variable declarations ---
+
+global_var_decl: "const"? glsl_type IDENT "=" expr ";" -> const_global_decl
+               | "const"? glsl_type IDENT ";"          -> plain_global_decl
+
+// --- Functions ---
+
+function_def: glsl_type IDENT "(" func_param_list? ")" compound_stmt
+
+func_param_list: func_param ("," func_param)*
+func_param: ("in" | "out" | "inout")? glsl_type IDENT
+
+// --- Statements ---
+
+compound_stmt: "{" statement* "}"
+
+?statement: var_decl_stmt
+          | assign_stmt
+          | compound_assign_stmt
+          | return_stmt
+          | if_stmt
+          | for_stmt
+          | while_stmt
+          | expr_stmt
+          | compound_stmt
+          | incr_decr_stmt
+
+var_decl_stmt: glsl_type IDENT "=" expr ";"
+             | glsl_type IDENT ";"
+
+assign_stmt: lvalue "=" expr ";"
+
+compound_assign_stmt: lvalue COMPOUND_OP expr ";"
+COMPOUND_OP: "+=" | "-=" | "*=" | "/="
+
+return_stmt: "return" expr? ";"
+
+if_stmt: "if" "(" expr ")" statement ("else" statement)?
+
+for_stmt: "for" "(" for_init? ";" expr? ";" for_update? ")" statement
+?for_init: glsl_type IDENT "=" expr -> for_init_decl
+         | expr                     -> for_init_expr
+?for_update: expr -> for_update_expr
+           | lvalue COMPOUND_OP expr -> for_update_compound
+           | lvalue "++" -> for_update_incr
+           | lvalue "--" -> for_update_decr
+
+while_stmt: "while" "(" expr ")" statement
+
+incr_decr_stmt: lvalue INCR_DECR_OP ";"
+INCR_DECR_OP: "++" | "--"
+
+expr_stmt: expr ";"
+
+// --- Lvalue ---
+
+?lvalue: IDENT -> lvalue_ident
+       | lvalue "." IDENT -> lvalue_field
+       | lvalue "." SWIZZLE -> lvalue_swizzle
+       | lvalue "[" expr "]" -> lvalue_index
+
+// --- Types ---
+
+?glsl_type: GLSL_TYPE_NAME
+
+GLSL_TYPE_NAME: "void" | "float" | "int" | "uint" | "bool"
+              | "vec2" | "vec3" | "vec4"
+              | "ivec2" | "ivec3" | "ivec4"
+              | "uvec2" | "uvec3" | "uvec4"
+              | "mat2" | "mat3" | "mat4"
+              | "sampler2D" | "samplerCube"
+
+// --- Expressions (precedence climbing) ---
+
+?expr: ternary_expr
+
+?ternary_expr: or_expr ("?" expr ":" ternary_expr)?
+
+?or_expr: and_expr ("||" and_expr)*
+?and_expr: equality_expr ("&&" equality_expr)*
+?equality_expr: comparison_expr (EQUALITY_OP comparison_expr)*
+?comparison_expr: additive_expr (COMPARISON_OP additive_expr)*
+?additive_expr: multiplicative_expr (ADD_OP multiplicative_expr)*
+?multiplicative_expr: unary_expr (MUL_OP unary_expr)*
+
+EQUALITY_OP: "==" | "!="
+COMPARISON_OP: "<=" | ">=" | "<" | ">"
+ADD_OP: "+" | "-"
+MUL_OP: "*" | "/" | "%"
+
+?unary_expr: UNARY_OP unary_expr -> unary
+           | prefix_incr
+           | postfix_expr
+
+UNARY_OP: "-" | "!" | "~"
+
+prefix_incr: INCR_DECR_OP postfix_expr
+
+?postfix_expr: primary
+             | postfix_expr "(" arg_list? ")" -> call_expr
+             | postfix_expr "." SWIZZLE       -> swizzle_access
+             | postfix_expr "." IDENT         -> field_access
+             | postfix_expr "[" expr "]"      -> index_access
+             | postfix_expr INCR_DECR_OP      -> postfix_incr
+
+arg_list: expr ("," expr)*
+
+SWIZZLE: /[xyzw]{2,4}/ | /[rgba]{2,4}/ | /[stpq]{2,4}/
+
+?primary: FLOAT_LIT   -> float_lit
+        | INT_LIT     -> int_lit
+        | "true"      -> bool_true
+        | "false"     -> bool_false
+        | IDENT       -> var_ref
+        | "(" expr ")"
+
+// Float literals: handle trailing f suffix
+FLOAT_LIT: /[0-9]+\.[0-9]*([eE][+-]?[0-9]+)?f?/ | /[0-9]+[eE][+-]?[0-9]+f?/ | /[0-9]*\.[0-9]+([eE][+-]?[0-9]+)?f?/
+INT_LIT: /0[xX][0-9a-fA-F]+[uU]?/ | /[0-9]+[uU]/  | /[0-9]+/
+
+IDENT: /[a-zA-Z_][a-zA-Z0-9_]*/
+
+// Comments and whitespace
+%ignore /\/\/.*/
+%ignore /\/\*[\s\S]*?\*\//
+%ignore /[ \t\f\r\n]+/
