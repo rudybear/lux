@@ -75,7 +75,8 @@ def load_shader_module(device: wgpu.GPUDevice, spv_path: Path) -> wgpu.GPUShader
         module = device.create_shader_module(code=spv_bytes)
         return module
     except Exception as exc:
-        print(f"[warn] direct SPIR-V load failed ({exc}); trying WGSL fallback...")
+        msg = str(exc).encode("ascii", errors="replace").decode("ascii")
+        print(f"[warn] direct SPIR-V load failed ({msg}); trying WGSL fallback...")
 
     # Fallback: SPIR-V -> WGSL via naga-cli
     wgsl = _try_spirv_to_wgsl(spv_path)

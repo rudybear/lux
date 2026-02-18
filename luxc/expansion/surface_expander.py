@@ -46,6 +46,11 @@ def expand_surfaces(module: Module) -> None:
             surface = surfaces[surf_name]
             geometry = geometries.get(geo_name) if geo_name else None
             stages = _expand_pipeline(surface, geometry, module)
+            # Tag fragment stages with set offset so uniforms don't clash
+            # with vertex uniforms when combined in a pipeline
+            for s in stages:
+                if s.stage_type == "fragment" and geometry:
+                    s._descriptor_set_offset = 1
             module.stages.extend(stages)
 
     # Standalone surfaces (no pipeline reference)
@@ -165,8 +170,8 @@ def _expand_surface_to_fragment(
     out._is_input = False
     stage.outputs.append(out)
 
-    # Light uniform
-    stage.push_constants.append(PushBlock("Light", [
+    # Light uniform (use uniform block for wgpu compatibility)
+    stage.uniforms.append(UniformBlock("Light", [
         BlockField("light_dir", "vec3"),
         BlockField("view_pos", "vec3"),
     ]))

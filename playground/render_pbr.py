@@ -1,0 +1,348 @@
+"""PBR render harness for Lux shader playground.
+
+Renders a 3D sphere with the PBR surface shader, using proper MVP
+matrices, lighting via push constants, and normal data.
+
+Usage:
+    python render_pbr.py <name>.vert.spv <name>.frag.spv -o output.png
+
+Dependencies:
+    pip install wgpu Pillow numpy
+"""
+
+import argparse
+import math
+import struct
+import sys
+from pathlib import Path
+
+import numpy as np
+import wgpu
+from PIL import Image
+
+from render_harness import load_shader_module, save_png
+
+
+# ---------------------------------------------------------------------------
+# Matrix math (pure numpy, no external deps)
+# ---------------------------------------------------------------------------
+
+def perspective(fov_y: float, aspect: float, near: float, far: float) -> np.ndarray:
+    """Column-major perspective projection matrix (Vulkan clip space: y-down, z [0,1])."""
+    f = 1.0 / math.tan(fov_y / 2.0)
+    m = np.zeros((4, 4), dtype=np.float32)
+    m[0, 0] = f / aspect
+    m[1, 1] = -f  # Vulkan y-flip
+    m[2, 2] = far / (near - far)
+    m[2, 3] = -1.0
+    m[3, 2] = (near * far) / (near - far)
+    return m
+
+
+def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
+    """Column-major look-at view matrix."""
+    f = target - eye
+    f = f / np.linalg.norm(f)
+    s = np.cross(f, up)
+    s = s / np.linalg.norm(s)
+    u = np.cross(s, f)
+
+    m = np.eye(4, dtype=np.float32)
+    m[0, 0] = s[0];  m[1, 0] = s[1];  m[2, 0] = s[2]
+    m[0, 1] = u[0];  m[1, 1] = u[1];  m[2, 1] = u[2]
+    m[0, 2] = -f[0]; m[1, 2] = -f[1]; m[2, 2] = -f[2]
+    m[3, 0] = -np.dot(s, eye)
+    m[3, 1] = -np.dot(u, eye)
+    m[3, 2] = np.dot(f, eye)
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Sphere mesh generation
+# ---------------------------------------------------------------------------
+
+def generate_sphere(stacks: int = 32, slices: int = 32, radius: float = 1.0):
+    """Generate a UV sphere. Returns (vertices, indices).
+
+    Vertices: list of (px, py, pz, nx, ny, nz) — position + normal.
+    Indices: list of uint32 triangle indices.
+    """
+    vertices = []
+    indices = []
+
+    for i in range(stacks + 1):
+        phi = math.pi * i / stacks
+        for j in range(slices + 1):
+            theta = 2.0 * math.pi * j / slices
+            x = math.sin(phi) * math.cos(theta)
+            y = math.cos(phi)
+            z = math.sin(phi) * math.sin(theta)
+            # Position = normal * radius; normal is the unit sphere direction
+            vertices.extend([
+                x * radius, y * radius, z * radius,  # position
+                x, y, z,                               # normal
+            ])
+
+    for i in range(stacks):
+        for j in range(slices):
+            a = i * (slices + 1) + j
+            b = a + slices + 1
+            indices.extend([a, b, a + 1])
+            indices.extend([b, b + 1, a + 1])
+
+    return vertices, indices
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def render_pbr(
+    vert_spv_path: Path,
+    frag_spv_path: Path,
+    width: int = 512,
+    height: int = 512,
+) -> np.ndarray:
+    """Render a PBR-lit sphere and return an (H, W, 4) uint8 RGBA array."""
+
+    # --- GPU setup ---
+    adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+    if adapter is None:
+        raise RuntimeError("No suitable GPU adapter found")
+    device = adapter.request_device_sync()
+
+    # --- Shaders ---
+    vert_module = load_shader_module(device, vert_spv_path)
+    frag_module = load_shader_module(device, frag_spv_path)
+
+    # --- Mesh data ---
+    sphere_verts, sphere_indices = generate_sphere(stacks=32, slices=32)
+    vertex_data = struct.pack(f"{len(sphere_verts)}f", *sphere_verts)
+    index_data = struct.pack(f"{len(sphere_indices)}I", *sphere_indices)
+    num_indices = len(sphere_indices)
+
+    vbo = device.create_buffer_with_data(data=vertex_data, usage=wgpu.BufferUsage.VERTEX)
+    ibo = device.create_buffer_with_data(data=index_data, usage=wgpu.BufferUsage.INDEX)
+
+    # --- MVP uniform buffer ---
+    eye = np.array([0.0, 0.0, 3.0], dtype=np.float32)
+    target = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    model = np.eye(4, dtype=np.float32)
+    view = look_at(eye, target, up)
+    proj = perspective(math.radians(45.0), width / height, 0.1, 100.0)
+
+    # Pack as column-major (numpy default) — 3 x mat4 = 192 bytes
+    mvp_data = model.tobytes() + view.tobytes() + proj.tobytes()
+    mvp_buffer = device.create_buffer_with_data(
+        data=mvp_data,
+        usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+    )
+
+    # --- Light uniform buffer (std140: vec3 padded to 16 bytes each) ---
+    light_dir = np.array([1.0, 1.0, 0.5], dtype=np.float32)
+    light_dir = light_dir / np.linalg.norm(light_dir)
+    # std140 layout: light_dir (vec3 @ offset 0, pad to 16), view_pos (vec3 @ offset 16)
+    light_data = struct.pack("3f", *light_dir) + struct.pack("f", 0.0)  # pad
+    light_data += struct.pack("3f", *eye) + struct.pack("f", 0.0)       # pad
+    light_buffer = device.create_buffer_with_data(
+        data=light_data,
+        usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+    )
+
+    # --- Bind groups: vertex MVP at set=0, fragment Light at set=1 ---
+    mvp_bind_group_layout = device.create_bind_group_layout(
+        entries=[
+            wgpu.BindGroupLayoutEntry(
+                binding=0,
+                visibility=wgpu.ShaderStage.VERTEX,
+                buffer=wgpu.BufferBindingLayout(type=wgpu.BufferBindingType.uniform),
+            ),
+        ]
+    )
+    light_bind_group_layout = device.create_bind_group_layout(
+        entries=[
+            wgpu.BindGroupLayoutEntry(
+                binding=0,
+                visibility=wgpu.ShaderStage.FRAGMENT,
+                buffer=wgpu.BufferBindingLayout(type=wgpu.BufferBindingType.uniform),
+            ),
+        ]
+    )
+
+    mvp_bind_group = device.create_bind_group(
+        layout=mvp_bind_group_layout,
+        entries=[
+            wgpu.BindGroupEntry(binding=0, resource=wgpu.BufferBinding(buffer=mvp_buffer, size=192)),
+        ],
+    )
+    light_bind_group = device.create_bind_group(
+        layout=light_bind_group_layout,
+        entries=[
+            wgpu.BindGroupEntry(binding=0, resource=wgpu.BufferBinding(buffer=light_buffer, size=32)),
+        ],
+    )
+
+    pipeline_layout = device.create_pipeline_layout(
+        bind_group_layouts=[mvp_bind_group_layout, light_bind_group_layout],
+    )
+
+    # --- Render target ---
+    texture = device.create_texture(
+        size=(width, height, 1),
+        format=wgpu.TextureFormat.rgba8unorm,
+        usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.COPY_SRC,
+    )
+    texture_view = texture.create_view()
+
+    # --- Depth buffer ---
+    depth_texture = device.create_texture(
+        size=(width, height, 1),
+        format=wgpu.TextureFormat.depth24plus,
+        usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
+    )
+    depth_view = depth_texture.create_view()
+
+    # --- Render pipeline ---
+    pipeline = device.create_render_pipeline(
+        layout=pipeline_layout,
+        vertex=wgpu.VertexState(
+            module=vert_module,
+            entry_point="main",
+            buffers=[
+                wgpu.VertexBufferLayout(
+                    array_stride=24,  # 6 floats = 24 bytes
+                    step_mode=wgpu.VertexStepMode.vertex,
+                    attributes=[
+                        wgpu.VertexAttribute(
+                            format=wgpu.VertexFormat.float32x3,
+                            offset=0,
+                            shader_location=0,  # position
+                        ),
+                        wgpu.VertexAttribute(
+                            format=wgpu.VertexFormat.float32x3,
+                            offset=12,
+                            shader_location=1,  # normal
+                        ),
+                    ],
+                ),
+            ],
+        ),
+        primitive=wgpu.PrimitiveState(
+            topology=wgpu.PrimitiveTopology.triangle_list,
+            cull_mode=wgpu.CullMode.back,
+            front_face=wgpu.FrontFace.ccw,
+        ),
+        depth_stencil=wgpu.DepthStencilState(
+            format=wgpu.TextureFormat.depth24plus,
+            depth_write_enabled=True,
+            depth_compare=wgpu.CompareFunction.less,
+        ),
+        multisample=wgpu.MultisampleState(count=1, mask=0xFFFFFFFF),
+        fragment=wgpu.FragmentState(
+            module=frag_module,
+            entry_point="main",
+            targets=[
+                wgpu.ColorTargetState(format=wgpu.TextureFormat.rgba8unorm),
+            ],
+        ),
+    )
+
+    # --- Encode render pass ---
+    encoder = device.create_command_encoder()
+    render_pass = encoder.begin_render_pass(
+        color_attachments=[
+            wgpu.RenderPassColorAttachment(
+                view=texture_view,
+                load_op=wgpu.LoadOp.clear,
+                store_op=wgpu.StoreOp.store,
+                clear_value=(0.05, 0.05, 0.08, 1.0),  # dark background
+            ),
+        ],
+        depth_stencil_attachment=wgpu.RenderPassDepthStencilAttachment(
+            view=depth_view,
+            depth_load_op=wgpu.LoadOp.clear,
+            depth_store_op=wgpu.StoreOp.store,
+            depth_clear_value=1.0,
+        ),
+    )
+
+    render_pass.set_pipeline(pipeline)
+    render_pass.set_bind_group(0, mvp_bind_group)
+    render_pass.set_bind_group(1, light_bind_group)
+    render_pass.set_vertex_buffer(0, vbo)
+    render_pass.set_index_buffer(ibo, wgpu.IndexFormat.uint32)
+    render_pass.draw_indexed(num_indices)
+    render_pass.end()
+
+    # --- Readback ---
+    bytes_per_row = width * 4
+    bytes_per_row_aligned = (bytes_per_row + 255) & ~255
+
+    readback_buffer = device.create_buffer(
+        size=bytes_per_row_aligned * height,
+        usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
+    )
+    encoder.copy_texture_to_buffer(
+        wgpu.TexelCopyTextureInfo(texture=texture),
+        wgpu.TexelCopyBufferInfo(
+            buffer=readback_buffer,
+            offset=0,
+            bytes_per_row=bytes_per_row_aligned,
+            rows_per_image=height,
+        ),
+        (width, height, 1),
+    )
+    device.queue.submit([encoder.finish()])
+
+    readback_buffer.map_sync(wgpu.MapMode.READ)
+    raw = readback_buffer.read_mapped()
+    arr = np.frombuffer(raw, dtype=np.uint8).reshape(height, bytes_per_row_aligned)
+    arr = arr[:, : width * 4].reshape(height, width, 4).copy()
+    readback_buffer.unmap()
+    return arr
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Render a PBR-lit sphere using compiled Lux SPIR-V shaders",
+    )
+    parser.add_argument("vert_spv", type=Path, help="Vertex shader .vert.spv file")
+    parser.add_argument("frag_spv", type=Path, help="Fragment shader .frag.spv file")
+    parser.add_argument(
+        "-o", "--output", type=Path, default=Path("pbr_output.png"),
+        help="Output PNG path (default: pbr_output.png)",
+    )
+    parser.add_argument("--width", type=int, default=512, help="Render width")
+    parser.add_argument("--height", type=int, default=512, help="Render height")
+    args = parser.parse_args()
+
+    if not args.vert_spv.exists():
+        print(f"Error: vertex shader not found: {args.vert_spv}", file=sys.stderr)
+        sys.exit(1)
+    if not args.frag_spv.exists():
+        print(f"Error: fragment shader not found: {args.frag_spv}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Loading shaders: {args.vert_spv}, {args.frag_spv}")
+    pixels = render_pbr(
+        args.vert_spv, args.frag_spv,
+        width=args.width, height=args.height,
+    )
+
+    save_png(pixels, args.output)
+    print(f"Saved {args.width}x{args.height} PBR render to {args.output}")
+
+    # Stats
+    non_black = (pixels[:, :, :3].sum(axis=2) > 10).sum()
+    total = pixels.shape[0] * pixels.shape[1]
+    print(f"Sphere coverage: {non_black / total * 100:.1f}%")
+
+
+if __name__ == "__main__":
+    main()

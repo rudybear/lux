@@ -25,7 +25,7 @@ def _assign_stage_layouts(stage: StageBlock, binding_start: int) -> None:
         loc += 1
 
     # Auto-assign uniform block set/binding
-    set_num = 0
+    set_num = getattr(stage, '_descriptor_set_offset', 0)
     binding = 0
     for ub in stage.uniforms:
         ub.set_number = set_num
