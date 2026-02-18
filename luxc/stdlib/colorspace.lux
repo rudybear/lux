@@ -1,0 +1,83 @@
+// Lux Standard Library: Color Space Conversions
+// HSV, contrast, saturation, and other artistic color controls
+
+// --- RGB <-> HSV ---
+
+fn rgb_to_hsv(c: vec3) -> vec3 {
+    let r: scalar = c.x;
+    let g: scalar = c.y;
+    let b: scalar = c.z;
+    let cmax: scalar = max(max(r, g), b);
+    let cmin: scalar = min(min(r, g), b);
+    let delta: scalar = cmax - cmin;
+
+    // Hue
+    let h_raw: scalar = (delta < 0.00001) ? 0.0
+        : (cmax == r) ? mod(((g - b) / delta), 6.0)
+        : (cmax == g) ? ((b - r) / delta + 2.0)
+        : ((r - g) / delta + 4.0);
+    let h: scalar = h_raw / 6.0;
+
+    // Saturation
+    let s: scalar = (cmax < 0.00001) ? 0.0 : delta / cmax;
+
+    // Value
+    return vec3(h, s, cmax);
+}
+
+fn hsv_to_rgb(c: vec3) -> vec3 {
+    let h: scalar = c.x * 6.0;
+    let s: scalar = c.y;
+    let v: scalar = c.z;
+    let chroma: scalar = v * s;
+    let x: scalar = chroma * (1.0 - abs(mod(h, 2.0) - 1.0));
+    let m: scalar = v - chroma;
+
+    let r: scalar = (h < 1.0) ? chroma
+        : (h < 2.0) ? x
+        : (h < 3.0) ? 0.0
+        : (h < 4.0) ? 0.0
+        : (h < 5.0) ? x
+        : chroma;
+
+    let g: scalar = (h < 1.0) ? x
+        : (h < 2.0) ? chroma
+        : (h < 3.0) ? chroma
+        : (h < 4.0) ? x
+        : (h < 5.0) ? 0.0
+        : 0.0;
+
+    let b: scalar = (h < 1.0) ? 0.0
+        : (h < 2.0) ? 0.0
+        : (h < 3.0) ? x
+        : (h < 4.0) ? chroma
+        : (h < 5.0) ? chroma
+        : x;
+
+    return vec3(r + m, g + m, b + m);
+}
+
+// --- Artistic Controls ---
+
+fn contrast(c: vec3, pivot: scalar, amount: scalar) -> vec3 {
+    return (c - vec3(pivot)) * amount + vec3(pivot);
+}
+
+fn saturate_color(c: vec3, amount: scalar) -> vec3 {
+    let lum: scalar = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    return mix(vec3(lum), c, vec3(amount));
+}
+
+fn hue_shift(c: vec3, shift: scalar) -> vec3 {
+    let hsv: vec3 = rgb_to_hsv(c);
+    let new_h: scalar = mod(hsv.x + shift, 1.0);
+    return hsv_to_rgb(vec3(new_h, hsv.y, hsv.z));
+}
+
+fn brightness(c: vec3, amount: scalar) -> vec3 {
+    return c * amount;
+}
+
+fn gamma_correct(c: vec3, gamma: scalar) -> vec3 {
+    return pow(c, vec3(1.0 / gamma));
+}

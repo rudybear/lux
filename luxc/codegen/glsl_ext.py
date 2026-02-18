@@ -91,4 +91,6 @@ LUX_TO_GLSL = {
     "cross": "Cross",
     "normalize": "Normalize",
     "reflect": "Reflect",
+    "refract": "Refract",
+    "inversesqrt": "InverseSqrt",
 }

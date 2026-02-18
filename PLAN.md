@@ -113,37 +113,45 @@ Written in Lux itself, fully inlineable.
 
 Gap analysis documented in [`ANALYSIS.md`](ANALYSIS.md).
 
-### P5.1 — Critical Built-in Gaps (Immediate)
+### P5.1 — Critical Built-in Gaps ✅ COMPLETE
 
-| Item | Effort | Impact |
+| Item | Effort | Status |
 |------|--------|--------|
-| Add `refract(I, N, eta)` built-in | Tiny | Unlocks transmission, volume, dispersion |
-| Add 2-arg `atan(y, x)` built-in | Tiny | Unlocks anisotropy |
-| Add `inversesqrt(x)` built-in | Tiny | Common in PBR (V_GGX) |
-| Add `mod(x, y)` built-in | Tiny | MaterialX `modulo` equivalent |
+| `refract(I, N, eta)` built-in → GLSL.std.450 Refract | Tiny | ✅ |
+| 2-arg `atan(y, x)` built-in → GLSL.std.450 Atan2 | Tiny | ✅ |
+| `inversesqrt(x)` built-in → GLSL.std.450 InverseSqrt | Tiny | ✅ |
+| `mod(x, y)` built-in → OpFMod | Tiny | ✅ |
 
-### P5.2 — stdlib Expansions (Near-term)
+### P5.2 — stdlib Expansions ✅ COMPLETE
 
-**New BRDF functions (`stdlib/brdf.lux`):**
+**New BRDF functions (`stdlib/brdf.lux`):** ✅
 
-| Function | Purpose |
-|----------|---------|
-| `v_ggx_correlated(NdotL, NdotV, alpha)` | Height-correlated Smith G (glTF spec compliance) |
-| `clearcoat_brdf(...)` | glTF clearcoat extension |
-| `charlie_ndf(roughness, NdotH)` | Sheen distribution (glTF sheen) |
-| `anisotropic_ggx_ndf(NdotH, TdotH, BdotH, at, ab)` | Anisotropic GGX (glTF anisotropy) |
-| `anisotropic_v_ggx(...)` | Anisotropic visibility |
-| `oren_nayar_diffuse(albedo, roughness, NdotL, NdotV)` | Better diffuse model |
-| `burley_diffuse(albedo, roughness, NdotL, NdotV, VdotH)` | Disney diffuse |
-| `conductor_fresnel(f0, f82, VdotH)` | Metals with complex IOR |
+| Function | Purpose | Status |
+|----------|---------|--------|
+| `v_ggx_correlated(NdotL, NdotV, alpha)` | Height-correlated Smith G (glTF spec compliance) | ✅ |
+| `clearcoat_brdf(n, v, l, clearcoat, roughness)` | glTF clearcoat extension | ✅ |
+| `charlie_ndf(roughness, NdotH)` | Sheen distribution (glTF sheen) | ✅ |
+| `sheen_brdf(color, roughness, NdotH, NdotL, NdotV)` | Complete sheen evaluation | ✅ |
+| `sheen_visibility(NdotL, NdotV)` | Sheen visibility term | ✅ |
+| `anisotropic_ggx_ndf(NdotH, TdotH, BdotH, at, ab)` | Anisotropic GGX (glTF anisotropy) | ✅ |
+| `anisotropic_v_ggx(...)` | Anisotropic visibility | ✅ |
+| `oren_nayar_diffuse(albedo, roughness, NdotL, NdotV)` | Better diffuse model | ✅ |
+| `burley_diffuse(albedo, roughness, NdotL, NdotV, VdotH)` | Disney diffuse | ✅ |
+| `conductor_fresnel(f0, f82, VdotH)` | Metals with complex IOR (Lazanyi) | ✅ |
+| `volume_attenuation(dist, attColor, attDist)` | Beer-Lambert absorption | ✅ |
+| `ior_to_f0(ior)` | IOR to Fresnel F0 conversion | ✅ |
+| `gltf_pbr(n, v, l, albedo, roughness, metallic)` | Full glTF PBR uber-shader | ✅ |
 
-**New color module (`stdlib/colorspace.lux`):**
+**New color module (`stdlib/colorspace.lux`):** ✅
 
-| Function | Purpose |
-|----------|---------|
-| `rgb_to_hsv(c)` / `hsv_to_rgb(c)` | HSV color space |
-| `contrast(c, pivot, amount)` | Artistic contrast control |
-| `saturate_color(c, amount)` | Saturation adjustment |
+| Function | Purpose | Status |
+|----------|---------|--------|
+| `rgb_to_hsv(c)` / `hsv_to_rgb(c)` | HSV color space | ✅ |
+| `contrast(c, pivot, amount)` | Artistic contrast control | ✅ |
+| `saturate_color(c, amount)` | Saturation adjustment | ✅ |
+| `hue_shift(c, shift)` | Hue rotation | ✅ |
+| `brightness(c, amount)` | Brightness scaling | ✅ |
+| `gamma_correct(c, gamma)` | Gamma correction | ✅ |
 
 **Normal mapping:**
 
@@ -276,8 +284,8 @@ procedural MetaBalls {
 | **P4** | GLSL-to-Lux transpiler | ✅ Complete |
 | **P4** | AI generation pipeline | ✅ Complete |
 | **P4** | Training data pipeline | ✅ Complete |
-| **P5.1** | Critical built-in gaps (refract, atan2, inversesqrt) | 🔲 Next |
-| **P5.2** | stdlib expansions (clearcoat, sheen, anisotropy, diffuse models, color) | 🔲 Planned |
+| **P5.1** | Critical built-in gaps (refract, atan2, inversesqrt, mod) | ✅ Complete |
+| **P5.2** | stdlib expansions (clearcoat, sheen, anisotropy, diffuse models, color) | ✅ Complete |
 | **P5.3** | Advanced materials (transmission, volume, iridescence, gltf_pbr) | 🔲 Planned |
 | **P6** | Ray tracing pipeline (RT stages, SPIR-V codegen, surface→RT expansion) | 🔲 Future |
 

@@ -47,7 +47,7 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     # --- GLSL.std.450 math functions ---
     # 1-arg: normalize, abs, floor, ceil, fract, sqrt, sin, cos, tan,
     #        asin, acos, atan, exp, exp2, log, log2, sign, length
-    for fn in ["abs", "floor", "ceil", "fract", "sqrt",
+    for fn in ["abs", "floor", "ceil", "fract", "sqrt", "inversesqrt",
                "sin", "cos", "tan", "asin", "acos", "atan",
                "exp", "exp2", "log", "log2", "sign", "normalize"]:
         add(_float_overloads_1(fn))
@@ -56,9 +56,12 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     for vt in [SCALAR, VEC2, VEC3, VEC4]:
         add([FuncSig("length", (vt,), SCALAR)])
 
-    # 2-arg: min, max, pow, step, reflect, distance, dot, mod
-    for fn in ["min", "max", "pow", "step", "reflect"]:
+    # 2-arg: min, max, pow, step, reflect, mod, atan2
+    for fn in ["min", "max", "pow", "step", "reflect", "mod"]:
         add(_float_overloads_2(fn))
+
+    # atan2(y, x) — 2-arg overload of atan
+    add(_float_overloads_2("atan"))
 
     # distance returns scalar
     for vt in [VEC2, VEC3, VEC4]:
@@ -79,6 +82,10 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     for vt in [VEC2, VEC3, VEC4]:
         add([FuncSig("mix", (vt, vt, SCALAR), vt)])
         add([FuncSig("clamp", (vt, SCALAR, SCALAR), vt)])
+
+    # refract(I, N, eta) — I and N are vecN, eta is scalar, returns vecN
+    for vt in [SCALAR, VEC2, VEC3, VEC4]:
+        add([FuncSig("refract", (vt, vt, SCALAR), vt)])
 
     # texture sampling
     add([FuncSig("sample", (SAMPLER2D, VEC2), VEC4)])

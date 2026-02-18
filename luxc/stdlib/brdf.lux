@@ -130,6 +130,105 @@ fn pbr_brdf_fast(n: vec3, v: vec3, l: vec3, albedo: vec3, roughness: scalar, met
     return (diffuse + specular) * n_dot_l;
 }
 
+// --- Height-Correlated Smith G (glTF spec-compliant) ---
+
+fn v_ggx_correlated(n_dot_l: scalar, n_dot_v: scalar, roughness: scalar) -> scalar {
+    let a2: scalar = roughness * roughness * roughness * roughness;
+    let ggxv: scalar = n_dot_l * sqrt(n_dot_v * n_dot_v * (1.0 - a2) + a2);
+    let ggxl: scalar = n_dot_v * sqrt(n_dot_l * n_dot_l * (1.0 - a2) + a2);
+    return 0.5 / (ggxv + ggxl + EPSILON);
+}
+
+// --- Diffuse Models ---
+
+fn oren_nayar_diffuse(albedo: vec3, roughness: scalar, n_dot_l: scalar, n_dot_v: scalar) -> vec3 {
+    let sigma2: scalar = roughness * roughness;
+    let a: scalar = 1.0 - 0.5 * sigma2 / (sigma2 + 0.33);
+    let b: scalar = 0.45 * sigma2 / (sigma2 + 0.09);
+    let sin_theta_l: scalar = sqrt(max(1.0 - n_dot_l * n_dot_l, 0.0));
+    let sin_theta_v: scalar = sqrt(max(1.0 - n_dot_v * n_dot_v, 0.0));
+    let s: scalar = max(sin_theta_l, sin_theta_v);
+    return albedo * INV_PI * (a + b * s) * max(n_dot_l, 0.0);
+}
+
+fn burley_diffuse(albedo: vec3, roughness: scalar, n_dot_l: scalar, n_dot_v: scalar, v_dot_h: scalar) -> vec3 {
+    let fd90: scalar = 0.5 + 2.0 * roughness * v_dot_h * v_dot_h;
+    let light_scatter: scalar = 1.0 + (fd90 - 1.0) * pow(1.0 - n_dot_l, 5.0);
+    let view_scatter: scalar = 1.0 + (fd90 - 1.0) * pow(1.0 - n_dot_v, 5.0);
+    return albedo * INV_PI * light_scatter * view_scatter * max(n_dot_l, 0.0);
+}
+
+// --- Conductor Fresnel (metals with complex IOR) ---
+
+fn conductor_fresnel(f0: vec3, f82: vec3, v_dot_h: scalar) -> vec3 {
+    let costh: scalar = clamp(v_dot_h, 0.0, 1.0);
+    let one_minus: scalar = 1.0 - costh;
+    let one_minus5: scalar = pow(one_minus, 5.0);
+    let schlick: vec3 = f0 + (vec3(1.0) - f0) * one_minus5;
+    let lazanyi: scalar = costh * pow(one_minus, 6.0);
+    return schlick - lazanyi * (vec3(1.0) - f82);
+}
+
+// --- Sheen (Charlie NDF + Visibility) ---
+
+fn charlie_ndf(roughness: scalar, n_dot_h: scalar) -> scalar {
+    let alpha: scalar = roughness * roughness;
+    let inv_alpha: scalar = 1.0 / alpha;
+    let cos2h: scalar = n_dot_h * n_dot_h;
+    let sin2h: scalar = max(1.0 - cos2h, 0.0);
+    return (2.0 + inv_alpha) * pow(sin2h, inv_alpha * 0.5) / (2.0 * PI);
+}
+
+fn sheen_visibility(n_dot_l: scalar, n_dot_v: scalar) -> scalar {
+    return 1.0 / (4.0 * (n_dot_l + n_dot_v - n_dot_l * n_dot_v) + EPSILON);
+}
+
+fn sheen_brdf(sheen_color: vec3, roughness: scalar, n_dot_h: scalar, n_dot_l: scalar, n_dot_v: scalar) -> vec3 {
+    let d: scalar = charlie_ndf(roughness, n_dot_h);
+    let vis: scalar = sheen_visibility(n_dot_l, n_dot_v);
+    return sheen_color * d * vis * max(n_dot_l, 0.0);
+}
+
+// --- Clearcoat ---
+
+fn clearcoat_brdf(n: vec3, v: vec3, l: vec3, clearcoat: scalar, clearcoat_roughness: scalar) -> scalar {
+    let h: vec3 = normalize(v + l);
+    let n_dot_h: scalar = max(dot(n, h), 0.0);
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let n_dot_v: scalar = max(dot(n, v), 0.0);
+    let v_dot_h: scalar = max(dot(v, h), 0.0);
+    let d: scalar = ggx_ndf(n_dot_h, clearcoat_roughness);
+    let vis: scalar = v_ggx_correlated(n_dot_l, n_dot_v, clearcoat_roughness);
+    let f0: scalar = 0.04;
+    let f: scalar = f0 + (1.0 - f0) * pow(1.0 - v_dot_h, 5.0);
+    return clearcoat * d * vis * f * n_dot_l;
+}
+
+// --- Anisotropic GGX ---
+
+fn anisotropic_ggx_ndf(n_dot_h: scalar, t_dot_h: scalar, b_dot_h: scalar, at: scalar, ab: scalar) -> scalar {
+    let f: scalar = t_dot_h * t_dot_h / (at * at) + b_dot_h * b_dot_h / (ab * ab) + n_dot_h * n_dot_h;
+    return 1.0 / (PI * at * ab * f * f + EPSILON);
+}
+
+fn anisotropic_v_ggx(n_dot_l: scalar, n_dot_v: scalar, t_dot_v: scalar, b_dot_v: scalar, t_dot_l: scalar, b_dot_l: scalar, at: scalar, ab: scalar) -> scalar {
+    let ggxv: scalar = n_dot_l * sqrt(t_dot_v * t_dot_v * at * at + b_dot_v * b_dot_v * ab * ab + n_dot_v * n_dot_v);
+    let ggxl: scalar = n_dot_v * sqrt(t_dot_l * t_dot_l * at * at + b_dot_l * b_dot_l * ab * ab + n_dot_l * n_dot_l);
+    return 0.5 / (ggxv + ggxl + EPSILON);
+}
+
+// --- Volume / Transmission ---
+
+fn volume_attenuation(distance: scalar, attenuation_color: vec3, attenuation_distance: scalar) -> vec3 {
+    let t: vec3 = log(attenuation_color) / attenuation_distance;
+    return exp(t * distance);
+}
+
+fn ior_to_f0(ior: scalar) -> scalar {
+    let r: scalar = (ior - 1.0) / (ior + 1.0);
+    return r * r;
+}
+
 // --- Composite BRDF ---
 
 fn pbr_brdf(n: vec3, v: vec3, l: vec3, albedo: vec3, roughness: scalar, metallic: scalar) -> vec3 {
@@ -145,6 +244,29 @@ fn pbr_brdf(n: vec3, v: vec3, l: vec3, albedo: vec3, roughness: scalar, metallic
 
     let diffuse: vec3 = kd * albedo * INV_PI;
     let specular: vec3 = microfacet_brdf(n, v, l, roughness, f0);
+
+    return (diffuse + specular) * n_dot_l;
+}
+
+// --- glTF PBR (spec-compliant with height-correlated Smith) ---
+
+fn gltf_pbr(n: vec3, v: vec3, l: vec3, albedo: vec3, roughness: scalar, metallic: scalar) -> vec3 {
+    let f0_dielectric: vec3 = vec3(0.04);
+    let f0: vec3 = mix(f0_dielectric, albedo, vec3(metallic));
+
+    let h: vec3 = normalize(v + l);
+    let n_dot_h: scalar = max(dot(n, h), 0.0);
+    let n_dot_v: scalar = max(dot(n, v), EPSILON);
+    let n_dot_l: scalar = max(dot(n, l), EPSILON);
+    let v_dot_h: scalar = max(dot(v, h), 0.0);
+
+    let d: scalar = ggx_ndf(n_dot_h, roughness);
+    let vis: scalar = v_ggx_correlated(n_dot_l, n_dot_v, roughness);
+    let f: vec3 = fresnel_schlick(v_dot_h, f0);
+
+    let kd: vec3 = (vec3(1.0) - f) * (1.0 - metallic);
+    let diffuse: vec3 = kd * albedo * INV_PI;
+    let specular: vec3 = f * d * vis;
 
     return (diffuse + specular) * n_dot_l;
 }

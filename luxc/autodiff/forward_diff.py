@@ -273,6 +273,16 @@ def _diff_call(expr: CallExpr, wrt: str, env: dict):
             return BinaryOp("/", du,
                 BinaryOp("*", NumberLit("2.0"),
                     CallExpr(VarRef("sqrt"), [copy.deepcopy(u)])))
+        elif fname == "inversesqrt":
+            # d/du(1/sqrt(u)) = -1/(2*u*sqrt(u)) = -inversesqrt(u)/(2*u)
+            # = -du / (2.0 * u * sqrt(u))
+            return _simplify_mul(
+                UnaryOp("-", BinaryOp("/",
+                    CallExpr(VarRef("inversesqrt"), [copy.deepcopy(u)]),
+                    BinaryOp("*", NumberLit("2.0"), copy.deepcopy(u))
+                )),
+                du
+            )
         elif fname == "abs":
             # sign(u) * du
             return _simplify_mul(
@@ -358,6 +368,19 @@ def _diff_call(expr: CallExpr, wrt: str, env: dict):
             return _simplify_add(
                 CallExpr(VarRef("dot"), [du, copy.deepcopy(v)]),
                 CallExpr(VarRef("dot"), [copy.deepcopy(u), dv])
+            )
+        elif fname == "mod":
+            # d/dx mod(u, v) = du (mod is like fract for the u component)
+            return du
+        elif fname == "reflect":
+            # d/dx reflect(I, N) = dI - 2*dot(N,dI)*N - 2*dot(dN,I)*N - 2*dot(N,I)*dN
+            # Simplified when N is constant: dI - 2*N*dot(N, dI)
+            return _simplify_sub(
+                du,
+                _simplify_mul(
+                    BinaryOp("*", NumberLit("2.0"), copy.deepcopy(v)),
+                    CallExpr(VarRef("dot"), [copy.deepcopy(v), copy.deepcopy(du)])
+                )
             )
 
     # --- 3-arg builtins ---

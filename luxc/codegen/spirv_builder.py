@@ -651,6 +651,17 @@ class SpvGenerator:
         result_type = self.reg.lux_type_to_spirv(expr.resolved_type)
         result = self.reg.next_id()
 
+        # atan with 2 args -> Atan2 (not Atan)
+        if fname == "atan" and len(arg_ids) == 2:
+            args_str = " ".join(arg_ids)
+            lines.append(f"{result} = OpExtInst {result_type} {self.glsl_ext_id} Atan2 {args_str}")
+            return result, lines
+
+        # mod -> OpFMod (core SPIR-V op, not GLSL.std.450)
+        if fname == "mod":
+            lines.append(f"{result} = OpFMod {result_type} {arg_ids[0]} {arg_ids[1]}")
+            return result, lines
+
         # Check if it's a GLSL.std.450 function
         glsl_name = LUX_TO_GLSL.get(fname)
         if glsl_name:
