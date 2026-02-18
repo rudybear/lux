@@ -1,7 +1,7 @@
 """PBR render harness for Lux shader playground.
 
 Renders a 3D sphere with the PBR surface shader, using proper MVP
-matrices, lighting via push constants, and normal data.
+matrices, lighting via uniforms, normal data, and diffuse texture.
 
 Usage:
     python render_pbr.py <name>.vert.spv <name>.frag.spv -o output.png
@@ -64,7 +64,7 @@ def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
 def generate_sphere(stacks: int = 32, slices: int = 32, radius: float = 1.0):
     """Generate a UV sphere. Returns (vertices, indices).
 
-    Vertices: list of (px, py, pz, nx, ny, nz) — position + normal.
+    Vertices: list of (px, py, pz, nx, ny, nz, u, v) — position + normal + UV.
     Indices: list of uint32 triangle indices.
     """
     vertices = []
@@ -72,15 +72,17 @@ def generate_sphere(stacks: int = 32, slices: int = 32, radius: float = 1.0):
 
     for i in range(stacks + 1):
         phi = math.pi * i / stacks
+        v_coord = i / stacks
         for j in range(slices + 1):
             theta = 2.0 * math.pi * j / slices
+            u_coord = j / slices
             x = math.sin(phi) * math.cos(theta)
             y = math.cos(phi)
             z = math.sin(phi) * math.sin(theta)
-            # Position = normal * radius; normal is the unit sphere direction
             vertices.extend([
                 x * radius, y * radius, z * radius,  # position
                 x, y, z,                               # normal
+                u_coord, v_coord,                      # UV
             ])
 
     for i in range(stacks):
@@ -91,6 +93,35 @@ def generate_sphere(stacks: int = 32, slices: int = 32, radius: float = 1.0):
             indices.extend([b, b + 1, a + 1])
 
     return vertices, indices
+
+
+# ---------------------------------------------------------------------------
+# Procedural texture generation
+# ---------------------------------------------------------------------------
+
+def generate_procedural_texture(size: int = 512) -> np.ndarray:
+    """Generate a colorful procedural texture. Returns (size, size, 4) uint8 RGBA."""
+    img = np.zeros((size, size, 4), dtype=np.uint8)
+    for y in range(size):
+        for x in range(size):
+            u = x / size
+            v = y / size
+            # Checker pattern with two color palettes
+            cx = int(u * 8) % 2
+            cy = int(v * 8) % 2
+            checker = cx ^ cy
+            if checker:
+                # Warm: terracotta / orange tones
+                r = int(200 + 40 * math.sin(u * 12.0))
+                g = int(120 + 30 * math.sin(v * 10.0))
+                b = int(80 + 20 * math.cos(u * 8.0 + v * 6.0))
+            else:
+                # Cool: teal / blue-green tones
+                r = int(60 + 30 * math.sin(u * 10.0 + v * 4.0))
+                g = int(150 + 40 * math.cos(v * 8.0))
+                b = int(170 + 50 * math.sin(u * 6.0))
+            img[y, x] = [min(255, max(0, r)), min(255, max(0, g)), min(255, max(0, b)), 255]
+    return img
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +146,7 @@ def render_pbr(
     vert_module = load_shader_module(device, vert_spv_path)
     frag_module = load_shader_module(device, frag_spv_path)
 
-    # --- Mesh data ---
+    # --- Mesh data (position + normal + UV = 8 floats per vertex) ---
     sphere_verts, sphere_indices = generate_sphere(stacks=32, slices=32)
     vertex_data = struct.pack(f"{len(sphere_verts)}f", *sphere_verts)
     index_data = struct.pack(f"{len(sphere_indices)}I", *sphere_indices)
@@ -141,9 +172,8 @@ def render_pbr(
     )
 
     # --- Light uniform buffer (std140: vec3 padded to 16 bytes each) ---
-    light_dir = np.array([1.0, 1.0, 0.5], dtype=np.float32)
+    light_dir = np.array([0.5, 0.8, 1.0], dtype=np.float32)
     light_dir = light_dir / np.linalg.norm(light_dir)
-    # std140 layout: light_dir (vec3 @ offset 0, pad to 16), view_pos (vec3 @ offset 16)
     light_data = struct.pack("3f", *light_dir) + struct.pack("f", 0.0)  # pad
     light_data += struct.pack("3f", *eye) + struct.pack("f", 0.0)       # pad
     light_buffer = device.create_buffer_with_data(
@@ -151,7 +181,34 @@ def render_pbr(
         usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
     )
 
-    # --- Bind groups: vertex MVP at set=0, fragment Light at set=1 ---
+    # --- Procedural albedo texture ---
+    print("Generating procedural texture...")
+    tex_data = generate_procedural_texture(512)
+    tex_size = tex_data.shape[1]  # square
+
+    albedo_texture = device.create_texture(
+        size=(tex_size, tex_size, 1),
+        format=wgpu.TextureFormat.rgba8unorm,
+        usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+    )
+    device.queue.write_texture(
+        wgpu.TexelCopyTextureInfo(texture=albedo_texture),
+        tex_data.tobytes(),
+        wgpu.TexelCopyBufferLayout(
+            offset=0,
+            bytes_per_row=tex_size * 4,
+            rows_per_image=tex_size,
+        ),
+        (tex_size, tex_size, 1),
+    )
+    albedo_view = albedo_texture.create_view()
+    albedo_sampler = device.create_sampler(
+        mag_filter=wgpu.FilterMode.linear,
+        min_filter=wgpu.FilterMode.linear,
+    )
+
+    # --- Bind group layouts ---
+    # Set 0: vertex MVP uniform
     mvp_bind_group_layout = device.create_bind_group_layout(
         entries=[
             wgpu.BindGroupLayoutEntry(
@@ -161,12 +218,26 @@ def render_pbr(
             ),
         ]
     )
-    light_bind_group_layout = device.create_bind_group_layout(
+    # Set 1: fragment Light uniform (binding=0) + albedo texture (binding=1)
+    frag_bind_group_layout = device.create_bind_group_layout(
         entries=[
             wgpu.BindGroupLayoutEntry(
                 binding=0,
                 visibility=wgpu.ShaderStage.FRAGMENT,
                 buffer=wgpu.BufferBindingLayout(type=wgpu.BufferBindingType.uniform),
+            ),
+            wgpu.BindGroupLayoutEntry(
+                binding=1,
+                visibility=wgpu.ShaderStage.FRAGMENT,
+                sampler=wgpu.SamplerBindingLayout(type=wgpu.SamplerBindingType.filtering),
+            ),
+            wgpu.BindGroupLayoutEntry(
+                binding=2,
+                visibility=wgpu.ShaderStage.FRAGMENT,
+                texture=wgpu.TextureBindingLayout(
+                    sample_type=wgpu.TextureSampleType.float,
+                    view_dimension=wgpu.TextureViewDimension.d2,
+                ),
             ),
         ]
     )
@@ -177,15 +248,17 @@ def render_pbr(
             wgpu.BindGroupEntry(binding=0, resource=wgpu.BufferBinding(buffer=mvp_buffer, size=192)),
         ],
     )
-    light_bind_group = device.create_bind_group(
-        layout=light_bind_group_layout,
+    frag_bind_group = device.create_bind_group(
+        layout=frag_bind_group_layout,
         entries=[
             wgpu.BindGroupEntry(binding=0, resource=wgpu.BufferBinding(buffer=light_buffer, size=32)),
+            wgpu.BindGroupEntry(binding=1, resource=albedo_sampler),
+            wgpu.BindGroupEntry(binding=2, resource=albedo_view),
         ],
     )
 
     pipeline_layout = device.create_pipeline_layout(
-        bind_group_layouts=[mvp_bind_group_layout, light_bind_group_layout],
+        bind_group_layouts=[mvp_bind_group_layout, frag_bind_group_layout],
     )
 
     # --- Render target ---
@@ -212,7 +285,7 @@ def render_pbr(
             entry_point="main",
             buffers=[
                 wgpu.VertexBufferLayout(
-                    array_stride=24,  # 6 floats = 24 bytes
+                    array_stride=32,  # 8 floats = 32 bytes
                     step_mode=wgpu.VertexStepMode.vertex,
                     attributes=[
                         wgpu.VertexAttribute(
@@ -224,6 +297,11 @@ def render_pbr(
                             format=wgpu.VertexFormat.float32x3,
                             offset=12,
                             shader_location=1,  # normal
+                        ),
+                        wgpu.VertexAttribute(
+                            format=wgpu.VertexFormat.float32x2,
+                            offset=24,
+                            shader_location=2,  # uv
                         ),
                     ],
                 ),
@@ -270,7 +348,7 @@ def render_pbr(
 
     render_pass.set_pipeline(pipeline)
     render_pass.set_bind_group(0, mvp_bind_group)
-    render_pass.set_bind_group(1, light_bind_group)
+    render_pass.set_bind_group(1, frag_bind_group)
     render_pass.set_vertex_buffer(0, vbo)
     render_pass.set_index_buffer(ibo, wgpu.IndexFormat.uint32)
     render_pass.draw_indexed(num_indices)

@@ -68,6 +68,7 @@ class ImportDecl:
 class SurfaceDecl:
     name: str
     members: list[SurfaceMember]
+    samplers: list[str] = field(default_factory=list)
     loc: Optional[SourceLocation] = None
 
 
@@ -174,7 +175,8 @@ class BlockField:
 class SamplerDecl:
     name: str
     set_number: Optional[int] = None
-    binding: Optional[int] = None
+    binding: Optional[int] = None          # sampler state binding
+    texture_binding: Optional[int] = None  # texture image binding
     loc: Optional[SourceLocation] = None
 
 

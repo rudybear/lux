@@ -14,8 +14,10 @@ together and generates both stages.
 from __future__ import annotations
 from luxc.parser.ast_nodes import (
     Module, StageBlock, VarDecl, UniformBlock, PushBlock, BlockField,
+    SamplerDecl,
     FunctionDef, Param, LetStmt, AssignStmt, ReturnStmt, ExprStmt,
     NumberLit, VarRef, BinaryOp, CallExpr, ConstructorExpr,
+    SwizzleAccess,
     AssignTarget, SurfaceDecl, GeometryDecl, PipelineDecl,
 )
 
@@ -165,6 +167,14 @@ def _expand_surface_to_fragment(
         v._is_input = True
         stage.inputs.append(v)
 
+    # If the surface uses textures and frag_uv isn't already an input, add it
+    has_frag_uv = any(name == "frag_uv" for name, _ in frag_inputs)
+    if surface.samplers and not has_frag_uv:
+        frag_inputs.append(("frag_uv", "vec2"))
+        v = VarDecl("frag_uv", "vec2")
+        v._is_input = True
+        stage.inputs.append(v)
+
     # Fragment output
     out = VarDecl("color", "vec4")
     out._is_input = False
@@ -175,6 +185,10 @@ def _expand_surface_to_fragment(
         BlockField("light_dir", "vec3"),
         BlockField("view_pos", "vec3"),
     ]))
+
+    # Add sampler declarations from the surface
+    for sam_name in surface.samplers:
+        stage.samplers.append(SamplerDecl(sam_name))
 
     # Generate main function body
     body = _generate_surface_main(surface, frag_inputs)
@@ -234,10 +248,25 @@ def _generate_surface_main(
             VarRef("ndotl"),
         )))
 
+    # Add ambient illumination and exposure for visible output
+    body.append(LetStmt("ambient", "vec3", BinaryOp("*",
+        VarRef("result"),
+        NumberLit("0.3"),
+    )))
+    body.append(LetStmt("lit", "vec3", BinaryOp("+",
+        VarRef("result"),
+        VarRef("ambient"),
+    )))
+    # Simple exposure boost (PBR outputs are physically correct but dark)
+    body.append(LetStmt("final_color", "vec3", BinaryOp("*",
+        VarRef("lit"),
+        NumberLit("2.5"),
+    )))
+
     # Output final color
     body.append(AssignStmt(
         AssignTarget(VarRef("color")),
-        ConstructorExpr("vec4", [VarRef("result"), NumberLit("1.0")]),
+        ConstructorExpr("vec4", [VarRef("final_color"), NumberLit("1.0")]),
     ))
 
     return body

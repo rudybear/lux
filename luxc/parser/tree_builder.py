@@ -99,7 +99,13 @@ class LuxTransformer(Transformer):
     def surface_decl(self, args):
         name = args[0]
         members = [a for a in args[1:] if isinstance(a, SurfaceMember)]
-        return SurfaceDecl(str(name), members, _tok_loc(name))
+        samplers = [str(a) for a in args[1:] if isinstance(a, Token) and a.type == "IDENT" and a not in [name]]
+        # Collect sampler names from surface_sampler rules (returned as strings)
+        sampler_names = [a for a in args[1:] if isinstance(a, str) and a not in [str(name)]]
+        return SurfaceDecl(str(name), members, samplers=sampler_names, loc=_tok_loc(name))
+
+    def surface_sampler(self, args):
+        return str(args[0])  # Return sampler name as string
 
     def surface_member(self, args):
         return SurfaceMember(str(args[0]), args[1])

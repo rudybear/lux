@@ -221,18 +221,31 @@ class SpvGenerator:
             for i, offset in enumerate(offsets):
                 self.decorations.append(f"OpMemberDecorate {struct_id} {i} Offset {offset}")
 
-        # --- Samplers ---
+        # --- Samplers (separate sampler + texture for WebGPU compatibility) ---
         for sam in self.stage.samplers:
-            type_id = self.reg.sampled_image_type()
-            ptr_type = self.reg.pointer("UniformConstant", type_id)
-            var_id = self.reg.next_id()
-            self.global_vars.append(f"{var_id} = OpVariable {ptr_type} UniformConstant")
-            self.decorations.append(f"OpDecorate {var_id} DescriptorSet {sam.set_number}")
-            self.decorations.append(f"OpDecorate {var_id} Binding {sam.binding}")
-            self.var_map[sam.name] = var_id
+            # Sampler state variable
+            sampler_type = self.reg.sampler_type()
+            sampler_ptr = self.reg.pointer("UniformConstant", sampler_type)
+            sampler_var = self.reg.next_id()
+            self.global_vars.append(f"{sampler_var} = OpVariable {sampler_ptr} UniformConstant")
+            self.decorations.append(f"OpDecorate {sampler_var} DescriptorSet {sam.set_number}")
+            self.decorations.append(f"OpDecorate {sampler_var} Binding {sam.binding}")
+            self.interface_ids.append(sampler_var)
+
+            # Texture image variable
+            image_type = self.reg.image_type()
+            image_ptr = self.reg.pointer("UniformConstant", image_type)
+            texture_var = self.reg.next_id()
+            self.global_vars.append(f"{texture_var} = OpVariable {image_ptr} UniformConstant")
+            self.decorations.append(f"OpDecorate {texture_var} DescriptorSet {sam.set_number}")
+            self.decorations.append(f"OpDecorate {texture_var} Binding {sam.texture_binding}")
+            self.interface_ids.append(texture_var)
+
+            # Store both var IDs for use in sample() codegen
+            self.var_map[sam.name + ".__sampler"] = sampler_var
+            self.var_map[sam.name + ".__texture"] = texture_var
             self.var_types[sam.name] = "sampler2d"
             self.var_storage[sam.name] = "UniformConstant"
-            self.interface_ids.append(var_id)
 
     def _make_array_type(self, elem_type: str, length: int) -> str:
         length_id = self.reg.const_uint(length)
@@ -596,6 +609,38 @@ class SpvGenerator:
 
         fname = expr.func.name
 
+        # sample(tex, uv) — handle before general arg generation since tex
+        # is not a loadable variable (it's split into sampler + texture)
+        if fname == "sample":
+            sampler_arg = expr.args[0]
+            # Generate UV argument normally
+            uv_id, uv_lines = self._gen_expr(expr.args[1])
+            lines.extend(uv_lines)
+            result_type = self.reg.lux_type_to_spirv(expr.resolved_type)
+            result = self.reg.next_id()
+            if isinstance(sampler_arg, VarRef) and sampler_arg.name + ".__sampler" in self.var_map:
+                sam_name = sampler_arg.name
+                # Load the texture image
+                img_type = self.reg.image_type()
+                tex_loaded = self.reg.next_id()
+                lines.append(f"{tex_loaded} = OpLoad {img_type} {self.var_map[sam_name + '.__texture']}")
+                # Load the sampler
+                samp_type = self.reg.sampler_type()
+                samp_loaded = self.reg.next_id()
+                lines.append(f"{samp_loaded} = OpLoad {samp_type} {self.var_map[sam_name + '.__sampler']}")
+                # Combine into sampled image
+                sampled_img_type = self.reg.sampled_image_type()
+                combined = self.reg.next_id()
+                lines.append(f"{combined} = OpSampledImage {sampled_img_type} {tex_loaded} {samp_loaded}")
+                # Sample
+                lines.append(f"{result} = OpImageSampleImplicitLod {result_type} {combined} {uv_id}")
+            else:
+                # Fallback: combined image sampler (legacy)
+                tex_id, tex_lines = self._gen_expr(sampler_arg)
+                lines.extend(tex_lines)
+                lines.append(f"{result} = OpImageSampleImplicitLod {result_type} {tex_id} {uv_id}")
+            return result, lines
+
         # Generate arguments
         arg_ids = []
         for arg in expr.args:
@@ -616,11 +661,6 @@ class SpvGenerator:
         # dot -> OpDot
         if fname == "dot":
             lines.append(f"{result} = OpDot {result_type} {arg_ids[0]} {arg_ids[1]}")
-            return result, lines
-
-        # sample -> OpImageSampleImplicitLod
-        if fname == "sample":
-            lines.append(f"{result} = OpImageSampleImplicitLod {result_type} {arg_ids[0]} {arg_ids[1]}")
             return result, lines
 
         # User-defined function — inline it

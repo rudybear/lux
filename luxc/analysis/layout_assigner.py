@@ -32,11 +32,12 @@ def _assign_stage_layouts(stage: StageBlock, binding_start: int) -> None:
         ub.binding = binding
         binding += 1
 
-    # Auto-assign sampler bindings (same set, continuing binding numbers)
+    # Auto-assign sampler bindings (same set, 2 bindings each: sampler + texture)
     for sam in stage.samplers:
         sam.set_number = set_num
-        sam.binding = binding
-        binding += 1
+        sam.binding = binding           # sampler state
+        sam.texture_binding = binding + 1  # texture image
+        binding += 2
 
 
 def compute_std140_offsets(fields: list) -> list[int]:

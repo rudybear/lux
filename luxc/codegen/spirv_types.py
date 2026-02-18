@@ -57,6 +57,10 @@ class TypeRegistry:
         key = "image2d"
         return self._ensure_type(key, f"OpTypeImage {f32} 2D 0 0 0 1 Unknown")
 
+    def sampler_type(self) -> str:
+        key = "sampler"
+        return self._ensure_type(key, "OpTypeSampler")
+
     def sampled_image_type(self) -> str:
         img = self.image_type()
         key = "sampled_image"

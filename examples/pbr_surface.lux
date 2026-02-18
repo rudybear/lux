@@ -1,14 +1,13 @@
-// PBR material using declarative surface syntax
-// This is the v0.2 math-first approach: describe the material,
-// the compiler generates the shaders.
+// PBR material with texture sampling using declarative surface syntax
+// This demonstrates the v0.2 math-first approach with diffuse textures.
 
 import brdf;
-import color;
 
-// Declare vertex transform pipeline
+// Declare vertex transform pipeline with UV passthrough
 geometry StandardMesh {
     position: vec3,
     normal: vec3,
+    uv: vec2,
     transform: MVP {
         model: mat4,
         view: mat4,
@@ -17,17 +16,19 @@ geometry StandardMesh {
     outputs {
         world_pos: (model * vec4(position, 1.0)).xyz,
         world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        frag_uv: uv,
         clip_pos: projection * view * model * vec4(position, 1.0),
     }
 }
 
-// Declare material — just math, no boilerplate
-surface CopperMetal {
-    brdf: pbr(vec3(0.95, 0.64, 0.54), 0.3, 0.9),
+// Declare material — texture-sampled albedo, dielectric, moderate roughness
+surface TexturedPBR {
+    sampler2d albedo_tex,
+    brdf: pbr(sample(albedo_tex, frag_uv).xyz, 0.5, 0.0),
 }
 
 // Tie them together — compiler generates both vertex + fragment SPIR-V
 pipeline PBRForward {
     geometry: StandardMesh,
-    surface: CopperMetal,
+    surface: TexturedPBR,
 }

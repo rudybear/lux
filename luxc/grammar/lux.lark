@@ -26,8 +26,10 @@ import_decl: "import" IDENT ";"
 
 // --- Surface declarations ---
 
-surface_decl: "surface" IDENT "{" surface_member ("," surface_member)* ","? "}"
+surface_decl: "surface" IDENT "{" surface_item ("," surface_item)* ","? "}"
 
+?surface_item: surface_sampler | surface_member
+surface_sampler: "sampler2d" IDENT
 surface_member: IDENT ":" expr
 
 // --- Geometry declarations ---
