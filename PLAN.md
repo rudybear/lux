@@ -160,36 +160,58 @@ Gap analysis documented in [`ANALYSIS.md`](ANALYSIS.md).
 | TBN matrix construction from tangent + bitangent | Essential for textured content |
 | Tangent/bitangent as stage inputs | Geometry pipeline support |
 
-### P5.3 — Advanced Material Models (Medium-term)
+### P5.3 — Advanced Material Models ✅ COMPLETE
 
-| Item | Effort | Impact |
-|------|--------|--------|
-| `transmission_btdf(roughness, ior, baseColor)` | Medium | Glass, liquids (glTF transmission) |
-| `volume_attenuation(distance, attColor, attDist)` | Small | Beer-Lambert (glTF volume) |
-| `iridescence_fresnel(...)` | Large | Thin-film interference (glTF iridescence) |
-| `gltf_pbr(base_color, metallic, roughness, ...)` | Medium | Full glTF uber-shader |
-| Triplanar projection | Small | Common texture technique |
-| Dispersion (per-channel IOR refraction) | Medium | Specialty content |
+**New BRDF functions (`stdlib/brdf.lux`):** ✅
 
-### glTF Extension Coverage Target
+| Function | Purpose | Status |
+|----------|---------|--------|
+| `transmission_btdf(n, v, l, roughness, ior)` | Thin-surface microfacet BTDF (glTF transmission) | ✅ |
+| `transmission_color(base_color, btdf, factor)` | Transmission color tinting | ✅ |
+| `diffuse_transmission(albedo, n_dot_l)` | Back-face Lambert (glTF diffuse_transmission) | ✅ |
+| `volumetric_btdf(n, v, l, roughness, eta_i, eta_o)` | Walter 2007 volumetric BTDF with Jacobian | ✅ |
+| `iridescence_fresnel(outside_ior, film_ior, base_f0, thickness, cos_theta)` | Belcour & Barla 2017 thin-film interference | ✅ |
+| `iridescence_sensitivity(opd, shift)` | CIE XYZ spectral evaluation via Gaussians | ✅ |
+| `iridescence_f0_to_ior(f0)` / `iridescence_ior_to_f0(n_t, n_i)` | IOR↔F0 conversion helpers | ✅ |
+| `dispersion_ior(base_ior, dispersion)` | Per-channel IOR via Abbe number | ✅ |
+| `dispersion_f0(base_ior, dispersion)` | Per-channel F0 from dispersed IOR | ✅ |
+| `dispersion_refract(v, n, base_ior, dispersion)` | Per-channel refraction | ✅ |
 
-| Extension | Status | Blocked By |
-|-----------|--------|------------|
-| **Core PBR** | ✅ Have (separable Smith) | P5.2 for spec-compliant correlated Smith |
-| **ior** | ✅ Trivial (arithmetic only) | Nothing |
-| **specular** | ✅ Trivial (F0/F90 mods) | Nothing |
-| **emissive_strength** | ✅ Trivial (scalar multiply) | Nothing |
-| **unlit** | ✅ Already expressible | Nothing |
-| **occlusion** | ✅ Easy (`mix(1, ao, strength)`) | Nothing |
-| **diffuse_transmission** | ✅ Easy (flipped Lambert) | Nothing |
-| **clearcoat** | ❌ Missing | P5.2 clearcoat_brdf |
-| **sheen** | ❌ Missing | P5.2 charlie_ndf |
-| **anisotropy** | ❌ Missing | P5.1 atan2, P5.2 anisotropic GGX |
-| **transmission** | ❌ Missing | P5.1 refract, P5.3 BTDF |
-| **volume** | ❌ Missing | P5.1 refract, P5.3 attenuation |
-| **iridescence** | ❌ Missing | P5.3 iridescence_fresnel |
-| **dispersion** | ❌ Missing | P5.1 refract, P5.3 per-channel IOR |
-| **normal mapping** | ❌ Missing | P5.2 TBN construction |
+**New texture module (`stdlib/texture.lux`):** ✅
+
+| Function | Purpose | Status |
+|----------|---------|--------|
+| `tbn_perturb_normal(sample, n, t, b)` | Normal mapping via TBN matrix | ✅ |
+| `tbn_from_tangent(normal, tangent_vec4)` | Bitangent from tangent (w=handedness) | ✅ |
+| `unpack_normal(encoded)` | Decode [0,1]→[-1,1] normal map | ✅ |
+| `unpack_normal_strength(encoded, strength)` | Normal map with strength control | ✅ |
+| `triplanar_weights(normal, sharpness)` | Triplanar blend weights | ✅ |
+| `triplanar_uv_x/y/z(world_pos)` | Triplanar UV projection | ✅ |
+| `triplanar_blend(x, y, z, weights)` | Triplanar color blending | ✅ |
+| `triplanar_blend_scalar(x, y, z, weights)` | Triplanar scalar blending | ✅ |
+| `parallax_offset(height, scale, view_ts)` | Simple parallax mapping | ✅ |
+| `rotate_uv(uv, angle, center)` | UV rotation | ✅ |
+| `tile_uv(uv, scale)` | UV tiling | ✅ |
+
+### glTF Extension Coverage — ALL COMPLETE ✅
+
+| Extension | Status | Implementation |
+|-----------|--------|----------------|
+| **Core PBR** | ✅ | `gltf_pbr()` with height-correlated Smith (`v_ggx_correlated`) |
+| **ior** | ✅ | `ior_to_f0()` |
+| **specular** | ✅ | Expressible via F0/F90 modification |
+| **emissive_strength** | ✅ | Scalar multiply (no special function needed) |
+| **unlit** | ✅ | Bypass BRDF (already expressible) |
+| **occlusion** | ✅ | `mix(1.0, ao, strength)` |
+| **clearcoat** | ✅ | `clearcoat_brdf()` |
+| **sheen** | ✅ | `charlie_ndf()` + `sheen_brdf()` |
+| **anisotropy** | ✅ | `anisotropic_ggx_ndf()` + `anisotropic_v_ggx()` + `atan()` 2-arg |
+| **transmission** | ✅ | `transmission_btdf()` + `transmission_color()` |
+| **volume** | ✅ | `volume_attenuation()` + `volumetric_btdf()` |
+| **iridescence** | ✅ | `iridescence_fresnel()` (Belcour & Barla 2017) |
+| **dispersion** | ✅ | `dispersion_ior()` + `dispersion_f0()` + `dispersion_refract()` |
+| **diffuse_transmission** | ✅ | `diffuse_transmission()` |
+| **normal mapping** | ✅ | `tbn_perturb_normal()` + `tbn_from_tangent()` + `unpack_normal()` |
 
 ---
 
@@ -286,7 +308,7 @@ procedural MetaBalls {
 | **P4** | Training data pipeline | ✅ Complete |
 | **P5.1** | Critical built-in gaps (refract, atan2, inversesqrt, mod) | ✅ Complete |
 | **P5.2** | stdlib expansions (clearcoat, sheen, anisotropy, diffuse models, color) | ✅ Complete |
-| **P5.3** | Advanced materials (transmission, volume, iridescence, gltf_pbr) | 🔲 Planned |
+| **P5.3** | Advanced materials (transmission, iridescence, dispersion, texture) | ✅ Complete |
 | **P6** | Ray tracing pipeline (RT stages, SPIR-V codegen, surface→RT expansion) | 🔲 Future |
 
 ---

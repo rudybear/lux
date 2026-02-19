@@ -552,7 +552,14 @@ class SpvGenerator:
                 lines.append(f"{splat_id} = OpCompositeConstruct {vec_type} {components}")
                 left_id = splat_id
 
-        lines.append(f"{result} = {spv_op} {result_type} {left_id} {right_id}")
+        # OpVectorTimesScalar requires vector as first operand, scalar as second.
+        # When expression is scalar * vec, swap operand order.
+        if spv_op == "OpVectorTimesScalar" and isinstance(lt_type, ScalarType) and isinstance(rt_type, VectorType):
+            lines.append(f"{result} = {spv_op} {result_type} {right_id} {left_id}")
+        elif spv_op == "OpMatrixTimesScalar" and isinstance(lt_type, ScalarType) and isinstance(rt_type, MatrixType):
+            lines.append(f"{result} = {spv_op} {result_type} {right_id} {left_id}")
+        else:
+            lines.append(f"{result} = {spv_op} {result_type} {left_id} {right_id}")
         return result, lines
 
     def _select_arith_op(self, op: str, lt: str, rt: str) -> str:

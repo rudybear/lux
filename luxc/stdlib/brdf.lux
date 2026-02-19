@@ -270,3 +270,189 @@ fn gltf_pbr(n: vec3, v: vec3, l: vec3, albedo: vec3, roughness: scalar, metallic
 
     return (diffuse + specular) * n_dot_l;
 }
+
+// =====================================================================
+// P5.3 — Advanced Material Models
+// =====================================================================
+
+// --- Transmission BTDF (glTF KHR_materials_transmission) ---
+// Thin-surface model: no net macroscopic refraction, Jacobian dropped.
+// Same D and G as specular BRDF, but half-vector is for transmitted ray.
+
+fn transmission_btdf(n: vec3, v: vec3, l: vec3, roughness: scalar, ior: scalar) -> scalar {
+    // Thin-surface half-vector: reflected view through surface
+    let h: vec3 = normalize(v + l);
+    let n_dot_h: scalar = max(dot(n, h), 0.0);
+    let n_dot_v: scalar = max(dot(n, v), EPSILON);
+    let n_dot_l: scalar = max(dot(n, l), EPSILON);
+
+    let d: scalar = ggx_ndf(n_dot_h, roughness);
+    let vis: scalar = v_ggx_correlated(n_dot_l, n_dot_v, roughness);
+
+    return d * vis;
+}
+
+fn transmission_color(base_color: vec3, btdf: scalar, transmission_factor: scalar) -> vec3 {
+    return base_color * btdf * transmission_factor;
+}
+
+fn diffuse_transmission(albedo: vec3, n_dot_l: scalar) -> vec3 {
+    // Back-face Lambert: same as lambert_brdf but for transmitted light
+    return albedo * INV_PI * max(-n_dot_l, 0.0);
+}
+
+// --- Volumetric Refraction BTDF (Walter et al. 2007) ---
+// For thick refractive surfaces with actual macroscopic refraction.
+
+fn volumetric_btdf(n: vec3, v: vec3, l: vec3, roughness: scalar, eta_i: scalar, eta_o: scalar) -> scalar {
+    // Refraction half-vector
+    let ht: vec3 = normalize(v * eta_i + l * eta_o);
+    let n_dot_ht: scalar = abs(dot(n, ht));
+    let v_dot_ht: scalar = abs(dot(v, ht));
+    let l_dot_ht: scalar = abs(dot(l, ht));
+    let n_dot_v: scalar = max(abs(dot(n, v)), EPSILON);
+    let n_dot_l: scalar = max(abs(dot(n, l)), EPSILON);
+
+    let d: scalar = ggx_ndf(n_dot_ht, roughness);
+    let vis: scalar = v_ggx_correlated(n_dot_l, n_dot_v, roughness);
+
+    // Walter Jacobian: eta_o^2 / (eta_i * VdotH + eta_o * LdotH)^2
+    let denom: scalar = eta_i * v_dot_ht + eta_o * l_dot_ht;
+    let jacobian: scalar = eta_o * eta_o / (denom * denom + EPSILON);
+
+    return d * vis * v_dot_ht * l_dot_ht * jacobian / (n_dot_v * n_dot_l + EPSILON);
+}
+
+// --- Iridescence (glTF KHR_materials_iridescence) ---
+// Thin-film interference using Belcour & Barla 2017 Fourier approach.
+
+fn iridescence_f0_to_ior(f0: scalar) -> scalar {
+    let s: scalar = sqrt(clamp(f0, 0.0, 0.9999));
+    return (1.0 + s) / (1.0 - s + EPSILON);
+}
+
+fn iridescence_ior_to_f0(n_t: scalar, n_i: scalar) -> scalar {
+    let r: scalar = (n_t - n_i) / (n_t + n_i + EPSILON);
+    return r * r;
+}
+
+fn iridescence_sensitivity(opd: scalar, shift: vec3) -> vec3 {
+    // Spectral evaluation via Gaussian-approximated CIE XYZ curves
+    // OPD in nanometers, phase = 2*pi * OPD * 1e-9
+    let phase: scalar = opd * 0.00000000628318530;
+
+    // CIE XYZ Gaussian approximation parameters (amplitude, center, variance)
+    // X primary lobe
+    let x1: scalar = 5.4856e-13 * sqrt(6.2832 * 4.3278e9) * cos(1.6810e6 * phase + shift.x) * exp(-4.3278e9 * phase * phase);
+    // X secondary lobe
+    let x2: scalar = 9.7470e-14 * sqrt(6.2832 * 4.5282e9) * cos(2.2399e6 * phase + shift.x) * exp(-4.5282e9 * phase * phase);
+    // Y
+    let y: scalar = 4.4201e-13 * sqrt(6.2832 * 9.3046e9) * cos(1.7953e6 * phase + shift.y) * exp(-9.3046e9 * phase * phase);
+    // Z
+    let z: scalar = 5.2481e-13 * sqrt(6.2832 * 6.6121e9) * cos(2.2084e6 * phase + shift.z) * exp(-6.6121e9 * phase * phase);
+
+    let xyz: vec3 = vec3(x1 + x2, y, z) / 1.0685e-7;
+
+    // XYZ to sRGB (Rec. 709)
+    let r: scalar = xyz.x * 3.2404542 + xyz.y * -1.5371385 + xyz.z * -0.4985314;
+    let g: scalar = xyz.x * -0.9692660 + xyz.y * 1.8760108 + xyz.z * 0.0415560;
+    let b: scalar = xyz.x * 0.0556434 + xyz.y * -0.2040259 + xyz.z * 1.0572252;
+
+    return vec3(r, g, b);
+}
+
+fn iridescence_fresnel(outside_ior: scalar, film_ior: scalar, base_f0: vec3, thickness: scalar, cos_theta: scalar) -> vec3 {
+    // Snell's law: refracted angle inside film
+    let sin_theta1_sq: scalar = 1.0 - cos_theta * cos_theta;
+    let sin_theta2_sq: scalar = sin_theta1_sq * (outside_ior * outside_ior) / (film_ior * film_ior);
+
+    // Total internal reflection check
+    let cos_theta2: scalar = sqrt(max(1.0 - sin_theta2_sq, 0.0));
+
+    // Interface reflectances
+    let r12_f0: scalar = iridescence_ior_to_f0(film_ior, outside_ior);
+    let r12: scalar = r12_f0 + (1.0 - r12_f0) * pow(1.0 - cos_theta, 5.0);
+
+    // Base interface: per-channel (base_f0 is RGB)
+    let base_ior: vec3 = vec3(
+        iridescence_f0_to_ior(base_f0.x),
+        iridescence_f0_to_ior(base_f0.y),
+        iridescence_f0_to_ior(base_f0.z)
+    );
+    let r23_f0: vec3 = vec3(
+        iridescence_ior_to_f0(base_ior.x, film_ior),
+        iridescence_ior_to_f0(base_ior.y, film_ior),
+        iridescence_ior_to_f0(base_ior.z, film_ior)
+    );
+    let r23: vec3 = r23_f0 + (vec3(1.0) - r23_f0) * pow(1.0 - cos_theta2, 5.0);
+
+    // Optical path difference (in nanometers)
+    let opd: scalar = 2.0 * film_ior * thickness * cos_theta2;
+
+    // Phase shifts at interfaces (half-wave loss)
+    let phi12: scalar = (film_ior < outside_ior) ? PI : 0.0;
+    let phi21: scalar = PI - phi12;
+    let phi23: vec3 = vec3(
+        (base_ior.x < film_ior) ? PI : 0.0,
+        (base_ior.y < film_ior) ? PI : 0.0,
+        (base_ior.z < film_ior) ? PI : 0.0
+    );
+    let total_phi: vec3 = vec3(phi21) + phi23;
+
+    // Airy summation (Belcour 2017 Fourier approach)
+    let r123: vec3 = clamp(vec3(r12) * r23, vec3(1.0e-5), vec3(0.9999));
+    let r123_sqrt: vec3 = sqrt(r123);
+    let t121: scalar = 1.0 - r12;
+
+    let rs: vec3 = vec3(t121 * t121) * r23 / (vec3(1.0) - r123);
+
+    // DC term
+    let c0: vec3 = vec3(r12) + rs;
+
+    // First harmonic
+    let cm: vec3 = rs - vec3(t121);
+    let c1: vec3 = cm * r123_sqrt;
+
+    // Second harmonic
+    let c2: vec3 = c1 * r123_sqrt;
+
+    // Spectral integration
+    let s1: vec3 = iridescence_sensitivity(opd, total_phi);
+    let s2: vec3 = iridescence_sensitivity(2.0 * opd, 2.0 * total_phi);
+
+    let result: vec3 = c0 + c1 * 2.0 * s1 + c2 * 2.0 * s2;
+
+    return max(result, vec3(0.0));
+}
+
+// --- Dispersion (glTF KHR_materials_dispersion) ---
+// Per-channel IOR via Cauchy equation with Abbe number.
+
+fn dispersion_ior(base_ior: scalar, dispersion: scalar) -> vec3 {
+    // dispersion = 20 / Vd, so half_spread = (ior-1) * 0.025 * dispersion
+    let half_spread: scalar = (base_ior - 1.0) * 0.025 * dispersion;
+    let ior_r: scalar = max(base_ior - half_spread, 1.0);
+    let ior_g: scalar = base_ior;
+    let ior_b: scalar = max(base_ior + half_spread, 1.0);
+    return vec3(ior_r, ior_g, ior_b);
+}
+
+fn dispersion_refract(v: vec3, n: vec3, base_ior: scalar, dispersion: scalar) -> vec3 {
+    // Refract each channel separately through its own IOR
+    let iors: vec3 = dispersion_ior(base_ior, dispersion);
+    let refr_r: vec3 = refract(v, n, 1.0 / iors.x);
+    let refr_g: vec3 = refract(v, n, 1.0 / iors.y);
+    let refr_b: vec3 = refract(v, n, 1.0 / iors.z);
+    // Return per-channel deviation as angular spread
+    return vec3(length(refr_r - refr_g), 0.0, length(refr_b - refr_g));
+}
+
+fn dispersion_f0(base_ior: scalar, dispersion: scalar) -> vec3 {
+    // Per-channel F0 from dispersed IOR
+    let iors: vec3 = dispersion_ior(base_ior, dispersion);
+    return vec3(
+        ior_to_f0(iors.x),
+        ior_to_f0(iors.y),
+        ior_to_f0(iors.z)
+    );
+}

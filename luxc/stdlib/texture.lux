@@ -1,0 +1,91 @@
+// Lux Standard Library: Texture Utilities
+// Normal mapping, triplanar projection, and texture helpers
+
+// --- TBN Matrix Construction ---
+// Constructs a tangent-bitangent-normal matrix for normal mapping.
+// The tangent and bitangent should be pre-normalized and orthogonalized.
+
+fn tbn_perturb_normal(normal_sample: vec3, world_normal: vec3, world_tangent: vec3, world_bitangent: vec3) -> vec3 {
+    // Unpack normal from [0,1] to [-1,1]
+    let ts_normal: vec3 = normal_sample * 2.0 - vec3(1.0);
+    // Transform from tangent space to world space via TBN
+    let result: vec3 = world_tangent * ts_normal.x + world_bitangent * ts_normal.y + world_normal * ts_normal.z;
+    return normalize(result);
+}
+
+fn tbn_from_tangent(normal: vec3, tangent: vec4) -> vec3 {
+    // Compute bitangent from normal and tangent (tangent.w = handedness)
+    let t: vec3 = normalize(vec3(tangent.x, tangent.y, tangent.z));
+    let b: vec3 = cross(normal, t) * tangent.w;
+    return normalize(b);
+}
+
+fn unpack_normal(encoded: vec3) -> vec3 {
+    // Decode normal map from [0,1] range to [-1,1] range
+    return normalize(encoded * 2.0 - vec3(1.0));
+}
+
+fn unpack_normal_strength(encoded: vec3, strength: scalar) -> vec3 {
+    let n: vec3 = encoded * 2.0 - vec3(1.0);
+    return normalize(vec3(n.x * strength, n.y * strength, n.z));
+}
+
+// --- Triplanar Projection ---
+// Blends three planar texture projections based on normal direction.
+// Returns blend weights for X, Y, Z planes.
+
+fn triplanar_weights(normal: vec3, sharpness: scalar) -> vec3 {
+    // Absolute normal components raised to sharpness power
+    let w: vec3 = vec3(
+        pow(abs(normal.x), sharpness),
+        pow(abs(normal.y), sharpness),
+        pow(abs(normal.z), sharpness)
+    );
+    // Normalize weights to sum to 1
+    let total: scalar = w.x + w.y + w.z + 0.00001;
+    return w / total;
+}
+
+fn triplanar_uv_x(world_pos: vec3) -> vec2 {
+    // X-axis projection: use Y and Z as UV
+    return vec2(world_pos.y, world_pos.z);
+}
+
+fn triplanar_uv_y(world_pos: vec3) -> vec2 {
+    // Y-axis projection: use X and Z as UV
+    return vec2(world_pos.x, world_pos.z);
+}
+
+fn triplanar_uv_z(world_pos: vec3) -> vec2 {
+    // Z-axis projection: use X and Y as UV
+    return vec2(world_pos.x, world_pos.y);
+}
+
+fn triplanar_blend(sample_x: vec3, sample_y: vec3, sample_z: vec3, weights: vec3) -> vec3 {
+    return sample_x * weights.x + sample_y * weights.y + sample_z * weights.z;
+}
+
+fn triplanar_blend_scalar(sample_x: scalar, sample_y: scalar, sample_z: scalar, weights: vec3) -> scalar {
+    return sample_x * weights.x + sample_y * weights.y + sample_z * weights.z;
+}
+
+// --- Parallax Mapping Helpers ---
+
+fn parallax_offset(height: scalar, scale: scalar, view_dir_ts: vec3) -> vec2 {
+    // Simple parallax offset mapping
+    let h: scalar = height * scale - scale * 0.5;
+    return vec2(view_dir_ts.x, view_dir_ts.y) / (view_dir_ts.z + 0.42) * h;
+}
+
+// --- UV Utilities ---
+
+fn rotate_uv(uv: vec2, angle: scalar, center: vec2) -> vec2 {
+    let c: scalar = cos(angle);
+    let s: scalar = sin(angle);
+    let offset: vec2 = uv - center;
+    return vec2(offset.x * c - offset.y * s, offset.x * s + offset.y * c) + center;
+}
+
+fn tile_uv(uv: vec2, scale: vec2) -> vec2 {
+    return vec2(mod(uv.x * scale.x, 1.0), mod(uv.y * scale.y, 1.0));
+}
