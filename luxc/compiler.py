@@ -78,7 +78,7 @@ def compile_source(
     _resolve_imports(module, source_dir)
 
     # Expand surface/geometry/pipeline declarations into stage blocks
-    if module.surfaces or module.pipelines:
+    if module.surfaces or module.pipelines or module.environments or module.procedurals:
         from luxc.expansion.surface_expander import expand_surfaces
         expand_surfaces(module)
 
@@ -96,9 +96,20 @@ def compile_source(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    _SUFFIX_MAP = {
+        "vertex": "vert",
+        "fragment": "frag",
+        "raygen": "rgen",
+        "closest_hit": "rchit",
+        "any_hit": "rahit",
+        "miss": "rmiss",
+        "intersection": "rint",
+        "callable": "rcall",
+    }
+
     for stage in module.stages:
-        stage_name = stage.stage_type  # "vertex" or "fragment"
-        suffix = {"vertex": "vert", "fragment": "frag"}[stage_name]
+        stage_name = stage.stage_type
+        suffix = _SUFFIX_MAP[stage_name]
 
         asm_text = generate_spirv(module, stage)
 

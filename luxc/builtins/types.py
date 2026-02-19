@@ -43,6 +43,11 @@ class VoidType(LuxType):
     pass
 
 
+@dataclass(frozen=True)
+class AccelerationStructureType(LuxType):
+    pass
+
+
 # Singleton type instances
 VOID = VoidType("void")
 BOOL = BoolType("bool")
@@ -67,6 +72,7 @@ MAT3 = MatrixType("mat3", 3)
 MAT4 = MatrixType("mat4", 4)
 
 SAMPLER2D = SamplerType("sampler2d")
+ACCELERATION_STRUCTURE = AccelerationStructureType("acceleration_structure")
 
 # Lookup table: type name string -> LuxType
 TYPE_MAP: dict[str, LuxType] = {
@@ -80,6 +86,7 @@ TYPE_MAP: dict[str, LuxType] = {
     "uvec2": UVEC2, "uvec3": UVEC3, "uvec4": UVEC4,
     "mat2": MAT2, "mat3": MAT3, "mat4": MAT4,
     "sampler2d": SAMPLER2D,
+    "acceleration_structure": ACCELERATION_STRUCTURE,
 }
 
 

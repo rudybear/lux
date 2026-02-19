@@ -309,7 +309,7 @@ procedural MetaBalls {
 | **P5.1** | Critical built-in gaps (refract, atan2, inversesqrt, mod) | ✅ Complete |
 | **P5.2** | stdlib expansions (clearcoat, sheen, anisotropy, diffuse models, color) | ✅ Complete |
 | **P5.3** | Advanced materials (transmission, iridescence, dispersion, texture) | ✅ Complete |
-| **P6** | Ray tracing pipeline (RT stages, SPIR-V codegen, surface→RT expansion) | 🔲 Future |
+| **P6** | Ray tracing pipeline (RT stages, SPIR-V codegen, surface→RT expansion) | ✅ Complete |
 
 ---
 

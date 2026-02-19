@@ -25,6 +25,8 @@ class Module:
     geometries: list[GeometryDecl] = field(default_factory=list)
     pipelines: list[PipelineDecl] = field(default_factory=list)
     schedules: list[ScheduleDecl] = field(default_factory=list)
+    environments: list[EnvironmentDecl] = field(default_factory=list)
+    procedurals: list[ProceduralDecl] = field(default_factory=list)
 
 
 # --- Top-level declarations ---
@@ -143,17 +145,46 @@ class ScheduleMember:
     value: str
 
 
+# --- Environment declarations (RT miss shader) ---
+
+@dataclass
+class EnvironmentDecl:
+    name: str
+    members: list[SurfaceMember]
+    samplers: list[str] = field(default_factory=list)
+    loc: Optional[SourceLocation] = None
+
+
+# --- Procedural declarations (RT intersection shader) ---
+
+@dataclass
+class ProceduralDecl:
+    name: str
+    members: list[ProceduralMember]
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class ProceduralMember:
+    name: str
+    value: Expr
+
+
 # --- Stage blocks ---
 
 @dataclass
 class StageBlock:
-    stage_type: str  # "vertex" or "fragment"
+    stage_type: str  # "vertex", "fragment", "raygen", "closest_hit", "any_hit", "miss", "intersection", "callable"
     inputs: list[VarDecl] = field(default_factory=list)
     outputs: list[VarDecl] = field(default_factory=list)
     uniforms: list[UniformBlock] = field(default_factory=list)
     push_constants: list[PushBlock] = field(default_factory=list)
     samplers: list[SamplerDecl] = field(default_factory=list)
     functions: list[FunctionDef] = field(default_factory=list)
+    ray_payloads: list[RayPayloadDecl] = field(default_factory=list)
+    hit_attributes: list[HitAttributeDecl] = field(default_factory=list)
+    callable_data: list[CallableDataDecl] = field(default_factory=list)
+    accel_structs: list[AccelDecl] = field(default_factory=list)
     loc: Optional[SourceLocation] = None
 
 
@@ -193,6 +224,39 @@ class SamplerDecl:
     set_number: Optional[int] = None
     binding: Optional[int] = None          # sampler state binding
     texture_binding: Optional[int] = None  # texture image binding
+    loc: Optional[SourceLocation] = None
+
+
+# --- RT-specific declarations ---
+
+@dataclass
+class RayPayloadDecl:
+    name: str
+    type_name: str
+    location: Optional[int] = None
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class HitAttributeDecl:
+    name: str
+    type_name: str
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class CallableDataDecl:
+    name: str
+    type_name: str
+    location: Optional[int] = None
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class AccelDecl:
+    name: str
+    set_number: Optional[int] = None
+    binding: Optional[int] = None
     loc: Optional[SourceLocation] = None
 
 

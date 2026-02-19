@@ -100,6 +100,39 @@ class TypeChecker:
             from luxc.builtins.types import SAMPLER2D
             scope.define(Symbol(sam.name, SAMPLER2D, "sampler"))
 
+        # Register RT-specific variables
+        for rp in stage.ray_payloads:
+            t = resolve_type(rp.type_name)
+            if t is None:
+                raise TypeCheckError(f"Unknown type '{rp.type_name}' in ray_payload")
+            scope.define(Symbol(rp.name, t, "ray_payload"))
+
+        for ha in stage.hit_attributes:
+            t = resolve_type(ha.type_name)
+            if t is None:
+                raise TypeCheckError(f"Unknown type '{ha.type_name}' in hit_attribute")
+            scope.define(Symbol(ha.name, t, "hit_attribute"))
+
+        for cd in stage.callable_data:
+            t = resolve_type(cd.type_name)
+            if t is None:
+                raise TypeCheckError(f"Unknown type '{cd.type_name}' in callable_data")
+            scope.define(Symbol(cd.name, t, "callable_data"))
+
+        for accel in stage.accel_structs:
+            from luxc.builtins.types import ACCELERATION_STRUCTURE
+            scope.define(Symbol(accel.name, ACCELERATION_STRUCTURE, "accel_struct"))
+
+        # Register RT built-in variables
+        _RT_STAGE_TYPES = {"raygen", "closest_hit", "any_hit", "miss", "intersection", "callable"}
+        if stage.stage_type in _RT_STAGE_TYPES:
+            from luxc.codegen.spirv_builder import _RT_BUILTINS
+            for bname, (btype, _, valid_stages) in _RT_BUILTINS.items():
+                if stage.stage_type in valid_stages:
+                    t = resolve_type(btype)
+                    if t is not None:
+                        scope.define(Symbol(bname, t, "rt_builtin"))
+
         for fn in stage.functions:
             self._check_function(fn, scope)
 

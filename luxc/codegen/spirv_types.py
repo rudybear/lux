@@ -66,6 +66,10 @@ class TypeRegistry:
         key = "sampled_image"
         return self._ensure_type(key, f"OpTypeSampledImage {img}")
 
+    def acceleration_structure_type(self) -> str:
+        key = "accel_struct"
+        return self._ensure_type(key, "OpTypeAccelerationStructureKHR")
+
     def pointer(self, storage_class: str, pointee: str) -> str:
         key = f"ptr_{storage_class}_{pointee}"
         return self._ensure_type(key, f"OpTypePointer {storage_class} {pointee}")
@@ -164,6 +168,7 @@ class TypeRegistry:
             "mat3": lambda: self.mat(3),
             "mat4": lambda: self.mat(4),
             "sampler2d": self.sampled_image_type,
+            "acceleration_structure": self.acceleration_structure_type,
         }
         factory = mapping.get(resolved)
         if factory is None:

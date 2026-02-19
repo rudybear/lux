@@ -1,0 +1,23 @@
+// Lux Ray Tracing Example: Simple Path Tracer
+// Demonstrates surface → closest-hit, environment → miss,
+// and pipeline mode: raytrace
+
+import brdf;
+
+// Surface is UNCHANGED — same BRDF, works for both raster and RT
+surface CopperMetal {
+    brdf: pbr(vec3(0.95, 0.64, 0.54), 0.3, 0.9),
+}
+
+// New: environment for miss shader (sky gradient)
+environment GradientSky {
+    color: mix(vec3(1.0), vec3(0.5, 0.7, 1.0), 0.5),
+}
+
+// Pipeline with mode: raytrace
+pipeline PathTracer {
+    mode: raytrace,
+    surface: CopperMetal,
+    environment: GradientSky,
+    max_bounces: 1,
+}

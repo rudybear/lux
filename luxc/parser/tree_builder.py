@@ -16,6 +16,8 @@ from luxc.parser.ast_nodes import (
     GeometryDecl, GeometryField, GeometryTransform, GeometryOutputs, OutputBinding,
     PipelineDecl, PipelineMember,
     ScheduleDecl, ScheduleMember,
+    EnvironmentDecl, ProceduralDecl, ProceduralMember,
+    RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
 )
 
 _CONSTRUCTOR_TYPES = frozenset({
@@ -78,6 +80,10 @@ class LuxTransformer(Transformer):
                 mod.pipelines.append(item)
             elif isinstance(item, ScheduleDecl):
                 mod.schedules.append(item)
+            elif isinstance(item, EnvironmentDecl):
+                mod.environments.append(item)
+            elif isinstance(item, ProceduralDecl):
+                mod.procedurals.append(item)
         return mod
 
     # --- Top-level declarations ---
@@ -170,6 +176,24 @@ class LuxTransformer(Transformer):
     def schedule_member(self, args):
         return ScheduleMember(str(args[0]), str(args[1]))
 
+    # --- Environment declarations ---
+
+    def environment_decl(self, args):
+        name = args[0]
+        members = [a for a in args[1:] if isinstance(a, SurfaceMember)]
+        sampler_names = [a for a in args[1:] if isinstance(a, str) and a != str(name)]
+        return EnvironmentDecl(str(name), members, samplers=sampler_names, loc=_tok_loc(name))
+
+    # --- Procedural declarations ---
+
+    def procedural_decl(self, args):
+        name = args[0]
+        members = [a for a in args[1:] if isinstance(a, ProceduralMember)]
+        return ProceduralDecl(str(name), members, loc=_tok_loc(name))
+
+    def procedural_member(self, args):
+        return ProceduralMember(str(args[0]), args[1])
+
     # --- Stage blocks ---
 
     def stage_block(self, args):
@@ -189,6 +213,14 @@ class LuxTransformer(Transformer):
                 block.samplers.append(item)
             elif isinstance(item, FunctionDef):
                 block.functions.append(item)
+            elif isinstance(item, RayPayloadDecl):
+                block.ray_payloads.append(item)
+            elif isinstance(item, HitAttributeDecl):
+                block.hit_attributes.append(item)
+            elif isinstance(item, CallableDataDecl):
+                block.callable_data.append(item)
+            elif isinstance(item, AccelDecl):
+                block.accel_structs.append(item)
         return block
 
     def in_decl(self, args):
@@ -218,6 +250,23 @@ class LuxTransformer(Transformer):
 
     def sampler_decl(self, args):
         return SamplerDecl(str(args[0]), loc=_tok_loc(args[0]))
+
+    # --- RT declarations ---
+
+    def ray_payload_decl(self, args):
+        name, type_node = args[0], args[1]
+        return RayPayloadDecl(str(name), _extract_type(type_node), loc=_tok_loc(name))
+
+    def hit_attribute_decl(self, args):
+        name, type_node = args[0], args[1]
+        return HitAttributeDecl(str(name), _extract_type(type_node), loc=_tok_loc(name))
+
+    def callable_data_decl(self, args):
+        name, type_node = args[0], args[1]
+        return CallableDataDecl(str(name), _extract_type(type_node), loc=_tok_loc(name))
+
+    def accel_decl(self, args):
+        return AccelDecl(str(args[0]), loc=_tok_loc(args[0]))
 
     # --- Functions ---
 

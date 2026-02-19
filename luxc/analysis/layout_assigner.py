@@ -39,6 +39,27 @@ def _assign_stage_layouts(stage: StageBlock, binding_start: int) -> None:
         sam.texture_binding = binding + 1  # texture image
         binding += 2
 
+    # Auto-assign RT payload locations
+    payload_loc = 0
+    for rp in stage.ray_payloads:
+        if rp.location is None:
+            rp.location = payload_loc
+        payload_loc = rp.location + 1
+
+    callable_loc = 0
+    for cd in stage.callable_data:
+        if cd.location is None:
+            cd.location = callable_loc
+        callable_loc = cd.location + 1
+
+    # Auto-assign acceleration structure bindings
+    for accel in stage.accel_structs:
+        if accel.set_number is None:
+            accel.set_number = set_num
+        if accel.binding is None:
+            accel.binding = binding
+            binding += 1
+
 
 def compute_std140_offsets(fields: list) -> list[int]:
     """Compute std140 offsets for block fields.

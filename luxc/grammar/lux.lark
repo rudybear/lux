@@ -12,6 +12,8 @@ start: module_item*
             | geometry_decl
             | pipeline_decl
             | schedule_decl
+            | environment_decl
+            | procedural_decl
 
 // --- Top-level declarations ---
 
@@ -58,11 +60,20 @@ pipeline_member: IDENT ":" expr
 schedule_decl: "schedule" IDENT "{" schedule_member ("," schedule_member)* ","? "}"
 schedule_member: IDENT ":" IDENT
 
+// --- Environment declarations (maps to miss shader in RT) ---
+
+environment_decl: "environment" IDENT "{" surface_item ("," surface_item)* ","? "}"
+
+// --- Procedural declarations (maps to intersection shader in RT) ---
+
+procedural_decl: "procedural" IDENT "{" procedural_item ("," procedural_item)* ","? "}"
+?procedural_item: IDENT ":" expr -> procedural_member
+
 // --- Stage blocks ---
 
 stage_block: STAGE_TYPE "{" stage_item* "}"
 
-STAGE_TYPE: "vertex" | "fragment"
+STAGE_TYPE: "vertex" | "fragment" | "raygen" | "closest_hit" | "any_hit" | "miss" | "intersection" | "callable"
 
 ?stage_item: in_decl
            | out_decl
@@ -70,6 +81,10 @@ STAGE_TYPE: "vertex" | "fragment"
            | push_block
            | sampler_decl
            | function_def
+           | ray_payload_decl
+           | hit_attribute_decl
+           | callable_data_decl
+           | accel_decl
 
 in_decl: "in" IDENT ":" type ";"
 out_decl: "out" IDENT ":" type ";"
@@ -80,6 +95,12 @@ push_block: "push" IDENT "{" block_field ("," block_field)* ","? "}"
 block_field: IDENT ":" type
 
 sampler_decl: "sampler2d" IDENT ";"
+
+// RT-specific stage items
+ray_payload_decl: "ray_payload" IDENT ":" type ";"
+hit_attribute_decl: "hit_attribute" IDENT ":" type ";"
+callable_data_decl: "callable_data" IDENT ":" type ";"
+accel_decl: "acceleration_structure" IDENT ";"
 
 // --- Functions ---
 
@@ -121,6 +142,7 @@ TYPE_NAME: "scalar" | "int" | "uint" | "bool"
          | "uvec2" | "uvec3" | "uvec4"
          | "mat2" | "mat3" | "mat4"
          | "sampler2d" | "void"
+         | "acceleration_structure"
          | IDENT
 
 // --- Expressions (precedence climbing) ---

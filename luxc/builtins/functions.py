@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from luxc.builtins.types import (
     LuxType, SCALAR, INT, UINT, BOOL, VOID,
     VEC2, VEC3, VEC4, MAT2, MAT3, MAT4, SAMPLER2D,
+    ACCELERATION_STRUCTURE,
     VectorType, MatrixType, ScalarType,
 )
 
@@ -89,6 +90,26 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
 
     # texture sampling
     add([FuncSig("sample", (SAMPLER2D, VEC2), VEC4)])
+
+    # --- RT instructions ---
+    # trace_ray(accel, ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,
+    #           origin, tmin, direction, tmax, payload_loc)
+    add([FuncSig("trace_ray", (
+        ACCELERATION_STRUCTURE, UINT, UINT, UINT, UINT, UINT,
+        VEC3, SCALAR, VEC3, SCALAR, INT,
+    ), VOID)])
+
+    # report_intersection(hit_t, hit_kind) -> bool
+    add([FuncSig("report_intersection", (SCALAR, UINT), BOOL)])
+
+    # execute_callable(sbt_index, callable_data_loc) -> void
+    add([FuncSig("execute_callable", (UINT, INT), VOID)])
+
+    # ignore_intersection() -> void
+    add([FuncSig("ignore_intersection", (), VOID)])
+
+    # terminate_ray() -> void
+    add([FuncSig("terminate_ray", (), VOID)])
 
     return table
 

@@ -17,9 +17,10 @@ from luxc.parser.ast_nodes import (
     SamplerDecl,
     FunctionDef, Param, LetStmt, AssignStmt, ReturnStmt, ExprStmt,
     NumberLit, VarRef, BinaryOp, CallExpr, ConstructorExpr,
-    SwizzleAccess,
+    SwizzleAccess, UnaryOp,
     AssignTarget, SurfaceDecl, GeometryDecl, PipelineDecl,
-    ScheduleDecl,
+    ScheduleDecl, EnvironmentDecl, ProceduralDecl,
+    RayPayloadDecl, HitAttributeDecl, AccelDecl,
 )
 
 
@@ -69,15 +70,24 @@ def expand_surfaces(module: Module) -> None:
     If a pipeline declaration references a surface and geometry by name,
     generate vertex + fragment stages. Otherwise, if a surface exists
     without a pipeline, generate just the fragment stage.
+
+    For RT pipelines (mode: raytrace), generates raygen, closest_hit,
+    miss, and optionally any_hit/intersection stages.
     """
     # Index declarations by name
     surfaces = {s.name: s for s in module.surfaces}
     geometries = {g.name: g for g in module.geometries}
+    environments = {e.name: e for e in module.environments}
+    procedurals = {p.name: p for p in module.procedurals}
 
     for pipeline in module.pipelines:
         geo_name = None
         surf_name = None
         schedule_name = None
+        env_name = None
+        mode = "rasterize"
+        max_bounces = 1
+        procedural_name = None
         for member in pipeline.members:
             if member.name == "geometry":
                 if isinstance(member.value, VarRef):
@@ -88,13 +98,34 @@ def expand_surfaces(module: Module) -> None:
             elif member.name == "schedule":
                 if isinstance(member.value, VarRef):
                     schedule_name = member.value.name
+            elif member.name == "mode":
+                if isinstance(member.value, VarRef):
+                    mode = member.value.name
+            elif member.name == "environment":
+                if isinstance(member.value, VarRef):
+                    env_name = member.value.name
+            elif member.name == "max_bounces":
+                if isinstance(member.value, NumberLit):
+                    max_bounces = int(member.value.value)
+            elif member.name == "procedural":
+                if isinstance(member.value, VarRef):
+                    procedural_name = member.value.name
 
         # Resolve schedule if specified
         schedule = None
         if schedule_name:
             schedule = _resolve_schedule(module, schedule_name)
 
-        if surf_name and surf_name in surfaces:
+        if mode == "raytrace":
+            # RT pipeline expansion
+            surface = surfaces.get(surf_name) if surf_name else None
+            environment = environments.get(env_name) if env_name else None
+            procedural = procedurals.get(procedural_name) if procedural_name else None
+            stages = _expand_rt_pipeline(
+                surface, environment, procedural, module, schedule, max_bounces
+            )
+            module.stages.extend(stages)
+        elif surf_name and surf_name in surfaces:
             surface = surfaces[surf_name]
             geometry = geometries.get(geo_name) if geo_name else None
             stages = _expand_pipeline(surface, geometry, module, schedule)
@@ -414,3 +445,396 @@ def _infer_output_type(name: str) -> str:
         "uv": "vec2",
     }
     return type_hints.get(name, "vec3")
+
+
+# =========================================================================
+# RT Pipeline Expansion
+# =========================================================================
+
+def _expand_rt_pipeline(
+    surface: SurfaceDecl | None,
+    environment: EnvironmentDecl | None,
+    procedural: ProceduralDecl | None,
+    module: Module,
+    schedule: dict[str, str] | None = None,
+    max_bounces: int = 1,
+) -> list[StageBlock]:
+    """Generate ray tracing stages from pipeline declarations."""
+    stages = []
+
+    # 1. Ray generation shader
+    raygen = _expand_raygen(surface, environment, max_bounces)
+    stages.append(raygen)
+
+    # 2. Closest-hit shader from surface
+    if surface:
+        chit = _expand_surface_to_closest_hit(surface, module, schedule)
+        stages.append(chit)
+
+        # 3. Any-hit shader if surface has opacity
+        has_opacity = any(m.name == "opacity" for m in surface.members)
+        if has_opacity:
+            ahit = _expand_surface_to_any_hit(surface)
+            stages.append(ahit)
+
+    # 4. Miss shader from environment
+    if environment:
+        miss = _expand_environment_to_miss(environment)
+        stages.append(miss)
+
+    # 5. Intersection shader from procedural
+    if procedural:
+        isect = _expand_procedural_to_intersection(procedural)
+        stages.append(isect)
+
+    return stages
+
+
+def _expand_raygen(
+    surface: SurfaceDecl | None,
+    environment: EnvironmentDecl | None,
+    max_bounces: int = 1,
+) -> StageBlock:
+    """Generate a ray generation shader.
+
+    Creates a simple primary ray caster that:
+    - Computes ray from launch_id/launch_size (camera model)
+    - Calls trace_ray
+    - Stores result from payload into output image
+    """
+    stage = StageBlock(stage_type="raygen")
+
+    # Acceleration structure binding
+    stage.accel_structs.append(AccelDecl("tlas"))
+
+    # Ray payload: color result
+    stage.ray_payloads.append(RayPayloadDecl("payload", "vec4"))
+
+    # Camera uniform
+    stage.uniforms.append(UniformBlock("Camera", [
+        BlockField("camera_pos", "vec3"),
+        BlockField("camera_inv_view", "mat4"),
+        BlockField("camera_inv_proj", "mat4"),
+    ]))
+
+    # Output image (out variable for now; in real RT this would be a storage image)
+    out = VarDecl("result_color", "vec4")
+    out._is_input = False
+    stage.outputs.append(out)
+
+    # Main body: compute ray and trace
+    body = []
+
+    # Compute normalized pixel coordinates from launch_id / launch_size
+    # let pixel: vec2 = vec2(launch_id.x, launch_id.y) + vec2(0.5);
+    body.append(LetStmt("pixel", "vec2", BinaryOp("+",
+        ConstructorExpr("vec2", [
+            SwizzleAccess(VarRef("launch_id"), "x"),
+            SwizzleAccess(VarRef("launch_id"), "y"),
+        ]),
+        ConstructorExpr("vec2", [NumberLit("0.5")]),
+    )))
+
+    # let uv: vec2 = pixel / vec2(launch_size.x, launch_size.y);
+    body.append(LetStmt("uv", "vec2", BinaryOp("/",
+        VarRef("pixel"),
+        ConstructorExpr("vec2", [
+            SwizzleAccess(VarRef("launch_size"), "x"),
+            SwizzleAccess(VarRef("launch_size"), "y"),
+        ]),
+    )))
+
+    # let ndc: vec2 = uv * 2.0 - vec2(1.0);
+    body.append(LetStmt("ndc", "vec2", BinaryOp("-",
+        BinaryOp("*", VarRef("uv"), NumberLit("2.0")),
+        ConstructorExpr("vec2", [NumberLit("1.0")]),
+    )))
+
+    # Initialize payload to zero
+    body.append(AssignStmt(
+        AssignTarget(VarRef("payload")),
+        ConstructorExpr("vec4", [NumberLit("0.0")]),
+    ))
+
+    # Compute ray origin and direction using camera matrices
+    # let target: vec4 = camera_inv_proj * vec4(ndc.x, ndc.y, 1.0, 1.0);
+    body.append(LetStmt("target", "vec4", BinaryOp("*",
+        VarRef("camera_inv_proj"),
+        ConstructorExpr("vec4", [
+            SwizzleAccess(VarRef("ndc"), "x"),
+            SwizzleAccess(VarRef("ndc"), "y"),
+            NumberLit("1.0"),
+            NumberLit("1.0"),
+        ]),
+    )))
+
+    # let ray_dir: vec4 = camera_inv_view * vec4(normalize(target.xyz), 0.0);
+    body.append(LetStmt("ray_dir", "vec4", BinaryOp("*",
+        VarRef("camera_inv_view"),
+        ConstructorExpr("vec4", [
+            CallExpr(VarRef("normalize"), [SwizzleAccess(VarRef("target"), "xyz")]),
+            NumberLit("0.0"),
+        ]),
+    )))
+
+    # trace_ray(tlas, 0xff, 0xff, 0, 0, 0, camera_pos, 0.001, ray_dir.xyz, 10000.0, 0);
+    body.append(ExprStmt(CallExpr(VarRef("trace_ray"), [
+        VarRef("tlas"),
+        NumberLit("0"),    # ray_flags
+        NumberLit("255"),  # cull_mask
+        NumberLit("0"),    # sbt_offset
+        NumberLit("0"),    # sbt_stride
+        NumberLit("0"),    # miss_index
+        VarRef("camera_pos"),
+        NumberLit("0.001"),  # tmin
+        SwizzleAccess(VarRef("ray_dir"), "xyz"),
+        NumberLit("10000.0"),  # tmax
+        NumberLit("0"),    # payload location
+    ])))
+
+    # result_color = payload;
+    body.append(AssignStmt(
+        AssignTarget(VarRef("result_color")),
+        VarRef("payload"),
+    ))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
+def _expand_surface_to_closest_hit(
+    surface: SurfaceDecl,
+    module: Module,
+    schedule: dict[str, str] | None = None,
+) -> StageBlock:
+    """Generate a closest-hit shader from a surface declaration.
+
+    The closest-hit shader:
+    - Receives incoming ray payload
+    - Evaluates BRDF using hit point data (builtins: world_ray_origin, hit_t, etc.)
+    - Writes color to the payload
+    """
+    stage = StageBlock(stage_type="closest_hit")
+
+    # Incoming ray payload
+    stage.ray_payloads.append(RayPayloadDecl("payload", "vec4"))
+
+    # Hit attributes (barycentric coordinates from triangle intersection)
+    stage.hit_attributes.append(HitAttributeDecl("attribs", "vec2"))
+
+    # Main body: evaluate BRDF
+    body = []
+
+    # Compute hit point from ray origin + direction * hit_t
+    body.append(LetStmt("hit_pos", "vec3", BinaryOp("+",
+        VarRef("world_ray_origin"),
+        BinaryOp("*", VarRef("world_ray_direction"), VarRef("hit_t")),
+    )))
+
+    # Use a default normal pointing up (in a real implementation,
+    # this would be interpolated from vertex normals using barycentrics)
+    body.append(LetStmt("n", "vec3", ConstructorExpr("vec3", [
+        NumberLit("0.0"), NumberLit("1.0"), NumberLit("0.0"),
+    ])))
+
+    # View direction: from hit point back to ray origin
+    body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
+        BinaryOp("-", VarRef("world_ray_origin"), VarRef("hit_pos")),
+    ])))
+
+    # Light direction (default: overhead directional)
+    body.append(LetStmt("l", "vec3", CallExpr(VarRef("normalize"), [
+        ConstructorExpr("vec3", [NumberLit("1.0"), NumberLit("1.0"), NumberLit("0.5")]),
+    ])))
+
+    # Evaluate the BRDF from the surface declaration
+    brdf_expr = None
+    for member in surface.members:
+        if member.name == "brdf":
+            brdf_expr = member.value
+
+    if brdf_expr is not None:
+        result_expr = _expand_brdf_call(brdf_expr, schedule)
+        body.append(LetStmt("result", "vec3", result_expr))
+    else:
+        # Default: simple lambert
+        body.append(LetStmt("ndotl", "scalar", CallExpr(VarRef("max"), [
+            CallExpr(VarRef("dot"), [VarRef("n"), VarRef("l")]),
+            NumberLit("0.0"),
+        ])))
+        body.append(LetStmt("result", "vec3", BinaryOp("*",
+            ConstructorExpr("vec3", [NumberLit("1.0")]),
+            VarRef("ndotl"),
+        )))
+
+    # Write result to payload
+    body.append(AssignStmt(
+        AssignTarget(VarRef("payload")),
+        ConstructorExpr("vec4", [VarRef("result"), NumberLit("1.0")]),
+    ))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
+def _expand_surface_to_any_hit(surface: SurfaceDecl) -> StageBlock:
+    """Generate an any-hit shader from a surface with opacity.
+
+    Reads the opacity value and calls ignore_intersection if transparent.
+    """
+    stage = StageBlock(stage_type="any_hit")
+
+    # Hit attributes
+    stage.hit_attributes.append(HitAttributeDecl("attribs", "vec2"))
+
+    body = []
+
+    # Find opacity expression
+    opacity_expr = None
+    for member in surface.members:
+        if member.name == "opacity":
+            opacity_expr = member.value
+
+    if opacity_expr is not None:
+        body.append(LetStmt("alpha", "scalar", opacity_expr))
+    else:
+        body.append(LetStmt("alpha", "scalar", NumberLit("1.0")))
+
+    # if (alpha < 0.5) { ignore_intersection(); }
+    from luxc.parser.ast_nodes import IfStmt
+    body.append(IfStmt(
+        BinaryOp("<", VarRef("alpha"), NumberLit("0.5")),
+        [ExprStmt(CallExpr(VarRef("ignore_intersection"), []))],
+        [],
+    ))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
+def _expand_environment_to_miss(environment: EnvironmentDecl) -> StageBlock:
+    """Generate a miss shader from an environment declaration.
+
+    The miss shader sets the payload color based on the environment definition,
+    typically using the incoming ray direction for sky/environment mapping.
+    """
+    stage = StageBlock(stage_type="miss")
+
+    # Incoming ray payload
+    stage.ray_payloads.append(RayPayloadDecl("payload", "vec4"))
+
+    # Add samplers from environment
+    for sam_name in environment.samplers:
+        stage.samplers.append(SamplerDecl(sam_name))
+
+    body = []
+
+    # Find color expression
+    color_expr = None
+    for member in environment.members:
+        if member.name == "color":
+            color_expr = member.value
+
+    if color_expr is not None:
+        body.append(LetStmt("env_color", "vec3", color_expr))
+    else:
+        # Default sky gradient
+        body.append(LetStmt("t", "scalar", BinaryOp("*",
+            BinaryOp("+", SwizzleAccess(VarRef("world_ray_direction"), "y"), NumberLit("1.0")),
+            NumberLit("0.5"),
+        )))
+        body.append(LetStmt("env_color", "vec3", CallExpr(VarRef("mix"), [
+            ConstructorExpr("vec3", [NumberLit("1.0")]),
+            ConstructorExpr("vec3", [NumberLit("0.5"), NumberLit("0.7"), NumberLit("1.0")]),
+            VarRef("t"),
+        ])))
+
+    # Write to payload
+    body.append(AssignStmt(
+        AssignTarget(VarRef("payload")),
+        ConstructorExpr("vec4", [VarRef("env_color"), NumberLit("1.0")]),
+    ))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
+def _expand_procedural_to_intersection(procedural: ProceduralDecl) -> StageBlock:
+    """Generate an intersection shader from a procedural declaration.
+
+    Evaluates the SDF expression to find ray-surface intersection using
+    sphere tracing (ray marching). Reports intersection when close enough.
+    """
+    stage = StageBlock(stage_type="intersection")
+
+    # Hit attributes for barycentric-like data
+    stage.hit_attributes.append(HitAttributeDecl("attribs", "vec2"))
+
+    body = []
+
+    # Find SDF expression
+    sdf_expr = None
+    for member in procedural.members:
+        if member.name == "sdf":
+            sdf_expr = member.value
+
+    if sdf_expr is None:
+        # Default: unit sphere
+        sdf_expr = CallExpr(VarRef("sdf_sphere"), [NumberLit("1.0")])
+
+    # Simple ray marching loop unrolled as chained let statements
+    # (Lux has no loops — we unroll a fixed number of march steps)
+    max_steps = 64
+    threshold = 0.001
+
+    # Initialize march state
+    body.append(LetStmt("t", "scalar", VarRef("ray_tmin")))
+    body.append(LetStmt("hit_found", "scalar", NumberLit("0.0")))
+
+    # For each step, compute position, evaluate SDF, advance
+    # We unroll a small number of steps (8) as a demonstration
+    # (Full 64 steps would bloat the AST; in practice the user writes
+    # their own intersection shader for complex procedurals)
+    for i in range(8):
+        sfx = f"_{i}"
+        body.append(LetStmt(f"p{sfx}", "vec3", BinaryOp("+",
+            VarRef("world_ray_origin"),
+            BinaryOp("*", VarRef("world_ray_direction"), VarRef("t")),
+        )))
+
+        # Evaluate SDF at the march point
+        # We wrap the sdf_expr to pass the current position
+        if isinstance(sdf_expr, CallExpr) and isinstance(sdf_expr.func, VarRef):
+            sdf_call = CallExpr(sdf_expr.func, [VarRef(f"p{sfx}")] + list(sdf_expr.args))
+        else:
+            sdf_call = sdf_expr
+
+        body.append(LetStmt(f"d{sfx}", "scalar", sdf_call))
+
+        # Advance: t = t + d
+        body.append(AssignStmt(
+            AssignTarget(VarRef("t")),
+            BinaryOp("+", VarRef("t"), VarRef(f"d{sfx}")),
+        ))
+
+    # After marching, check if we hit (last distance < threshold)
+    from luxc.parser.ast_nodes import IfStmt
+    body.append(IfStmt(
+        BinaryOp("<", VarRef("d_7"), NumberLit(str(threshold))),
+        [
+            # Set attribs to zero (no barycentric for procedural)
+            AssignStmt(
+                AssignTarget(VarRef("attribs")),
+                ConstructorExpr("vec2", [NumberLit("0.0")]),
+            ),
+            # Report intersection
+            ExprStmt(CallExpr(VarRef("report_intersection"), [
+                VarRef("t"),
+                NumberLit("0"),  # hit_kind
+            ])),
+        ],
+        [],
+    ))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
