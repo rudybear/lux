@@ -409,7 +409,7 @@ void RasterRenderer::setupPBRResources(VulkanContext& ctx) {
         float _pad1;
     };
 
-    glm::vec3 lightDir = glm::normalize(glm::vec3(0.5f, 0.8f, 1.0f));
+    glm::vec3 lightDir = glm::normalize(glm::vec3(1.0f, 0.8f, 0.6f));
     LightData lightData = {lightDir, 0.0f, Camera::DEFAULT_EYE, 0.0f};
 
     VkBufferCreateInfo lightBufInfo = {};

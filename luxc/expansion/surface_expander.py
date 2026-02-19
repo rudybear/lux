@@ -644,7 +644,7 @@ def _expand_surface_to_closest_hit(
 
     # Light direction (default: overhead directional)
     body.append(LetStmt("l", "vec3", CallExpr(VarRef("normalize"), [
-        ConstructorExpr("vec3", [NumberLit("1.0"), NumberLit("1.0"), NumberLit("0.5")]),
+        ConstructorExpr("vec3", [NumberLit("1.0"), NumberLit("0.8"), NumberLit("0.6")]),
     ])))
 
     # Evaluate the BRDF from the surface declaration

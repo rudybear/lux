@@ -172,7 +172,7 @@ def render_pbr(
     )
 
     # --- Light uniform buffer (std140: vec3 padded to 16 bytes each) ---
-    light_dir = np.array([0.5, 0.8, 1.0], dtype=np.float32)
+    light_dir = np.array([1.0, 0.8, 0.6], dtype=np.float32)
     light_dir = light_dir / np.linalg.norm(light_dir)
     light_data = struct.pack("3f", *light_dir) + struct.pack("f", 0.0)  # pad
     light_data += struct.pack("3f", *eye) + struct.pack("f", 0.0)       # pad

@@ -1029,7 +1029,7 @@ fn render_pbr(
     )?;
 
     // Light uniform buffer (32 bytes: light_dir vec4 + camera_pos vec4)
-    let light_dir = glam::Vec3::new(0.5, 0.8, 1.0).normalize();
+    let light_dir = glam::Vec3::new(1.0, 0.8, 0.6).normalize();
     let camera_pos = DefaultCamera::EYE;
     let mut light_data = [0u8; 32];
     light_data[0..12].copy_from_slice(bytemuck::cast_slice(light_dir.as_ref()));
