@@ -123,6 +123,10 @@ class TypeChecker:
             from luxc.builtins.types import ACCELERATION_STRUCTURE
             scope.define(Symbol(accel.name, ACCELERATION_STRUCTURE, "accel_struct"))
 
+        for si in getattr(stage, 'storage_images', []):
+            from luxc.builtins.types import STORAGE_IMAGE
+            scope.define(Symbol(si.name, STORAGE_IMAGE, "storage_image"))
+
         # Register RT built-in variables
         _RT_STAGE_TYPES = {"raygen", "closest_hit", "any_hit", "miss", "intersection", "callable"}
         if stage.stage_type in _RT_STAGE_TYPES:

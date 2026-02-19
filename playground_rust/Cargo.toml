@@ -1,0 +1,18 @@
+[package]
+name = "lux-playground"
+version = "0.1.0"
+edition = "2021"
+description = "Native Vulkan playground for the Lux shader language"
+
+[dependencies]
+ash = "0.38"
+ash-window = "0.13"
+gpu-allocator = { version = "0.28", features = ["vulkan"] }
+winit = "0.30"
+raw-window-handle = "0.6"
+glam = "0.29"
+image = "0.25"
+bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"

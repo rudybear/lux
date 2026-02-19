@@ -4,6 +4,7 @@
 raygen {
     acceleration_structure tlas;
     ray_payload payload: vec4;
+    storage_image output_image;
 
     fn main() {
         let pixel: uvec3 = launch_id;
@@ -18,6 +19,9 @@ raygen {
         let direction: vec3 = normalize(vec3(px * 2.0 - 1.0, py * 2.0 - 1.0, -1.0));
 
         trace_ray(tlas, 0, 255, 0, 0, 0, origin, 0.001, direction, 1000.0, 0);
+
+        // Write result to storage image using pixel coordinates
+        image_store(output_image, vec2(pixel.x, pixel.y), payload);
     }
 }
 

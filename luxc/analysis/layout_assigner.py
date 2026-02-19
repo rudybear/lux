@@ -60,6 +60,14 @@ def _assign_stage_layouts(stage: StageBlock, binding_start: int) -> None:
             accel.binding = binding
             binding += 1
 
+    # Auto-assign storage image bindings
+    for si in getattr(stage, 'storage_images', []):
+        if si.set_number is None:
+            si.set_number = set_num
+        if si.binding is None:
+            si.binding = binding
+            binding += 1
+
 
 def compute_std140_offsets(fields: list) -> list[int]:
     """Compute std140 offsets for block fields.

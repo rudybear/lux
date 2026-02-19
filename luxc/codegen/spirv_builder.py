@@ -7,12 +7,13 @@ from luxc.parser.ast_nodes import (
     CallExpr, ConstructorExpr, FieldAccess, SwizzleAccess, IndexAccess,
     TernaryExpr, AssignTarget,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
+    StorageImageDecl,
 )
 from luxc.codegen.spirv_types import TypeRegistry
 from luxc.codegen.glsl_ext import GLSL_STD_450, LUX_TO_GLSL
 from luxc.analysis.layout_assigner import compute_std140_offsets
 from luxc.builtins.types import (
-    resolve_type, VectorType, MatrixType, ScalarType, TYPE_MAP,
+    resolve_type, resolve_alias_chain, VectorType, MatrixType, ScalarType, TYPE_MAP,
 )
 
 
@@ -41,8 +42,8 @@ _RT_BUILTINS = {
     "instance_id": ("int", "InstanceCustomIndexKHR", {"closest_hit", "any_hit", "intersection"}),
     "primitive_id": ("int", "PrimitiveId", {"closest_hit", "any_hit", "intersection"}),
     "hit_kind": ("uint", "HitKindKHR", {"closest_hit", "any_hit"}),
-    "object_to_world": ("mat4", "ObjectToWorldKHR", {"closest_hit", "any_hit", "intersection"}),
-    "world_to_object": ("mat4", "WorldToObjectKHR", {"closest_hit", "any_hit", "intersection"}),
+    "object_to_world": ("mat4x3", "ObjectToWorldKHR", {"closest_hit", "any_hit", "intersection"}),
+    "world_to_object": ("mat4x3", "WorldToObjectKHR", {"closest_hit", "any_hit", "intersection"}),
     "incoming_ray_flags": ("uint", "IncomingRayFlagsKHR", {"closest_hit", "any_hit", "miss", "intersection"}),
 }
 
@@ -292,8 +293,8 @@ class SpvGenerator:
         for i, rp in enumerate(self.stage.ray_payloads):
             type_id = self.reg.lux_type_to_spirv(rp.type_name)
             # Outgoing payloads use RayPayloadKHR, incoming use IncomingRayPayloadKHR
-            # In raygen/miss: RayPayloadKHR; in closest_hit/any_hit: IncomingRayPayloadKHR
-            if self.stage.stage_type in ("raygen", "miss"):
+            # In raygen: RayPayloadKHR; in closest_hit/any_hit/miss: IncomingRayPayloadKHR
+            if self.stage.stage_type == "raygen":
                 storage = "RayPayloadKHR"
             else:
                 storage = "IncomingRayPayloadKHR"
@@ -304,6 +305,10 @@ class SpvGenerator:
             self.decorations.append(f"OpDecorate {var_id} Location {loc}")
             self.var_map[rp.name] = var_id
             self.var_types[rp.name] = rp.type_name
+            # Track payload location -> variable ID for trace_ray
+            if not hasattr(self, '_payload_vars'):
+                self._payload_vars = {}
+            self._payload_vars[loc] = var_id
             self.var_storage[rp.name] = storage
             self.interface_ids.append(var_id)
 
@@ -350,6 +355,30 @@ class SpvGenerator:
             self.var_map[accel.name] = var_id
             self.var_types[accel.name] = "acceleration_structure"
             self.var_storage[accel.name] = storage
+            self.interface_ids.append(var_id)
+
+        # --- RT: Storage image variables ---
+        for si in getattr(self.stage, 'storage_images', []):
+            # R8G8B8A8 2D storage image (Rgba8)
+            f32 = self.reg.float32()
+            img_type_key = "storage_image_2d"
+            if img_type_key not in self.reg._types:
+                img_type_id = self.reg.next_id()
+                self.reg._types[img_type_key] = img_type_id
+                self.reg._decls.append(f"{img_type_id} = OpTypeImage {f32} 2D 0 0 0 2 Rgba8")
+            else:
+                img_type_id = self.reg._types[img_type_key]
+            storage = "UniformConstant"
+            ptr_type = self.reg.pointer(storage, img_type_id)
+            var_id = self.reg.next_id()
+            self.global_vars.append(f"{var_id} = OpVariable {ptr_type} {storage}")
+            if si.set_number is not None:
+                self.decorations.append(f"OpDecorate {var_id} DescriptorSet {si.set_number}")
+            if si.binding is not None:
+                self.decorations.append(f"OpDecorate {var_id} Binding {si.binding}")
+            self.var_map[si.name] = var_id
+            self.var_types[si.name] = "storage_image"
+            self.var_storage[si.name] = storage
             self.interface_ids.append(var_id)
 
         # --- RT: Built-in variables ---
@@ -661,11 +690,44 @@ class SpvGenerator:
         spv_op = self._select_arith_op(op, lt, rt)
 
         # Handle mixed vec/scalar for +, -, /, % by splatting scalar to vec
-        from luxc.builtins.types import resolve_alias_chain
         lt_resolved = resolve_alias_chain(lt)
         rt_resolved = resolve_alias_chain(rt)
         lt_type = resolve_type(lt_resolved)
         rt_type = resolve_type(rt_resolved)
+
+        # Implicit int/uint→float conversion for float arithmetic
+        def _is_int_type(t):
+            if isinstance(t, ScalarType) and t.name in ("int", "uint"):
+                return True
+            if isinstance(t, VectorType) and t.component in ("int", "uint"):
+                return True
+            return False
+
+        def _is_float_type(t):
+            if isinstance(t, ScalarType) and t.name == "scalar":
+                return True
+            if isinstance(t, VectorType) and t.component == "scalar":
+                return True
+            return False
+
+        if _is_int_type(lt_type) and (_is_float_type(rt_type) or not _is_int_type(rt_type)):
+            conv_id = self.reg.next_id()
+            conv_type = self.reg.float32()
+            conv_op = "OpConvertSToF" if (isinstance(lt_type, ScalarType) and lt_type.name == "int") or (isinstance(lt_type, VectorType) and lt_type.component == "int") else "OpConvertUToF"
+            lines.append(f"{conv_id} = {conv_op} {conv_type} {left_id}")
+            left_id = conv_id
+            lt_type = resolve_type("scalar")
+            lt_resolved = "scalar"
+
+        if _is_int_type(rt_type) and (_is_float_type(lt_type) or not _is_int_type(lt_type)):
+            conv_id = self.reg.next_id()
+            conv_type = self.reg.float32()
+            conv_op = "OpConvertSToF" if (isinstance(rt_type, ScalarType) and rt_type.name == "int") or (isinstance(rt_type, VectorType) and rt_type.component == "int") else "OpConvertUToF"
+            lines.append(f"{conv_id} = {conv_op} {conv_type} {right_id}")
+            right_id = conv_id
+            rt_type = resolve_type("scalar")
+            rt_resolved = "scalar"
+
         if op in ("+", "-", "/", "%"):
             if isinstance(lt_type, VectorType) and isinstance(rt_type, ScalarType):
                 splat_id = self.reg.next_id()
@@ -802,10 +864,9 @@ class SpvGenerator:
             # trace_ray(accel, ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,
             #           origin, tmin, direction, tmax, payload_loc)
             # OpTraceRayKHR is void, no result
-            # Args 1-5 must be uint, arg 10 must be int — convert from scalar if needed
+            # Args 1-5 must be uint; last arg is payload variable (not location index)
             accel_id = arg_ids[0]
             uint_type = self.reg.uint32()
-            int_type = self.reg.int32()
             converted = list(arg_ids[1:])
             # Indices 0-4 (ray_flags..miss_index) need uint
             for i in range(5):
@@ -813,11 +874,22 @@ class SpvGenerator:
                     conv_id = self.reg.next_id()
                     lines.append(f"{conv_id} = OpConvertFToU {uint_type} {converted[i]}")
                     converted[i] = conv_id
-            # Index 9 (payload_loc) needs int
+            # Last arg (payload_loc) must be the payload OpVariable, not a location number
             if len(converted) > 9:
-                conv_id = self.reg.next_id()
-                lines.append(f"{conv_id} = OpConvertFToS {int_type} {converted[9]}")
-                converted[9] = conv_id
+                # Get the payload location (as a constant, e.g. 0)
+                payload_loc = 0  # default
+                last_arg = expr.args[-1]
+                if hasattr(last_arg, 'value'):
+                    payload_loc = int(last_arg.value)
+                # Look up the payload variable
+                payload_vars = getattr(self, '_payload_vars', {})
+                if payload_loc in payload_vars:
+                    converted[9] = payload_vars[payload_loc]
+                else:
+                    # Fallback: find first payload variable
+                    for pv in payload_vars.values():
+                        converted[9] = pv
+                        break
             args_str = " ".join(converted)
             lines.append(f"OpTraceRayKHR {accel_id} {args_str}")
             # Return a dummy zero for the expression system
@@ -846,6 +918,46 @@ class SpvGenerator:
             lines.append("OpTerminateRayKHR")
             result = self.reg.const_float(0.0)
             return result, lines
+
+        if fname == "image_store":
+            # image_store(image, coord_ivec2, value_vec4)
+            # OpImageWrite image coord value
+            # The image arg was already loaded by _gen_expr; arg_ids[0] IS the loaded image
+            img_loaded = arg_ids[0]
+            # Convert coord to ivec2 if needed (launch_id.xy is uvec2 or vec2)
+            coord_id = arg_ids[1]
+            value_id = arg_ids[2]
+            # Coord must be integer — convert from float if needed
+            coord_type_name = getattr(expr.args[1], 'resolved_type', 'vec2')
+            coord_resolved = resolve_type(resolve_alias_chain(coord_type_name))
+            if isinstance(coord_resolved, VectorType) and coord_resolved.component == "scalar":
+                # Convert float vec2 to int ivec2
+                ivec2_type = self.reg.vec(2, "int")
+                conv_id = self.reg.next_id()
+                lines.append(f"{conv_id} = OpConvertFToS {ivec2_type} {coord_id}")
+                coord_id = conv_id
+            elif isinstance(coord_resolved, VectorType) and coord_resolved.component == "uint":
+                # Convert uint uvec2 to int ivec2
+                ivec2_type = self.reg.vec(2, "int")
+                conv_id = self.reg.next_id()
+                lines.append(f"{conv_id} = OpBitcast {ivec2_type} {coord_id}")
+                coord_id = conv_id
+            lines.append(f"OpImageWrite {img_loaded} {coord_id} {value_id}")
+            result = self.reg.const_float(0.0)
+            return result, lines
+
+        # mix/clamp/smoothstep: splat scalar args to vector when needed
+        if fname in ("mix", "clamp", "smoothstep") and len(expr.args) >= 3:
+            first_type = resolve_type(resolve_alias_chain(expr.args[0].resolved_type))
+            if isinstance(first_type, VectorType):
+                for i in range(1, len(arg_ids)):
+                    arg_type = resolve_type(resolve_alias_chain(expr.args[i].resolved_type))
+                    if isinstance(arg_type, ScalarType):
+                        vec_type = self.reg.lux_type_to_spirv(first_type.name)
+                        splat_id = self.reg.next_id()
+                        parts = " ".join([arg_ids[i]] * first_type.size)
+                        lines.append(f"{splat_id} = OpCompositeConstruct {vec_type} {parts}")
+                        arg_ids[i] = splat_id
 
         # Check if it's a GLSL.std.450 function
         glsl_name = LUX_TO_GLSL.get(fname)
@@ -945,12 +1057,24 @@ class SpvGenerator:
             for aid, atn in zip(arg_ids, arg_type_names):
                 at = resolve_type(atn)
                 if isinstance(at, VectorType):
-                    # Extract each component
+                    # Extract each component using the source vector's component type
+                    comp_type = self.reg._component_type(
+                        at.component if at.component != "scalar" else "float"
+                    )
                     for i in range(at.size):
-                        comp_type = self.reg.float32()
                         c = self.reg.next_id()
                         lines.append(f"{c} = OpCompositeExtract {comp_type} {aid} {i}")
-                        components.append(c)
+                        # Convert to float if source is integer but target is float vector
+                        if at.component in ("int", "uint") and target_type.component in ("scalar", "float"):
+                            fc = self.reg.next_id()
+                            float_type = self.reg.float32()
+                            if at.component == "int":
+                                lines.append(f"{fc} = OpConvertSToF {float_type} {c}")
+                            else:
+                                lines.append(f"{fc} = OpConvertUToF {float_type} {c}")
+                            components.append(fc)
+                        else:
+                            components.append(c)
                 else:
                     components.append(aid)
 
@@ -984,20 +1108,50 @@ class SpvGenerator:
         components = expr.components
         indices = [_swizzle_index(c) for c in components]
 
+        # Determine the component type from the source vector
+        obj_type_name = getattr(expr.object, 'resolved_type', 'vec4')
+        obj_type = resolve_type(resolve_alias_chain(obj_type_name))
+        component_kind = "float"
+        if isinstance(obj_type, VectorType):
+            component_kind = obj_type.component if obj_type.component != "scalar" else "float"
+
+        # Determine expected result type from the expression's resolved_type
+        expr_resolved = getattr(expr, 'resolved_type', 'scalar')
+        needs_float_conv = component_kind in ("uint", "int") and expr_resolved in ("scalar", "vec2", "vec3", "vec4")
+
         if len(indices) == 1:
-            # Single component extract
-            result_type = self.reg.float32()
-            result = self.reg.next_id()
-            lines.append(f"{result} = OpCompositeExtract {result_type} {obj_id} {indices[0]}")
-            return result, lines
+            # Single component extract — use source type, then convert if needed
+            extract_type = self.reg._component_type(component_kind)
+            extract_id = self.reg.next_id()
+            lines.append(f"{extract_id} = OpCompositeExtract {extract_type} {obj_id} {indices[0]}")
+
+            if needs_float_conv:
+                result = self.reg.next_id()
+                float_type = self.reg.float32()
+                conv_op = "OpConvertSToF" if component_kind == "int" else "OpConvertUToF"
+                lines.append(f"{result} = {conv_op} {float_type} {extract_id}")
+                return result, lines
+            return extract_id, lines
         else:
             # Multi-component shuffle
             n = len(indices)
-            result_type = self.reg.lux_type_to_spirv(f"vec{n}")
-            result = self.reg.next_id()
+            if component_kind == "uint":
+                shuffle_type = self.reg.lux_type_to_spirv(f"uvec{n}")
+            elif component_kind == "int":
+                shuffle_type = self.reg.lux_type_to_spirv(f"ivec{n}")
+            else:
+                shuffle_type = self.reg.lux_type_to_spirv(f"vec{n}")
+            shuffle_id = self.reg.next_id()
             idx_str = " ".join(str(i) for i in indices)
-            lines.append(f"{result} = OpVectorShuffle {result_type} {obj_id} {obj_id} {idx_str}")
-            return result, lines
+            lines.append(f"{shuffle_id} = OpVectorShuffle {shuffle_type} {obj_id} {obj_id} {idx_str}")
+
+            if needs_float_conv:
+                result = self.reg.next_id()
+                float_vec_type = self.reg.lux_type_to_spirv(f"vec{n}")
+                conv_op = "OpConvertSToF" if component_kind == "int" else "OpConvertUToF"
+                lines.append(f"{result} = {conv_op} {float_vec_type} {shuffle_id}")
+                return result, lines
+            return shuffle_id, lines
 
     def _gen_field_access(self, expr: FieldAccess, lines: list[str]) -> tuple[str, list[str]]:
         # This handles struct.field — for uniform block fields accessed via dot

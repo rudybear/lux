@@ -25,7 +25,8 @@ class VectorType(LuxType):
 
 @dataclass(frozen=True)
 class MatrixType(LuxType):
-    size: int  # 2, 3, 4 (square only in v1)
+    size: int  # 2, 3, 4 (cols)
+    rows: int = 0  # 0 means square (rows == size); non-zero for non-square (e.g., mat4x3)
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,11 @@ class VoidType(LuxType):
 
 @dataclass(frozen=True)
 class AccelerationStructureType(LuxType):
+    pass
+
+
+@dataclass(frozen=True)
+class StorageImageType(LuxType):
     pass
 
 
@@ -70,9 +76,11 @@ UVEC4 = VectorType("uvec4", "uint", 4)
 MAT2 = MatrixType("mat2", 2)
 MAT3 = MatrixType("mat3", 3)
 MAT4 = MatrixType("mat4", 4)
+MAT4X3 = MatrixType("mat4x3", 4, 3)
 
 SAMPLER2D = SamplerType("sampler2d")
 ACCELERATION_STRUCTURE = AccelerationStructureType("acceleration_structure")
+STORAGE_IMAGE = StorageImageType("storage_image")
 
 # Lookup table: type name string -> LuxType
 TYPE_MAP: dict[str, LuxType] = {
@@ -84,9 +92,10 @@ TYPE_MAP: dict[str, LuxType] = {
     "vec2": VEC2, "vec3": VEC3, "vec4": VEC4,
     "ivec2": IVEC2, "ivec3": IVEC3, "ivec4": IVEC4,
     "uvec2": UVEC2, "uvec3": UVEC3, "uvec4": UVEC4,
-    "mat2": MAT2, "mat3": MAT3, "mat4": MAT4,
+    "mat2": MAT2, "mat3": MAT3, "mat4": MAT4, "mat4x3": MAT4X3,
     "sampler2d": SAMPLER2D,
     "acceleration_structure": ACCELERATION_STRUCTURE,
+    "storage_image": STORAGE_IMAGE,
 }
 
 

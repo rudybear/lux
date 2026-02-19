@@ -52,6 +52,12 @@ class TypeRegistry:
         key = f"mat{n}"
         return self._ensure_type(key, f"OpTypeMatrix {col} {n}")
 
+    def mat_cols_rows(self, cols: int, rows: int) -> str:
+        """Non-square matrix: cols columns of rows-component vectors."""
+        col = self.vec(rows)
+        key = f"mat{cols}x{rows}"
+        return self._ensure_type(key, f"OpTypeMatrix {col} {cols}")
+
     def image_type(self) -> str:
         f32 = self.float32()
         key = "image2d"
@@ -69,6 +75,11 @@ class TypeRegistry:
     def acceleration_structure_type(self) -> str:
         key = "accel_struct"
         return self._ensure_type(key, "OpTypeAccelerationStructureKHR")
+
+    def _storage_image_type(self) -> str:
+        f32 = self.float32()
+        key = "storage_image_2d"
+        return self._ensure_type(key, f"OpTypeImage {f32} 2D 0 0 0 2 Rgba8")
 
     def pointer(self, storage_class: str, pointee: str) -> str:
         key = f"ptr_{storage_class}_{pointee}"
@@ -167,8 +178,10 @@ class TypeRegistry:
             "mat2": lambda: self.mat(2),
             "mat3": lambda: self.mat(3),
             "mat4": lambda: self.mat(4),
+            "mat4x3": lambda: self.mat_cols_rows(4, 3),
             "sampler2d": self.sampled_image_type,
             "acceleration_structure": self.acceleration_structure_type,
+            "storage_image": self._storage_image_type,
         }
         factory = mapping.get(resolved)
         if factory is None:

@@ -18,6 +18,7 @@ from luxc.parser.ast_nodes import (
     ScheduleDecl, ScheduleMember,
     EnvironmentDecl, ProceduralDecl, ProceduralMember,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
+    StorageImageDecl,
 )
 
 _CONSTRUCTOR_TYPES = frozenset({
@@ -221,6 +222,8 @@ class LuxTransformer(Transformer):
                 block.callable_data.append(item)
             elif isinstance(item, AccelDecl):
                 block.accel_structs.append(item)
+            elif isinstance(item, StorageImageDecl):
+                block.storage_images.append(item)
         return block
 
     def in_decl(self, args):
@@ -267,6 +270,9 @@ class LuxTransformer(Transformer):
 
     def accel_decl(self, args):
         return AccelDecl(str(args[0]), loc=_tok_loc(args[0]))
+
+    def storage_image_decl(self, args):
+        return StorageImageDecl(str(args[0]), loc=_tok_loc(args[0]))
 
     # --- Functions ---
 

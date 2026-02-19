@@ -185,6 +185,7 @@ class StageBlock:
     hit_attributes: list[HitAttributeDecl] = field(default_factory=list)
     callable_data: list[CallableDataDecl] = field(default_factory=list)
     accel_structs: list[AccelDecl] = field(default_factory=list)
+    storage_images: list[StorageImageDecl] = field(default_factory=list)
     loc: Optional[SourceLocation] = None
 
 
@@ -254,6 +255,14 @@ class CallableDataDecl:
 
 @dataclass
 class AccelDecl:
+    name: str
+    set_number: Optional[int] = None
+    binding: Optional[int] = None
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class StorageImageDecl:
     name: str
     set_number: Optional[int] = None
     binding: Optional[int] = None

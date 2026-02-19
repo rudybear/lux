@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from luxc.builtins.types import (
     LuxType, SCALAR, INT, UINT, BOOL, VOID,
     VEC2, VEC3, VEC4, MAT2, MAT3, MAT4, SAMPLER2D,
-    ACCELERATION_STRUCTURE,
+    ACCELERATION_STRUCTURE, STORAGE_IMAGE, IVEC2, UVEC2,
     VectorType, MatrixType, ScalarType,
 )
 
@@ -110,6 +110,11 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
 
     # terminate_ray() -> void
     add([FuncSig("terminate_ray", (), VOID)])
+
+    # image_store(image, coord, value) -> void
+    add([FuncSig("image_store", (STORAGE_IMAGE, IVEC2, VEC4), VOID)])
+    add([FuncSig("image_store", (STORAGE_IMAGE, VEC2, VEC4), VOID)])
+    add([FuncSig("image_store", (STORAGE_IMAGE, UVEC2, VEC4), VOID)])
 
     return table
 

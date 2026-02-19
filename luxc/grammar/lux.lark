@@ -85,6 +85,7 @@ STAGE_TYPE: "vertex" | "fragment" | "raygen" | "closest_hit" | "any_hit" | "miss
            | hit_attribute_decl
            | callable_data_decl
            | accel_decl
+           | storage_image_decl
 
 in_decl: "in" IDENT ":" type ";"
 out_decl: "out" IDENT ":" type ";"
@@ -101,6 +102,7 @@ ray_payload_decl: "ray_payload" IDENT ":" type ";"
 hit_attribute_decl: "hit_attribute" IDENT ":" type ";"
 callable_data_decl: "callable_data" IDENT ":" type ";"
 accel_decl: "acceleration_structure" IDENT ";"
+storage_image_decl: "storage_image" IDENT ";"
 
 // --- Functions ---
 
