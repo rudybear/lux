@@ -37,7 +37,7 @@ _RT_BUILTINS = {
     "world_ray_direction": ("vec3", "WorldRayDirectionKHR", {"closest_hit", "any_hit", "miss", "intersection"}),
     "ray_tmin": ("scalar", "RayTminKHR", {"closest_hit", "any_hit", "miss", "intersection"}),
     "ray_tmax": ("scalar", "RayTmaxKHR", {"closest_hit", "any_hit", "miss", "intersection"}),
-    "hit_t": ("scalar", "HitTKHR", {"closest_hit", "any_hit"}),
+    "hit_t": ("scalar", "RayTmaxKHR", {"closest_hit", "any_hit"}),
     "instance_id": ("int", "InstanceCustomIndexKHR", {"closest_hit", "any_hit", "intersection"}),
     "primitive_id": ("int", "PrimitiveId", {"closest_hit", "any_hit", "intersection"}),
     "hit_kind": ("uint", "HitKindKHR", {"closest_hit", "any_hit"}),
@@ -354,8 +354,16 @@ class SpvGenerator:
 
         # --- RT: Built-in variables ---
         if self.stage.stage_type in _RT_STAGES:
+            emitted_builtins: dict[str, str] = {}  # spv_builtin -> var_id
             for builtin_name, (btype, spv_builtin, valid_stages) in _RT_BUILTINS.items():
                 if self.stage.stage_type in valid_stages:
+                    # Deduplicate: if same SPIR-V builtin already emitted, reuse its variable
+                    if spv_builtin in emitted_builtins:
+                        var_id = emitted_builtins[spv_builtin]
+                        self.var_map[builtin_name] = var_id
+                        self.var_types[builtin_name] = btype
+                        self.var_storage[builtin_name] = "Input"
+                        continue
                     type_id = self.reg.lux_type_to_spirv(btype)
                     ptr_type = self.reg.pointer("Input", type_id)
                     var_id = self.reg.next_id()
@@ -365,6 +373,7 @@ class SpvGenerator:
                     self.var_types[builtin_name] = btype
                     self.var_storage[builtin_name] = "Input"
                     self.interface_ids.append(var_id)
+                    emitted_builtins[spv_builtin] = var_id
 
     def _make_array_type(self, elem_type: str, length: int) -> str:
         length_id = self.reg.const_uint(length)
@@ -793,8 +802,23 @@ class SpvGenerator:
             # trace_ray(accel, ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,
             #           origin, tmin, direction, tmax, payload_loc)
             # OpTraceRayKHR is void, no result
+            # Args 1-5 must be uint, arg 10 must be int — convert from scalar if needed
             accel_id = arg_ids[0]
-            args_str = " ".join(arg_ids[1:])
+            uint_type = self.reg.uint32()
+            int_type = self.reg.int32()
+            converted = list(arg_ids[1:])
+            # Indices 0-4 (ray_flags..miss_index) need uint
+            for i in range(5):
+                if i < len(converted):
+                    conv_id = self.reg.next_id()
+                    lines.append(f"{conv_id} = OpConvertFToU {uint_type} {converted[i]}")
+                    converted[i] = conv_id
+            # Index 9 (payload_loc) needs int
+            if len(converted) > 9:
+                conv_id = self.reg.next_id()
+                lines.append(f"{conv_id} = OpConvertFToS {int_type} {converted[9]}")
+                converted[9] = conv_id
+            args_str = " ".join(converted)
             lines.append(f"OpTraceRayKHR {accel_id} {args_str}")
             # Return a dummy zero for the expression system
             result = self.reg.const_float(0.0)

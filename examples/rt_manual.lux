@@ -1,0 +1,51 @@
+// Manual Ray Tracing Shader — hand-written raygen, closest_hit, miss stages
+// Demonstrates low-level RT stage blocks with RT-specific builtins
+
+raygen {
+    acceleration_structure tlas;
+    ray_payload payload: vec4;
+
+    fn main() {
+        let pixel: uvec3 = launch_id;
+        let dims: uvec3 = launch_size;
+
+        // Normalized pixel coordinates
+        let px: scalar = (pixel.x + 0.5) / dims.x;
+        let py: scalar = (pixel.y + 0.5) / dims.y;
+
+        // Simple pinhole camera
+        let origin: vec3 = vec3(0.0, 0.0, 2.0);
+        let direction: vec3 = normalize(vec3(px * 2.0 - 1.0, py * 2.0 - 1.0, -1.0));
+
+        trace_ray(tlas, 0, 255, 0, 0, 0, origin, 0.001, direction, 1000.0, 0);
+    }
+}
+
+closest_hit {
+    ray_payload payload: vec4;
+    hit_attribute attribs: vec2;
+
+    fn main() {
+        // Simple shading based on hit distance
+        let t: scalar = hit_t;
+        let shade: scalar = 1.0 / (1.0 + t * t * 0.1);
+
+        // Barycentric-based coloring
+        let bary: vec2 = attribs;
+        let r: scalar = 1.0 - bary.x - bary.y;
+
+        payload = vec4(r * shade, bary.x * shade, bary.y * shade, 1.0);
+    }
+}
+
+miss {
+    ray_payload payload: vec4;
+
+    fn main() {
+        // Sky gradient based on ray direction
+        let dir: vec3 = world_ray_direction;
+        let t: scalar = dir.y * 0.5 + 0.5;
+        let sky: vec3 = mix(vec3(1.0, 1.0, 1.0), vec3(0.5, 0.7, 1.0), vec3(t));
+        payload = vec4(sky, 1.0);
+    }
+}

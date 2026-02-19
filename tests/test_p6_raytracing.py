@@ -455,7 +455,7 @@ class TestRTCodegen:
         }
         '''
         asm = self._get_spirv(src)
-        assert "BuiltIn HitTKHR" in asm
+        assert "BuiltIn RayTmaxKHR" in asm
 
     def test_vertex_shader_unchanged(self):
         """Vertex shaders should NOT get RT capabilities."""

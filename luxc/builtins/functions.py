@@ -130,4 +130,9 @@ def lookup_builtin(name: str, arg_types: list[LuxType]) -> FuncSig | None:
 
 
 def _type_matches(param: LuxType, arg: LuxType) -> bool:
-    return param.name == arg.name
+    if param.name == arg.name:
+        return True
+    # Allow scalar literals to match int/uint parameters (numeric promotion)
+    if arg.name == "scalar" and param.name in ("int", "uint"):
+        return True
+    return False

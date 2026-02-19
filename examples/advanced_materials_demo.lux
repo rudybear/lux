@@ -1,0 +1,67 @@
+// Advanced Materials Demo — transmission, iridescence, dispersion, volume
+// Screen divided into 4 quadrants showing different advanced material effects
+
+import brdf;
+
+fragment {
+    in uv: vec2;
+    out color: vec4;
+
+    fn main() {
+        // Fixed vectors for BRDF evaluation
+        let n: vec3 = vec3(0.0, 0.0, 1.0);
+        let v: vec3 = normalize(vec3(0.0, 0.0, 1.0));
+
+        // Light direction varies with UV for visual interest
+        let lx: scalar = (uv.x - 0.5) * 2.0;
+        let ly: scalar = (uv.y - 0.5) * 2.0;
+        let l: vec3 = normalize(vec3(lx, ly, 1.0));
+
+        let cos_theta: scalar = max(dot(n, v), 0.001);
+        let n_dot_l: scalar = max(dot(n, l), 0.0);
+
+        // Determine quadrant (2x2 grid)
+        let qx: scalar = (uv.x < 0.5) ? 0.0 : 1.0;
+        let qy: scalar = (uv.y < 0.5) ? 0.0 : 1.0;
+
+        // Local UV within each quadrant [0, 1]
+        let lu: scalar = (uv.x - qx * 0.5) * 2.0;
+        let lv: scalar = (uv.y - qy * 0.5) * 2.0;
+
+        // Q1 (bottom-left): Transmission BTDF
+        let btdf_val: scalar = transmission_btdf(n, v, l, 0.1 + lu * 0.5, 1.5);
+        let trans_color: vec3 = transmission_color(vec3(0.8, 0.9, 1.0), btdf_val, 0.8);
+        let q1: vec3 = trans_color * n_dot_l;
+
+        // Q2 (bottom-right): Iridescence
+        let film_thickness: scalar = 200.0 + lu * 400.0;
+        let base_f0: vec3 = vec3(0.04, 0.04, 0.04);
+        let irid: vec3 = iridescence_fresnel(1.0, 1.5, base_f0, film_thickness, cos_theta);
+        let q2: vec3 = irid * n_dot_l;
+
+        // Q3 (top-left): Dispersion
+        let disp_f0: vec3 = dispersion_f0(1.5, 20.0);
+        let disp_fresnel: vec3 = fresnel_schlick(cos_theta, disp_f0);
+        let disp_base: vec3 = lambert_brdf(vec3(0.6, 0.7, 0.9), n_dot_l);
+        let q3: vec3 = disp_base + disp_fresnel * 0.3;
+
+        // Q4 (top-right): Volume attenuation
+        let dist: scalar = lu * 5.0 + 0.1;
+        let atten_color: vec3 = vec3(0.8, 0.4, 0.2);
+        let vol_atten: vec3 = volume_attenuation(dist, atten_color, 2.0);
+        let q4: vec3 = vol_atten * vec3(0.9, 0.8, 0.7);
+
+        // Select quadrant
+        let result: vec3 = (qx < 0.5) ?
+            ((qy < 0.5) ? q1 : q3)
+            : ((qy < 0.5) ? q2 : q4);
+
+        // Draw grid lines between quadrants
+        let gx: scalar = smoothstep(0.005, 0.0, abs(uv.x - 0.5));
+        let gy: scalar = smoothstep(0.005, 0.0, abs(uv.y - 0.5));
+        let grid: scalar = max(gx, gy);
+        let final_c: vec3 = mix(result, vec3(0.8), vec3(grid));
+
+        color = vec4(final_c, 1.0);
+    }
+}

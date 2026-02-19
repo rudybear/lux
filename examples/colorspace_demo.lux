@@ -1,0 +1,36 @@
+// Colorspace Demo — rainbow gradient with HSV, contrast, saturation, gamma
+// Demonstrates color space conversion and artistic color controls
+
+import colorspace;
+
+fragment {
+    in uv: vec2;
+    out color: vec4;
+
+    fn main() {
+        // Create a rainbow via HSV: hue sweeps across X, saturation and value from Y
+        let hue: scalar = uv.x;
+        let sat: scalar = 0.7 + uv.y * 0.3;
+        let val: scalar = 0.5 + uv.y * 0.5;
+        let hsv: vec3 = vec3(hue, sat, val);
+        let rainbow: vec3 = hsv_to_rgb(hsv);
+
+        // Apply artistic controls based on vertical position
+        // Bottom third: contrast adjustment
+        // Middle third: saturation boost + hue shift
+        // Top third: gamma correction
+        let band: scalar = uv.y * 3.0;
+
+        let adjusted: vec3 = (band < 1.0) ? contrast(rainbow, 0.5, 1.5)
+            : (band < 2.0) ? hue_shift(saturate_color(rainbow, 1.5), 0.15)
+            : gamma_correct(rainbow, 2.2);
+
+        // Verify roundtrip: rgb -> hsv -> rgb should preserve color
+        let roundtrip: vec3 = hsv_to_rgb(rgb_to_hsv(adjusted));
+
+        // Blend original and roundtrip to show both
+        let final_c: vec3 = (uv.x < 0.5) ? adjusted : roundtrip;
+
+        color = vec4(final_c, 1.0);
+    }
+}

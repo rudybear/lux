@@ -1,0 +1,46 @@
+// Texture Utilities Demo — UV manipulation, tiling, rotation, triplanar weights
+// Demonstrates texture stdlib functions with procedural patterns
+
+import texture;
+
+fragment {
+    in uv: vec2;
+    out color: vec4;
+
+    fn main() {
+        // Tile the UV space into a 4x4 grid
+        let tiled: vec2 = tile_uv(uv, vec2(4.0, 4.0));
+
+        // Rotate the tiled UVs by an angle that varies across the screen
+        let angle: scalar = uv.x * 1.5708;
+        let rotated: vec2 = rotate_uv(tiled, angle, vec2(0.5, 0.5));
+
+        // Create a procedural pattern from the rotated UVs
+        let grid_x: scalar = smoothstep(0.02, 0.05, abs(rotated.x - 0.5));
+        let grid_y: scalar = smoothstep(0.02, 0.05, abs(rotated.y - 0.5));
+        let grid: scalar = grid_x * grid_y;
+
+        // Triplanar weights visualization
+        // Simulate a normal that rotates based on UV position
+        let nx: scalar = sin(uv.x * 6.28318);
+        let ny: scalar = cos(uv.y * 6.28318);
+        let nz: scalar = 0.5;
+        let sim_normal: vec3 = normalize(vec3(nx, ny, nz));
+        let weights: vec3 = triplanar_weights(sim_normal, 4.0);
+
+        // Unpack a simulated normal map value
+        let encoded: vec3 = vec3(0.5 + rotated.x * 0.5, 0.5 + rotated.y * 0.5, 1.0);
+        let unpacked: vec3 = unpack_normal(encoded);
+        let normal_vis: scalar = unpacked.z * 0.5 + 0.5;
+
+        // Combine: grid pattern colored by triplanar weights
+        let pattern: vec3 = weights * grid;
+
+        // Add normal map visualization in the corners
+        let corner: scalar = (1.0 - grid) * normal_vis * 0.3;
+
+        let final_c: vec3 = pattern + vec3(corner);
+
+        color = vec4(final_c, 1.0);
+    }
+}

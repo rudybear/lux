@@ -1,0 +1,52 @@
+// Autodiff Demo — forward-mode automatic differentiation
+// Top half shows f(x), bottom half shows f'(x) using UV.x as parameter
+// The compiler auto-generates wave_d_x from the @differentiable annotation
+
+@differentiable
+fn wave(x: scalar) -> scalar {
+    return sin(x * 6.28318) * 0.5 + x * x * 0.3;
+}
+
+fragment {
+    in uv: vec2;
+    out color: vec4;
+
+    fn main() {
+        // Map UV.x to a parameter range [-2, 2]
+        let x: scalar = uv.x * 4.0 - 2.0;
+
+        // Evaluate function and its auto-generated derivative
+        let f_val: scalar = wave(x);
+        let f_grad: scalar = wave_d_x(x);
+
+        // Normalize values for visualization
+        let f_norm: scalar = f_val * 0.3 + 0.5;
+        let g_norm: scalar = f_grad * 0.1 + 0.5;
+
+        // Top half: function value as color gradient
+        // Bottom half: gradient (derivative) as color gradient
+        let is_top: scalar = (uv.y > 0.5) ? 1.0 : 0.0;
+
+        // Function visualization: warm colors
+        let f_color: vec3 = vec3(
+            clamp(f_norm, 0.0, 1.0),
+            clamp(f_norm * 0.6, 0.0, 1.0),
+            clamp(0.2, 0.0, 1.0)
+        );
+
+        // Gradient visualization: cool colors
+        let g_color: vec3 = vec3(
+            clamp(0.2, 0.0, 1.0),
+            clamp(g_norm * 0.7, 0.0, 1.0),
+            clamp(g_norm, 0.0, 1.0)
+        );
+
+        // Draw a line at the boundary between function and gradient
+        let boundary: scalar = smoothstep(0.49, 0.5, uv.y) - smoothstep(0.5, 0.51, uv.y);
+        let line: vec3 = vec3(1.0, 1.0, 1.0) * boundary;
+
+        let result: vec3 = is_top * f_color + (1.0 - is_top) * g_color + line;
+
+        color = vec4(result, 1.0);
+    }
+}
