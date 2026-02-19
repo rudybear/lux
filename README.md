@@ -29,6 +29,143 @@ pipeline PBRForward {
 
 The compiler expands this into fully typed vertex + fragment SPIR-V — no manual stage wiring needed.
 
+## Gallery
+
+### Ray Tracing
+
+Real-time ray traced sphere with barycentric shading and sky gradient — compiled from a single `.lux` file to three SPIR-V stages (raygen, closest-hit, miss).
+
+<p align="center"><img src="playground/rt_manual_cpp.png" width="400"></p>
+
+```
+raygen {
+    acceleration_structure tlas;
+    ray_payload payload: vec4;
+    storage_image output_image;
+
+    fn main() {
+        let pixel: uvec3 = launch_id;
+        let origin: vec3 = vec3(0.0, 0.0, 2.0);
+        let direction: vec3 = normalize(vec3(px * 2.0 - 1.0, py * 2.0 - 1.0, -1.0));
+        trace_ray(tlas, 0, 255, 0, 0, 0, origin, 0.001, direction, 1000.0, 0);
+        image_store(output_image, vec2(pixel.x, pixel.y), payload);
+    }
+}
+```
+
+### PBR Surface
+
+Declarative material pipeline — just declare geometry, surface BRDF, and pipeline. The compiler generates vertex + fragment stages automatically.
+
+<p align="center"><img src="playground/pbr_surface_cpp.png" width="400"></p>
+
+```
+import brdf;
+
+surface TexturedPBR {
+    sampler2d albedo_tex,
+    brdf: pbr(sample(albedo_tex, frag_uv).xyz, 0.5, 0.0),
+}
+
+pipeline PBRForward {
+    geometry: StandardMesh,
+    surface: TexturedPBR,
+}
+```
+
+### SDF Shapes
+
+Signed distance field primitives with smooth boolean operations — sphere, box, and torus combined with smooth union.
+
+<p align="center"><img src="playground/sdf_shapes_cpp.png" width="400"></p>
+
+```
+import sdf;
+
+let d_sphere: scalar = sdf_sphere(p, 0.8);
+let d_box: scalar = sdf_box(sdf_translate(p, vec3(1.2, 0.0, 0.0)), vec3(0.5));
+let d_torus: scalar = sdf_torus(sdf_translate(p, vec3(-1.2, 0.0, 0.0)), 0.5, 0.2);
+let d_final: scalar = sdf_smooth_union(sdf_smooth_union(d_sphere, d_box, 0.3), d_torus, 0.3);
+```
+
+### Procedural Noise
+
+Domain-warped FBM noise with Voronoi cell overlay — organic, natural-looking textures from pure math.
+
+<p align="center"><img src="playground/procedural_noise_cpp.png" width="400"></p>
+
+```
+import noise;
+
+let n1: scalar = fbm2d_4(p, 2.0, 0.5);
+let n2: scalar = fbm2d_4(p + vec2(5.2, 1.3), 2.0, 0.5);
+let warped: scalar = fbm2d_4(p + vec2(n1, n2) * 2.0, 2.0, 0.5);
+let vor: vec2 = voronoi2d(uv * 6.0);
+```
+
+### Automatic Differentiation
+
+Mark any function with `@differentiable` and the compiler generates its derivative. Top: wave function, bottom: auto-generated gradient.
+
+<p align="center"><img src="playground/autodiff_demo_cpp.png" width="400"></p>
+
+```
+@differentiable
+fn wave(x: scalar) -> scalar {
+    return sin(x * 6.28318) * 0.5 + x * x * 0.3;
+}
+
+let f_val: scalar = wave(x);
+let f_grad: scalar = wave_d_x(x);  // auto-generated derivative
+```
+
+### Colorspace Transforms
+
+HSV rainbow with artistic controls — contrast, saturation, hue shift, and gamma correction from the colorspace stdlib.
+
+<p align="center"><img src="playground/colorspace_demo_cpp.png" width="400"></p>
+
+```
+import colorspace;
+
+let rainbow: vec3 = hsv_to_rgb(vec3(hue, sat, val));
+let adjusted: vec3 = hue_shift(saturate_color(rainbow, 1.5), 0.15);
+let corrected: vec3 = gamma_correct(rainbow, 2.2);
+```
+
+### Hello Triangle
+
+The simplest Lux program — per-vertex colors, zero boilerplate. The entire shader is 15 lines.
+
+<p align="center"><img src="playground/hello_triangle_cpp.png" width="400"></p>
+
+```
+vertex {
+    in position: vec3;
+    in color: vec3;
+    out frag_color: vec3;
+
+    fn main() {
+        frag_color = color;
+        builtin_position = vec4(position, 1.0);
+    }
+}
+```
+
+### Native GPU Playgrounds
+
+Both C++ and Rust native Vulkan renderers are included — build from source and render any `.lux` shader, including ray tracing:
+
+```bash
+# C++
+cd playground_cpp && cmake -B build && cmake --build build --config Release
+./build/Release/lux-playground --mode rt playground/rt_manual
+
+# Rust
+cd playground_rust && cargo build --release
+./target/release/lux-playground --mode rt playground/rt_manual
+```
+
 ## Features
 
 - **Declarative materials** — `surface`, `geometry`, `pipeline` blocks expand to full shader stages
