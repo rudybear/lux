@@ -10,3 +10,4 @@ build/
 *.spvasm
 .venv/
 venv/
+playground/assets/

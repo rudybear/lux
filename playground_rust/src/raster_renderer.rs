@@ -1,24 +1,176 @@
-//! Rasterization renderer: triangle, fullscreen quad, and PBR sphere modes.
+//! Rasterization renderer: scene/pipeline architecture.
+//!
+//! Two public entry points:
+//! - `render_raster()` — render a raster scene (sphere, triangle, or glTF) through a pipeline
+//! - `render_fullscreen()` — render a fullscreen fragment shader
 
 use ash::vk;
 use bytemuck;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 use gpu_allocator::MemoryLocation;
 use log::info;
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::camera::DefaultCamera;
+use crate::reflected_pipeline;
 use crate::scene;
 use crate::screenshot;
 use crate::spv_loader;
 use crate::vulkan_context::VulkanContext;
 
-/// The rendering mode for the rasterizer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RasterMode {
-    Triangle,
-    Fullscreen,
-    Pbr,
+/// IBL cubemap texture with its associated resources.
+struct IblTexture {
+    image: vk::Image,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+    allocation: Option<Allocation>,
+}
+
+impl IblTexture {
+    fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
+        unsafe {
+            device.destroy_sampler(self.sampler, None);
+            device.destroy_image_view(self.view, None);
+        }
+        if let Some(alloc) = self.allocation.take() {
+            let _ = allocator.free(alloc);
+        }
+        unsafe {
+            device.destroy_image(self.image, None);
+        }
+    }
+}
+
+/// Loaded IBL assets: specular cubemap, irradiance cubemap, BRDF LUT.
+struct IblAssets {
+    env_specular: Option<IblTexture>,
+    env_irradiance: Option<IblTexture>,
+    brdf_lut: Option<IblTexture>,
+}
+
+impl IblAssets {
+    fn empty() -> Self {
+        Self {
+            env_specular: None,
+            env_irradiance: None,
+            brdf_lut: None,
+        }
+    }
+
+    fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
+        if let Some(ref mut tex) = self.env_specular {
+            tex.destroy(device, allocator);
+        }
+        if let Some(ref mut tex) = self.env_irradiance {
+            tex.destroy(device, allocator);
+        }
+        if let Some(ref mut tex) = self.brdf_lut {
+            tex.destroy(device, allocator);
+        }
+    }
+
+    /// Get the image view for a named IBL binding (if available).
+    fn view_for_binding(&self, name: &str) -> Option<vk::ImageView> {
+        match name {
+            "env_specular" => self.env_specular.as_ref().map(|t| t.view),
+            "env_irradiance" => self.env_irradiance.as_ref().map(|t| t.view),
+            "brdf_lut" => self.brdf_lut.as_ref().map(|t| t.view),
+            _ => None,
+        }
+    }
+
+    /// Get the sampler for a named IBL binding (if available).
+    fn sampler_for_binding(&self, name: &str) -> Option<vk::Sampler> {
+        match name {
+            "env_specular" => self.env_specular.as_ref().map(|t| t.sampler),
+            "env_irradiance" => self.env_irradiance.as_ref().map(|t| t.sampler),
+            "brdf_lut" => self.brdf_lut.as_ref().map(|t| t.sampler),
+            _ => None,
+        }
+    }
+}
+
+/// IBL manifest (parsed from manifest.json).
+#[derive(serde::Deserialize, Default)]
+struct IblManifest {
+    #[serde(default)]
+    specular_face_size: u32,
+    #[serde(default)]
+    specular_mip_count: u32,
+    #[serde(default)]
+    irradiance_face_size: u32,
+    #[serde(default)]
+    brdf_lut_size: u32,
+    // Also accept the nested form from preprocess_ibl.py
+    #[serde(default)]
+    specular: Option<IblSpecularManifest>,
+    #[serde(default)]
+    irradiance: Option<IblIrradianceManifest>,
+    #[serde(default)]
+    brdf_lut: Option<IblBrdfLutManifest>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct IblSpecularManifest {
+    #[serde(default)]
+    face_size: u32,
+    #[serde(default)]
+    mip_count: u32,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct IblIrradianceManifest {
+    #[serde(default)]
+    face_size: u32,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct IblBrdfLutManifest {
+    #[serde(default)]
+    size: u32,
+}
+
+impl IblManifest {
+    fn spec_face_size(&self) -> u32 {
+        if self.specular_face_size > 0 {
+            self.specular_face_size
+        } else if let Some(ref s) = self.specular {
+            if s.face_size > 0 { s.face_size } else { 256 }
+        } else {
+            256
+        }
+    }
+
+    fn spec_mip_count(&self) -> u32 {
+        if self.specular_mip_count > 0 {
+            self.specular_mip_count
+        } else if let Some(ref s) = self.specular {
+            if s.mip_count > 0 { s.mip_count } else { 5 }
+        } else {
+            5
+        }
+    }
+
+    fn irr_face_size(&self) -> u32 {
+        if self.irradiance_face_size > 0 {
+            self.irradiance_face_size
+        } else if let Some(ref i) = self.irradiance {
+            if i.face_size > 0 { i.face_size } else { 32 }
+        } else {
+            32
+        }
+    }
+
+    fn lut_size(&self) -> u32 {
+        if self.brdf_lut_size > 0 {
+            self.brdf_lut_size
+        } else if let Some(ref b) = self.brdf_lut {
+            if b.size > 0 { b.size } else { 512 }
+        } else {
+            512
+        }
+    }
 }
 
 /// GPU buffer with its allocation.
@@ -397,82 +549,108 @@ fn create_texture_image(
     Ok(image)
 }
 
-/// Render using the rasterization pipeline and save the result as a PNG.
+/// Render a raster scene (sphere, triangle, or glTF) through a pipeline.
+///
+/// Three-phase architecture:
+/// 1. Upload scene geometry to GPU
+/// 2. Create pipeline from shaders
+/// 3. Bind scene to pipeline and execute render
 pub fn render_raster(
     ctx: &mut VulkanContext,
-    mode: RasterMode,
-    shader_base: &str,
+    pipeline_base: &str,
+    scene_source: &str,
     width: u32,
     height: u32,
     output_path: &Path,
 ) -> Result<(), String> {
-    info!("Raster render: mode={:?}, {}x{}", mode, width, height);
+    info!(
+        "Raster render: scene='{}', pipeline='{}', {}x{}",
+        scene_source, pipeline_base, width, height
+    );
 
-    // --- Load shaders ---
-    let (vert_module, frag_module) = load_shaders(ctx, mode, shader_base)?;
+    match scene_source {
+        "triangle" => {
+            let vert_path = format!("{}.vert.spv", pipeline_base);
+            let frag_path = format!("{}.frag.spv", pipeline_base);
+            let vert_code = spv_loader::load_spirv(Path::new(&vert_path))?;
+            let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
+            let vert_module = spv_loader::create_shader_module(&ctx.device, &vert_code)?;
+            let frag_module = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
 
-    // --- Create resources based on mode ---
-    match mode {
-        RasterMode::Triangle => {
-            render_triangle(ctx, vert_module, frag_module, width, height, output_path)
-        }
-        RasterMode::Fullscreen => {
-            render_fullscreen(ctx, frag_module, width, height, output_path)
-        }
-        RasterMode::Pbr => {
-            render_pbr(ctx, vert_module, frag_module, width, height, output_path)
-        }
-    }?;
+            render_triangle_scene(ctx, vert_module, frag_module, width, height, output_path)?;
 
-    // Cleanup shader modules
-    unsafe {
-        ctx.device.destroy_shader_module(frag_module, None);
-        if vert_module != vk::ShaderModule::null() {
-            ctx.device.destroy_shader_module(vert_module, None);
+            unsafe {
+                ctx.device.destroy_shader_module(frag_module, None);
+                ctx.device.destroy_shader_module(vert_module, None);
+            }
+        }
+        source if source.ends_with(".glb") || source.ends_with(".gltf") => {
+            // glTF scene: load mesh, use PBR pipeline
+            let vert_path = format!("{}.vert.spv", pipeline_base);
+            let frag_path = format!("{}.frag.spv", pipeline_base);
+            let vert_code = spv_loader::load_spirv(Path::new(&vert_path))?;
+            let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
+            let vert_module = spv_loader::create_shader_module(&ctx.device, &vert_code)?;
+            let frag_module = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
+
+            // For glTF, use the PBR rendering path with glTF mesh data
+            render_pbr_scene(ctx, vert_module, frag_module, pipeline_base, scene_source, width, height, output_path)?;
+
+            unsafe {
+                ctx.device.destroy_shader_module(frag_module, None);
+                ctx.device.destroy_shader_module(vert_module, None);
+            }
+        }
+        _ => {
+            // Default: sphere or other procedural scenes use PBR pipeline
+            let vert_path = format!("{}.vert.spv", pipeline_base);
+            let frag_path = format!("{}.frag.spv", pipeline_base);
+            let vert_code = spv_loader::load_spirv(Path::new(&vert_path))?;
+            let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
+            let vert_module = spv_loader::create_shader_module(&ctx.device, &vert_code)?;
+            let frag_module = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
+
+            render_pbr_scene(ctx, vert_module, frag_module, pipeline_base, scene_source, width, height, output_path)?;
+
+            unsafe {
+                ctx.device.destroy_shader_module(frag_module, None);
+                ctx.device.destroy_shader_module(vert_module, None);
+            }
         }
     }
 
     Ok(())
 }
 
-/// Load vertex and fragment shader modules based on mode.
-fn load_shaders(
-    ctx: &VulkanContext,
-    mode: RasterMode,
-    shader_base: &str,
-) -> Result<(vk::ShaderModule, vk::ShaderModule), String> {
-    match mode {
-        RasterMode::Triangle => {
-            let vert_path = format!("{}.vert.spv", shader_base);
-            let frag_path = format!("{}.frag.spv", shader_base);
-            let vert_code = spv_loader::load_spirv(Path::new(&vert_path))?;
-            let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
-            let vert_mod = spv_loader::create_shader_module(&ctx.device, &vert_code)?;
-            let frag_mod = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
-            Ok((vert_mod, frag_mod))
-        }
-        RasterMode::Fullscreen => {
-            let frag_path = format!("{}.frag.spv", shader_base);
-            let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
-            let frag_mod = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
-            // Vertex module will be created inline from built-in SPIR-V
-            Ok((vk::ShaderModule::null(), frag_mod))
-        }
-        RasterMode::Pbr => {
-            let vert_path = format!("{}.vert.spv", shader_base);
-            let frag_path = format!("{}.frag.spv", shader_base);
-            let vert_code = spv_loader::load_spirv(Path::new(&vert_path))?;
-            let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
-            let vert_mod = spv_loader::create_shader_module(&ctx.device, &vert_code)?;
-            let frag_mod = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
-            Ok((vert_mod, frag_mod))
-        }
+/// Render a fullscreen fragment shader.
+pub fn render_fullscreen(
+    ctx: &mut VulkanContext,
+    pipeline_base: &str,
+    width: u32,
+    height: u32,
+    output_path: &Path,
+) -> Result<(), String> {
+    info!(
+        "Fullscreen render: pipeline='{}', {}x{}",
+        pipeline_base, width, height
+    );
+
+    let frag_path = format!("{}.frag.spv", pipeline_base);
+    let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
+    let frag_module = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
+
+    render_fullscreen_scene(ctx, frag_module, width, height, output_path)?;
+
+    unsafe {
+        ctx.device.destroy_shader_module(frag_module, None);
     }
+
+    Ok(())
 }
 
-// ---- Triangle rendering ----
+// ---- Triangle scene rendering ----
 
-fn render_triangle(
+fn render_triangle_scene(
     ctx: &mut VulkanContext,
     vert_module: vk::ShaderModule,
     frag_module: vk::ShaderModule,
@@ -700,9 +878,9 @@ fn render_triangle(
     Ok(())
 }
 
-// ---- Fullscreen rendering ----
+// ---- Fullscreen scene rendering ----
 
-fn render_fullscreen(
+fn render_fullscreen_scene(
     ctx: &mut VulkanContext,
     frag_module: vk::ShaderModule,
     width: u32,
@@ -975,12 +1153,632 @@ void main() {
     }
 }
 
-// ---- PBR sphere rendering ----
+// ---- PBR scene rendering (sphere, glTF, or other) ----
+//
+// Reflection-driven: reads .vert.json and .frag.json to determine descriptor
+// set layouts, pool sizes, and binding assignments. No hardcoded layouts.
 
-fn render_pbr(
+/// Create a 1x1 white RGBA default texture image (used when a texture slot
+/// is declared in the reflection but no actual image data is available).
+fn create_default_white_texture(ctx: &mut VulkanContext) -> Result<GpuImage, String> {
+    let white_pixel: [u8; 4] = [255, 255, 255, 255];
+    create_texture_image(ctx, 1, 1, &white_pixel, "default_white_1x1")
+}
+
+/// Create a cubemap VkImage with CUBE_COMPATIBLE flag, upload data via staging, create CUBE view.
+fn create_cubemap_image(
+    ctx: &mut VulkanContext,
+    face_size: u32,
+    mip_count: u32,
+    format: vk::Format,
+    pixel_data: &[u8],
+    bytes_per_pixel: u32,
+    name: &str,
+) -> Result<(vk::Image, vk::ImageView, Allocation), String> {
+    let device_clone = ctx.device.clone();
+    let device = &device_clone;
+
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width: face_size,
+            height: face_size,
+            depth: 1,
+        })
+        .mip_levels(mip_count)
+        .array_layers(6)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .flags(vk::ImageCreateFlags::CUBE_COMPATIBLE);
+
+    let image = unsafe {
+        device
+            .create_image(&image_info, None)
+            .map_err(|e| format!("Failed to create cubemap image '{}': {:?}", name, e))?
+    };
+
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+
+    let allocation = ctx
+        .allocator_mut()
+        .allocate(&AllocationCreateDesc {
+            name,
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("Failed to allocate cubemap image memory '{}': {:?}", name, e))?;
+
+    unsafe {
+        ctx.device
+            .bind_image_memory(image, allocation.memory(), allocation.offset())
+            .map_err(|e| format!("Failed to bind cubemap image memory '{}': {:?}", name, e))?;
+    }
+
+    // Create staging buffer
+    let staging_info = vk::BufferCreateInfo::default()
+        .size(pixel_data.len() as u64)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let staging_buffer = unsafe {
+        ctx.device
+            .create_buffer(&staging_info, None)
+            .map_err(|e| format!("Failed to create cubemap staging buffer: {:?}", e))?
+    };
+
+    let staging_reqs = unsafe { ctx.device.get_buffer_memory_requirements(staging_buffer) };
+
+    let mut staging_alloc = ctx
+        .allocator_mut()
+        .allocate(&AllocationCreateDesc {
+            name: "cubemap_staging",
+            requirements: staging_reqs,
+            location: MemoryLocation::CpuToGpu,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("Failed to allocate cubemap staging memory: {:?}", e))?;
+
+    unsafe {
+        ctx.device
+            .bind_buffer_memory(staging_buffer, staging_alloc.memory(), staging_alloc.offset())
+            .map_err(|e| format!("Failed to bind cubemap staging memory: {:?}", e))?;
+    }
+
+    if let Some(mapped) = staging_alloc.mapped_slice_mut() {
+        mapped[..pixel_data.len()].copy_from_slice(pixel_data);
+    }
+
+    // Transition image and copy all mip levels / faces
+    let cmd = ctx.begin_single_commands()?;
+
+    // Transition entire image to TRANSFER_DST_OPTIMAL
+    let barrier = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(mip_count)
+                .base_array_layer(0)
+                .layer_count(6),
+        )
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+
+    unsafe {
+        ctx.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
+    }
+
+    // Copy each mip level and face from the staging buffer
+    // Data layout: mip-major, then face-major (mip0-face0..5, mip1-face0..5, ...)
+    let mut buffer_offset: u64 = 0;
+    let mut regions: Vec<vk::BufferImageCopy> = Vec::new();
+
+    for mip in 0..mip_count {
+        let mip_size = std::cmp::max(face_size >> mip, 1);
+        let face_bytes = (mip_size * mip_size * bytes_per_pixel) as u64;
+
+        for face in 0..6u32 {
+            regions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(buffer_offset)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(mip)
+                            .base_array_layer(face)
+                            .layer_count(1),
+                    )
+                    .image_offset(vk::Offset3D::default())
+                    .image_extent(vk::Extent3D {
+                        width: mip_size,
+                        height: mip_size,
+                        depth: 1,
+                    }),
+            );
+            buffer_offset += face_bytes;
+        }
+    }
+
+    unsafe {
+        ctx.device.cmd_copy_buffer_to_image(
+            cmd,
+            staging_buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
+        );
+    }
+
+    // Transition to SHADER_READ_ONLY_OPTIMAL
+    let barrier2 = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(mip_count)
+                .base_array_layer(0)
+                .layer_count(6),
+        )
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+
+    unsafe {
+        ctx.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier2],
+        );
+    }
+
+    ctx.end_single_commands(cmd)?;
+
+    // Cleanup staging
+    let _ = ctx.allocator_mut().free(staging_alloc);
+    unsafe {
+        ctx.device.destroy_buffer(staging_buffer, None);
+    }
+
+    // Create CUBE image view
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::CUBE)
+        .format(format)
+        .components(vk::ComponentMapping::default())
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(mip_count)
+                .base_array_layer(0)
+                .layer_count(6),
+        );
+
+    let view = unsafe {
+        ctx.device
+            .create_image_view(&view_info, None)
+            .map_err(|e| format!("Failed to create cubemap image view '{}': {:?}", name, e))?
+    };
+
+    Ok((image, view, allocation))
+}
+
+/// Create a 2D image from raw pixel data and upload it via a staging buffer.
+/// This is the float16 variant used by the BRDF LUT.
+fn create_texture_image_raw(
+    ctx: &mut VulkanContext,
+    width: u32,
+    height: u32,
+    pixel_data: &[u8],
+    format: vk::Format,
+    name: &str,
+) -> Result<GpuImage, String> {
+    let data_size = pixel_data.len() as u64;
+
+    // Create staging buffer
+    let staging_info = vk::BufferCreateInfo::default()
+        .size(data_size)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let staging_buffer = unsafe {
+        ctx.device
+            .create_buffer(&staging_info, None)
+            .map_err(|e| format!("Failed to create staging buffer: {:?}", e))?
+    };
+
+    let staging_reqs = unsafe { ctx.device.get_buffer_memory_requirements(staging_buffer) };
+
+    let mut staging_alloc = ctx
+        .allocator_mut()
+        .allocate(&AllocationCreateDesc {
+            name: "texture_raw_staging",
+            requirements: staging_reqs,
+            location: MemoryLocation::CpuToGpu,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("Failed to allocate staging memory: {:?}", e))?;
+
+    unsafe {
+        ctx.device
+            .bind_buffer_memory(staging_buffer, staging_alloc.memory(), staging_alloc.offset())
+            .map_err(|e| format!("Failed to bind staging memory: {:?}", e))?;
+    }
+
+    if let Some(mapped) = staging_alloc.mapped_slice_mut() {
+        mapped[..pixel_data.len()].copy_from_slice(pixel_data);
+    }
+
+    // Create GPU image
+    let device_clone = ctx.device.clone();
+    let image = create_offscreen_image(
+        &device_clone,
+        ctx.allocator_mut(),
+        width,
+        height,
+        format,
+        vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        vk::ImageAspectFlags::COLOR,
+        name,
+    )?;
+
+    // Copy staging -> image
+    let cmd = ctx.begin_single_commands()?;
+
+    screenshot::cmd_transition_image(
+        &ctx.device,
+        cmd,
+        image.image,
+        vk::ImageLayout::UNDEFINED,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::AccessFlags::empty(),
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::TOP_OF_PIPE,
+        vk::PipelineStageFlags::TRANSFER,
+    );
+
+    let region = vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D::default())
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        });
+
+    unsafe {
+        ctx.device.cmd_copy_buffer_to_image(
+            cmd,
+            staging_buffer,
+            image.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+    }
+
+    screenshot::cmd_transition_image(
+        &ctx.device,
+        cmd,
+        image.image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::AccessFlags::SHADER_READ,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::FRAGMENT_SHADER,
+    );
+
+    ctx.end_single_commands(cmd)?;
+
+    // Cleanup staging
+    let _ = ctx.allocator_mut().free(staging_alloc);
+    unsafe {
+        ctx.device.destroy_buffer(staging_buffer, None);
+    }
+
+    Ok(image)
+}
+
+/// Try to find and load IBL assets from playground/assets/ibl/<name>/ directories.
+/// Returns IblAssets with whatever textures could be loaded, or empty if not found.
+fn load_ibl_assets(ctx: &mut VulkanContext) -> IblAssets {
+    // Search for IBL asset directories
+    let ibl_base = Path::new("playground/assets/ibl");
+    if !ibl_base.exists() {
+        info!("IBL assets directory not found at {:?}, using defaults", ibl_base);
+        return IblAssets::empty();
+    }
+
+    // Find first directory with a manifest.json
+    let ibl_dir = match std::fs::read_dir(ibl_base) {
+        Ok(entries) => {
+            let mut found = None;
+            let mut sorted_entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            sorted_entries.sort_by_key(|e| e.file_name());
+            for entry in sorted_entries {
+                let path = entry.path();
+                if path.is_dir() && path.join("manifest.json").exists() {
+                    found = Some(path);
+                    break;
+                }
+            }
+            match found {
+                Some(dir) => dir,
+                None => {
+                    info!("No IBL manifest.json found in {:?}", ibl_base);
+                    return IblAssets::empty();
+                }
+            }
+        }
+        Err(_) => {
+            info!("Failed to read IBL assets directory");
+            return IblAssets::empty();
+        }
+    };
+
+    info!("Loading IBL assets from {:?}", ibl_dir);
+
+    // Parse manifest
+    let manifest_path = ibl_dir.join("manifest.json");
+    let manifest: IblManifest = match std::fs::read_to_string(&manifest_path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => {
+            info!("Failed to read IBL manifest");
+            return IblAssets::empty();
+        }
+    };
+
+    let mut assets = IblAssets::empty();
+
+    // Load specular cubemap
+    let spec_path = ibl_dir.join("specular.bin");
+    if spec_path.exists() {
+        match load_specular_cubemap(ctx, &spec_path, &manifest) {
+            Ok(tex) => {
+                info!("Loaded specular cubemap: {}x{}, {} mips",
+                    manifest.spec_face_size(), manifest.spec_face_size(), manifest.spec_mip_count());
+                assets.env_specular = Some(tex);
+            }
+            Err(e) => info!("Failed to load specular cubemap: {}", e),
+        }
+    }
+
+    // Load irradiance cubemap
+    let irr_path = ibl_dir.join("irradiance.bin");
+    if irr_path.exists() {
+        match load_irradiance_cubemap(ctx, &irr_path, &manifest) {
+            Ok(tex) => {
+                info!("Loaded irradiance cubemap: {}x{}",
+                    manifest.irr_face_size(), manifest.irr_face_size());
+                assets.env_irradiance = Some(tex);
+            }
+            Err(e) => info!("Failed to load irradiance cubemap: {}", e),
+        }
+    }
+
+    // Load BRDF LUT
+    let brdf_path = ibl_dir.join("brdf_lut.bin");
+    if brdf_path.exists() {
+        match load_brdf_lut(ctx, &brdf_path, &manifest) {
+            Ok(tex) => {
+                info!("Loaded BRDF LUT: {}x{}", manifest.lut_size(), manifest.lut_size());
+                assets.brdf_lut = Some(tex);
+            }
+            Err(e) => info!("Failed to load BRDF LUT: {}", e),
+        }
+    }
+
+    info!("IBL assets loaded: specular={}, irradiance={}, brdf_lut={}",
+        assets.env_specular.is_some(),
+        assets.env_irradiance.is_some(),
+        assets.brdf_lut.is_some());
+
+    assets
+}
+
+/// Load the specular cubemap from specular.bin (float16 RGBA, mip-major, face-major).
+fn load_specular_cubemap(
+    ctx: &mut VulkanContext,
+    path: &Path,
+    manifest: &IblManifest,
+) -> Result<IblTexture, String> {
+    let raw_data = std::fs::read(path)
+        .map_err(|e| format!("Failed to read specular.bin: {}", e))?;
+
+    let face_size = manifest.spec_face_size();
+    let mip_count = manifest.spec_mip_count();
+    let bytes_per_pixel = 8u32; // float16 RGBA = 4 * 2 bytes
+
+    let (image, view, allocation) = create_cubemap_image(
+        ctx,
+        face_size,
+        mip_count,
+        vk::Format::R16G16B16A16_SFLOAT,
+        &raw_data,
+        bytes_per_pixel,
+        "ibl_specular",
+    )?;
+
+    // Create sampler with linear + mipmap filtering
+    let sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .max_lod(mip_count as f32);
+
+    let sampler = unsafe {
+        ctx.device
+            .create_sampler(&sampler_info, None)
+            .map_err(|e| format!("Failed to create specular sampler: {:?}", e))?
+    };
+
+    Ok(IblTexture {
+        image,
+        view,
+        sampler,
+        allocation: Some(allocation),
+    })
+}
+
+/// Load the irradiance cubemap from irradiance.bin (float16 RGBA, 6 faces, 1 mip).
+fn load_irradiance_cubemap(
+    ctx: &mut VulkanContext,
+    path: &Path,
+    manifest: &IblManifest,
+) -> Result<IblTexture, String> {
+    let raw_data = std::fs::read(path)
+        .map_err(|e| format!("Failed to read irradiance.bin: {}", e))?;
+
+    let face_size = manifest.irr_face_size();
+    let bytes_per_pixel = 8u32; // float16 RGBA
+
+    let (image, view, allocation) = create_cubemap_image(
+        ctx,
+        face_size,
+        1,
+        vk::Format::R16G16B16A16_SFLOAT,
+        &raw_data,
+        bytes_per_pixel,
+        "ibl_irradiance",
+    )?;
+
+    let sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+
+    let sampler = unsafe {
+        ctx.device
+            .create_sampler(&sampler_info, None)
+            .map_err(|e| format!("Failed to create irradiance sampler: {:?}", e))?
+    };
+
+    Ok(IblTexture {
+        image,
+        view,
+        sampler,
+        allocation: Some(allocation),
+    })
+}
+
+/// Load the BRDF LUT from brdf_lut.bin (float16 RG, padded to RGBA).
+fn load_brdf_lut(
+    ctx: &mut VulkanContext,
+    path: &Path,
+    manifest: &IblManifest,
+) -> Result<IblTexture, String> {
+    let raw_data = std::fs::read(path)
+        .map_err(|e| format!("Failed to read brdf_lut.bin: {}", e))?;
+
+    let lut_size = manifest.lut_size();
+    let expected_rg_bytes = (lut_size * lut_size * 2 * 2) as usize; // float16 RG = 2 * 2 bytes
+
+    if raw_data.len() < expected_rg_bytes {
+        return Err(format!(
+            "BRDF LUT data too small: {} < {} expected",
+            raw_data.len(),
+            expected_rg_bytes
+        ));
+    }
+
+    // Pad RG float16 to RGBA float16 (each pixel: 4 bytes -> 8 bytes)
+    let pixel_count = (lut_size * lut_size) as usize;
+    let mut rgba_data: Vec<u8> = Vec::with_capacity(pixel_count * 8);
+    let zero_u16: [u8; 2] = [0, 0]; // float16 zero
+
+    for i in 0..pixel_count {
+        let src_offset = i * 4; // 2 channels * 2 bytes each
+        // R channel
+        rgba_data.extend_from_slice(&raw_data[src_offset..src_offset + 2]);
+        // G channel
+        rgba_data.extend_from_slice(&raw_data[src_offset + 2..src_offset + 4]);
+        // B channel (zero)
+        rgba_data.extend_from_slice(&zero_u16);
+        // A channel (zero)
+        rgba_data.extend_from_slice(&zero_u16);
+    }
+
+    let gpu_image = create_texture_image_raw(
+        ctx,
+        lut_size,
+        lut_size,
+        &rgba_data,
+        vk::Format::R16G16B16A16_SFLOAT,
+        "ibl_brdf_lut",
+    )?;
+
+    let sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+
+    let sampler = unsafe {
+        ctx.device
+            .create_sampler(&sampler_info, None)
+            .map_err(|e| format!("Failed to create BRDF LUT sampler: {:?}", e))?
+    };
+
+    Ok(IblTexture {
+        image: gpu_image.image,
+        view: gpu_image.view,
+        sampler,
+        allocation: gpu_image.allocation,
+    })
+}
+
+fn render_pbr_scene(
     ctx: &mut VulkanContext,
     vert_module: vk::ShaderModule,
     frag_module: vk::ShaderModule,
+    pipeline_base: &str,
+    scene_source: &str,
     width: u32,
     height: u32,
     output_path: &Path,
@@ -988,11 +1786,207 @@ fn render_pbr(
     let device_owned = ctx.device.clone();
     let device = &device_owned;
 
-    // Generate sphere mesh
-    let (sphere_verts, sphere_indices) = scene::generate_sphere(32, 32);
-    let vertex_data: &[u8] = bytemuck::cast_slice(&sphere_verts);
-    let index_data: &[u8] = bytemuck::cast_slice(&sphere_indices);
-    let num_indices = sphere_indices.len() as u32;
+    // =====================================================================
+    // Phase 0: Load reflection JSON and build descriptor layouts
+    // =====================================================================
+    let vert_json_path = format!("{}.vert.json", pipeline_base);
+    let frag_json_path = format!("{}.frag.json", pipeline_base);
+
+    let vert_refl = reflected_pipeline::load_reflection(Path::new(&vert_json_path))?;
+    let frag_refl = reflected_pipeline::load_reflection(Path::new(&frag_json_path))?;
+
+    info!(
+        "Reflection loaded: vert={} frag={} descriptor_sets: vert={:?}, frag={:?}",
+        vert_json_path,
+        frag_json_path,
+        vert_refl.descriptor_sets.keys().collect::<Vec<_>>(),
+        frag_refl.descriptor_sets.keys().collect::<Vec<_>>(),
+    );
+
+    // Merge descriptor sets from both stages
+    let merged = reflected_pipeline::merge_descriptor_sets(&[&vert_refl, &frag_refl]);
+
+    // Create VkDescriptorSetLayouts from reflection
+    let ds_layouts = unsafe {
+        reflected_pipeline::create_descriptor_set_layouts_from_merged(device, &merged)?
+    };
+
+    // Compute pool sizes
+    let (pool_sizes, max_sets) = reflected_pipeline::compute_pool_sizes(&merged);
+
+    info!(
+        "Reflection-driven descriptors: {} sets, {} pool size entries",
+        max_sets,
+        pool_sizes.len()
+    );
+
+    // Create descriptor pool
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(max_sets)
+        .pool_sizes(&pool_sizes);
+
+    let descriptor_pool = unsafe {
+        device
+            .create_descriptor_pool(&pool_info, None)
+            .map_err(|e| format!("Failed to create descriptor pool: {:?}", e))?
+    };
+
+    // Allocate descriptor sets (ordered by set index)
+    let max_set_idx = ds_layouts.keys().copied().max().unwrap_or(0);
+    let mut ordered_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
+    for i in 0..=max_set_idx {
+        if let Some(&layout) = ds_layouts.get(&i) {
+            ordered_layouts.push(layout);
+        }
+    }
+
+    let alloc_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&ordered_layouts);
+
+    let descriptor_sets = unsafe {
+        device
+            .allocate_descriptor_sets(&alloc_info)
+            .map_err(|e| format!("Failed to allocate descriptor sets: {:?}", e))?
+    };
+
+    // Build a map: set_index -> vk::DescriptorSet
+    let mut ds_map: HashMap<u32, vk::DescriptorSet> = HashMap::new();
+    {
+        let mut ds_idx = 0;
+        for i in 0..=max_set_idx {
+            if ds_layouts.contains_key(&i) {
+                ds_map.insert(i, descriptor_sets[ds_idx]);
+                ds_idx += 1;
+            }
+        }
+    }
+
+    // Build push constant ranges from reflection data
+    let mut push_ranges: Vec<vk::PushConstantRange> = Vec::new();
+    for pc in &vert_refl.push_constants {
+        push_ranges.push(
+            vk::PushConstantRange::default()
+                .stage_flags(reflected_pipeline::stage_flags_from_strings_public(&pc.stage_flags))
+                .offset(0)
+                .size(pc.size),
+        );
+    }
+    for pc in &frag_refl.push_constants {
+        push_ranges.push(
+            vk::PushConstantRange::default()
+                .stage_flags(reflected_pipeline::stage_flags_from_strings_public(&pc.stage_flags))
+                .offset(0)
+                .size(pc.size),
+        );
+    }
+
+    // Build push constant data buffer from reflection fields
+    let mut push_constant_data: Vec<u8> = Vec::new();
+    let mut push_constant_stage_flags = vk::ShaderStageFlags::empty();
+    {
+        let all_pcs: Vec<&reflected_pipeline::PushConstantInfo> = vert_refl
+            .push_constants
+            .iter()
+            .chain(frag_refl.push_constants.iter())
+            .collect();
+        if !all_pcs.is_empty() {
+            // Use the max size across all push constant blocks
+            let total_size = all_pcs.iter().map(|pc| pc.size as usize).max().unwrap_or(0);
+            push_constant_data.resize(total_size, 0u8);
+            for pc in &all_pcs {
+                push_constant_stage_flags |=
+                    reflected_pipeline::stage_flags_from_strings_public(&pc.stage_flags);
+                for field in &pc.fields {
+                    let offset = field.offset as usize;
+                    match field.name.as_str() {
+                        "light_dir" => {
+                            let v = glam::Vec3::new(1.0, 0.8, 0.6).normalize();
+                            let bytes = bytemuck::cast_slice::<f32, u8>(v.as_ref());
+                            push_constant_data[offset..offset + bytes.len()]
+                                .copy_from_slice(bytes);
+                        }
+                        "view_pos" => {
+                            let v = glam::Vec3::new(0.0, 0.0, 3.0);
+                            let bytes = bytemuck::cast_slice::<f32, u8>(v.as_ref());
+                            push_constant_data[offset..offset + bytes.len()]
+                                .copy_from_slice(bytes);
+                        }
+                        _ => {
+                            info!(
+                                "Unknown push constant field '{}', leaving zeroed",
+                                field.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pipeline layout
+    let pipeline_layout = unsafe {
+        reflected_pipeline::create_pipeline_layout_from_merged(device, &ds_layouts, &push_ranges)?
+    };
+
+    // =====================================================================
+    // Phase 1: Load scene geometry
+    // =====================================================================
+    let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
+
+    // Load glTF scene (if applicable) before we start using textures
+    let gltf_scene = if is_gltf {
+        Some(crate::gltf_loader::load_gltf(Path::new(scene_source))?)
+    } else {
+        None
+    };
+
+    // Determine if we need 48-byte vertices (with tangent) based on reflection stride
+    let pipeline_vertex_stride = vert_refl.vertex_stride;
+
+    let (vertex_data_owned, pbr_indices) = if let Some(ref gltf_s) = gltf_scene {
+        if gltf_s.meshes.is_empty() {
+            return Err(format!("No meshes found in glTF file: {}", scene_source));
+        }
+        let mesh = &gltf_s.meshes[0];
+
+        if pipeline_vertex_stride == 48 {
+            // Use GltfVertex directly (48 bytes with tangent)
+            let data: Vec<u8> = bytemuck::cast_slice(&mesh.vertices).to_vec();
+            (data, mesh.indices.clone())
+        } else {
+            // Use PbrVertex (32 bytes without tangent)
+            let verts: Vec<scene::PbrVertex> = mesh.vertices.iter().map(|v| {
+                scene::PbrVertex {
+                    position: v.position,
+                    normal: v.normal,
+                    uv: v.uv,
+                }
+            }).collect();
+            let data: Vec<u8> = bytemuck::cast_slice(&verts).to_vec();
+            (data, mesh.indices.clone())
+        }
+    } else {
+        let (sphere_verts, sphere_indices) = scene::generate_sphere(32, 32);
+
+        if pipeline_vertex_stride == 48 {
+            // Pad sphere PbrVertex (32 bytes) to 48 bytes with default tangent
+            let default_tangent: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+            let mut padded_data: Vec<u8> = Vec::with_capacity(sphere_verts.len() * 48);
+            for v in &sphere_verts {
+                padded_data.extend_from_slice(bytemuck::cast_slice(&[*v]));
+                padded_data.extend_from_slice(bytemuck::cast_slice(&default_tangent));
+            }
+            (padded_data, sphere_indices)
+        } else {
+            let data: Vec<u8> = bytemuck::cast_slice(&sphere_verts).to_vec();
+            (data, sphere_indices)
+        }
+    };
+
+    let vertex_data: &[u8] = &vertex_data_owned;
+    let index_data: &[u8] = bytemuck::cast_slice(&pbr_indices);
+    let num_indices = pbr_indices.len() as u32;
 
     let mut vbo = create_buffer_with_data(
         device,
@@ -1010,7 +2004,11 @@ fn render_pbr(
         "pbr_ibo",
     )?;
 
-    // MVP uniform buffer (3 x mat4 = 192 bytes)
+    // =====================================================================
+    // Phase 2: Create uniform buffers and textures based on reflection
+    // =====================================================================
+
+    // MVP uniform buffer (192 bytes)
     let model = DefaultCamera::model();
     let view = DefaultCamera::view();
     let proj = DefaultCamera::projection(width as f32 / height as f32);
@@ -1028,14 +2026,14 @@ fn render_pbr(
         "pbr_mvp",
     )?;
 
-    // Light uniform buffer (32 bytes: light_dir vec4 + camera_pos vec4)
+    // Light uniform buffer (32 bytes)
     let light_dir = glam::Vec3::new(1.0, 0.8, 0.6).normalize();
     let camera_pos = DefaultCamera::EYE;
     let mut light_data = [0u8; 32];
     light_data[0..12].copy_from_slice(bytemuck::cast_slice(light_dir.as_ref()));
-    light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes()); // padding
+    light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
     light_data[16..28].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
-    light_data[28..32].copy_from_slice(&0.0f32.to_le_bytes()); // padding
+    light_data[28..32].copy_from_slice(&0.0f32.to_le_bytes());
 
     let mut light_buffer = create_buffer_with_data(
         device,
@@ -1045,13 +2043,8 @@ fn render_pbr(
         "pbr_light",
     )?;
 
-    // Procedural texture
-    info!("Generating procedural texture...");
-    let tex_pixels = scene::generate_procedural_texture(512);
-    let mut texture_image = create_texture_image(ctx, 512, 512, &tex_pixels, "pbr_albedo")?;
-
-    // Sampler
-    let sampler_info = vk::SamplerCreateInfo::default()
+    // Sampler (shared by all texture bindings)
+    let sampler_create = vk::SamplerCreateInfo::default()
         .mag_filter(vk::Filter::LINEAR)
         .min_filter(vk::Filter::LINEAR)
         .address_mode_u(vk::SamplerAddressMode::REPEAT)
@@ -1060,145 +2053,260 @@ fn render_pbr(
 
     let sampler = unsafe {
         device
-            .create_sampler(&sampler_info, None)
+            .create_sampler(&sampler_create, None)
             .map_err(|e| format!("Failed to create sampler: {:?}", e))?
     };
 
-    // Descriptor set layout 0: MVP UBO (vertex)
-    let mvp_binding = vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::VERTEX);
+    // Get glTF material (if any) for texture extraction
+    let gltf_material = gltf_scene.as_ref().and_then(|s| {
+        if !s.materials.is_empty() { Some(&s.materials[0]) } else { None }
+    });
 
-    let mvp_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
-        .bindings(std::slice::from_ref(&mvp_binding));
+    // Create a 1x1 white default texture for any missing texture slots
+    let mut default_texture = create_default_white_texture(ctx)?;
 
-    let mvp_ds_layout = unsafe {
-        device
-            .create_descriptor_set_layout(&mvp_layout_info, None)
-            .map_err(|e| format!("Failed to create MVP descriptor layout: {:?}", e))?
-    };
+    // Create textures from glTF images. We track them by name for binding.
+    // Name -> GpuImage mapping
+    let mut texture_images: HashMap<String, GpuImage> = HashMap::new();
 
-    // Descriptor set layout 1: Light UBO + sampler + texture (fragment)
-    let frag_bindings = [
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(1)
-            .descriptor_type(vk::DescriptorType::SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(2)
-            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+    // Helper: try to get a glTF texture image by name, or use default
+    let texture_names = [
+        "base_color_tex",
+        "normal_tex",
+        "metallic_roughness_tex",
+        "occlusion_tex",
+        "emissive_tex",
+        "albedo_tex",
     ];
 
-    let frag_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
-        .bindings(&frag_bindings);
+    for tex_name in &texture_names {
+        let tex_image_opt = match *tex_name {
+            "base_color_tex" | "albedo_tex" => {
+                gltf_material.and_then(|m| m.base_color_image.as_ref())
+            }
+            "normal_tex" => gltf_material.and_then(|m| m.normal_image.as_ref()),
+            "metallic_roughness_tex" => gltf_material.and_then(|m| m.metallic_roughness_image.as_ref()),
+            "occlusion_tex" => gltf_material.and_then(|m| m.occlusion_image.as_ref()),
+            "emissive_tex" => gltf_material.and_then(|m| m.emissive_image.as_ref()),
+            _ => None,
+        };
 
-    let frag_ds_layout = unsafe {
-        device
-            .create_descriptor_set_layout(&frag_layout_info, None)
-            .map_err(|e| format!("Failed to create frag descriptor layout: {:?}", e))?
-    };
+        if let Some(tex_data) = tex_image_opt {
+            info!(
+                "Uploading texture '{}': {}x{}",
+                tex_name, tex_data.width, tex_data.height
+            );
+            let gpu_img = create_texture_image(
+                ctx,
+                tex_data.width,
+                tex_data.height,
+                &tex_data.pixels,
+                tex_name,
+            )?;
+            texture_images.insert(tex_name.to_string(), gpu_img);
+        }
+        // If no glTF image, we will use the default texture
+    }
 
-    // Descriptor pool
-    let pool_sizes = [
-        vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(2),
-        vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::SAMPLER)
-            .descriptor_count(1),
-        vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::SAMPLED_IMAGE)
-            .descriptor_count(1),
-    ];
+    // For non-glTF scenes, generate a procedural texture and use it for albedo_tex / base_color_tex
+    if gltf_material.is_none() {
+        info!("Generating procedural texture for non-glTF scene...");
+        let tex_pixels = scene::generate_procedural_texture(512);
+        let proc_texture = create_texture_image(ctx, 512, 512, &tex_pixels, "procedural_albedo")?;
+        texture_images.insert("albedo_tex".to_string(), proc_texture);
+        // Also map base_color_tex to the same procedural texture
+        let proc_texture2 = create_texture_image(ctx, 512, 512, &tex_pixels, "procedural_base_color")?;
+        texture_images.insert("base_color_tex".to_string(), proc_texture2);
+    }
 
-    let pool_info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets(2)
-        .pool_sizes(&pool_sizes);
+    // Load IBL assets (specular cubemap, irradiance cubemap, BRDF LUT)
+    let mut ibl_assets = load_ibl_assets(ctx);
 
-    let descriptor_pool = unsafe {
-        device
-            .create_descriptor_pool(&pool_info, None)
-            .map_err(|e| format!("Failed to create descriptor pool: {:?}", e))?
-    };
+    // =====================================================================
+    // Phase 3: Write descriptor sets from reflection data
+    // =====================================================================
 
-    // Allocate descriptor sets
-    let set_layouts = [mvp_ds_layout, frag_ds_layout];
-    let alloc_info = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(descriptor_pool)
-        .set_layouts(&set_layouts);
+    // We need to keep descriptor write infos alive during update_descriptor_sets
+    // Use a Vec to hold them
+    let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+    let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
+    let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
 
-    let descriptor_sets = unsafe {
-        device
-            .allocate_descriptor_sets(&alloc_info)
-            .map_err(|e| format!("Failed to allocate descriptor sets: {:?}", e))?
-    };
+    // Pre-allocate buffer and image infos so pointers remain stable
+    // Count total bindings first
+    let total_bindings: usize = merged.values().map(|v| v.len()).sum();
+    buffer_infos.reserve(total_bindings);
+    image_infos.reserve(total_bindings);
 
-    // Write descriptor sets
-    let mvp_buffer_info = vk::DescriptorBufferInfo::default()
-        .buffer(mvp_buffer.buffer)
-        .offset(0)
-        .range(192);
+    for (&set_idx, bindings) in &merged {
+        let ds = match ds_map.get(&set_idx) {
+            Some(&ds) => ds,
+            None => continue,
+        };
 
-    let light_buffer_info = vk::DescriptorBufferInfo::default()
-        .buffer(light_buffer.buffer)
-        .offset(0)
-        .range(32);
+        for binding in bindings {
+            let vk_type = reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
 
-    let sampler_info_desc = vk::DescriptorImageInfo::default()
-        .sampler(sampler);
+            match vk_type {
+                vk::DescriptorType::UNIFORM_BUFFER => {
+                    // Match by name
+                    let (buffer, range) = match binding.name.as_str() {
+                        "MVP" => (mvp_buffer.buffer, binding.size as u64),
+                        "Light" => (light_buffer.buffer, binding.size as u64),
+                        _ => {
+                            info!(
+                                "Unknown UBO name '{}' at set={} binding={}, skipping",
+                                binding.name, set_idx, binding.binding
+                            );
+                            continue;
+                        }
+                    };
 
-    let tex_image_info = vk::DescriptorImageInfo::default()
-        .image_view(texture_image.view)
-        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                    let buf_info_idx = buffer_infos.len();
+                    buffer_infos.push(
+                        vk::DescriptorBufferInfo::default()
+                            .buffer(buffer)
+                            .offset(0)
+                            .range(range),
+                    );
 
-    let writes = [
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_sets[0])
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .buffer_info(std::slice::from_ref(&mvp_buffer_info)),
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_sets[1])
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .buffer_info(std::slice::from_ref(&light_buffer_info)),
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_sets[1])
-            .dst_binding(1)
-            .descriptor_type(vk::DescriptorType::SAMPLER)
-            .image_info(std::slice::from_ref(&sampler_info_desc)),
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_sets[1])
-            .dst_binding(2)
-            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-            .image_info(std::slice::from_ref(&tex_image_info)),
-    ];
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(ds)
+                            .dst_binding(binding.binding)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .buffer_info(unsafe {
+                                std::slice::from_raw_parts(
+                                    &buffer_infos[buf_info_idx] as *const _,
+                                    1,
+                                )
+                            }),
+                    );
+                }
+                vk::DescriptorType::SAMPLER => {
+                    // Use IBL-specific sampler if the binding name matches an IBL texture,
+                    // otherwise use the default sampler.
+                    let actual_sampler = ibl_assets
+                        .sampler_for_binding(&binding.name)
+                        .unwrap_or(sampler);
+
+                    let img_info_idx = image_infos.len();
+                    image_infos.push(
+                        vk::DescriptorImageInfo::default().sampler(actual_sampler),
+                    );
+
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(ds)
+                            .dst_binding(binding.binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .image_info(unsafe {
+                                std::slice::from_raw_parts(
+                                    &image_infos[img_info_idx] as *const _,
+                                    1,
+                                )
+                            }),
+                    );
+                }
+                vk::DescriptorType::SAMPLED_IMAGE => {
+                    let is_cube = reflected_pipeline::is_cube_image_binding(&binding.binding_type);
+
+                    if is_cube {
+                        // Cubemap binding: use IBL textures or fall back to default
+                        let view = ibl_assets
+                            .view_for_binding(&binding.name)
+                            .unwrap_or(default_texture.view);
+
+                        let img_info_idx = image_infos.len();
+                        image_infos.push(
+                            vk::DescriptorImageInfo::default()
+                                .image_view(view)
+                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                        );
+
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds)
+                                .dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                .image_info(unsafe {
+                                    std::slice::from_raw_parts(
+                                        &image_infos[img_info_idx] as *const _,
+                                        1,
+                                    )
+                                }),
+                        );
+                    } else if binding.name == "brdf_lut" {
+                        // BRDF LUT is a 2D image, not a cubemap
+                        let view = ibl_assets
+                            .view_for_binding(&binding.name)
+                            .unwrap_or(default_texture.view);
+
+                        let img_info_idx = image_infos.len();
+                        image_infos.push(
+                            vk::DescriptorImageInfo::default()
+                                .image_view(view)
+                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                        );
+
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds)
+                                .dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                .image_info(unsafe {
+                                    std::slice::from_raw_parts(
+                                        &image_infos[img_info_idx] as *const _,
+                                        1,
+                                    )
+                                }),
+                        );
+                    } else {
+                        // Regular 2D texture: look up by name, fall back to default white
+                        let view = texture_images
+                            .get(&binding.name)
+                            .map(|img| img.view)
+                            .unwrap_or(default_texture.view);
+
+                        let img_info_idx = image_infos.len();
+                        image_infos.push(
+                            vk::DescriptorImageInfo::default()
+                                .image_view(view)
+                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                        );
+
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds)
+                                .dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                .image_info(unsafe {
+                                    std::slice::from_raw_parts(
+                                        &image_infos[img_info_idx] as *const _,
+                                        1,
+                                    )
+                                }),
+                        );
+                    }
+                }
+                _ => {
+                    info!(
+                        "Unhandled descriptor type {:?} at set={} binding={} name='{}'",
+                        vk_type, set_idx, binding.binding, binding.name
+                    );
+                }
+            }
+        }
+    }
 
     unsafe {
         device.update_descriptor_sets(&writes, &[]);
     }
 
-    // Pipeline layout with 2 descriptor set layouts
-    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-        .set_layouts(&set_layouts);
+    // =====================================================================
+    // Phase 4: Create render pass, framebuffer, graphics pipeline
+    // =====================================================================
 
-    let pipeline_layout = unsafe {
-        device
-            .create_pipeline_layout(&pipeline_layout_info, None)
-            .map_err(|e| format!("Failed to create PBR pipeline layout: {:?}", e))?
-    };
-
-    // Offscreen color + depth images
     let mut color_image = create_offscreen_image(
         device,
         ctx.allocator_mut(),
@@ -1221,7 +2329,6 @@ fn render_pbr(
         "pbr_depth",
     )?;
 
-    // Render pass with depth
     let attachments = [
         vk::AttachmentDescription::default()
             .format(vk::Format::R8G8B8A8_UNORM)
@@ -1294,28 +2401,9 @@ fn render_pbr(
             .name(entry_name),
     ];
 
-    let binding_desc = [vk::VertexInputBindingDescription::default()
-        .binding(0)
-        .stride(32) // sizeof(PbrVertex) = 32
-        .input_rate(vk::VertexInputRate::VERTEX)];
-
-    let attr_descs = [
-        vk::VertexInputAttributeDescription::default()
-            .binding(0)
-            .location(0)
-            .format(vk::Format::R32G32B32_SFLOAT)
-            .offset(0), // position
-        vk::VertexInputAttributeDescription::default()
-            .binding(0)
-            .location(1)
-            .format(vk::Format::R32G32B32_SFLOAT)
-            .offset(12), // normal
-        vk::VertexInputAttributeDescription::default()
-            .binding(0)
-            .location(2)
-            .format(vk::Format::R32G32_SFLOAT)
-            .offset(24), // uv
-    ];
+    // Use reflection-driven vertex input (stride and attributes from vert_refl)
+    let (binding_desc, attr_descs) =
+        reflected_pipeline::create_reflected_vertex_input(&vert_refl);
 
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&binding_desc)
@@ -1376,7 +2464,10 @@ fn render_pbr(
             .map_err(|e| format!("Failed to create PBR pipeline: {:?}", e))?[0]
     };
 
-    // Record commands
+    // =====================================================================
+    // Phase 5: Record commands and render
+    // =====================================================================
+
     let cmd = ctx.begin_single_commands()?;
 
     let clear_values = [
@@ -1413,6 +2504,15 @@ fn render_pbr(
             &descriptor_sets,
             &[],
         );
+        if !push_constant_data.is_empty() {
+            device.cmd_push_constants(
+                cmd,
+                pipeline_layout,
+                push_constant_stage_flags,
+                0,
+                &push_constant_data,
+            );
+        }
         device.cmd_bind_vertex_buffers(cmd, 0, &[vbo.buffer], &[0]);
         device.cmd_bind_index_buffer(cmd, ibo.buffer, 0, vk::IndexType::UINT32);
         device.cmd_draw_indexed(cmd, num_indices, 1, 0, 0, 0);
@@ -1433,9 +2533,11 @@ fn render_pbr(
     let pixels = staging.read_pixels(width, height)?;
     screenshot::save_png(&pixels, width, height, output_path)?;
 
-    info!("Saved PBR render to {:?}", output_path);
+    info!("Saved raster scene render to {:?}", output_path);
 
+    // =====================================================================
     // Cleanup
+    // =====================================================================
     staging.destroy(device, ctx.allocator_mut());
     unsafe {
         device.destroy_pipeline(pipeline, None);
@@ -1443,13 +2545,18 @@ fn render_pbr(
         device.destroy_framebuffer(framebuffer, None);
         device.destroy_render_pass(render_pass, None);
         device.destroy_descriptor_pool(descriptor_pool, None);
-        device.destroy_descriptor_set_layout(mvp_ds_layout, None);
-        device.destroy_descriptor_set_layout(frag_ds_layout, None);
+        for (_, layout) in &ds_layouts {
+            device.destroy_descriptor_set_layout(*layout, None);
+        }
         device.destroy_sampler(sampler, None);
     }
     color_image.destroy(device, ctx.allocator_mut());
     depth_image.destroy(device, ctx.allocator_mut());
-    texture_image.destroy(device, ctx.allocator_mut());
+    default_texture.destroy(device, ctx.allocator_mut());
+    for (_, mut tex) in texture_images {
+        tex.destroy(device, ctx.allocator_mut());
+    }
+    ibl_assets.destroy(device, ctx.allocator_mut());
     mvp_buffer.destroy(device, ctx.allocator_mut());
     light_buffer.destroy(device, ctx.allocator_mut());
     vbo.destroy(device, ctx.allocator_mut());

@@ -48,15 +48,17 @@ _RT_BUILTINS = {
 }
 
 
-def generate_spirv(module: Module, stage: StageBlock) -> str:
-    gen = SpvGenerator(module, stage)
+def generate_spirv(module: Module, stage: StageBlock, debug: bool = False, source_name: str = "") -> str:
+    gen = SpvGenerator(module, stage, debug=debug, source_name=source_name)
     return gen.generate()
 
 
 class SpvGenerator:
-    def __init__(self, module: Module, stage: StageBlock):
+    def __init__(self, module: Module, stage: StageBlock, debug: bool = False, source_name: str = ""):
         self.module = module
         self.stage = stage
+        self.debug = debug
+        self.source_name = source_name
         self.reg = TypeRegistry()
         self.body_lines: list[str] = []
         self.decorations: list[str] = []
@@ -84,6 +86,10 @@ class SpvGenerator:
         # gl_PerVertex output block for vertex shader
         self.per_vertex_var_id: str | None = None
         self.per_vertex_struct_id: str | None = None
+
+        # Debug info tracking
+        self._debug_source_id: str | None = None
+        self._debug_current_line: int = -1  # track last emitted line to avoid redundancy
 
     def _next_label(self) -> str:
         self._label_counter += 1
@@ -113,6 +119,12 @@ class SpvGenerator:
             lines.append('OpExtension "SPV_KHR_ray_tracing"')
         lines.append(f"{self.glsl_ext_id} = OpExtInstImport \"GLSL.std.450\"")
         lines.append("OpMemoryModel Logical GLSL450")
+
+        # Debug source info (OpString / OpSource)
+        if self.debug and self.source_name:
+            self._debug_source_id = self.reg.next_id()
+            lines.append(f'{self._debug_source_id} = OpString "{self.source_name}"')
+            lines.append(f"OpSource GLSL 450 {self._debug_source_id}")
 
         # Entry point
         if is_rt:
@@ -274,8 +286,9 @@ class SpvGenerator:
             self.decorations.append(f"OpDecorate {sampler_var} Binding {sam.binding}")
             self.interface_ids.append(sampler_var)
 
-            # Texture image variable
-            image_type = self.reg.image_type()
+            # Texture image variable (2D or Cube depending on sampler type)
+            is_cube = getattr(sam, 'type_name', 'sampler2d') == 'samplerCube'
+            image_type = self.reg.cube_image_type() if is_cube else self.reg.image_type()
             image_ptr = self.reg.pointer("UniformConstant", image_type)
             texture_var = self.reg.next_id()
             self.global_vars.append(f"{texture_var} = OpVariable {image_ptr} UniformConstant")
@@ -286,7 +299,8 @@ class SpvGenerator:
             # Store both var IDs for use in sample() codegen
             self.var_map[sam.name + ".__sampler"] = sampler_var
             self.var_map[sam.name + ".__texture"] = texture_var
-            self.var_types[sam.name] = "sampler2d"
+            sam_type_name = getattr(sam, 'type_name', 'sampler2d')
+            self.var_types[sam.name] = sam_type_name
             self.var_storage[sam.name] = "UniformConstant"
 
         # --- RT: Ray payload variables ---
@@ -458,8 +472,22 @@ class SpvGenerator:
                 self._pre_declare_locals(stmt.then_body)
                 self._pre_declare_locals(stmt.else_body)
 
+    def _emit_debug_line(self, node, lines: list[str]) -> None:
+        """Emit OpLine before a statement/expression if debug mode is on and the node has a loc."""
+        if not self.debug or self._debug_source_id is None:
+            return
+        loc = getattr(node, 'loc', None)
+        if loc is None:
+            return
+        # Avoid redundant OpLine for the same source line
+        if loc.line != self._debug_current_line:
+            self._debug_current_line = loc.line
+            col = loc.column if loc.column else 0
+            lines.append(f"OpLine {self._debug_source_id} {loc.line} {col}")
+
     def _gen_stmt(self, stmt) -> list[str]:
         lines = []
+        self._emit_debug_line(stmt, lines)
 
         if isinstance(stmt, LetStmt):
             # Variable already declared in _pre_declare_locals
@@ -817,8 +845,10 @@ class SpvGenerator:
             result = self.reg.next_id()
             if isinstance(sampler_arg, VarRef) and sampler_arg.name + ".__sampler" in self.var_map:
                 sam_name = sampler_arg.name
+                # Determine if this is a cube or 2D sampler
+                is_cube = self.var_types.get(sam_name) == "samplerCube"
                 # Load the texture image
-                img_type = self.reg.image_type()
+                img_type = self.reg.cube_image_type() if is_cube else self.reg.image_type()
                 tex_loaded = self.reg.next_id()
                 lines.append(f"{tex_loaded} = OpLoad {img_type} {self.var_map[sam_name + '.__texture']}")
                 # Load the sampler
@@ -826,7 +856,7 @@ class SpvGenerator:
                 samp_loaded = self.reg.next_id()
                 lines.append(f"{samp_loaded} = OpLoad {samp_type} {self.var_map[sam_name + '.__sampler']}")
                 # Combine into sampled image
-                sampled_img_type = self.reg.sampled_image_type()
+                sampled_img_type = self.reg.sampled_cube_image_type() if is_cube else self.reg.sampled_image_type()
                 combined = self.reg.next_id()
                 lines.append(f"{combined} = OpSampledImage {sampled_img_type} {tex_loaded} {samp_loaded}")
                 # Sample
@@ -836,6 +866,35 @@ class SpvGenerator:
                 tex_id, tex_lines = self._gen_expr(sampler_arg)
                 lines.extend(tex_lines)
                 lines.append(f"{result} = OpImageSampleImplicitLod {result_type} {tex_id} {uv_id}")
+            return result, lines
+
+        # sample_lod(tex, coords, lod) — explicit LOD sampling
+        if fname == "sample_lod":
+            sampler_arg = expr.args[0]
+            # Generate coords and lod arguments
+            coords_id, coords_lines = self._gen_expr(expr.args[1])
+            lines.extend(coords_lines)
+            lod_id, lod_lines = self._gen_expr(expr.args[2])
+            lines.extend(lod_lines)
+            result_type = self.reg.lux_type_to_spirv(expr.resolved_type)
+            result = self.reg.next_id()
+            if isinstance(sampler_arg, VarRef) and sampler_arg.name + ".__sampler" in self.var_map:
+                sam_name = sampler_arg.name
+                is_cube = self.var_types.get(sam_name) == "samplerCube"
+                img_type = self.reg.cube_image_type() if is_cube else self.reg.image_type()
+                tex_loaded = self.reg.next_id()
+                lines.append(f"{tex_loaded} = OpLoad {img_type} {self.var_map[sam_name + '.__texture']}")
+                samp_type = self.reg.sampler_type()
+                samp_loaded = self.reg.next_id()
+                lines.append(f"{samp_loaded} = OpLoad {samp_type} {self.var_map[sam_name + '.__sampler']}")
+                sampled_img_type = self.reg.sampled_cube_image_type() if is_cube else self.reg.sampled_image_type()
+                combined = self.reg.next_id()
+                lines.append(f"{combined} = OpSampledImage {sampled_img_type} {tex_loaded} {samp_loaded}")
+                lines.append(f"{result} = OpImageSampleExplicitLod {result_type} {combined} {coords_id} Lod {lod_id}")
+            else:
+                tex_id, tex_lines = self._gen_expr(sampler_arg)
+                lines.extend(tex_lines)
+                lines.append(f"{result} = OpImageSampleExplicitLod {result_type} {tex_id} {coords_id} Lod {lod_id}")
             return result, lines
 
         # Generate arguments
@@ -969,6 +1028,11 @@ class SpvGenerator:
         # dot -> OpDot
         if fname == "dot":
             lines.append(f"{result} = OpDot {result_type} {arg_ids[0]} {arg_ids[1]}")
+            return result, lines
+
+        # transpose -> OpTranspose (core SPIR-V, not GLSL.std.450)
+        if fname == "transpose":
+            lines.append(f"{result} = OpTranspose {result_type} {arg_ids[0]}")
             return result, lines
 
         # User-defined function — inline it

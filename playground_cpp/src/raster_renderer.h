@@ -4,19 +4,23 @@
 #include "vk_mem_alloc.h"
 #include "vulkan_context.h"
 #include "scene.h"
+#include "gltf_loader.h"
+#include "reflected_pipeline.h"
 #include <string>
-
-enum class RasterMode {
-    Triangle,
-    Fullscreen,
-    PBR
-};
+#include <vector>
+#include <unordered_map>
 
 class RasterRenderer {
 public:
-    void init(VulkanContext& ctx, RasterMode mode,
-              const std::string& vertSpvPath, const std::string& fragSpvPath,
+    // Three-phase initialization: scene/pipeline architecture
+    void init(VulkanContext& ctx, const std::string& sceneSource,
+              const std::string& pipelineBase, const std::string& renderPath,
               uint32_t width, uint32_t height);
+
+    // Three-phase rendering methods
+    void uploadScene(VulkanContext& ctx, const std::string& sceneSource);
+    void createPipeline(VulkanContext& ctx, const std::string& pipelineBase, const std::string& renderPath);
+    void bindSceneToPipeline(VulkanContext& ctx);
 
     void render(VulkanContext& ctx);
 
@@ -34,7 +38,9 @@ public:
     void cleanup(VulkanContext& ctx);
 
 private:
-    RasterMode mode = RasterMode::Triangle;
+    std::string m_sceneSource;
+    std::string m_renderPath;  // "raster", "fullscreen", "rt"
+    std::string m_pipelineBase; // pipeline base path for reflection JSON lookup
     uint32_t renderWidth = 512;
     uint32_t renderHeight = 512;
 
@@ -43,10 +49,11 @@ private:
     VmaAllocation offscreenAllocation = VK_NULL_HANDLE;
     VkImageView offscreenImageView = VK_NULL_HANDLE;
 
-    // Depth buffer (PBR mode)
+    // Depth buffer (raster scenes with depth)
     VkImage depthImage = VK_NULL_HANDLE;
     VmaAllocation depthAllocation = VK_NULL_HANDLE;
     VkImageView depthImageView = VK_NULL_HANDLE;
+    bool m_needsDepth = false;
 
     // Render pass and framebuffer
     VkRenderPass renderPass = VK_NULL_HANDLE;
@@ -56,22 +63,29 @@ private:
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
 
-    // Descriptor sets (PBR mode)
-    VkDescriptorSetLayout descSetLayout0 = VK_NULL_HANDLE; // MVP
-    VkDescriptorSetLayout descSetLayout1 = VK_NULL_HANDLE; // Light + texture
+    // Reflection-driven descriptor sets (dynamic, not hardcoded)
+    std::unordered_map<int, VkDescriptorSetLayout> reflectedSetLayouts;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet descSet0 = VK_NULL_HANDLE;
-    VkDescriptorSet descSet1 = VK_NULL_HANDLE;
+    std::unordered_map<int, VkDescriptorSet> reflectedDescSets;
 
-    // Uniform buffers (PBR mode)
+    // Uniform buffers (created based on reflection)
     VkBuffer mvpBuffer = VK_NULL_HANDLE;
     VmaAllocation mvpAllocation = VK_NULL_HANDLE;
     VkBuffer lightBuffer = VK_NULL_HANDLE;
     VmaAllocation lightAllocation = VK_NULL_HANDLE;
 
-    // Mesh data
+    // Mesh data (scene GPU resources)
     GPUMesh mesh = {};
-    GPUTexture texture = {};
+
+    // Textures: keyed by binding name from reflection JSON
+    // (e.g. "base_color_tex", "normal_tex", "metallic_roughness_tex", etc.)
+    std::unordered_map<std::string, GPUTexture> namedTextures;
+
+    // IBL cubemap textures: keyed by "env_specular", "env_irradiance", "brdf_lut"
+    std::unordered_map<std::string, GPUTexture> iblTextures;
+
+    // Default 1x1 white texture for missing bindings
+    GPUTexture defaultWhiteTexture = {};
 
     // Triangle vertex buffer
     VkBuffer triangleVB = VK_NULL_HANDLE;
@@ -81,6 +95,19 @@ private:
     VkShaderModule vertModule = VK_NULL_HANDLE;
     VkShaderModule fragModule = VK_NULL_HANDLE;
 
+    // Reflection data cached from JSON parsing
+    ReflectionData vertReflection;
+    ReflectionData fragReflection;
+
+    // Push constant data (from reflection, filled with scene lighting)
+    std::vector<uint8_t> pushConstantData;
+    VkShaderStageFlags pushConstantStageFlags = 0;
+    uint32_t pushConstantSize = 0;
+
+    // glTF scene data (for texture extraction)
+    GltfScene m_gltfScene;
+    bool m_hasGltfScene = false;
+
     void createOffscreenTarget(VulkanContext& ctx);
     void createRenderPass(VulkanContext& ctx);
     void createFramebuffer(VulkanContext& ctx);
@@ -88,4 +115,13 @@ private:
     void createPipelineFullscreen(VulkanContext& ctx);
     void createPipelinePBR(VulkanContext& ctx);
     void setupPBRResources(VulkanContext& ctx);
+
+    // Reflection-driven descriptor setup
+    void setupReflectedDescriptors(VulkanContext& ctx);
+    void createDefaultWhiteTexture(VulkanContext& ctx);
+    void uploadGltfTextures(VulkanContext& ctx);
+    void loadIBLAssets(VulkanContext& ctx, const std::string& iblName);
+    GPUTexture uploadCubemapF16(VulkanContext& ctx, uint32_t faceSize, uint32_t mipCount,
+                                const std::vector<uint16_t>& data);
+    GPUTexture& getTextureForBinding(const std::string& name);
 };

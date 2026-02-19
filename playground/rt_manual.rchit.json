@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "source": "rt_manual.lux",
+  "stage": "closest_hit",
+  "execution_model": "ClosestHitKHR",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {},
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "ray_payloads": [
+    {
+      "name": "payload",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "hit_attributes": [
+    {
+      "name": "attribs",
+      "type": "vec2"
+    }
+  ]
+}

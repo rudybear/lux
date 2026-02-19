@@ -1,10 +1,12 @@
 //! CLI entry point for the Lux shader playground.
 //!
-//! Supports rasterization (triangle, fullscreen, PBR) and ray tracing modes.
+//! Supports scene/pipeline architecture with auto-detection of render paths.
 //! Can run headless (offscreen render to PNG) or interactively (winit window).
 
 mod camera;
+pub mod gltf_loader;
 mod raster_renderer;
+pub mod reflected_pipeline;
 mod rt_renderer;
 mod scene;
 mod screenshot;
@@ -19,17 +21,19 @@ use std::path::Path;
 #[derive(Parser)]
 #[command(name = "lux-playground", about = "Lux shader playground")]
 struct Args {
-    /// Base name or path to .spv files (without stage extension).
-    ///
-    /// For example, "shaders/my_shader" will look for:
-    ///   - shaders/my_shader.vert.spv + shaders/my_shader.frag.spv (triangle/pbr)
-    ///   - shaders/my_shader.frag.spv (fullscreen)
-    ///   - shaders/my_shader.rgen.spv + .rchit.spv + .rmiss.spv (rt)
-    shader: String,
+    /// Scene source: sphere, fullscreen, triangle, or path to .glb/.gltf
+    #[arg(long, required_unless_present = "shader")]
+    scene: Option<String>,
 
-    /// Rendering mode: triangle, fullscreen, pbr, or rt.
-    ///
-    /// If not specified, auto-detected from which .spv files exist.
+    /// Pipeline shader base path (auto-resolved from scene if not given)
+    #[arg(long)]
+    pipeline: Option<String>,
+
+    /// [DEPRECATED: use --scene/--pipeline] Base path to .spv shader files
+    #[arg(index = 1)]
+    shader: Option<String>,
+
+    /// [DEPRECATED: use --scene instead]
     #[arg(long, value_parser = ["triangle", "fullscreen", "pbr", "rt"])]
     mode: Option<String>,
 
@@ -65,94 +69,111 @@ fn main() {
     }
 }
 
-fn run(args: Args) -> Result<(), String> {
-    let shader_base = &args.shader;
+/// Resolve a default pipeline shader base path from the scene source.
+fn resolve_default_pipeline(scene: &str) -> Result<String, String> {
+    if scene.ends_with(".glb") || scene.ends_with(".gltf") {
+        Ok("examples/gltf_pbr".to_string())
+    } else if scene == "fullscreen" {
+        Err("--pipeline required for fullscreen scenes".to_string())
+    } else if scene == "triangle" {
+        Ok("examples/hello_triangle".to_string())
+    } else {
+        Ok("examples/pbr_basic".to_string())
+    }
+}
 
-    // Detect or use provided mode
-    let mode = match args.mode.as_deref() {
-        Some(m) => m.to_string(),
-        None => detect_mode(shader_base).to_string(),
+/// Auto-detect the render path from which .spv files exist for a pipeline base.
+fn detect_render_path(pipeline_base: &str) -> &'static str {
+    if Path::new(&format!("{}.rgen.spv", pipeline_base)).exists() {
+        "rt"
+    } else if Path::new(&format!("{}.vert.spv", pipeline_base)).exists()
+        && Path::new(&format!("{}.frag.spv", pipeline_base)).exists()
+    {
+        "raster"
+    } else if Path::new(&format!("{}.frag.spv", pipeline_base)).exists() {
+        "fullscreen"
+    } else {
+        panic!(
+            "No shader files found for pipeline base: {}",
+            pipeline_base
+        );
+    }
+}
+
+fn run(args: Args) -> Result<(), String> {
+    // Handle backward compatibility: old --mode maps to new --scene
+    let scene_source = if let Some(scene) = &args.scene {
+        scene.clone()
+    } else if let Some(mode) = &args.mode {
+        match mode.as_str() {
+            "triangle" => "triangle".to_string(),
+            "fullscreen" => "fullscreen".to_string(),
+            "pbr" => "sphere".to_string(),
+            "rt" => "sphere".to_string(),
+            _ => "sphere".to_string(),
+        }
+    } else {
+        "sphere".to_string() // default
     };
 
-    info!("Mode: {}", mode);
-    info!("Shader base: {}", shader_base);
+    let pipeline_base = if let Some(p) = &args.pipeline {
+        p.clone()
+    } else if let Some(shader) = &args.shader {
+        shader.clone()
+    } else {
+        resolve_default_pipeline(&scene_source).unwrap_or_else(|e| panic!("{}", e))
+    };
+
+    let render_path = detect_render_path(&pipeline_base);
+
+    info!("Scene: {}", scene_source);
+    info!("Pipeline: {}", pipeline_base);
+    info!("Render path: {}", render_path);
     info!("Resolution: {}x{}", args.width, args.height);
     info!("Output: {}", args.output);
 
     if args.interactive && !args.headless {
-        run_interactive(shader_base, &mode, args.width, args.height)?;
+        run_interactive(&pipeline_base, &scene_source, render_path, args.width, args.height)?;
     } else {
-        run_headless(shader_base, &mode, args.width, args.height, &args.output)?;
+        run_headless(&pipeline_base, &scene_source, render_path, args.width, args.height, &args.output)?;
     }
 
     Ok(())
 }
 
-/// Auto-detect the rendering mode from which .spv files exist.
-fn detect_mode(base: &str) -> &str {
-    if Path::new(&format!("{}.rgen.spv", base)).exists() {
-        "rt"
-    } else if Path::new(&format!("{}.vert.spv", base)).exists()
-        && Path::new(&format!("{}.frag.spv", base)).exists()
-    {
-        "triangle"
-    } else if Path::new(&format!("{}.frag.spv", base)).exists() {
-        "fullscreen"
-    } else {
-        panic!(
-            "No .spv files found for base: {}. Expected one of:\n  \
-             {0}.rgen.spv (ray tracing)\n  \
-             {0}.vert.spv + {0}.frag.spv (triangle/pbr)\n  \
-             {0}.frag.spv (fullscreen)",
-            base
-        );
-    }
-}
-
 /// Run in headless mode: create context, render offscreen, save PNG.
 fn run_headless(
-    shader_base: &str,
-    mode: &str,
+    pipeline_base: &str,
+    scene_source: &str,
+    render_path: &str,
     width: u32,
     height: u32,
     output: &str,
 ) -> Result<(), String> {
-    let enable_rt = mode == "rt";
+    let enable_rt = render_path == "rt";
 
     info!("Creating Vulkan context (RT: {})...", enable_rt);
     let mut ctx = vulkan_context::VulkanContext::new(enable_rt)?;
 
     let output_path = Path::new(output);
 
-    let result = match mode {
-        "triangle" => {
-            info!("Rendering triangle...");
+    let result = match render_path {
+        "raster" => {
+            info!("Rendering raster scene '{}' with pipeline '{}'...", scene_source, pipeline_base);
             raster_renderer::render_raster(
                 &mut ctx,
-                raster_renderer::RasterMode::Triangle,
-                shader_base,
+                pipeline_base,
+                scene_source,
                 width,
                 height,
                 output_path,
             )
         }
         "fullscreen" => {
-            info!("Rendering fullscreen quad...");
-            raster_renderer::render_raster(
+            info!("Rendering fullscreen pipeline '{}'...", pipeline_base);
+            raster_renderer::render_fullscreen(
                 &mut ctx,
-                raster_renderer::RasterMode::Fullscreen,
-                shader_base,
-                width,
-                height,
-                output_path,
-            )
-        }
-        "pbr" => {
-            info!("Rendering PBR sphere...");
-            raster_renderer::render_raster(
-                &mut ctx,
-                raster_renderer::RasterMode::Pbr,
-                shader_base,
+                pipeline_base,
                 width,
                 height,
                 output_path,
@@ -168,9 +189,9 @@ fn run_headless(
                 );
             }
             info!("Rendering ray traced image...");
-            rt_renderer::render_rt(&mut ctx, shader_base, width, height, output_path)
+            rt_renderer::render_rt(&mut ctx, pipeline_base, scene_source, width, height, output_path)
         }
-        _ => Err(format!("Unknown mode: {}", mode)),
+        _ => Err(format!("Unknown render path: {}", render_path)),
     };
 
     // Wait for GPU idle before cleanup
@@ -190,8 +211,9 @@ fn run_headless(
 
 /// Run in interactive mode with a winit window.
 fn run_interactive(
-    shader_base: &str,
-    mode: &str,
+    pipeline_base: &str,
+    scene_source: &str,
+    render_path: &str,
     width: u32,
     height: u32,
 ) -> Result<(), String> {
@@ -203,8 +225,9 @@ fn run_interactive(
 
     struct App {
         window: Option<Window>,
-        shader_base: String,
-        mode: String,
+        pipeline_base: String,
+        scene_source: String,
+        render_path: String,
         width: u32,
         height: u32,
         rendered: bool,
@@ -256,47 +279,39 @@ fn run_interactive(
                         // the result info. A full swapchain-based interactive loop
                         // would require surface creation and presentation.
                         info!(
-                            "Interactive mode: rendering {} with mode '{}'",
-                            self.shader_base, self.mode
+                            "Interactive mode: rendering scene '{}' with pipeline '{}' ({})",
+                            self.scene_source, self.pipeline_base, self.render_path
                         );
 
-                        let enable_rt = self.mode == "rt";
+                        let enable_rt = self.render_path == "rt";
                         match vulkan_context::VulkanContext::new(enable_rt) {
                             Ok(mut ctx) => {
                                 let output_path = Path::new("interactive_output.png");
-                                let result = match self.mode.as_str() {
-                                    "triangle" => raster_renderer::render_raster(
+                                let result = match self.render_path.as_str() {
+                                    "raster" => raster_renderer::render_raster(
                                         &mut ctx,
-                                        raster_renderer::RasterMode::Triangle,
-                                        &self.shader_base,
+                                        &self.pipeline_base,
+                                        &self.scene_source,
                                         self.width,
                                         self.height,
                                         output_path,
                                     ),
-                                    "fullscreen" => raster_renderer::render_raster(
+                                    "fullscreen" => raster_renderer::render_fullscreen(
                                         &mut ctx,
-                                        raster_renderer::RasterMode::Fullscreen,
-                                        &self.shader_base,
-                                        self.width,
-                                        self.height,
-                                        output_path,
-                                    ),
-                                    "pbr" => raster_renderer::render_raster(
-                                        &mut ctx,
-                                        raster_renderer::RasterMode::Pbr,
-                                        &self.shader_base,
+                                        &self.pipeline_base,
                                         self.width,
                                         self.height,
                                         output_path,
                                     ),
                                     "rt" => rt_renderer::render_rt(
                                         &mut ctx,
-                                        &self.shader_base,
+                                        &self.pipeline_base,
+                                        &self.scene_source,
                                         self.width,
                                         self.height,
                                         output_path,
                                     ),
-                                    _ => Err(format!("Unknown mode: {}", self.mode)),
+                                    _ => Err(format!("Unknown render path: {}", self.render_path)),
                                 };
 
                                 unsafe {
@@ -328,8 +343,9 @@ fn run_interactive(
 
     let mut app = App {
         window: None,
-        shader_base: shader_base.to_string(),
-        mode: mode.to_string(),
+        pipeline_base: pipeline_base.to_string(),
+        scene_source: scene_source.to_string(),
+        render_path: render_path.to_string(),
         width,
         height,
         rendered: false,

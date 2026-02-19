@@ -1,12 +1,14 @@
 #include "rt_renderer.h"
 #include "spv_loader.h"
 #include "camera.h"
+#include "reflected_pipeline.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <stdexcept>
 #include <iostream>
 #include <cstring>
 #include <array>
+#include <filesystem>
 
 // --------------------------------------------------------------------------
 // Alignment helper
@@ -87,11 +89,40 @@ void RTRenderer::createStorageImage(VulkanContext& ctx) {
 // BLAS creation from sphere mesh
 // --------------------------------------------------------------------------
 
+static bool isGltfFileRT(const std::string& source) {
+    if (source.size() > 4 && source.substr(source.size()-4) == ".glb") return true;
+    if (source.size() > 5 && source.substr(source.size()-5) == ".gltf") return true;
+    return false;
+}
+
 void RTRenderer::createBLAS(VulkanContext& ctx) {
-    // Generate sphere mesh and upload to GPU
+    // Load mesh from glTF or generate procedural sphere
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
-    Scene::generateSphere(32, 32, vertices, indices);
+
+    if (isGltfFileRT(m_sceneSource)) {
+        std::cout << "[info] Loading glTF for RT BLAS: " << m_sceneSource << std::endl;
+        GltfScene gltfScene = loadGltf(m_sceneSource);
+
+        if (!gltfScene.meshes.empty()) {
+            auto& gmesh = gltfScene.meshes[0];
+            vertices.resize(gmesh.vertices.size());
+            for (size_t i = 0; i < gmesh.vertices.size(); i++) {
+                vertices[i].position = gmesh.vertices[i].position;
+                vertices[i].normal = gmesh.vertices[i].normal;
+                vertices[i].uv = gmesh.vertices[i].uv;
+            }
+            indices = gmesh.indices;
+            std::cout << "[info] Loaded glTF mesh for BLAS: " << vertices.size()
+                      << " vertices, " << indices.size() << " indices" << std::endl;
+        } else {
+            std::cout << "[warn] glTF has no meshes, falling back to sphere" << std::endl;
+            Scene::generateSphere(32, 32, vertices, indices);
+        }
+    } else {
+        Scene::generateSphere(32, 32, vertices, indices);
+    }
+
     sphereMesh = Scene::uploadMesh(ctx.allocator, ctx.device, ctx.commandPool,
                                    ctx.graphicsQueue, vertices, indices);
 
@@ -355,7 +386,7 @@ void RTRenderer::createTLAS(VulkanContext& ctx) {
 }
 
 // --------------------------------------------------------------------------
-// RT pipeline creation
+// RT pipeline creation (reflection-driven descriptor sets)
 // --------------------------------------------------------------------------
 
 void RTRenderer::createRTPipeline(VulkanContext& ctx) {
@@ -407,46 +438,12 @@ void RTRenderer::createRTPipeline(VulkanContext& ctx) {
     groups[2].anyHitShader = VK_SHADER_UNUSED_KHR;
     groups[2].intersectionShader = VK_SHADER_UNUSED_KHR;
 
-    // Descriptor set layout: 3 bindings
-    VkDescriptorSetLayoutBinding bindings[3] = {};
+    // Create descriptor set layouts from reflection data (NO hardcoded bindings)
+    reflectedSetLayouts = createDescriptorSetLayoutsMultiStage(ctx.device, stageReflections);
 
-    // Binding 0: TLAS (acceleration structure)
-    bindings[0].binding = 0;
-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
-
-    // Binding 1: Storage image (RT output)
-    bindings[1].binding = 1;
-    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
-
-    // Binding 2: Camera UBO
-    bindings[2].binding = 2;
-    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    bindings[2].descriptorCount = 1;
-    bindings[2].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
-                             VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
-
-    VkDescriptorSetLayoutCreateInfo layoutInfo = {};
-    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 3;
-    layoutInfo.pBindings = bindings;
-
-    if (vkCreateDescriptorSetLayout(ctx.device, &layoutInfo, nullptr, &descSetLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create RT descriptor set layout");
-    }
-
-    // Pipeline layout
-    VkPipelineLayoutCreateInfo pipeLayoutInfo = {};
-    pipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipeLayoutInfo.setLayoutCount = 1;
-    pipeLayoutInfo.pSetLayouts = &descSetLayout;
-
-    if (vkCreatePipelineLayout(ctx.device, &pipeLayoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create RT pipeline layout");
-    }
+    // Pipeline layout from reflection
+    pipelineLayout = createReflectedPipelineLayoutMultiStage(
+        ctx.device, reflectedSetLayouts, stageReflections);
 
     // Create RT pipeline
     VkRayTracingPipelineCreateInfoKHR rtPipeInfo = {};
@@ -465,7 +462,7 @@ void RTRenderer::createRTPipeline(VulkanContext& ctx) {
         throw std::runtime_error("Failed to create ray tracing pipeline");
     }
 
-    std::cout << "[info] RT pipeline created" << std::endl;
+    std::cout << "[info] RT pipeline created (reflection-driven)" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -557,7 +554,7 @@ void RTRenderer::createSBT(VulkanContext& ctx) {
 }
 
 // --------------------------------------------------------------------------
-// Descriptor set creation and update
+// Reflection-driven descriptor set creation and update
 // --------------------------------------------------------------------------
 
 void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
@@ -579,80 +576,110 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
     // Update camera data
     updateCameraUBO(ctx);
 
-    // Create descriptor pool
-    VkDescriptorPoolSize poolSizes[] = {
-        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-    };
+    // Get merged bindings from reflection data for pool sizing
+    auto mergedBindings = getMergedBindings(stageReflections);
+
+    // Count pool sizes from reflection data
+    std::unordered_map<VkDescriptorType, uint32_t> typeCounts;
+    for (auto& b : mergedBindings) {
+        VkDescriptorType vkType;
+        if (b.type == "uniform_buffer") vkType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        else if (b.type == "sampler") vkType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        else if (b.type == "sampled_image") vkType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        else if (b.type == "sampled_cube_image") vkType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        else if (b.type == "storage_image") vkType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        else if (b.type == "acceleration_structure") vkType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        else vkType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        typeCounts[vkType]++;
+    }
+
+    std::vector<VkDescriptorPoolSize> poolSizes;
+    for (auto& [type, count] : typeCounts) {
+        poolSizes.push_back({type, count});
+    }
+
+    uint32_t maxSets = static_cast<uint32_t>(reflectedSetLayouts.size());
 
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 1;
-    poolInfo.poolSizeCount = 3;
-    poolInfo.pPoolSizes = poolSizes;
+    poolInfo.maxSets = maxSets;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
 
     if (vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create RT descriptor pool");
     }
 
-    // Allocate descriptor set
-    VkDescriptorSetAllocateInfo allocSetInfo = {};
-    allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocSetInfo.descriptorPool = descriptorPool;
-    allocSetInfo.descriptorSetCount = 1;
-    allocSetInfo.pSetLayouts = &descSetLayout;
+    // Allocate descriptor sets
+    for (auto& [setIdx, layout] : reflectedSetLayouts) {
+        VkDescriptorSetAllocateInfo allocSetInfo = {};
+        allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocSetInfo.descriptorPool = descriptorPool;
+        allocSetInfo.descriptorSetCount = 1;
+        allocSetInfo.pSetLayouts = &layout;
 
-    if (vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &descriptorSet) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate RT descriptor set");
+        VkDescriptorSet set;
+        if (vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &set) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate RT descriptor set");
+        }
+        reflectedDescSets[setIdx] = set;
     }
 
-    // Write TLAS (binding 0) via pNext
-    VkWriteDescriptorSetAccelerationStructureKHR asWrite = {};
-    asWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
-    asWrite.accelerationStructureCount = 1;
-    asWrite.pAccelerationStructures = &tlas;
+    // Write descriptor sets based on reflection binding names
+    // We need to keep descriptor info structs alive until vkUpdateDescriptorSets
+    struct DescWriteInfo {
+        VkDescriptorBufferInfo bufferInfo;
+        VkDescriptorImageInfo imageInfo;
+        VkWriteDescriptorSetAccelerationStructureKHR asInfo;
+    };
+    std::vector<DescWriteInfo> writeInfos(mergedBindings.size());
+    std::vector<VkWriteDescriptorSet> writes;
 
-    // Write storage image (binding 1)
-    VkDescriptorImageInfo imageDescInfo = {};
-    imageDescInfo.imageView = storageImageView;
-    imageDescInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    for (size_t i = 0; i < mergedBindings.size(); i++) {
+        auto& b = mergedBindings[i];
+        auto setIt = reflectedDescSets.find(b.set);
+        if (setIt == reflectedDescSets.end()) continue;
 
-    // Write camera UBO (binding 2)
-    VkDescriptorBufferInfo camBufDesc = {};
-    camBufDesc.buffer = cameraBuffer;
-    camBufDesc.offset = 0;
-    camBufDesc.range = 128;
+        VkWriteDescriptorSet w = {};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = setIt->second;
+        w.dstBinding = static_cast<uint32_t>(b.binding);
+        w.descriptorCount = 1;
 
-    VkWriteDescriptorSet writes[3] = {};
+        if (b.type == "uniform_buffer") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            // Match by name: "Camera" or "Light" -> cameraBuffer
+            writeInfos[i].bufferInfo = {cameraBuffer, 0,
+                static_cast<VkDeviceSize>(b.size > 0 ? b.size : 128)};
+            w.pBufferInfo = &writeInfos[i].bufferInfo;
+        } else if (b.type == "acceleration_structure") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            writeInfos[i].asInfo = {};
+            writeInfos[i].asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+            writeInfos[i].asInfo.accelerationStructureCount = 1;
+            writeInfos[i].asInfo.pAccelerationStructures = &tlas;
+            w.pNext = &writeInfos[i].asInfo;
+        } else if (b.type == "storage_image") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writeInfos[i].imageInfo = {};
+            writeInfos[i].imageInfo.imageView = storageImageView;
+            writeInfos[i].imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            w.pImageInfo = &writeInfos[i].imageInfo;
+        } else {
+            continue; // Skip unsupported types
+        }
 
-    // Binding 0: TLAS
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].pNext = &asWrite;
-    writes[0].dstSet = descriptorSet;
-    writes[0].dstBinding = 0;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        writes.push_back(w);
+    }
 
-    // Binding 1: Storage image
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = descriptorSet;
-    writes[1].dstBinding = 1;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[1].pImageInfo = &imageDescInfo;
+    if (!writes.empty()) {
+        vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
+    }
 
-    // Binding 2: Camera UBO
-    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[2].dstSet = descriptorSet;
-    writes[2].dstBinding = 2;
-    writes[2].descriptorCount = 1;
-    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    writes[2].pBufferInfo = &camBufDesc;
-
-    vkUpdateDescriptorSets(ctx.device, 3, writes, 0, nullptr);
-
-    std::cout << "[info] RT descriptor set created" << std::endl;
+    std::cout << "[info] RT descriptor set created (reflection-driven: "
+              << reflectedSetLayouts.size() << " set(s), "
+              << mergedBindings.size() << " binding(s))" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -679,15 +706,47 @@ void RTRenderer::init(VulkanContext& ctx,
                       const std::string& rgenSpvPath,
                       const std::string& rmissSpvPath,
                       const std::string& rchitSpvPath,
-                      uint32_t width, uint32_t height) {
+                      uint32_t width, uint32_t height,
+                      const std::string& sceneSource) {
     if (!ctx.supportsRT()) {
         throw std::runtime_error("Ray tracing is not supported on this device");
     }
 
     renderWidth = width;
     renderHeight = height;
+    m_sceneSource = sceneSource;
 
     std::cout << "[info] Initializing RT renderer (" << width << "x" << height << ")" << std::endl;
+
+    // Derive pipeline base from rgen path (strip .rgen.spv suffix)
+    m_pipelineBase = rgenSpvPath;
+    auto pos = m_pipelineBase.find(".rgen.spv");
+    if (pos != std::string::npos) {
+        m_pipelineBase = m_pipelineBase.substr(0, pos);
+    }
+
+    // Load reflection JSON for all RT stages
+    namespace fs = std::filesystem;
+    std::string rgenJsonPath = m_pipelineBase + ".rgen.json";
+    std::string rmissJsonPath = m_pipelineBase + ".rmiss.json";
+    std::string rchitJsonPath = m_pipelineBase + ".rchit.json";
+
+    if (fs::exists(rgenJsonPath)) {
+        std::cout << "[info] Loading reflection JSON: " << rgenJsonPath << std::endl;
+        stageReflections.push_back(parseReflectionJson(rgenJsonPath));
+    }
+    if (fs::exists(rchitJsonPath)) {
+        std::cout << "[info] Loading reflection JSON: " << rchitJsonPath << std::endl;
+        stageReflections.push_back(parseReflectionJson(rchitJsonPath));
+    }
+    if (fs::exists(rmissJsonPath)) {
+        std::cout << "[info] Loading reflection JSON: " << rmissJsonPath << std::endl;
+        stageReflections.push_back(parseReflectionJson(rmissJsonPath));
+    }
+
+    if (stageReflections.empty()) {
+        throw std::runtime_error("No reflection JSON files found for RT pipeline: " + m_pipelineBase);
+    }
 
     // Load shader modules
     auto rgenCode = SpvLoader::loadSPIRV(rgenSpvPath);
@@ -741,10 +800,22 @@ void RTRenderer::render(VulkanContext& ctx) {
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    // Bind RT pipeline and descriptors
+    // Bind RT pipeline and reflection-driven descriptors
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
-                            pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+
+    // Bind descriptor sets in order
+    int maxSet = -1;
+    for (auto& [idx, _] : reflectedDescSets) {
+        maxSet = std::max(maxSet, idx);
+    }
+    for (int i = 0; i <= maxSet; i++) {
+        auto it = reflectedDescSets.find(i);
+        if (it != reflectedDescSets.end()) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                    pipelineLayout, static_cast<uint32_t>(i),
+                                    1, &it->second, 0, nullptr);
+        }
+    }
 
     // Trace rays
     ctx.pfnCmdTraceRaysKHR(cmd,
@@ -775,8 +846,13 @@ void RTRenderer::cleanup(VulkanContext& ctx) {
     // Pipeline resources
     if (pipeline) vkDestroyPipeline(ctx.device, pipeline, nullptr);
     if (pipelineLayout) vkDestroyPipelineLayout(ctx.device, pipelineLayout, nullptr);
-    if (descSetLayout) vkDestroyDescriptorSetLayout(ctx.device, descSetLayout, nullptr);
     if (descriptorPool) vkDestroyDescriptorPool(ctx.device, descriptorPool, nullptr);
+
+    for (auto& [_, layout] : reflectedSetLayouts) {
+        vkDestroyDescriptorSetLayout(ctx.device, layout, nullptr);
+    }
+    reflectedSetLayouts.clear();
+    reflectedDescSets.clear();
 
     // Shader modules
     if (rgenModule) vkDestroyShaderModule(ctx.device, rgenModule, nullptr);

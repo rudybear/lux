@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "source": "pbr_basic.lux",
+  "stage": "fragment",
+  "execution_model": "Fragment",
+  "inputs": [
+    {
+      "name": "frag_normal",
+      "type": "vec3",
+      "location": 0
+    },
+    {
+      "name": "frag_pos",
+      "type": "vec3",
+      "location": 1
+    },
+    {
+      "name": "frag_uv",
+      "type": "vec2",
+      "location": 2
+    }
+  ],
+  "outputs": [
+    {
+      "name": "color",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "descriptor_sets": {
+    "1": [
+      {
+        "binding": 0,
+        "type": "sampler",
+        "name": "albedo_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "sampled_image",
+        "name": "albedo_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "Lighting",
+      "fields": [
+        {
+          "name": "light_dir",
+          "type": "vec3",
+          "offset": 0,
+          "size": 12
+        },
+        {
+          "name": "view_pos",
+          "type": "vec3",
+          "offset": 16,
+          "size": 12
+        }
+      ],
+      "size": 32,
+      "stage_flags": [
+        "fragment"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0
+}

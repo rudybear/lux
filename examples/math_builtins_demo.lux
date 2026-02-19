@@ -1,0 +1,75 @@
+// Math Builtins Demo — visualize round, trunc, sinh, cosh, tanh,
+// radians, degrees, faceforward functions in a grid layout
+
+fragment {
+    in uv: vec2;
+    out color: vec4;
+
+    fn main() {
+        // 4x2 grid (4 columns, 2 rows = 8 cells)
+        let cols: scalar = 4.0;
+        let rows: scalar = 2.0;
+        let cell_uv: vec2 = fract(vec2(uv.x * cols, uv.y * rows));
+        let cell_x: scalar = floor(uv.x * cols);
+        let cell_y: scalar = floor(uv.y * rows);
+        let cell_id: scalar = cell_y * cols + cell_x;
+
+        // Input value mapped from cell UV: x in [-3, 3]
+        let x: scalar = cell_uv.x * 6.0 - 3.0;
+        // Normalized value for display (map function output to [0,1])
+        let val: scalar = 0.0;
+
+        // Cell 0: round
+        let v0: scalar = round(x) * 0.15 + 0.5;
+        // Cell 1: trunc
+        let v1: scalar = trunc(x) * 0.15 + 0.5;
+        // Cell 2: sinh (scaled)
+        let v2: scalar = sinh(x * 0.5) * 0.1 + 0.5;
+        // Cell 3: cosh (scaled)
+        let v3: scalar = (cosh(x * 0.5) - 1.0) * 0.15 + 0.2;
+        // Cell 4: tanh
+        let v4: scalar = tanh(x) * 0.4 + 0.5;
+        // Cell 5: radians (map degrees to radians, scaled)
+        let v5: scalar = radians(x * 60.0) * 0.1 + 0.5;
+        // Cell 6: degrees (map radians to degrees, scaled)
+        let v6: scalar = degrees(x * 0.5) * 0.005 + 0.5;
+        // Cell 7: faceforward visualization
+        let test_n: vec3 = vec3(0.0, 1.0, 0.0);
+        let test_i: vec3 = normalize(vec3(cell_uv.x - 0.5, cell_uv.y - 0.5, 0.5));
+        let test_ref: vec3 = vec3(0.0, 0.0, 1.0);
+        let ff: vec3 = faceforward(test_n, test_i, test_ref);
+        let v7: scalar = ff.y * 0.5 + 0.5;
+
+        // Select value based on cell
+        let is0: scalar = (cell_id < 0.5) ? 1.0 : 0.0;
+        let is1: scalar = (cell_id > 0.5 && cell_id < 1.5) ? 1.0 : 0.0;
+        let is2: scalar = (cell_id > 1.5 && cell_id < 2.5) ? 1.0 : 0.0;
+        let is3: scalar = (cell_id > 2.5 && cell_id < 3.5) ? 1.0 : 0.0;
+        let is4: scalar = (cell_id > 3.5 && cell_id < 4.5) ? 1.0 : 0.0;
+        let is5: scalar = (cell_id > 4.5 && cell_id < 5.5) ? 1.0 : 0.0;
+        let is6: scalar = (cell_id > 5.5 && cell_id < 6.5) ? 1.0 : 0.0;
+        let is7: scalar = (cell_id > 6.5) ? 1.0 : 0.0;
+
+        let selected: scalar = v0*is0 + v1*is1 + v2*is2 + v3*is3 + v4*is4 + v5*is5 + v6*is6 + v7*is7;
+
+        // Plot: draw a curve line where cell_uv.y ≈ selected value
+        let plot_dist: scalar = abs(cell_uv.y - clamp(selected, 0.0, 1.0));
+        let line: scalar = smoothstep(0.02, 0.005, plot_dist);
+
+        // Color: warm for positive, cool for negative
+        let base_hue: scalar = (selected > 0.5) ? 0.1 : 0.6;
+        let r: scalar = 0.1 + line * ((base_hue < 0.3) ? 0.9 : 0.2);
+        let g: scalar = 0.1 + line * 0.4;
+        let b: scalar = 0.15 + line * ((base_hue > 0.3) ? 0.8 : 0.2);
+
+        // Midline reference
+        let mid_line: scalar = smoothstep(0.01, 0.003, abs(cell_uv.y - 0.5));
+        let ref_r: scalar = mid_line * 0.2;
+
+        // Grid lines
+        let gx: scalar = smoothstep(0.0, 0.015, cell_uv.x) * smoothstep(0.0, 0.015, 1.0 - cell_uv.x);
+        let gy: scalar = smoothstep(0.0, 0.015, cell_uv.y) * smoothstep(0.0, 0.015, 1.0 - cell_uv.y);
+
+        color = vec4(vec3(r + ref_r, g + ref_r * 0.5, b) * gx * gy, 1.0);
+    }
+}

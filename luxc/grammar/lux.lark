@@ -95,7 +95,8 @@ push_block: "push" IDENT "{" block_field ("," block_field)* ","? "}"
 
 block_field: IDENT ":" type
 
-sampler_decl: "sampler2d" IDENT ";"
+sampler_decl: SAMPLER_TYPE IDENT ";"
+SAMPLER_TYPE: "sampler2d" | "samplerCube"
 
 // RT-specific stage items
 ray_payload_decl: "ray_payload" IDENT ":" type ";"
@@ -143,7 +144,7 @@ TYPE_NAME: "scalar" | "int" | "uint" | "bool"
          | "ivec2" | "ivec3" | "ivec4"
          | "uvec2" | "uvec3" | "uvec4"
          | "mat2" | "mat3" | "mat4"
-         | "sampler2d" | "void"
+         | "sampler2d" | "samplerCube" | "void"
          | "acceleration_structure"
          | IDENT
 

@@ -6,6 +6,31 @@ from luxc.builtins.types import resolve_type, MatrixType
 
 
 def assign_layouts(module: Module) -> None:
+    # Auto-assign descriptor set offsets for multi-stage shaders.
+    # Each stage gets its own descriptor set to avoid binding conflicts.
+    # Only applies if the offset wasn't already set (e.g. by surface_expander).
+    #
+    # Raster: vertex → set 0, fragment → set 1
+    # RT: raygen → set 0, closest_hit → set 1, miss → set 2
+    has_vertex = any(s.stage_type == "vertex" for s in module.stages)
+    has_fragment = any(s.stage_type == "fragment" for s in module.stages)
+    if has_vertex and has_fragment:
+        for stage in module.stages:
+            if not hasattr(stage, '_descriptor_set_offset'):
+                if stage.stage_type == "vertex":
+                    stage._descriptor_set_offset = 0
+                elif stage.stage_type == "fragment":
+                    stage._descriptor_set_offset = 1
+
+    # RT multi-stage: assign each stage its own set offset
+    rt_stage_order = {"raygen": 0, "closest_hit": 1, "miss": 2,
+                      "any_hit": 3, "intersection": 4, "callable": 5}
+    rt_stages = [s for s in module.stages if s.stage_type in rt_stage_order]
+    if len(rt_stages) > 1:
+        for stage in rt_stages:
+            if not hasattr(stage, '_descriptor_set_offset'):
+                stage._descriptor_set_offset = rt_stage_order[stage.stage_type]
+
     binding_counter = 0
     for stage in module.stages:
         _assign_stage_layouts(stage, binding_counter)

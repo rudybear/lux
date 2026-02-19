@@ -79,6 +79,7 @@ MAT4 = MatrixType("mat4", 4)
 MAT4X3 = MatrixType("mat4x3", 4, 3)
 
 SAMPLER2D = SamplerType("sampler2d")
+SAMPLER_CUBE = SamplerType("samplerCube")
 ACCELERATION_STRUCTURE = AccelerationStructureType("acceleration_structure")
 STORAGE_IMAGE = StorageImageType("storage_image")
 
@@ -94,6 +95,7 @@ TYPE_MAP: dict[str, LuxType] = {
     "uvec2": UVEC2, "uvec3": UVEC3, "uvec4": UVEC4,
     "mat2": MAT2, "mat3": MAT3, "mat4": MAT4, "mat4x3": MAT4X3,
     "sampler2d": SAMPLER2D,
+    "samplerCube": SAMPLER_CUBE,
     "acceleration_structure": ACCELERATION_STRUCTURE,
     "storage_image": STORAGE_IMAGE,
 }

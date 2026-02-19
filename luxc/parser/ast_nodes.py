@@ -222,6 +222,7 @@ class BlockField:
 @dataclass
 class SamplerDecl:
     name: str
+    type_name: str = "sampler2d"           # "sampler2d" or "samplerCube"
     set_number: Optional[int] = None
     binding: Optional[int] = None          # sampler state binding
     texture_binding: Optional[int] = None  # texture image binding

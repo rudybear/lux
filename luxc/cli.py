@@ -43,6 +43,16 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip compilation verification of AI-generated code",
     )
     parser.add_argument(
+        "--no-reflection",
+        action="store_true",
+        help="Skip .lux.json reflection metadata emission",
+    )
+    parser.add_argument(
+        "-g", "--debug",
+        action="store_true",
+        help="Emit OpLine/OpSource debug info in SPIR-V",
+    )
+    parser.add_argument(
         "--version", action="version", version="luxc 0.1.0"
     )
 
@@ -117,6 +127,9 @@ def main(argv: list[str] | None = None) -> None:
             dump_ast=args.dump_ast,
             emit_asm=args.emit_asm,
             validate=not args.no_validate,
+            emit_reflection=not args.no_reflection,
+            debug=args.debug,
+            source_name=input_path.name,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

@@ -287,6 +287,8 @@ def _generate_surface_main(
 ) -> list:
     """Generate the main() body for a surface-expanded fragment shader."""
     body = []
+    # Use the surface declaration's source location for synthetic nodes
+    _synth_loc = surface.loc
 
     # Determine which inputs we have
     has_normal = any(n in ("frag_normal", "world_normal") for n, _ in frag_inputs)
@@ -295,7 +297,7 @@ def _generate_surface_main(
     pos_var = next((n for n, _ in frag_inputs if n in ("frag_pos", "world_pos")), "frag_pos")
 
     # Normalize the surface normal
-    body.append(LetStmt("n", "vec3", CallExpr(VarRef("normalize"), [VarRef(normal_var)])))
+    body.append(LetStmt("n", "vec3", CallExpr(VarRef("normalize"), [VarRef(normal_var)]), loc=_synth_loc))
 
     # Compute view and light directions
     if has_pos:
@@ -307,7 +309,7 @@ def _generate_surface_main(
             ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("0.0"), NumberLit("1.0")])
         ])))
 
-    body.append(LetStmt("l", "vec3", CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+    body.append(LetStmt("l", "vec3", CallExpr(VarRef("normalize"), [VarRef("light_dir")]), loc=_synth_loc))
 
     # Evaluate the BRDF based on the surface members
     brdf_expr = None

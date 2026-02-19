@@ -62,6 +62,8 @@ set(SOURCES
     src/scene.cpp
     src/camera.cpp
     src/screenshot.cpp
+    src/reflected_pipeline.cpp
+    src/gltf_loader.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})

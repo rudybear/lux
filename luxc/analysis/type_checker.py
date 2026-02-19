@@ -97,8 +97,10 @@ class TypeChecker:
 
         # Register samplers
         for sam in stage.samplers:
-            from luxc.builtins.types import SAMPLER2D
-            scope.define(Symbol(sam.name, SAMPLER2D, "sampler"))
+            from luxc.builtins.types import SAMPLER2D, SAMPLER_CUBE
+            sam_type_name = getattr(sam, 'type_name', 'sampler2d')
+            sam_type = SAMPLER_CUBE if sam_type_name == "samplerCube" else SAMPLER2D
+            scope.define(Symbol(sam.name, sam_type, "sampler"))
 
         # Register RT-specific variables
         for rp in stage.ray_payloads:

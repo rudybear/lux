@@ -1,12 +1,17 @@
 #include "raster_renderer.h"
 #include "spv_loader.h"
 #include "camera.h"
+#include "gltf_loader.h"
+#include "reflected_pipeline.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <stdexcept>
 #include <iostream>
 #include <cstring>
 #include <array>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
 
 // --------------------------------------------------------------------------
 // Offscreen render target creation
@@ -46,8 +51,8 @@ void RasterRenderer::createOffscreenTarget(VulkanContext& ctx) {
 
     vkCreateImageView(ctx.device, &viewInfo, nullptr, &offscreenImageView);
 
-    // Depth attachment (PBR mode)
-    if (mode == RasterMode::PBR) {
+    // Depth attachment (raster scenes with 3D geometry)
+    if (m_needsDepth) {
         VkImageCreateInfo depthInfo = imageInfo;
         depthInfo.format = VK_FORMAT_D32_SFLOAT;
         depthInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
@@ -90,8 +95,8 @@ void RasterRenderer::createRenderPass(VulkanContext& ctx) {
     colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorRefs.push_back(colorRef);
 
-    // Depth attachment (PBR only)
-    if (mode == RasterMode::PBR) {
+    // Depth attachment (raster scenes with 3D geometry)
+    if (m_needsDepth) {
         VkAttachmentDescription depthAtt = {};
         depthAtt.format = VK_FORMAT_D32_SFLOAT;
         depthAtt.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -111,7 +116,7 @@ void RasterRenderer::createRenderPass(VulkanContext& ctx) {
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = static_cast<uint32_t>(colorRefs.size());
     subpass.pColorAttachments = colorRefs.data();
-    if (mode == RasterMode::PBR) {
+    if (m_needsDepth) {
         subpass.pDepthStencilAttachment = &depthRef;
     }
 
@@ -146,7 +151,7 @@ void RasterRenderer::createRenderPass(VulkanContext& ctx) {
 
 void RasterRenderer::createFramebuffer(VulkanContext& ctx) {
     std::vector<VkImageView> attachments = {offscreenImageView};
-    if (mode == RasterMode::PBR) {
+    if (m_needsDepth) {
         attachments.push_back(depthImageView);
     }
 
@@ -370,7 +375,468 @@ void RasterRenderer::createPipelineFullscreen(VulkanContext& ctx) {
 }
 
 // --------------------------------------------------------------------------
-// PBR pipeline
+// Default 1x1 white texture for missing texture bindings
+// --------------------------------------------------------------------------
+
+void RasterRenderer::createDefaultWhiteTexture(VulkanContext& ctx) {
+    std::vector<uint8_t> white = {255, 255, 255, 255};
+    defaultWhiteTexture = Scene::uploadTexture(ctx.allocator, ctx.device, ctx.commandPool,
+                                                ctx.graphicsQueue, white, 1, 1);
+    std::cout << "[info] Created default 1x1 white fallback texture" << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Upload glTF texture images to GPU
+// --------------------------------------------------------------------------
+
+void RasterRenderer::uploadGltfTextures(VulkanContext& ctx) {
+    if (!m_hasGltfScene || m_gltfScene.materials.empty()) return;
+
+    // Use the first material (most common case for single-material models)
+    auto& mat = m_gltfScene.materials[0];
+
+    auto uploadIfValid = [&](const GltfTextureData& texData, const std::string& name) {
+        if (texData.valid()) {
+            auto gpuTex = Scene::uploadTexture(ctx.allocator, ctx.device, ctx.commandPool,
+                                                ctx.graphicsQueue, texData.pixels,
+                                                static_cast<uint32_t>(texData.width),
+                                                static_cast<uint32_t>(texData.height));
+            namedTextures[name] = gpuTex;
+            std::cout << "[info] Uploaded GPU texture: " << name
+                      << " (" << texData.width << "x" << texData.height << ")" << std::endl;
+        }
+    };
+
+    uploadIfValid(mat.base_color_tex, "base_color_tex");
+    uploadIfValid(mat.normal_tex, "normal_tex");
+    uploadIfValid(mat.metallic_roughness_tex, "metallic_roughness_tex");
+    uploadIfValid(mat.occlusion_tex, "occlusion_tex");
+    uploadIfValid(mat.emissive_tex, "emissive_tex");
+}
+
+// --------------------------------------------------------------------------
+// Cubemap upload (F16 RGBA data, 6 faces, N mip levels)
+// --------------------------------------------------------------------------
+
+GPUTexture RasterRenderer::uploadCubemapF16(VulkanContext& ctx, uint32_t faceSize,
+                                             uint32_t mipCount,
+                                             const std::vector<uint16_t>& data) {
+    GPUTexture tex;
+    tex.width = faceSize;
+    tex.height = faceSize;
+
+    // Create cubemap image
+    VkImageCreateInfo imageInfo = {};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    imageInfo.extent = {faceSize, faceSize, 1};
+    imageInfo.mipLevels = mipCount;
+    imageInfo.arrayLayers = 6;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+
+    VmaAllocationCreateInfo imageAllocInfo = {};
+    imageAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+    VkResult result = vmaCreateImage(ctx.allocator, &imageInfo, &imageAllocInfo,
+                                     &tex.image, &tex.allocation, nullptr);
+    if (result != VK_SUCCESS) {
+        std::cerr << "[warn] Failed to create cubemap image" << std::endl;
+        return tex;
+    }
+
+    // Create staging buffer for all data
+    VkDeviceSize dataSize = data.size() * sizeof(uint16_t);
+    VkBuffer stagingBuffer;
+    VmaAllocation stagingAlloc;
+    VkBufferCreateInfo stagingInfo = {};
+    stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    stagingInfo.size = dataSize;
+    stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VmaAllocationCreateInfo stagingAllocInfo = {};
+    stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+    vmaCreateBuffer(ctx.allocator, &stagingInfo, &stagingAllocInfo,
+                    &stagingBuffer, &stagingAlloc, nullptr);
+
+    void* mapped;
+    vmaMapMemory(ctx.allocator, stagingAlloc, &mapped);
+    memcpy(mapped, data.data(), dataSize);
+    vmaUnmapMemory(ctx.allocator, stagingAlloc);
+
+    // Transition image to TRANSFER_DST
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = tex.image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = mipCount;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 6;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    // Copy each face+mip from the staging buffer
+    // Data layout: for each mip level, for each face: faceWidth*faceHeight*4 half-floats
+    VkDeviceSize offset = 0;
+    for (uint32_t mip = 0; mip < mipCount; mip++) {
+        uint32_t mipSize = std::max(1u, faceSize >> mip);
+        VkDeviceSize faceBytes = static_cast<VkDeviceSize>(mipSize) * mipSize * 4 * sizeof(uint16_t);
+
+        for (uint32_t face = 0; face < 6; face++) {
+            VkBufferImageCopy region = {};
+            region.bufferOffset = offset;
+            region.bufferRowLength = 0;
+            region.bufferImageHeight = 0;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.mipLevel = mip;
+            region.imageSubresource.baseArrayLayer = face;
+            region.imageSubresource.layerCount = 1;
+            region.imageOffset = {0, 0, 0};
+            region.imageExtent = {mipSize, mipSize, 1};
+
+            vkCmdCopyBufferToImage(cmd, stagingBuffer, tex.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            offset += faceBytes;
+        }
+    }
+
+    // Transition to SHADER_READ_ONLY
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    ctx.endSingleTimeCommands(cmd);
+
+    vmaDestroyBuffer(ctx.allocator, stagingBuffer, stagingAlloc);
+
+    // Create cube image view
+    VkImageViewCreateInfo viewInfo = {};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = tex.image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+    viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = mipCount;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 6;
+
+    vkCreateImageView(ctx.device, &viewInfo, nullptr, &tex.imageView);
+
+    // Create sampler with linear filtering + mipmap
+    VkSamplerCreateInfo samplerInfo = {};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = static_cast<float>(mipCount);
+
+    vkCreateSampler(ctx.device, &samplerInfo, nullptr, &tex.sampler);
+
+    return tex;
+}
+
+// --------------------------------------------------------------------------
+// IBL asset loading
+// --------------------------------------------------------------------------
+
+void RasterRenderer::loadIBLAssets(VulkanContext& ctx, const std::string& iblName) {
+    namespace fs = std::filesystem;
+
+    std::string iblDir = "playground/assets/ibl/" + iblName;
+    std::string manifestPath = iblDir + "/manifest.json";
+
+    if (!fs::exists(manifestPath)) {
+        std::cout << "[info] No IBL assets found at " << manifestPath
+                  << ", skipping IBL loading" << std::endl;
+        return;
+    }
+
+    // Read manifest JSON
+    std::ifstream manifestFile(manifestPath);
+    if (!manifestFile.is_open()) {
+        std::cerr << "[warn] Failed to open IBL manifest: " << manifestPath << std::endl;
+        return;
+    }
+    std::stringstream ss;
+    ss << manifestFile.rdbuf();
+    std::string manifestContent = ss.str();
+
+    // Simple JSON parsing for manifest fields
+    // Expected fields: specular_size, specular_mips, irradiance_size, brdf_lut_size
+    auto extractInt = [&](const std::string& json, const std::string& key) -> int {
+        auto pos = json.find("\"" + key + "\"");
+        if (pos == std::string::npos) return 0;
+        pos = json.find(":", pos);
+        if (pos == std::string::npos) return 0;
+        pos++;
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+        return std::stoi(json.substr(pos));
+    };
+
+    int specSize = extractInt(manifestContent, "specular_size");
+    int specMips = extractInt(manifestContent, "specular_mips");
+    int irrSize = extractInt(manifestContent, "irradiance_size");
+    int brdfSize = extractInt(manifestContent, "brdf_lut_size");
+
+    if (specSize <= 0 || specMips <= 0 || irrSize <= 0 || brdfSize <= 0) {
+        std::cerr << "[warn] Invalid IBL manifest values" << std::endl;
+        return;
+    }
+
+    std::cout << "[info] Loading IBL assets: " << iblName
+              << " (spec=" << specSize << "x" << specSize << " mips=" << specMips
+              << ", irr=" << irrSize << "x" << irrSize
+              << ", brdf=" << brdfSize << "x" << brdfSize << ")" << std::endl;
+
+    // Load specular cubemap
+    {
+        std::string specPath = iblDir + "/specular.bin";
+        std::ifstream specFile(specPath, std::ios::binary | std::ios::ate);
+        if (specFile.is_open()) {
+            size_t fileSize = specFile.tellg();
+            specFile.seekg(0);
+            std::vector<uint16_t> specData(fileSize / sizeof(uint16_t));
+            specFile.read(reinterpret_cast<char*>(specData.data()), fileSize);
+
+            auto specTex = uploadCubemapF16(ctx, static_cast<uint32_t>(specSize),
+                                             static_cast<uint32_t>(specMips), specData);
+            if (specTex.image != VK_NULL_HANDLE) {
+                iblTextures["env_specular"] = specTex;
+                std::cout << "[info] Loaded IBL specular cubemap" << std::endl;
+            }
+        } else {
+            std::cerr << "[warn] Failed to open " << specPath << std::endl;
+        }
+    }
+
+    // Load irradiance cubemap
+    {
+        std::string irrPath = iblDir + "/irradiance.bin";
+        std::ifstream irrFile(irrPath, std::ios::binary | std::ios::ate);
+        if (irrFile.is_open()) {
+            size_t fileSize = irrFile.tellg();
+            irrFile.seekg(0);
+            std::vector<uint16_t> irrData(fileSize / sizeof(uint16_t));
+            irrFile.read(reinterpret_cast<char*>(irrData.data()), fileSize);
+
+            auto irrTex = uploadCubemapF16(ctx, static_cast<uint32_t>(irrSize), 1, irrData);
+            if (irrTex.image != VK_NULL_HANDLE) {
+                iblTextures["env_irradiance"] = irrTex;
+                std::cout << "[info] Loaded IBL irradiance cubemap" << std::endl;
+            }
+        } else {
+            std::cerr << "[warn] Failed to open " << irrPath << std::endl;
+        }
+    }
+
+    // Load BRDF LUT (2D texture, RG16F data padded to RGBA16F)
+    {
+        std::string brdfPath = iblDir + "/brdf_lut.bin";
+        std::ifstream brdfFile(brdfPath, std::ios::binary | std::ios::ate);
+        if (brdfFile.is_open()) {
+            size_t fileSize = brdfFile.tellg();
+            brdfFile.seekg(0);
+            std::vector<uint16_t> rawData(fileSize / sizeof(uint16_t));
+            brdfFile.read(reinterpret_cast<char*>(rawData.data()), fileSize);
+
+            // Determine if data is RG (2 channels) or RGBA (4 channels)
+            size_t totalPixels = static_cast<size_t>(brdfSize) * brdfSize;
+            std::vector<uint16_t> rgbaData;
+
+            if (rawData.size() == totalPixels * 2) {
+                // RG data - pad to RGBA
+                rgbaData.resize(totalPixels * 4);
+                for (size_t p = 0; p < totalPixels; p++) {
+                    rgbaData[p * 4 + 0] = rawData[p * 2 + 0];
+                    rgbaData[p * 4 + 1] = rawData[p * 2 + 1];
+                    rgbaData[p * 4 + 2] = 0;
+                    rgbaData[p * 4 + 3] = 0x3C00; // 1.0 in half-float
+                }
+            } else {
+                // Already RGBA
+                rgbaData = rawData;
+            }
+
+            // Upload as 2D texture (not cubemap)
+            GPUTexture brdfTex;
+            brdfTex.width = static_cast<uint32_t>(brdfSize);
+            brdfTex.height = static_cast<uint32_t>(brdfSize);
+
+            VkDeviceSize imgSize = rgbaData.size() * sizeof(uint16_t);
+
+            VkBuffer stagBuf;
+            VmaAllocation stagAlloc;
+            VkBufferCreateInfo stagInfo = {};
+            stagInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            stagInfo.size = imgSize;
+            stagInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            VmaAllocationCreateInfo stagAllocInfo = {};
+            stagAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+            vmaCreateBuffer(ctx.allocator, &stagInfo, &stagAllocInfo,
+                            &stagBuf, &stagAlloc, nullptr);
+
+            void* mapped;
+            vmaMapMemory(ctx.allocator, stagAlloc, &mapped);
+            memcpy(mapped, rgbaData.data(), imgSize);
+            vmaUnmapMemory(ctx.allocator, stagAlloc);
+
+            VkImageCreateInfo imgInfo = {};
+            imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            imgInfo.imageType = VK_IMAGE_TYPE_2D;
+            imgInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            imgInfo.extent = {static_cast<uint32_t>(brdfSize), static_cast<uint32_t>(brdfSize), 1};
+            imgInfo.mipLevels = 1;
+            imgInfo.arrayLayers = 1;
+            imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+            imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+            VmaAllocationCreateInfo imgAllocInfo = {};
+            imgAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+            vmaCreateImage(ctx.allocator, &imgInfo, &imgAllocInfo,
+                           &brdfTex.image, &brdfTex.allocation, nullptr);
+
+            VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+
+            VkImageMemoryBarrier barrier = {};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = brdfTex.image;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseMipLevel = 0;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.baseArrayLayer = 0;
+            barrier.subresourceRange.layerCount = 1;
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+            VkBufferImageCopy region = {};
+            region.bufferOffset = 0;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.mipLevel = 0;
+            region.imageSubresource.baseArrayLayer = 0;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {static_cast<uint32_t>(brdfSize), static_cast<uint32_t>(brdfSize), 1};
+
+            vkCmdCopyBufferToImage(cmd, stagBuf, brdfTex.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+            ctx.endSingleTimeCommands(cmd);
+            vmaDestroyBuffer(ctx.allocator, stagBuf, stagAlloc);
+
+            VkImageViewCreateInfo viewInfo = {};
+            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            viewInfo.image = brdfTex.image;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            viewInfo.subresourceRange.baseMipLevel = 0;
+            viewInfo.subresourceRange.levelCount = 1;
+            viewInfo.subresourceRange.baseArrayLayer = 0;
+            viewInfo.subresourceRange.layerCount = 1;
+
+            vkCreateImageView(ctx.device, &viewInfo, nullptr, &brdfTex.imageView);
+
+            VkSamplerCreateInfo samplerInfo = {};
+            samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            samplerInfo.magFilter = VK_FILTER_LINEAR;
+            samplerInfo.minFilter = VK_FILTER_LINEAR;
+            samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.anisotropyEnable = VK_FALSE;
+            samplerInfo.maxAnisotropy = 1.0f;
+            samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+            samplerInfo.unnormalizedCoordinates = VK_FALSE;
+            samplerInfo.compareEnable = VK_FALSE;
+            samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+
+            vkCreateSampler(ctx.device, &samplerInfo, nullptr, &brdfTex.sampler);
+
+            iblTextures["brdf_lut"] = brdfTex;
+            std::cout << "[info] Loaded IBL BRDF LUT" << std::endl;
+        } else {
+            std::cerr << "[warn] Failed to open " << brdfPath << std::endl;
+        }
+    }
+
+    std::cout << "[info] IBL loading complete: " << iblTextures.size() << " texture(s)" << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Get texture for a binding name, falling back to default white
+// --------------------------------------------------------------------------
+
+GPUTexture& RasterRenderer::getTextureForBinding(const std::string& name) {
+    auto it = namedTextures.find(name);
+    if (it != namedTextures.end()) {
+        return it->second;
+    }
+
+    // For "albedo_tex" used by pbr_surface, try "base_color_tex" as well
+    if (name == "albedo_tex") {
+        it = namedTextures.find("base_color_tex");
+        if (it != namedTextures.end()) {
+            return it->second;
+        }
+    }
+
+    return defaultWhiteTexture;
+}
+
+// --------------------------------------------------------------------------
+// PBR resources: uniforms only (descriptors are now reflection-driven)
 // --------------------------------------------------------------------------
 
 void RasterRenderer::setupPBRResources(VulkanContext& ctx) {
@@ -427,147 +893,271 @@ void RasterRenderer::setupPBRResources(VulkanContext& ctx) {
     memcpy(mapped, &lightData, sizeof(LightData));
     vmaUnmapMemory(ctx.allocator, lightAllocation);
 
-    // Generate and upload sphere mesh
-    std::vector<Vertex> vertices;
-    std::vector<uint32_t> indices;
-    Scene::generateSphere(32, 32, vertices, indices);
-    mesh = Scene::uploadMesh(ctx.allocator, ctx.device, ctx.commandPool,
-                             ctx.graphicsQueue, vertices, indices);
+    // Generate sphere mesh only if no mesh was already uploaded (e.g. from glTF)
+    if (mesh.vertexBuffer == VK_NULL_HANDLE) {
+        std::vector<Vertex> vertices;
+        std::vector<uint32_t> indices;
+        Scene::generateSphere(32, 32, vertices, indices);
 
-    // Generate and upload procedural texture
-    std::cout << "Generating procedural texture..." << std::endl;
-    auto texPixels = Scene::generateProceduralTexture(512);
-    texture = Scene::uploadTexture(ctx.allocator, ctx.device, ctx.commandPool,
-                                   ctx.graphicsQueue, texPixels, 512, 512);
+        // Check if vertex reflection requires 48-byte stride (with tangent)
+        if (vertReflection.vertex_stride == 48) {
+            // Pad sphere vertices to 48 bytes: pos(3)+normal(3)+uv(2)+tangent(4) = 12 floats
+            std::vector<float> vdata;
+            vdata.reserve(vertices.size() * 12);
+            for (auto& v : vertices) {
+                vdata.push_back(v.position.x);
+                vdata.push_back(v.position.y);
+                vdata.push_back(v.position.z);
+                vdata.push_back(v.normal.x);
+                vdata.push_back(v.normal.y);
+                vdata.push_back(v.normal.z);
+                vdata.push_back(v.uv.x);
+                vdata.push_back(v.uv.y);
+                // Default tangent
+                vdata.push_back(1.0f);
+                vdata.push_back(0.0f);
+                vdata.push_back(0.0f);
+                vdata.push_back(1.0f);
+            }
 
-    // Create descriptor set layout 0: MVP uniform
-    VkDescriptorSetLayoutBinding mvpBinding = {};
-    mvpBinding.binding = 0;
-    mvpBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    mvpBinding.descriptorCount = 1;
-    mvpBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+            // Upload raw 48-byte vertex data
+            VkDeviceSize vbufSize = vdata.size() * sizeof(float);
+            VkBufferCreateInfo vbufInfo = {};
+            vbufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            vbufInfo.size = vbufSize;
+            vbufInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+            VmaAllocationCreateInfo vbufAllocInfo = {};
+            vbufAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+            vmaCreateBuffer(ctx.allocator, &vbufInfo, &vbufAllocInfo,
+                            &mesh.vertexBuffer, &mesh.vertexAllocation, nullptr);
 
-    VkDescriptorSetLayoutCreateInfo layout0Info = {};
-    layout0Info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout0Info.bindingCount = 1;
-    layout0Info.pBindings = &mvpBinding;
+            VkBuffer vStagingBuf;
+            VmaAllocation vStagingAlloc;
+            VkBufferCreateInfo vStgInfo = {};
+            vStgInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            vStgInfo.size = vbufSize;
+            vStgInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            VmaAllocationCreateInfo vStgAllocInfo = {};
+            vStgAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+            vmaCreateBuffer(ctx.allocator, &vStgInfo, &vStgAllocInfo,
+                            &vStagingBuf, &vStagingAlloc, nullptr);
 
-    vkCreateDescriptorSetLayout(ctx.device, &layout0Info, nullptr, &descSetLayout0);
+            void* vMapped;
+            vmaMapMemory(ctx.allocator, vStagingAlloc, &vMapped);
+            memcpy(vMapped, vdata.data(), vbufSize);
+            vmaUnmapMemory(ctx.allocator, vStagingAlloc);
 
-    // Create descriptor set layout 1: light + sampler + texture
-    VkDescriptorSetLayoutBinding fragBindings[3] = {};
+            // Upload index data
+            VkDeviceSize ibufSize = indices.size() * sizeof(uint32_t);
+            VkBufferCreateInfo ibufInfo = {};
+            ibufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            ibufInfo.size = ibufSize;
+            ibufInfo.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+            VmaAllocationCreateInfo ibufAllocInfo = {};
+            ibufAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+            vmaCreateBuffer(ctx.allocator, &ibufInfo, &ibufAllocInfo,
+                            &mesh.indexBuffer, &mesh.indexAllocation, nullptr);
 
-    fragBindings[0].binding = 0;
-    fragBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    fragBindings[0].descriptorCount = 1;
-    fragBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkBuffer iStagingBuf;
+            VmaAllocation iStagingAlloc;
+            VkBufferCreateInfo iStgInfo = {};
+            iStgInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            iStgInfo.size = ibufSize;
+            iStgInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            VmaAllocationCreateInfo iStgAllocInfo = {};
+            iStgAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+            vmaCreateBuffer(ctx.allocator, &iStgInfo, &iStgAllocInfo,
+                            &iStagingBuf, &iStagingAlloc, nullptr);
 
-    fragBindings[1].binding = 1;
-    fragBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    fragBindings[1].descriptorCount = 1;
-    fragBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            void* iMapped;
+            vmaMapMemory(ctx.allocator, iStagingAlloc, &iMapped);
+            memcpy(iMapped, indices.data(), ibufSize);
+            vmaUnmapMemory(ctx.allocator, iStagingAlloc);
 
-    fragBindings[2].binding = 2;
-    fragBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    fragBindings[2].descriptorCount = 1;
-    fragBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkCommandBuffer copyCmd = ctx.beginSingleTimeCommands();
+            VkBufferCopy vCopy = {}; vCopy.size = vbufSize;
+            vkCmdCopyBuffer(copyCmd, vStagingBuf, mesh.vertexBuffer, 1, &vCopy);
+            VkBufferCopy iCopy = {}; iCopy.size = ibufSize;
+            vkCmdCopyBuffer(copyCmd, iStagingBuf, mesh.indexBuffer, 1, &iCopy);
+            ctx.endSingleTimeCommands(copyCmd);
 
-    VkDescriptorSetLayoutCreateInfo layout1Info = {};
-    layout1Info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout1Info.bindingCount = 3;
-    layout1Info.pBindings = fragBindings;
+            vmaDestroyBuffer(ctx.allocator, vStagingBuf, vStagingAlloc);
+            vmaDestroyBuffer(ctx.allocator, iStagingBuf, iStagingAlloc);
 
-    vkCreateDescriptorSetLayout(ctx.device, &layout1Info, nullptr, &descSetLayout1);
+            mesh.vertexCount = static_cast<uint32_t>(vertices.size());
+            mesh.indexCount = static_cast<uint32_t>(indices.size());
 
-    // Create descriptor pool
-    VkDescriptorPoolSize poolSizes[] = {
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, 1},
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1},
-    };
+            std::cout << "[info] Uploaded sphere mesh with 48-byte stride" << std::endl;
+        } else {
+            mesh = Scene::uploadMesh(ctx.allocator, ctx.device, ctx.commandPool,
+                                     ctx.graphicsQueue, vertices, indices);
+        }
+    }
+
+    // Create default 1x1 white texture for missing bindings
+    createDefaultWhiteTexture(ctx);
+
+    // Upload glTF textures if available
+    uploadGltfTextures(ctx);
+
+    // If no named textures at all (non-glTF scene), create a procedural one as "albedo_tex"/"base_color_tex"
+    if (namedTextures.empty()) {
+        std::cout << "Generating procedural texture..." << std::endl;
+        auto texPixels = Scene::generateProceduralTexture(512);
+        auto gpuTex = Scene::uploadTexture(ctx.allocator, ctx.device, ctx.commandPool,
+                                            ctx.graphicsQueue, texPixels, 512, 512);
+        namedTextures["albedo_tex"] = gpuTex;
+        namedTextures["base_color_tex"] = gpuTex;
+    }
+
+}
+
+// --------------------------------------------------------------------------
+// Reflection-driven descriptor set creation
+// --------------------------------------------------------------------------
+
+void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
+    // Use reflected_pipeline utilities to create descriptor set layouts from reflection JSON
+    std::vector<ReflectionData> stages = {vertReflection, fragReflection};
+    reflectedSetLayouts = createDescriptorSetLayoutsMultiStage(ctx.device, stages);
+
+    // Get merged binding info for pool sizing and descriptor writes
+    auto mergedBindings = getMergedBindings(stages);
+
+    // Count pool sizes from reflection data
+    std::unordered_map<VkDescriptorType, uint32_t> typeCounts;
+    for (auto& b : mergedBindings) {
+        VkDescriptorType vkType;
+        if (b.type == "uniform_buffer") vkType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        else if (b.type == "sampler") vkType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        else if (b.type == "sampled_image") vkType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        else if (b.type == "sampled_cube_image") vkType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        else if (b.type == "storage_image") vkType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        else if (b.type == "acceleration_structure") vkType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        else vkType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        typeCounts[vkType]++;
+    }
+
+    std::vector<VkDescriptorPoolSize> poolSizes;
+    for (auto& [type, count] : typeCounts) {
+        poolSizes.push_back({type, count});
+    }
+
+    uint32_t maxSets = static_cast<uint32_t>(reflectedSetLayouts.size());
 
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 2;
-    poolInfo.poolSizeCount = 3;
-    poolInfo.pPoolSizes = poolSizes;
+    poolInfo.maxSets = maxSets;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
 
     vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &descriptorPool);
 
     // Allocate descriptor sets
-    VkDescriptorSetLayout layouts[] = {descSetLayout0, descSetLayout1};
-    VkDescriptorSetAllocateInfo allocSetInfo = {};
-    allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocSetInfo.descriptorPool = descriptorPool;
-    allocSetInfo.descriptorSetCount = 2;
-    allocSetInfo.pSetLayouts = layouts;
+    for (auto& [setIdx, layout] : reflectedSetLayouts) {
+        VkDescriptorSetAllocateInfo allocSetInfo = {};
+        allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocSetInfo.descriptorPool = descriptorPool;
+        allocSetInfo.descriptorSetCount = 1;
+        allocSetInfo.pSetLayouts = &layout;
 
-    VkDescriptorSet sets[2];
-    vkAllocateDescriptorSets(ctx.device, &allocSetInfo, sets);
-    descSet0 = sets[0];
-    descSet1 = sets[1];
+        VkDescriptorSet set;
+        vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &set);
+        reflectedDescSets[setIdx] = set;
+    }
 
-    // Update descriptor set 0: MVP
-    VkDescriptorBufferInfo mvpBufDesc = {};
-    mvpBufDesc.buffer = mvpBuffer;
-    mvpBufDesc.offset = 0;
-    mvpBufDesc.range = 192;
+    // Write descriptor sets based on reflection binding names
+    // We need to keep descriptor info structs alive until vkUpdateDescriptorSets returns
+    struct DescWriteInfo {
+        VkDescriptorBufferInfo bufferInfo;
+        VkDescriptorImageInfo imageInfo;
+    };
+    std::vector<DescWriteInfo> writeInfos(mergedBindings.size());
+    std::vector<VkWriteDescriptorSet> writes;
 
-    VkWriteDescriptorSet writes[4] = {};
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = descSet0;
-    writes[0].dstBinding = 0;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    writes[0].pBufferInfo = &mvpBufDesc;
+    for (size_t i = 0; i < mergedBindings.size(); i++) {
+        auto& b = mergedBindings[i];
+        auto setIt = reflectedDescSets.find(b.set);
+        if (setIt == reflectedDescSets.end()) continue;
 
-    // Update descriptor set 1: Light + sampler + texture
-    VkDescriptorBufferInfo lightBufDesc = {};
-    lightBufDesc.buffer = lightBuffer;
-    lightBufDesc.offset = 0;
-    lightBufDesc.range = 32;
+        VkWriteDescriptorSet w = {};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = setIt->second;
+        w.dstBinding = static_cast<uint32_t>(b.binding);
+        w.descriptorCount = 1;
 
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = descSet1;
-    writes[1].dstBinding = 0;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    writes[1].pBufferInfo = &lightBufDesc;
+        if (b.type == "uniform_buffer") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            // Match by name: "MVP" -> mvpBuffer, "Light" -> lightBuffer
+            if (b.name == "MVP") {
+                writeInfos[i].bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
+            } else if (b.name == "Light") {
+                writeInfos[i].bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+            } else {
+                // Unknown UBO name - use MVP as fallback
+                writeInfos[i].bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
+            }
+            w.pBufferInfo = &writeInfos[i].bufferInfo;
+        } else if (b.type == "sampler") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            // Check IBL textures first, then regular textures
+            auto iblIt = iblTextures.find(b.name);
+            if (iblIt != iblTextures.end()) {
+                writeInfos[i].imageInfo = {};
+                writeInfos[i].imageInfo.sampler = iblIt->second.sampler;
+            } else {
+                auto& tex = getTextureForBinding(b.name);
+                writeInfos[i].imageInfo = {};
+                writeInfos[i].imageInfo.sampler = tex.sampler;
+            }
+            w.pImageInfo = &writeInfos[i].imageInfo;
+        } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            // Check IBL textures first, then regular textures
+            auto iblIt = iblTextures.find(b.name);
+            if (iblIt != iblTextures.end()) {
+                writeInfos[i].imageInfo = {};
+                writeInfos[i].imageInfo.imageView = iblIt->second.imageView;
+                writeInfos[i].imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            } else {
+                auto& tex = getTextureForBinding(b.name);
+                writeInfos[i].imageInfo = {};
+                writeInfos[i].imageInfo.imageView = tex.imageView;
+                writeInfos[i].imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+            w.pImageInfo = &writeInfos[i].imageInfo;
+        } else {
+            continue; // Skip unsupported types
+        }
 
-    VkDescriptorImageInfo samplerDesc = {};
-    samplerDesc.sampler = texture.sampler;
+        writes.push_back(w);
+    }
 
-    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[2].dstSet = descSet1;
-    writes[2].dstBinding = 1;
-    writes[2].descriptorCount = 1;
-    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    writes[2].pImageInfo = &samplerDesc;
+    if (!writes.empty()) {
+        vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
+    }
 
-    VkDescriptorImageInfo texDesc = {};
-    texDesc.imageView = texture.imageView;
-    texDesc.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[3].dstSet = descSet1;
-    writes[3].dstBinding = 2;
-    writes[3].descriptorCount = 1;
-    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    writes[3].pImageInfo = &texDesc;
-
-    vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
+    std::cout << "[info] Reflection-driven descriptors created: "
+              << reflectedSetLayouts.size() << " set(s), "
+              << mergedBindings.size() << " binding(s)" << std::endl;
 }
 
+// --------------------------------------------------------------------------
+// PBR pipeline (reflection-driven layout)
+// --------------------------------------------------------------------------
+
 void RasterRenderer::createPipelinePBR(VulkanContext& ctx) {
-    // Pipeline layout with 2 descriptor sets
-    VkDescriptorSetLayout layouts[] = {descSetLayout0, descSetLayout1};
-
-    VkPipelineLayoutCreateInfo layoutInfo = {};
-    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layoutInfo.setLayoutCount = 2;
-    layoutInfo.pSetLayouts = layouts;
-
-    vkCreatePipelineLayout(ctx.device, &layoutInfo, nullptr, &pipelineLayout);
+    // Pipeline layout from reflection data
+    pipelineLayout = createReflectedPipelineLayoutMultiStage(
+        ctx.device, reflectedSetLayouts,
+        {vertReflection, fragReflection});
 
     // Shader stages
     VkPipelineShaderStageCreateInfo stages[2] = {};
@@ -581,34 +1171,15 @@ void RasterRenderer::createPipelinePBR(VulkanContext& ctx) {
     stages[1].module = fragModule;
     stages[1].pName = "main";
 
-    // Vertex input: position (vec3) + normal (vec3) + uv (vec2) = 32 bytes
-    VkVertexInputBindingDescription binding = {};
-    binding.binding = 0;
-    binding.stride = sizeof(Vertex); // 32 bytes
-    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-    VkVertexInputAttributeDescription attrs[3] = {};
-    attrs[0].location = 0; // position
-    attrs[0].binding = 0;
-    attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attrs[0].offset = 0;
-
-    attrs[1].location = 1; // normal
-    attrs[1].binding = 0;
-    attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attrs[1].offset = 12;
-
-    attrs[2].location = 2; // uv
-    attrs[2].binding = 0;
-    attrs[2].format = VK_FORMAT_R32G32_SFLOAT;
-    attrs[2].offset = 24;
+    // Vertex input from reflection data (supports both 32-byte and 48-byte stride)
+    auto reflectedInput = createReflectedVertexInput(vertReflection);
 
     VkPipelineVertexInputStateCreateInfo vertexInput = {};
     vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = 3;
-    vertexInput.pVertexAttributeDescriptions = attrs;
+    vertexInput.pVertexBindingDescriptions = &reflectedInput.binding;
+    vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(reflectedInput.attributes.size());
+    vertexInput.pVertexAttributeDescriptions = reflectedInput.attributes.data();
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -687,69 +1258,287 @@ void RasterRenderer::createPipelinePBR(VulkanContext& ctx) {
 }
 
 // --------------------------------------------------------------------------
-// Initialization
+// Helper: detect if scene source is a glTF file
 // --------------------------------------------------------------------------
 
-void RasterRenderer::init(VulkanContext& ctx, RasterMode renderMode,
-                          const std::string& vertSpvPath, const std::string& fragSpvPath,
+static bool isGltfFile(const std::string& source) {
+    if (source.size() > 4 && source.substr(source.size()-4) == ".glb") return true;
+    if (source.size() > 5 && source.substr(source.size()-5) == ".gltf") return true;
+    return false;
+}
+
+// --------------------------------------------------------------------------
+// Three-phase initialization
+// --------------------------------------------------------------------------
+
+void RasterRenderer::init(VulkanContext& ctx, const std::string& sceneSource,
+                          const std::string& pipelineBase, const std::string& renderPath,
                           uint32_t width, uint32_t height) {
-    mode = renderMode;
+    m_sceneSource = sceneSource;
+    m_renderPath = renderPath;
+    m_pipelineBase = pipelineBase;
     renderWidth = width;
     renderHeight = height;
 
-    // Load shader modules
-    if (mode == RasterMode::Fullscreen) {
-        // Use built-in fullscreen vertex shader
-        const auto& fullscreenSpv = SpvLoader::getFullscreenVertSPIRV();
-        vertModule = SpvLoader::createShaderModule(ctx.device, fullscreenSpv);
-    } else {
-        auto vertCode = SpvLoader::loadSPIRV(vertSpvPath);
-        vertModule = SpvLoader::createShaderModule(ctx.device, vertCode);
-    }
+    // Determine if depth buffer is needed based on scene
+    m_needsDepth = (sceneSource == "sphere" || isGltfFile(sceneSource));
 
-    auto fragCode = SpvLoader::loadSPIRV(fragSpvPath);
-    fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
+    // Phase 1: Upload scene GPU resources
+    uploadScene(ctx, sceneSource);
 
-    // Create offscreen target
+    // Create offscreen target (depends on depth requirement)
     createOffscreenTarget(ctx);
     createRenderPass(ctx);
     createFramebuffer(ctx);
 
-    // Setup mode-specific resources
-    switch (mode) {
-        case RasterMode::Triangle: {
-            // Upload triangle vertex data
-            std::vector<TriangleVertex> triVerts;
-            Scene::generateTriangle(triVerts);
+    // Phase 2: Create pipeline from shader files
+    createPipeline(ctx, pipelineBase, renderPath);
 
-            VkDeviceSize bufSize = triVerts.size() * sizeof(TriangleVertex);
-            VkBufferCreateInfo bufInfo = {};
-            bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-            bufInfo.size = bufSize;
-            bufInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    // Phase 3: Bind scene resources to pipeline descriptor sets
+    bindSceneToPipeline(ctx);
+}
 
-            VmaAllocationCreateInfo allocInfo = {};
-            allocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+// --------------------------------------------------------------------------
+// Phase 1: Upload scene GPU resources
+// --------------------------------------------------------------------------
 
-            vmaCreateBuffer(ctx.allocator, &bufInfo, &allocInfo,
-                            &triangleVB, &triangleVBAllocation, nullptr);
+void RasterRenderer::uploadScene(VulkanContext& ctx, const std::string& sceneSource) {
+    if (sceneSource == "sphere") {
+        // Generate sphere mesh + uniforms (descriptors created later via reflection)
+        setupPBRResources(ctx);
+    } else if (sceneSource == "triangle") {
+        // Generate triangle mesh
+        std::vector<TriangleVertex> triVerts;
+        Scene::generateTriangle(triVerts);
 
-            void* mapped;
-            vmaMapMemory(ctx.allocator, triangleVBAllocation, &mapped);
-            memcpy(mapped, triVerts.data(), bufSize);
-            vmaUnmapMemory(ctx.allocator, triangleVBAllocation);
+        VkDeviceSize bufSize = triVerts.size() * sizeof(TriangleVertex);
+        VkBufferCreateInfo bufInfo = {};
+        bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufInfo.size = bufSize;
+        bufInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 
-            createPipelineTriangle(ctx);
-            break;
+        VmaAllocationCreateInfo allocInfo = {};
+        allocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+        vmaCreateBuffer(ctx.allocator, &bufInfo, &allocInfo,
+                        &triangleVB, &triangleVBAllocation, nullptr);
+
+        void* mapped;
+        vmaMapMemory(ctx.allocator, triangleVBAllocation, &mapped);
+        memcpy(mapped, triVerts.data(), bufSize);
+        vmaUnmapMemory(ctx.allocator, triangleVBAllocation);
+    } else if (sceneSource == "fullscreen") {
+        // No mesh, no depth buffer for fullscreen scenes
+    } else if (isGltfFile(sceneSource)) {
+        // Load glTF scene and upload mesh + textures
+        std::cout << "[info] Loading glTF scene: " << sceneSource << std::endl;
+        m_gltfScene = loadGltf(sceneSource);
+        m_hasGltfScene = true;
+        auto drawItems = flattenScene(m_gltfScene);
+
+        if (!m_gltfScene.meshes.empty()) {
+            // Pack vertices to 48-byte stride (pos+normal+uv+tangent) to match
+            // the Lux PBR vertex layout expected by reflection-driven pipelines
+            auto& gmesh = m_gltfScene.meshes[0];
+            std::vector<float> vdata;
+            vdata.reserve(gmesh.vertices.size() * 12); // 12 floats = 48 bytes per vertex
+            for (size_t i = 0; i < gmesh.vertices.size(); i++) {
+                auto& gv = gmesh.vertices[i];
+                vdata.push_back(gv.position.x);
+                vdata.push_back(gv.position.y);
+                vdata.push_back(gv.position.z);
+                vdata.push_back(gv.normal.x);
+                vdata.push_back(gv.normal.y);
+                vdata.push_back(gv.normal.z);
+                vdata.push_back(gv.uv.x);
+                vdata.push_back(gv.uv.y);
+                if (gmesh.hasTangents) {
+                    vdata.push_back(gv.tangent.x);
+                    vdata.push_back(gv.tangent.y);
+                    vdata.push_back(gv.tangent.z);
+                    vdata.push_back(gv.tangent.w);
+                } else {
+                    vdata.push_back(1.0f);
+                    vdata.push_back(0.0f);
+                    vdata.push_back(0.0f);
+                    vdata.push_back(1.0f);
+                }
+            }
+
+            // Upload raw vertex data directly (bypasses Scene::uploadMesh which uses 32-byte Vertex)
+            VkDeviceSize vbufSize = vdata.size() * sizeof(float);
+            VkBufferCreateInfo vbufInfo = {};
+            vbufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            vbufInfo.size = vbufSize;
+            vbufInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+
+            VmaAllocationCreateInfo vbufAllocInfo = {};
+            vbufAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+            vmaCreateBuffer(ctx.allocator, &vbufInfo, &vbufAllocInfo,
+                            &mesh.vertexBuffer, &mesh.vertexAllocation, nullptr);
+
+            // Staging buffer for vertex data
+            VkBuffer vStagingBuffer;
+            VmaAllocation vStagingAlloc;
+            VkBufferCreateInfo vStagingInfo = {};
+            vStagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            vStagingInfo.size = vbufSize;
+            vStagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            VmaAllocationCreateInfo vStagingAllocInfo = {};
+            vStagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+            vmaCreateBuffer(ctx.allocator, &vStagingInfo, &vStagingAllocInfo,
+                            &vStagingBuffer, &vStagingAlloc, nullptr);
+
+            void* vMapped;
+            vmaMapMemory(ctx.allocator, vStagingAlloc, &vMapped);
+            memcpy(vMapped, vdata.data(), vbufSize);
+            vmaUnmapMemory(ctx.allocator, vStagingAlloc);
+
+            // Upload index data
+            VkDeviceSize ibufSize = gmesh.indices.size() * sizeof(uint32_t);
+            VkBufferCreateInfo ibufInfo = {};
+            ibufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            ibufInfo.size = ibufSize;
+            ibufInfo.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+
+            VmaAllocationCreateInfo ibufAllocInfo = {};
+            ibufAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+            vmaCreateBuffer(ctx.allocator, &ibufInfo, &ibufAllocInfo,
+                            &mesh.indexBuffer, &mesh.indexAllocation, nullptr);
+
+            VkBuffer iStagingBuffer;
+            VmaAllocation iStagingAlloc;
+            VkBufferCreateInfo iStagingInfo = {};
+            iStagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            iStagingInfo.size = ibufSize;
+            iStagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            VmaAllocationCreateInfo iStagingAllocInfo = {};
+            iStagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+            vmaCreateBuffer(ctx.allocator, &iStagingInfo, &iStagingAllocInfo,
+                            &iStagingBuffer, &iStagingAlloc, nullptr);
+
+            void* iMapped;
+            vmaMapMemory(ctx.allocator, iStagingAlloc, &iMapped);
+            memcpy(iMapped, gmesh.indices.data(), ibufSize);
+            vmaUnmapMemory(ctx.allocator, iStagingAlloc);
+
+            // Copy staging -> device
+            VkCommandBuffer copyCmd = ctx.beginSingleTimeCommands();
+            VkBufferCopy vCopy = {};
+            vCopy.size = vbufSize;
+            vkCmdCopyBuffer(copyCmd, vStagingBuffer, mesh.vertexBuffer, 1, &vCopy);
+            VkBufferCopy iCopy = {};
+            iCopy.size = ibufSize;
+            vkCmdCopyBuffer(copyCmd, iStagingBuffer, mesh.indexBuffer, 1, &iCopy);
+            ctx.endSingleTimeCommands(copyCmd);
+
+            vmaDestroyBuffer(ctx.allocator, vStagingBuffer, vStagingAlloc);
+            vmaDestroyBuffer(ctx.allocator, iStagingBuffer, iStagingAlloc);
+
+            mesh.vertexCount = static_cast<uint32_t>(gmesh.vertices.size());
+            mesh.indexCount = static_cast<uint32_t>(gmesh.indices.size());
+
+            std::cout << "[info] Uploaded glTF mesh with 48-byte stride ("
+                      << mesh.vertexCount << " verts, " << mesh.indexCount << " indices)" << std::endl;
         }
-        case RasterMode::Fullscreen:
-            createPipelineFullscreen(ctx);
-            break;
-        case RasterMode::PBR:
-            setupPBRResources(ctx);
-            createPipelinePBR(ctx);
-            break;
+
+        // Setup PBR uniforms and upload glTF textures
+        setupPBRResources(ctx);
+    } else {
+        // Default: treat as sphere scene
+        setupPBRResources(ctx);
     }
+
+    std::cout << "[info] Scene uploaded: " << sceneSource << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Phase 2: Create pipeline from shader files
+// --------------------------------------------------------------------------
+
+void RasterRenderer::createPipeline(VulkanContext& ctx, const std::string& pipelineBase,
+                                     const std::string& renderPath) {
+    namespace fs = std::filesystem;
+    std::string fragPath = pipelineBase + ".frag.spv";
+
+    if (renderPath == "fullscreen") {
+        // Fullscreen: load frag.spv only, use built-in vertex shader
+        const auto& fullscreenSpv = SpvLoader::getFullscreenVertSPIRV();
+        vertModule = SpvLoader::createShaderModule(ctx.device, fullscreenSpv);
+        auto fragCode = SpvLoader::loadSPIRV(fragPath);
+        fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
+        createPipelineFullscreen(ctx);
+    } else if (renderPath == "raster") {
+        // Raster: load vert.spv + frag.spv
+        std::string vertPath = pipelineBase + ".vert.spv";
+        auto vertCode = SpvLoader::loadSPIRV(vertPath);
+        vertModule = SpvLoader::createShaderModule(ctx.device, vertCode);
+        auto fragCode = SpvLoader::loadSPIRV(fragPath);
+        fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
+
+        // Parse reflection JSON for descriptor set layouts
+        std::string vertJsonPath = pipelineBase + ".vert.json";
+        std::string fragJsonPath = pipelineBase + ".frag.json";
+
+        if (fs::exists(vertJsonPath) && fs::exists(fragJsonPath)) {
+            std::cout << "[info] Loading reflection JSON: " << vertJsonPath << std::endl;
+            vertReflection = parseReflectionJson(vertJsonPath);
+            std::cout << "[info] Loading reflection JSON: " << fragJsonPath << std::endl;
+            fragReflection = parseReflectionJson(fragJsonPath);
+        }
+
+        // Choose pipeline type based on scene
+        if (m_sceneSource == "triangle") {
+            createPipelineTriangle(ctx);
+        } else {
+            // Setup reflection-driven descriptors before creating pipeline
+            // (pipeline layout needs descriptor set layouts)
+            setupReflectedDescriptors(ctx);
+            createPipelinePBR(ctx);
+        }
+    } else {
+        throw std::runtime_error("Unsupported render path for raster renderer: " + renderPath);
+    }
+
+    std::cout << "[info] Pipeline created: " << pipelineBase << " (path=" << renderPath << ")" << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Phase 3: Bind scene resources to pipeline descriptor sets
+// --------------------------------------------------------------------------
+
+void RasterRenderer::bindSceneToPipeline(VulkanContext& ctx) {
+    // Build push constant data from reflection (now that reflection JSON is loaded)
+    glm::vec3 lightDir = glm::normalize(glm::vec3(1.0f, 0.8f, 0.6f));
+    auto buildPushData = [&](const ReflectionData& refl) {
+        for (auto& pc : refl.push_constants) {
+            if (pc.size <= 0) continue;
+            pushConstantSize = std::max(pushConstantSize, static_cast<uint32_t>(pc.size));
+            pushConstantData.resize(pushConstantSize, 0);
+            pushConstantStageFlags |= (refl.stage == "vertex")
+                ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+            for (auto& f : pc.fields) {
+                if (f.name == "light_dir" && static_cast<uint32_t>(f.offset) + 12 <= pushConstantSize) {
+                    memcpy(pushConstantData.data() + f.offset, &lightDir, sizeof(glm::vec3));
+                } else if (f.name == "view_pos" && static_cast<uint32_t>(f.offset) + 12 <= pushConstantSize) {
+                    glm::vec3 eye = Camera::DEFAULT_EYE;
+                    memcpy(pushConstantData.data() + f.offset, &eye, sizeof(glm::vec3));
+                }
+            }
+        }
+    };
+    buildPushData(vertReflection);
+    buildPushData(fragReflection);
+
+    std::cout << "[info] Scene bound to pipeline" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -762,14 +1551,14 @@ void RasterRenderer::render(VulkanContext& ctx) {
     // Set clear values
     std::vector<VkClearValue> clearValues;
     VkClearValue colorClear = {};
-    if (mode == RasterMode::PBR) {
+    if (m_needsDepth) {
         colorClear.color = {{0.05f, 0.05f, 0.08f, 1.0f}};
     } else {
         colorClear.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
     }
     clearValues.push_back(colorClear);
 
-    if (mode == RasterMode::PBR) {
+    if (m_needsDepth) {
         VkClearValue depthClear = {};
         depthClear.depthStencil = {1.0f, 0};
         clearValues.push_back(depthClear);
@@ -787,28 +1576,40 @@ void RasterRenderer::render(VulkanContext& ctx) {
     vkCmdBeginRenderPass(cmd, &rpBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-    switch (mode) {
-        case RasterMode::Triangle: {
-            VkDeviceSize offset = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &triangleVB, &offset);
-            vkCmdDraw(cmd, 3, 1, 0, 0);
-            break;
-        }
-        case RasterMode::Fullscreen:
-            vkCmdDraw(cmd, 3, 1, 0, 0);
-            break;
-        case RasterMode::PBR: {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    pipelineLayout, 0, 1, &descSet0, 0, nullptr);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    pipelineLayout, 1, 1, &descSet1, 0, nullptr);
+    // Push constants (if any)
+    if (pushConstantSize > 0 && pushConstantStageFlags != 0) {
+        vkCmdPushConstants(cmd, pipelineLayout, pushConstantStageFlags,
+                           0, pushConstantSize, pushConstantData.data());
+    }
 
-            VkDeviceSize offset = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &offset);
-            vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
-            break;
+    if (m_sceneSource == "triangle") {
+        // Triangle scene: bind triangle vertex buffer and draw
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &triangleVB, &offset);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    } else if (m_sceneSource == "fullscreen" || m_renderPath == "fullscreen") {
+        // Fullscreen scene: draw fullscreen triangle (no vertex buffer)
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    } else {
+        // Sphere, glTF, or default PBR scene: bind reflection-driven descriptors
+        // Bind descriptor sets in order
+        int maxSet = -1;
+        for (auto& [idx, _] : reflectedDescSets) {
+            maxSet = std::max(maxSet, idx);
         }
+        for (int i = 0; i <= maxSet; i++) {
+            auto it = reflectedDescSets.find(i);
+            if (it != reflectedDescSets.end()) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        pipelineLayout, static_cast<uint32_t>(i),
+                                        1, &it->second, 0, nullptr);
+            }
+        }
+
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &offset);
+        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
     }
 
     vkCmdEndRenderPass(cmd);
@@ -909,9 +1710,39 @@ void RasterRenderer::cleanup(VulkanContext& ctx) {
     if (lightBuffer) vmaDestroyBuffer(ctx.allocator, lightBuffer, lightAllocation);
 
     if (descriptorPool) vkDestroyDescriptorPool(ctx.device, descriptorPool, nullptr);
-    if (descSetLayout0) vkDestroyDescriptorSetLayout(ctx.device, descSetLayout0, nullptr);
-    if (descSetLayout1) vkDestroyDescriptorSetLayout(ctx.device, descSetLayout1, nullptr);
+    for (auto& [_, layout] : reflectedSetLayouts) {
+        vkDestroyDescriptorSetLayout(ctx.device, layout, nullptr);
+    }
+    reflectedSetLayouts.clear();
+    reflectedDescSets.clear();
 
     Scene::destroyMesh(ctx.allocator, mesh);
-    Scene::destroyTexture(ctx.allocator, ctx.device, texture);
+
+    // Destroy named textures
+    // Track already-destroyed textures to avoid double-free when multiple names
+    // point to the same GPUTexture (e.g. albedo_tex and base_color_tex for procedural)
+    std::vector<VkImage> destroyed;
+    for (auto& [name, tex] : namedTextures) {
+        if (tex.image != VK_NULL_HANDLE) {
+            bool alreadyDestroyed = false;
+            for (auto img : destroyed) {
+                if (img == tex.image) { alreadyDestroyed = true; break; }
+            }
+            if (!alreadyDestroyed) {
+                destroyed.push_back(tex.image);
+                Scene::destroyTexture(ctx.allocator, ctx.device, tex);
+            }
+        }
+    }
+    namedTextures.clear();
+
+    // Destroy IBL textures
+    for (auto& [name, tex] : iblTextures) {
+        if (tex.image != VK_NULL_HANDLE) {
+            Scene::destroyTexture(ctx.allocator, ctx.device, tex);
+        }
+    }
+    iblTextures.clear();
+
+    Scene::destroyTexture(ctx.allocator, ctx.device, defaultWhiteTexture);
 }

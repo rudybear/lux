@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "source": "differentiable.lux",
+  "stage": "fragment",
+  "execution_model": "Fragment",
+  "inputs": [
+    {
+      "name": "param",
+      "type": "scalar",
+      "location": 0
+    }
+  ],
+  "outputs": [
+    {
+      "name": "color",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "descriptor_sets": {},
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0
+}

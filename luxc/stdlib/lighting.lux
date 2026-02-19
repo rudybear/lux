@@ -1,0 +1,105 @@
+// Lux Standard Library: Multi-Light Evaluation
+// Supports directional, point, and spot light types.
+
+const MAX_LIGHTS: scalar = 16.0;
+
+// Light type constants
+const LIGHT_DIRECTIONAL: scalar = 0.0;
+const LIGHT_POINT: scalar = 1.0;
+const LIGHT_SPOT: scalar = 2.0;
+const LIGHT_AREA: scalar = 3.0;
+
+// --- Attenuation ---
+
+fn distance_attenuation(dist: scalar, range: scalar) -> scalar {
+    // Inverse-square falloff with range cutoff (glTF spec)
+    let d2: scalar = dist * dist;
+    let factor: scalar = d2 / max(range * range, 0.0001);
+    let smooth: scalar = clamp(1.0 - factor * factor, 0.0, 1.0);
+    return smooth * smooth / max(d2, 0.0001);
+}
+
+fn spot_attenuation(cos_angle: scalar, inner_cone: scalar, outer_cone: scalar) -> scalar {
+    // Angular attenuation for spot lights
+    let t: scalar = clamp((cos_angle - outer_cone) / max(inner_cone - outer_cone, 0.0001), 0.0, 1.0);
+    return t * t;
+}
+
+// --- Per-light evaluation ---
+
+fn evaluate_directional_light(
+    direction: vec3,
+    color: vec3,
+    intensity: scalar,
+    surface_normal: vec3
+) -> vec3 {
+    let l: vec3 = normalize(direction);
+    let n_dot_l: scalar = max(dot(surface_normal, l), 0.0);
+    return color * intensity * n_dot_l;
+}
+
+fn evaluate_point_light(
+    light_pos: vec3,
+    color: vec3,
+    intensity: scalar,
+    range: scalar,
+    surface_pos: vec3,
+    surface_normal: vec3
+) -> vec3 {
+    let to_light: vec3 = light_pos - surface_pos;
+    let dist: scalar = length(to_light);
+    let l: vec3 = to_light / max(dist, 0.0001);
+    let n_dot_l: scalar = max(dot(surface_normal, l), 0.0);
+    let atten: scalar = distance_attenuation(dist, range);
+    return color * intensity * n_dot_l * atten;
+}
+
+fn evaluate_spot_light(
+    light_pos: vec3,
+    light_dir: vec3,
+    color: vec3,
+    intensity: scalar,
+    range: scalar,
+    inner_cone: scalar,
+    outer_cone: scalar,
+    surface_pos: vec3,
+    surface_normal: vec3
+) -> vec3 {
+    let to_light: vec3 = light_pos - surface_pos;
+    let dist: scalar = length(to_light);
+    let l: vec3 = to_light / max(dist, 0.0001);
+    let n_dot_l: scalar = max(dot(surface_normal, l), 0.0);
+    let cos_angle: scalar = dot(normalize(light_dir), l);
+    let atten: scalar = distance_attenuation(dist, range);
+    let spot: scalar = spot_attenuation(cos_angle, inner_cone, outer_cone);
+    return color * intensity * n_dot_l * atten * spot;
+}
+
+// --- Combined light evaluation ---
+// In practice, the surface expander unrolls the multi-light loop.
+// These helpers are for individual light contribution.
+
+fn evaluate_light(
+    light_type: scalar,
+    light_pos: vec3,
+    light_dir: vec3,
+    color: vec3,
+    intensity: scalar,
+    range: scalar,
+    inner_cone: scalar,
+    outer_cone: scalar,
+    surface_pos: vec3,
+    surface_normal: vec3
+) -> vec3 {
+    // Select evaluation based on light type
+    // Type 0 = directional, 1 = point, 2 = spot
+    let is_dir: scalar = (light_type < 0.5) ? 1.0 : 0.0;
+    let is_point: scalar = (light_type > 0.5 && light_type < 1.5) ? 1.0 : 0.0;
+    let is_spot: scalar = (light_type > 1.5) ? 1.0 : 0.0;
+
+    let dir_contrib: vec3 = evaluate_directional_light(light_dir, color, intensity, surface_normal);
+    let point_contrib: vec3 = evaluate_point_light(light_pos, color, intensity, range, surface_pos, surface_normal);
+    let spot_contrib: vec3 = evaluate_spot_light(light_pos, light_dir, color, intensity, range, inner_cone, outer_cone, surface_pos, surface_normal);
+
+    return dir_contrib * is_dir + point_contrib * is_point + spot_contrib * is_spot;
+}

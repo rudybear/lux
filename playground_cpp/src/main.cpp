@@ -13,38 +13,17 @@
 #include <filesystem>
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 
 namespace fs = std::filesystem;
 
 // --------------------------------------------------------------------------
-// Rendering mode enumeration
-// --------------------------------------------------------------------------
-
-enum class PlaygroundMode {
-    Triangle,
-    Fullscreen,
-    PBR,
-    RT
-};
-
-static const char* modeToString(PlaygroundMode mode) {
-    switch (mode) {
-        case PlaygroundMode::Triangle:   return "triangle";
-        case PlaygroundMode::Fullscreen: return "fullscreen";
-        case PlaygroundMode::PBR:       return "pbr";
-        case PlaygroundMode::RT:        return "rt";
-    }
-    return "unknown";
-}
-
-// --------------------------------------------------------------------------
-// CLI argument parsing
+// CLI argument parsing (scene/pipeline architecture)
 // --------------------------------------------------------------------------
 
 struct CLIOptions {
-    std::string shaderBase;
-    PlaygroundMode mode = PlaygroundMode::Triangle;
-    bool modeSpecified = false;
+    std::string shaderBase;    // --pipeline value (resolved from scene if not given)
+    std::string sceneSource;   // --scene value (required)
     uint32_t width = 512;
     uint32_t height = 512;
     std::string output = "output.png";
@@ -53,25 +32,27 @@ struct CLIOptions {
 };
 
 static void printUsage(const char* program) {
-    std::cout << "Usage: " << program << " [OPTIONS] <shader_base>\n"
+    std::cout << "Usage: " << program << " [OPTIONS] [shader_base]\n"
               << "\n"
               << "Arguments:\n"
-              << "  <shader_base>   Base path for .spv shader files\n"
+              << "  [shader_base]          Base path for .spv shader files (positional, legacy)\n"
               << "\n"
               << "Options:\n"
-              << "  --mode <MODE>   Rendering mode: triangle|fullscreen|pbr|rt\n"
-              << "                  (auto-detected from available .spv files if omitted)\n"
-              << "  --width <N>     Output width in pixels (default: 512)\n"
-              << "  --height <N>    Output height in pixels (default: 512)\n"
-              << "  --output <PATH> Output PNG path (default: output.png)\n"
-              << "  --interactive   Open GLFW preview window\n"
-              << "  --headless      Offscreen render only (default)\n"
-              << "  --help          Show this help message\n"
+              << "  --scene <SOURCE>       Scene source: sphere, fullscreen, triangle, or path to .glb/.gltf\n"
+              << "  --pipeline <BASE>      Compiled shader base path (auto-resolved from scene if omitted)\n"
+              << "  --mode <MODE>          (Legacy) Rendering mode: triangle|fullscreen|pbr|rt\n"
+              << "  --width <N>            Output width in pixels (default: 512)\n"
+              << "  --height <N>           Output height in pixels (default: 512)\n"
+              << "  --output <PATH>        Output PNG path (default: output.png)\n"
+              << "  --interactive          Open GLFW preview window\n"
+              << "  --headless             Offscreen render only (default)\n"
+              << "  --help                 Show this help message\n"
               << std::endl;
 }
 
 static CLIOptions parseArgs(int argc, char* argv[]) {
     CLIOptions opts;
+    std::string legacyMode;
 
     if (argc < 2) {
         printUsage(argv[0]);
@@ -84,23 +65,15 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
         if (arg == "--help" || arg == "-h") {
             printUsage(argv[0]);
             std::exit(0);
+        } else if (arg == "--scene" && i + 1 < argc) {
+            opts.sceneSource = argv[++i];
+        } else if (arg == "--pipeline" && i + 1 < argc) {
+            opts.shaderBase = argv[++i];
         } else if (arg == "--mode" && i + 1 < argc) {
+            // Legacy --mode support: map to --scene
             i++;
-            std::string modeStr = argv[i];
-            std::transform(modeStr.begin(), modeStr.end(), modeStr.begin(), ::tolower);
-            if (modeStr == "triangle") {
-                opts.mode = PlaygroundMode::Triangle;
-            } else if (modeStr == "fullscreen") {
-                opts.mode = PlaygroundMode::Fullscreen;
-            } else if (modeStr == "pbr") {
-                opts.mode = PlaygroundMode::PBR;
-            } else if (modeStr == "rt") {
-                opts.mode = PlaygroundMode::RT;
-            } else {
-                std::cerr << "Unknown mode: " << modeStr << std::endl;
-                std::exit(1);
-            }
-            opts.modeSpecified = true;
+            legacyMode = argv[i];
+            std::transform(legacyMode.begin(), legacyMode.end(), legacyMode.begin(), ::tolower);
         } else if (arg == "--width" && i + 1 < argc) {
             i++;
             opts.width = static_cast<uint32_t>(std::stoi(argv[i]));
@@ -125,55 +98,53 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
         }
     }
 
-    if (opts.shaderBase.empty()) {
-        std::cerr << "Error: No shader base path specified." << std::endl;
-        printUsage(argv[0]);
-        std::exit(1);
+    // Legacy --mode backwards compatibility: map mode to scene source
+    if (!legacyMode.empty() && opts.sceneSource.empty()) {
+        if (legacyMode == "triangle")        opts.sceneSource = "triangle";
+        else if (legacyMode == "fullscreen") opts.sceneSource = "fullscreen";
+        else if (legacyMode == "pbr")        opts.sceneSource = "sphere";
+        else if (legacyMode == "rt")         opts.sceneSource = "sphere";
+        else {
+            std::cerr << "Unknown legacy mode: " << legacyMode << std::endl;
+            std::exit(1);
+        }
+        std::cout << "[info] Legacy --mode \"" << legacyMode
+                  << "\" mapped to --scene \"" << opts.sceneSource << "\"" << std::endl;
+    }
+
+    // Backwards compat: if no --scene, treat positional arg as pipeline base and use "sphere" as scene
+    if (opts.sceneSource.empty()) {
+        if (!opts.shaderBase.empty()) {
+            opts.sceneSource = "sphere";  // default scene
+        } else {
+            std::cerr << "Error: --scene is required\n";
+            printUsage(argv[0]);
+            std::exit(1);
+        }
     }
 
     return opts;
 }
 
 // --------------------------------------------------------------------------
-// Auto-detection of rendering mode from available .spv files
+// Pipeline resolution and render path detection
 // --------------------------------------------------------------------------
 
-static PlaygroundMode autoDetectMode(const std::string& shaderBase) {
-    // Check for RT shaders
-    if (fs::exists(shaderBase + ".rgen.spv")) {
-        std::cout << "[info] Auto-detected mode: RT (found .rgen.spv)" << std::endl;
-        return PlaygroundMode::RT;
-    }
+static std::string resolveDefaultPipeline(const std::string& scene) {
+    if (scene.size() > 4 && (scene.substr(scene.size()-4) == ".glb" || scene.substr(scene.size()-5) == ".gltf"))
+        return "examples/gltf_pbr";
+    if (scene == "fullscreen")
+        throw std::runtime_error("--pipeline required for fullscreen scenes");
+    if (scene == "triangle")
+        return "examples/hello_triangle";
+    return "examples/pbr_basic";
+}
 
-    bool hasVert = fs::exists(shaderBase + ".vert.spv");
-    bool hasFrag = fs::exists(shaderBase + ".frag.spv");
-
-    if (hasVert && hasFrag) {
-        // Check if PBR mode (look for PBR indicators in the shader base name)
-        std::string baseLower = shaderBase;
-        std::transform(baseLower.begin(), baseLower.end(), baseLower.begin(), ::tolower);
-        if (baseLower.find("pbr") != std::string::npos ||
-            baseLower.find("material") != std::string::npos ||
-            baseLower.find("sphere") != std::string::npos) {
-            std::cout << "[info] Auto-detected mode: PBR (found .vert.spv + .frag.spv with PBR indicator)" << std::endl;
-            return PlaygroundMode::PBR;
-        }
-        std::cout << "[info] Auto-detected mode: Triangle (found .vert.spv + .frag.spv)" << std::endl;
-        return PlaygroundMode::Triangle;
-    }
-
-    if (hasFrag) {
-        std::cout << "[info] Auto-detected mode: Fullscreen (found .frag.spv only)" << std::endl;
-        return PlaygroundMode::Fullscreen;
-    }
-
-    std::cerr << "[error] Could not auto-detect mode. No shader files found for base: "
-              << shaderBase << std::endl;
-    std::cerr << "Searched for:" << std::endl;
-    std::cerr << "  " << shaderBase << ".rgen.spv (RT)" << std::endl;
-    std::cerr << "  " << shaderBase << ".vert.spv (Triangle/PBR)" << std::endl;
-    std::cerr << "  " << shaderBase << ".frag.spv (Fullscreen/Triangle/PBR)" << std::endl;
-    std::exit(1);
+static std::string detectRenderPath(const std::string& base) {
+    if (fs::exists(base + ".rgen.spv")) return "rt";
+    if (fs::exists(base + ".vert.spv") && fs::exists(base + ".frag.spv")) return "raster";
+    if (fs::exists(base + ".frag.spv")) return "fullscreen";
+    throw std::runtime_error("No shader files found for: " + base);
 }
 
 // --------------------------------------------------------------------------
@@ -181,10 +152,12 @@ static PlaygroundMode autoDetectMode(const std::string& shaderBase) {
 // --------------------------------------------------------------------------
 
 static int runHeadless(const CLIOptions& opts) {
-    PlaygroundMode mode = opts.modeSpecified ? opts.mode : autoDetectMode(opts.shaderBase);
-    bool needRT = (mode == PlaygroundMode::RT);
+    std::string renderPath = detectRenderPath(opts.shaderBase);
+    bool needRT = (renderPath == "rt");
 
-    std::cout << "[info] Headless mode: " << modeToString(mode)
+    std::cout << "[info] Headless render: scene=\"" << opts.sceneSource
+              << "\" pipeline=\"" << opts.shaderBase
+              << "\" path=" << renderPath
               << " (" << opts.width << "x" << opts.height << ")" << std::endl;
 
     // Initialize Vulkan context
@@ -203,14 +176,15 @@ static int runHeadless(const CLIOptions& opts) {
     }
 
     try {
-        if (mode == PlaygroundMode::RT) {
+        if (needRT) {
             // RT rendering
             std::string rgenPath = opts.shaderBase + ".rgen.spv";
             std::string rmissPath = opts.shaderBase + ".rmiss.spv";
             std::string rchitPath = opts.shaderBase + ".rchit.spv";
 
             RTRenderer renderer;
-            renderer.init(ctx, rgenPath, rmissPath, rchitPath, opts.width, opts.height);
+            renderer.init(ctx, rgenPath, rmissPath, rchitPath,
+                          opts.width, opts.height, opts.sceneSource);
             renderer.render(ctx);
 
             // Save screenshot
@@ -222,32 +196,10 @@ static int runHeadless(const CLIOptions& opts) {
 
             renderer.cleanup(ctx);
         } else {
-            // Raster rendering
-            RasterMode rasterMode;
-            std::string vertPath;
-            std::string fragPath = opts.shaderBase + ".frag.spv";
-
-            switch (mode) {
-                case PlaygroundMode::Triangle:
-                    rasterMode = RasterMode::Triangle;
-                    vertPath = opts.shaderBase + ".vert.spv";
-                    break;
-                case PlaygroundMode::Fullscreen:
-                    rasterMode = RasterMode::Fullscreen;
-                    // vertPath left empty; RasterRenderer uses built-in fullscreen vert
-                    break;
-                case PlaygroundMode::PBR:
-                    rasterMode = RasterMode::PBR;
-                    vertPath = opts.shaderBase + ".vert.spv";
-                    break;
-                default:
-                    rasterMode = RasterMode::Triangle;
-                    vertPath = opts.shaderBase + ".vert.spv";
-                    break;
-            }
-
+            // Raster rendering (three-phase: upload scene, create pipeline, bind)
             RasterRenderer renderer;
-            renderer.init(ctx, rasterMode, vertPath, fragPath, opts.width, opts.height);
+            renderer.init(ctx, opts.sceneSource, opts.shaderBase, renderPath,
+                          opts.width, opts.height);
             renderer.render(ctx);
 
             // Save screenshot
@@ -275,10 +227,12 @@ static int runHeadless(const CLIOptions& opts) {
 // --------------------------------------------------------------------------
 
 static int runInteractive(const CLIOptions& opts) {
-    PlaygroundMode mode = opts.modeSpecified ? opts.mode : autoDetectMode(opts.shaderBase);
-    bool needRT = (mode == PlaygroundMode::RT);
+    std::string renderPath = detectRenderPath(opts.shaderBase);
+    bool needRT = (renderPath == "rt");
 
-    std::cout << "[info] Interactive mode: " << modeToString(mode)
+    std::cout << "[info] Interactive render: scene=\"" << opts.sceneSource
+              << "\" pipeline=\"" << opts.shaderBase
+              << "\" path=" << renderPath
               << " (" << opts.width << "x" << opts.height << ")" << std::endl;
 
     // Initialize GLFW
@@ -344,41 +298,21 @@ static int runInteractive(const CLIOptions& opts) {
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     vkCreateFence(ctx.device, &fenceInfo, nullptr, &inFlightFence);
 
-    // Initialize renderer
+    // Initialize renderers
     RasterRenderer rasterRenderer;
     RTRenderer rtRenderer;
-    bool useRT = (mode == PlaygroundMode::RT);
+    bool useRT = needRT;
 
     try {
         if (useRT) {
             std::string rgenPath = opts.shaderBase + ".rgen.spv";
             std::string rmissPath = opts.shaderBase + ".rmiss.spv";
             std::string rchitPath = opts.shaderBase + ".rchit.spv";
-            rtRenderer.init(ctx, rgenPath, rmissPath, rchitPath, opts.width, opts.height);
+            rtRenderer.init(ctx, rgenPath, rmissPath, rchitPath,
+                           opts.width, opts.height, opts.sceneSource);
         } else {
-            RasterMode rasterMode;
-            std::string vertPath;
-            std::string fragPath = opts.shaderBase + ".frag.spv";
-
-            switch (mode) {
-                case PlaygroundMode::Triangle:
-                    rasterMode = RasterMode::Triangle;
-                    vertPath = opts.shaderBase + ".vert.spv";
-                    break;
-                case PlaygroundMode::Fullscreen:
-                    rasterMode = RasterMode::Fullscreen;
-                    break;
-                case PlaygroundMode::PBR:
-                    rasterMode = RasterMode::PBR;
-                    vertPath = opts.shaderBase + ".vert.spv";
-                    break;
-                default:
-                    rasterMode = RasterMode::Triangle;
-                    vertPath = opts.shaderBase + ".vert.spv";
-                    break;
-            }
-
-            rasterRenderer.init(ctx, rasterMode, vertPath, fragPath, opts.width, opts.height);
+            rasterRenderer.init(ctx, opts.sceneSource, opts.shaderBase, renderPath,
+                                opts.width, opts.height);
         }
     } catch (const std::exception& e) {
         std::cerr << "[error] Failed to initialize renderer: " << e.what() << std::endl;
@@ -557,6 +491,17 @@ static int runInteractive(const CLIOptions& opts) {
 
 int main(int argc, char* argv[]) {
     CLIOptions opts = parseArgs(argc, argv);
+
+    // Resolve pipeline from scene if not explicitly given
+    if (opts.shaderBase.empty()) {
+        try {
+            opts.shaderBase = resolveDefaultPipeline(opts.sceneSource);
+            std::cout << "[info] Resolved pipeline: " << opts.shaderBase << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[error] " << e.what() << std::endl;
+            return 1;
+        }
+    }
 
     try {
         if (opts.interactive) {

@@ -5,9 +5,11 @@ use bytemuck;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 use gpu_allocator::MemoryLocation;
 use log::info;
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::camera::DefaultCamera;
+use crate::reflected_pipeline;
 use crate::scene;
 use crate::screenshot;
 use crate::spv_loader;
@@ -34,9 +36,9 @@ impl GpuBuffer {
 pub struct RTRenderer {
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
-    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_set_layouts: HashMap<u32, vk::DescriptorSetLayout>,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
+    descriptor_sets: Vec<vk::DescriptorSet>,
 
     blas: vk::AccelerationStructureKHR,
     blas_buffer: vk::Buffer,
@@ -67,17 +69,18 @@ pub struct RTRenderer {
 pub fn render_rt(
     ctx: &mut VulkanContext,
     shader_base: &str,
+    scene_source: &str,
     width: u32,
     height: u32,
     output_path: &Path,
 ) -> Result<(), String> {
-    info!("RT render: {}x{}", width, height);
+    info!("RT render: {}x{}, scene='{}'", width, height, scene_source);
 
     if !ctx.supports_rt() {
         return Err("Ray tracing is not supported on this GPU".to_string());
     }
 
-    let mut renderer = RTRenderer::new(ctx, shader_base, width, height)?;
+    let mut renderer = RTRenderer::new(ctx, shader_base, scene_source, width, height)?;
 
     // Record command buffer
     let device_clone = ctx.device.clone();
@@ -113,9 +116,14 @@ pub fn render_rt(
 
 impl RTRenderer {
     /// Create a new RT renderer: builds AS, creates pipeline, SBT, descriptors.
+    ///
+    /// Descriptor set layouts are driven by reflection JSON sidecar files.
+    /// If `scene_source` ends with `.glb` or `.gltf`, the BLAS is built from
+    /// the glTF mesh; otherwise a procedural sphere is used.
     pub fn new(
         ctx: &mut VulkanContext,
         shader_base: &str,
+        scene_source: &str,
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
@@ -133,6 +141,42 @@ impl RTRenderer {
         // Clone device to avoid borrow conflicts with allocator_mut()
         let device = ctx.device.clone();
 
+        // --- 0. Load reflection JSON for all RT stages ---
+        let rgen_json_path = format!("{}.rgen.json", shader_base);
+        let rchit_json_path = format!("{}.rchit.json", shader_base);
+        let rmiss_json_path = format!("{}.rmiss.json", shader_base);
+
+        let mut reflections: Vec<reflected_pipeline::ReflectionData> = Vec::new();
+        for json_path in &[&rgen_json_path, &rchit_json_path, &rmiss_json_path] {
+            if Path::new(json_path).exists() {
+                let refl = reflected_pipeline::load_reflection(Path::new(json_path))?;
+                info!("Loaded RT reflection: {} (sets: {:?})", json_path,
+                    refl.descriptor_sets.keys().collect::<Vec<_>>());
+                reflections.push(refl);
+            } else {
+                info!("RT reflection file not found (optional): {}", json_path);
+            }
+        }
+
+        // Merge descriptor sets from all RT stages
+        let refl_refs: Vec<&reflected_pipeline::ReflectionData> = reflections.iter().collect();
+        let merged = reflected_pipeline::merge_descriptor_sets(&refl_refs);
+
+        // Create descriptor set layouts from reflection
+        let descriptor_set_layouts = unsafe {
+            reflected_pipeline::create_descriptor_set_layouts_from_merged(&device, &merged)?
+        };
+
+        // Compute pool sizes
+        let (pool_sizes, max_sets) = reflected_pipeline::compute_pool_sizes(&merged);
+
+        info!("RT reflection-driven descriptors: {} sets, {} pool size entries", max_sets, pool_sizes.len());
+
+        // Create pipeline layout from reflection
+        let pipeline_layout = unsafe {
+            reflected_pipeline::create_pipeline_layout_from_merged(&device, &descriptor_set_layouts, &[])?
+        };
+
         // --- 1. Create storage image (RGBA8_UNORM, STORAGE | TRANSFER_SRC) ---
         let (storage_image, storage_image_view, storage_image_allocation) =
             create_storage_image(&device, ctx.allocator_mut(), width, height)?;
@@ -141,10 +185,29 @@ impl RTRenderer {
         let (camera_buffer, camera_allocation) =
             create_camera_ubo(&device, ctx.allocator_mut(), width, height)?;
 
-        // --- 3. Build BLAS from sphere mesh ---
-        let (sphere_verts, sphere_indices) = scene::generate_sphere(32, 32);
-        let (blas, blas_buffer, blas_allocation, blas_device_address) =
-            build_blas(ctx, &sphere_verts, &sphere_indices)?;
+        // --- 3. Build BLAS from scene geometry ---
+        let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
+
+        let (blas, blas_buffer, blas_allocation, blas_device_address) = if is_gltf {
+            info!("Loading glTF mesh for RT BLAS: {}", scene_source);
+            let gltf_scene = crate::gltf_loader::load_gltf(Path::new(scene_source))?;
+            if gltf_scene.meshes.is_empty() {
+                return Err(format!("No meshes found in glTF file: {}", scene_source));
+            }
+            let mesh = &gltf_scene.meshes[0];
+            // Convert GltfVertex to PbrVertex for BLAS (position is at offset 0 in both)
+            let verts: Vec<scene::PbrVertex> = mesh.vertices.iter().map(|v| {
+                scene::PbrVertex {
+                    position: v.position,
+                    normal: v.normal,
+                    uv: v.uv,
+                }
+            }).collect();
+            build_blas(ctx, &verts, &mesh.indices)?
+        } else {
+            let (sphere_verts, sphere_indices) = scene::generate_sphere(32, 32);
+            build_blas(ctx, &sphere_verts, &sphere_indices)?
+        };
 
         // --- 4. Build TLAS with single instance ---
         let (tlas, tlas_buffer, tlas_allocation) =
@@ -163,19 +226,7 @@ impl RTRenderer {
         let rchit_module = spv_loader::create_shader_module(&device, &rchit_code)?;
         let rmiss_module = spv_loader::create_shader_module(&device, &rmiss_code)?;
 
-        // --- 6. Create descriptor set layout ---
-        let descriptor_set_layout = create_descriptor_set_layout(&device)?;
-
-        // --- 7. Create RT pipeline ---
-        let pipeline_layout_info =
-            vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&descriptor_set_layout));
-
-        let pipeline_layout = unsafe {
-            device
-                .create_pipeline_layout(&pipeline_layout_info, None)
-                .map_err(|e| format!("Failed to create RT pipeline layout: {:?}", e))?
-        };
-
+        // --- 6. Create RT pipeline ---
         let rt_pipeline_loader = ctx.rt_pipeline_loader.as_ref().unwrap();
         let pipeline = create_rt_pipeline(
             &device,
@@ -193,7 +244,7 @@ impl RTRenderer {
             device.destroy_shader_module(rmiss_module, None);
         }
 
-        // --- 8. Create SBT ---
+        // --- 7. Create SBT ---
         let rt_props = ctx.rt_properties.as_ref().unwrap().clone();
         let rt_pipeline_loader_clone = ctx.rt_pipeline_loader.clone().unwrap();
         let (sbt_buffer, sbt_allocation, raygen_region, miss_region, hit_region) =
@@ -205,23 +256,64 @@ impl RTRenderer {
                 pipeline,
             )?;
 
-        // --- 9. Create descriptor sets ---
-        let (descriptor_pool, descriptor_set) = create_descriptors(
+        // --- 8. Create descriptor pool and allocate sets from reflection ---
+        let descriptor_pool = unsafe {
+            let pool_info = vk::DescriptorPoolCreateInfo::default()
+                .max_sets(max_sets)
+                .pool_sizes(&pool_sizes);
+            device
+                .create_descriptor_pool(&pool_info, None)
+                .map_err(|e| format!("Failed to create RT descriptor pool: {:?}", e))?
+        };
+
+        let max_set_idx = descriptor_set_layouts.keys().copied().max().unwrap_or(0);
+        let mut ordered_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
+        for i in 0..=max_set_idx {
+            if let Some(&layout) = descriptor_set_layouts.get(&i) {
+                ordered_layouts.push(layout);
+            }
+        }
+
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&ordered_layouts);
+
+        let descriptor_sets = unsafe {
+            device
+                .allocate_descriptor_sets(&alloc_info)
+                .map_err(|e| format!("Failed to allocate RT descriptor sets: {:?}", e))?
+        };
+
+        // Build map: set_index -> descriptor_set
+        let mut ds_map: HashMap<u32, vk::DescriptorSet> = HashMap::new();
+        {
+            let mut ds_idx = 0;
+            for i in 0..=max_set_idx {
+                if descriptor_set_layouts.contains_key(&i) {
+                    ds_map.insert(i, descriptor_sets[ds_idx]);
+                    ds_idx += 1;
+                }
+            }
+        }
+
+        // --- 9. Write descriptors from reflection data ---
+        write_rt_descriptors(
             &device,
-            descriptor_set_layout,
+            &merged,
+            &ds_map,
             tlas,
             storage_image_view,
             camera_buffer,
         )?;
 
-        info!("RT renderer initialized successfully");
+        info!("RT renderer initialized successfully (reflection-driven)");
 
         Ok(RTRenderer {
             pipeline,
             pipeline_layout,
-            descriptor_set_layout,
+            descriptor_set_layouts,
             descriptor_pool,
-            descriptor_set,
+            descriptor_sets,
             blas,
             blas_buffer,
             blas_allocation: Some(blas_allocation),
@@ -266,7 +358,7 @@ impl RTRenderer {
             vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
         );
 
-        // Bind RT pipeline and descriptor set
+        // Bind RT pipeline and descriptor sets
         unsafe {
             device.cmd_bind_pipeline(
                 cmd,
@@ -278,7 +370,7 @@ impl RTRenderer {
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 self.pipeline_layout,
                 0,
-                &[self.descriptor_set],
+                &self.descriptor_sets,
                 &[],
             );
         }
@@ -321,8 +413,9 @@ impl RTRenderer {
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             ctx.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
-            ctx.device
-                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            for (_, layout) in &self.descriptor_set_layouts {
+                ctx.device.destroy_descriptor_set_layout(*layout, None);
+            }
         }
 
         // Destroy acceleration structures
@@ -1092,122 +1185,129 @@ fn create_sbt(
     Ok((sbt_buffer, sbt_allocation, raygen_region, miss_region, hit_region))
 }
 
-/// Create the descriptor set layout for the RT pipeline.
+/// Write RT descriptor sets from reflection data.
 ///
-/// Binding 0: Acceleration Structure (RAYGEN)
-/// Binding 1: Storage Image (RAYGEN)
-/// Binding 2: Uniform Buffer / Camera (RAYGEN)
-fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout, String> {
-    let bindings = [
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(2)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-    ];
-
-    let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-
-    unsafe {
-        device
-            .create_descriptor_set_layout(&layout_info, None)
-            .map_err(|e| format!("Failed to create RT descriptor set layout: {:?}", e))
-    }
-}
-
-/// Create descriptor pool, allocate descriptor set, and write descriptors.
-fn create_descriptors(
+/// Matches resource names from the reflection JSON to actual Vulkan resources:
+/// - "Camera" / "Light" uniform_buffer -> camera_buffer (128 bytes)
+/// - "tlas" acceleration_structure -> tlas
+/// - "output_image" storage_image -> storage_image_view
+fn write_rt_descriptors(
     device: &ash::Device,
-    layout: vk::DescriptorSetLayout,
+    merged: &HashMap<u32, Vec<reflected_pipeline::BindingInfo>>,
+    ds_map: &HashMap<u32, vk::DescriptorSet>,
     tlas: vk::AccelerationStructureKHR,
     storage_image_view: vk::ImageView,
     camera_buffer: vk::Buffer,
-) -> Result<(vk::DescriptorPool, vk::DescriptorSet), String> {
-    let pool_sizes = [
-        vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-            .descriptor_count(1),
-        vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_IMAGE)
-            .descriptor_count(1),
-        vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1),
-    ];
+) -> Result<(), String> {
+    // We need to hold the AS write info alive across the update_descriptor_sets call.
+    // Use a Vec of all writes, but handle acceleration structure specially since
+    // it needs push_next.
 
-    let pool_info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets(1)
-        .pool_sizes(&pool_sizes);
+    // First pass: collect non-AS writes
+    let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+    let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
+    let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
 
-    let descriptor_pool = unsafe {
-        device
-            .create_descriptor_pool(&pool_info, None)
-            .map_err(|e| format!("Failed to create RT descriptor pool: {:?}", e))?
-    };
+    // Track AS binding for special handling
+    let mut as_bindings: Vec<(u32, u32)> = Vec::new(); // (set_idx, binding)
 
-    let alloc_info = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(descriptor_pool)
-        .set_layouts(std::slice::from_ref(&layout));
+    for (&set_idx, bindings) in merged {
+        let ds = match ds_map.get(&set_idx) {
+            Some(&ds) => ds,
+            None => continue,
+        };
 
-    let descriptor_sets = unsafe {
-        device
-            .allocate_descriptor_sets(&alloc_info)
-            .map_err(|e| format!("Failed to allocate RT descriptor set: {:?}", e))?
-    };
+        for binding in bindings {
+            let vk_type = reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
 
-    let descriptor_set = descriptor_sets[0];
-
-    // Write TLAS descriptor (binding 0)
-    let tlas_array = [tlas];
-    let mut as_write_info =
-        vk::WriteDescriptorSetAccelerationStructureKHR::default()
-            .acceleration_structures(&tlas_array);
-
-    let tlas_write = vk::WriteDescriptorSet::default()
-        .dst_set(descriptor_set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-        .descriptor_count(1)
-        .push_next(&mut as_write_info);
-
-    // Write storage image descriptor (binding 1)
-    let image_info = vk::DescriptorImageInfo::default()
-        .image_view(storage_image_view)
-        .image_layout(vk::ImageLayout::GENERAL);
-
-    let image_write = vk::WriteDescriptorSet::default()
-        .dst_set(descriptor_set)
-        .dst_binding(1)
-        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-        .image_info(std::slice::from_ref(&image_info));
-
-    // Write camera UBO descriptor (binding 2)
-    let buffer_info = vk::DescriptorBufferInfo::default()
-        .buffer(camera_buffer)
-        .offset(0)
-        .range(128);
-
-    let buffer_write = vk::WriteDescriptorSet::default()
-        .dst_set(descriptor_set)
-        .dst_binding(2)
-        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-        .buffer_info(std::slice::from_ref(&buffer_info));
-
-    unsafe {
-        device.update_descriptor_sets(&[tlas_write, image_write, buffer_write], &[]);
+            match vk_type {
+                vk::DescriptorType::UNIFORM_BUFFER => {
+                    let range = if binding.size > 0 { binding.size as u64 } else { 128 };
+                    let buf_info_idx = buffer_infos.len();
+                    buffer_infos.push(
+                        vk::DescriptorBufferInfo::default()
+                            .buffer(camera_buffer)
+                            .offset(0)
+                            .range(range),
+                    );
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(ds)
+                            .dst_binding(binding.binding)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .buffer_info(unsafe {
+                                std::slice::from_raw_parts(
+                                    &buffer_infos[buf_info_idx] as *const _,
+                                    1,
+                                )
+                            }),
+                    );
+                }
+                vk::DescriptorType::STORAGE_IMAGE => {
+                    let img_info_idx = image_infos.len();
+                    image_infos.push(
+                        vk::DescriptorImageInfo::default()
+                            .image_view(storage_image_view)
+                            .image_layout(vk::ImageLayout::GENERAL),
+                    );
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(ds)
+                            .dst_binding(binding.binding)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .image_info(unsafe {
+                                std::slice::from_raw_parts(
+                                    &image_infos[img_info_idx] as *const _,
+                                    1,
+                                )
+                            }),
+                    );
+                }
+                vk::DescriptorType::ACCELERATION_STRUCTURE_KHR => {
+                    as_bindings.push((set_idx, binding.binding));
+                }
+                _ => {
+                    info!(
+                        "Unhandled RT descriptor type {:?} at set={} binding={} name='{}'",
+                        vk_type, set_idx, binding.binding, binding.name
+                    );
+                }
+            }
+        }
     }
 
-    Ok((descriptor_pool, descriptor_set))
+    // Write non-AS descriptors first
+    if !writes.is_empty() {
+        unsafe {
+            device.update_descriptor_sets(&writes, &[]);
+        }
+    }
+
+    // Write acceleration structure descriptors (needs push_next, done separately)
+    for (set_idx, binding_idx) in &as_bindings {
+        let ds = match ds_map.get(set_idx) {
+            Some(&ds) => ds,
+            None => continue,
+        };
+
+        let tlas_array = [tlas];
+        let mut as_write_info =
+            vk::WriteDescriptorSetAccelerationStructureKHR::default()
+                .acceleration_structures(&tlas_array);
+
+        let as_write = vk::WriteDescriptorSet::default()
+            .dst_set(ds)
+            .dst_binding(*binding_idx)
+            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+            .descriptor_count(1)
+            .push_next(&mut as_write_info);
+
+        unsafe {
+            device.update_descriptor_sets(&[as_write], &[]);
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -31,6 +31,33 @@ The compiler expands this into fully typed vertex + fragment SPIR-V — no manua
 
 ## Gallery
 
+### glTF PBR with IBL
+
+Full glTF 2.0 PBR rendering — tangent-space normal mapping, metallic-roughness workflow, image-based lighting with pre-filtered specular cubemap + irradiance + BRDF LUT, and multi-scattering energy compensation.
+
+<p align="center"><img src="playground/test_gltf_pbr.png" width="400"></p>
+
+```
+import brdf;
+import color;
+import ibl;
+import texture;
+
+fragment {
+    samplerCube env_specular;
+    samplerCube env_irradiance;
+    sampler2d brdf_lut;
+
+    fn main() {
+        let n: vec3 = tbn_perturb_normal(normal_sample.xyz, world_normal, world_tangent, world_bitangent);
+        let prefiltered: vec3 = sample_lod(env_specular, reflect(v * -1.0, n), roughness * 4.0).xyz;
+        let irradiance: vec3 = sample(env_irradiance, n).xyz;
+        let brdf: vec2 = sample(brdf_lut, vec2(n_dot_v, roughness)).xy;
+        // ... multi-scattering energy compensation + ACES tonemapping
+    }
+}
+```
+
 ### Ray Tracing
 
 Real-time ray traced sphere with barycentric shading and sky gradient — compiled from a single `.lux` file to three SPIR-V stages (raygen, closest-hit, miss).
@@ -154,17 +181,25 @@ vertex {
 
 ### Native GPU Playgrounds
 
-Both C++ and Rust native Vulkan renderers are included — build from source and render any `.lux` shader, including ray tracing:
+Three rendering backends — Python/wgpu, C++/Vulkan, Rust/ash — all driven by the same reflection JSON from the Lux compiler:
 
 ```bash
+# Python (wgpu)
+python -m playground.engine --scene sphere --pipeline playground/pbr_surface
+
 # C++
 cd playground_cpp && cmake -B build && cmake --build build --config Release
-./build/Release/lux-playground --mode rt playground/rt_manual
+./build/Release/lux-playground --pipeline playground/gltf_pbr --scene path/to/model.glb
 
 # Rust
 cd playground_rust && cargo build --release
-./target/release/lux-playground --mode rt playground/rt_manual
+./target/release/lux-playground --pipeline playground/gltf_pbr --scene path/to/model.glb
+
+# Ray tracing (C++ and Rust)
+./build/Release/lux-playground --mode rt playground/rt_manual
 ```
+
+All three engines support reflection-driven descriptor binding, glTF loading, cubemap textures, and IBL.
 
 ## Features
 
@@ -172,14 +207,17 @@ cd playground_rust && cargo build --release
 - **Algorithm/schedule separation** — swap BRDF variants and tonemapping without touching material code
 - **Math-first syntax** — `scalar` not `float`, `builtin_position` not `gl_Position`
 - **Auto-layout** — locations, descriptor sets, and bindings assigned by declaration order
-- **Standard library** — 70+ functions across 6 modules: BRDF, SDF, noise, color, colorspace, texture
+- **Standard library** — 80+ functions across 8 modules: BRDF, SDF, noise, color, colorspace, texture, IBL, lighting
 - **Automatic differentiation** — `@differentiable` generates gradient functions via forward-mode autodiff
 - **Ray tracing** — `mode: raytrace` pipelines, `environment`/`procedural` declarations, RT stage blocks
 - **GLSL transpiler** — `--transpile` converts GLSL fragment shaders to Lux
 - **AI generation** — `--ai "description"` generates shaders from natural language
 - **One file, multi-stage** — vertex, fragment, and RT stages in a single `.lux` file
 - **Full SPIR-V output** — compiles to validated `.spv` binaries via `spirv-as` + `spirv-val`
-- **40+ built-in functions** — math, vector, matrix, texture sampling, RT instructions
+- **40+ built-in functions** — math, vector, matrix, texture sampling (2D + cubemap + explicit LOD), RT instructions
+- **glTF 2.0 PBR** — tangent normal mapping, metallic-roughness, image-based lighting, multi-scattering
+- **Rendering engine** — unified scene/pipeline architecture with Python, C++, and Rust Vulkan backends
+- **IBL pipeline** — offline HDR preprocessing to specular cubemap + irradiance + BRDF LUT
 - **Swizzle & constructors** — `v.xyz`, `vec4(pos, 1.0)`, `vec3(0.5)` (splat)
 - **Import system** — `import brdf;` pulls in stdlib or local modules
 - **User-defined functions** with inlining, structs, type aliases, constants
@@ -275,6 +313,7 @@ Options:
 | `ivec2/3/4` / `uvec2/3/4` | `OpTypeVector` | Integer vectors |
 | `mat2` / `mat3` / `mat4` | `OpTypeMatrix` | Column-major |
 | `sampler2d` | `OpTypeSampledImage` | Combined image sampler |
+| `samplerCube` | `OpTypeSampledImage (Cube)` | Cubemap image sampler |
 | `acceleration_structure` | `OpTypeAccelerationStructureKHR` | RT top-level acceleration structure |
 
 ### Stage Blocks
@@ -458,6 +497,7 @@ Import modules with `import <name>;` — functions are inlined at the call site.
 | Module | Functions | Description |
 |--------|-----------|-------------|
 | `brdf` | 30+ | Fresnel (Schlick, conductor), NDF (GGX, Charlie, anisotropic), Geometry (Smith GGX, height-correlated), Diffuse (Lambert, Oren-Nayar, Burley), Composite (PBR, glTF PBR), Clearcoat, Sheen, Transmission BTDF, Volumetric refraction (Walter 2007), Iridescence (Belcour 2017), Dispersion (Abbe number), Volume attenuation |
+| `ibl` | 8 | Specular/diffuse IBL contributions, Fresnel-roughness, GGX importance sampling, Hammersley sequence, combined glTF PBR+IBL with multi-scattering energy compensation |
 | `sdf` | 18 | Sphere, box, round box, plane, torus, cylinder, capsule, union, intersection, subtraction, smooth union/subtraction, translate, scale, repeat, round, onion, elongate |
 | `noise` | 13 | Hash functions (2D/3D), value noise, gradient/Perlin noise, FBM (4/6 octaves, 2D/3D, loop-unrolled), Voronoi 2D |
 | `color` | 5 | linear-to-sRGB, sRGB-to-linear, luminance, Reinhard tonemap, ACES tonemap |
@@ -470,7 +510,7 @@ Import modules with `import <name>;` — functions are inlined at the call site.
 
 **Native SPIR-V**: `dot` (OpDot)
 
-**Texture**: `sample(tex, uv)` (OpImageSampleImplicitLod)
+**Texture**: `sample(tex, uv)` (OpImageSampleImplicitLod), `sample_lod(tex, uv, lod)` (OpImageSampleExplicitLod — explicit mip level for IBL pre-filtered environment maps)
 
 **Ray tracing**: `trace_ray`, `report_intersection`, `execute_callable`, `ignore_intersection`, `terminate_ray`
 
@@ -559,6 +599,8 @@ luxc/
         color.lux            # tonemapping + color space
         colorspace.lux       # HSV, contrast, saturation
         texture.lux          # normal maps, triplanar, UV utils
+        ibl.lux              # image-based lighting + multi-scattering
+        lighting.lux         # multi-light shading (directional, point, spot)
     transpiler/
         glsl_ast.py          # GLSL AST nodes
         glsl_parser.py       # GLSL subset parser
@@ -578,10 +620,22 @@ examples/
     texture_demo.lux         # UV tiling, rotation, triplanar weights
     autodiff_demo.lux        # wave function + auto-generated derivative
     advanced_materials_demo.lux  # transmission, iridescence, dispersion, volume
+    gltf_pbr.lux             # glTF 2.0 PBR with IBL + normal mapping
+    gltf_pbr_rt.lux          # ray traced glTF PBR
+    lighting_demo.lux        # multi-light PBR (directional, point, spot)
+    ibl_demo.lux             # image-based lighting demo
+    math_builtins_demo.lux   # built-in function visualizer
 playground/
-    render_harness.py        # wgpu render (triangle + fullscreen quad)
-    render_pbr.py            # PBR sphere renderer
-    test_*.py                # screenshot tests (10 tests)
+    engine.py                # unified rendering engine (scene/pipeline separation)
+    reflected_pipeline.py    # reflection-driven descriptor binding
+    gltf_loader.py           # glTF 2.0 scene loader (meshes, materials, textures)
+    scene_utils.py           # procedural scene generators
+    preprocess_ibl.py        # HDR/EXR -> cubemap + irradiance + BRDF LUT
+    test_*.py                # screenshot tests (15 tests)
+playground_cpp/
+    src/                     # native Vulkan C++ renderer (raster + RT)
+playground_rust/
+    src/                     # native Vulkan Rust renderer (ash, raster + RT)
 tests/
     test_parser.py
     test_type_checker.py
@@ -616,6 +670,11 @@ tools/
 | `texture_demo.lux` | UV tiling, rotation, triplanar weight visualization |
 | `autodiff_demo.lux` | Wave function + derivative visualization |
 | `advanced_materials_demo.lux` | Transmission, iridescence, dispersion, volume attenuation |
+| `gltf_pbr.lux` | glTF 2.0 PBR: tangent normal mapping, metallic-roughness, IBL cubemaps, multi-scattering |
+| `gltf_pbr_rt.lux` | Ray traced glTF PBR: same material model with RT stages |
+| `lighting_demo.lux` | Multi-light: directional, point, spot lights with PBR |
+| `ibl_demo.lux` | Image-based lighting showcase: specular + diffuse IBL |
+| `math_builtins_demo.lux` | Built-in function visualizer: sin, smoothstep, fract, etc. |
 
 ## Screenshot Tests
 
@@ -631,16 +690,49 @@ python playground/test_texture_utils.py
 python playground/test_autodiff.py
 python playground/test_advanced_materials.py
 python playground/test_rt_pathtracer.py
+python playground/test_gltf_pbr.py
+python playground/test_lighting.py
+python playground/test_ibl.py
+python playground/test_math_builtins.py
 ```
 
 Each test compiles the shader, renders to a 512x512 PNG, and validates pixel-level properties (coverage, color distribution, spatial variation).
+
+### Rendering Engine
+
+The `playground/engine.py` provides a unified rendering engine with scene/pipeline separation:
+
+```bash
+# Render a glTF model with PBR shading
+python -m playground.engine --scene path/to/model.glb --pipeline playground/gltf_pbr --output render.png
+
+# Render a procedural sphere
+python -m playground.engine --scene sphere --pipeline playground/pbr_surface --output sphere.png
+
+# Render with IBL environment lighting
+python -m playground.engine --scene path/to/model.glb --pipeline playground/gltf_pbr --ibl neutral --output render_ibl.png
+```
+
+### IBL Preprocessing
+
+Convert HDR environment maps to pre-filtered cubemaps for image-based lighting:
+
+```bash
+# Download and preprocess a Khronos sample environment
+python -m playground.preprocess_ibl --download neutral
+
+# Process a custom HDR panorama
+python -m playground.preprocess_ibl my_environment.hdr
+```
+
+Output: specular cubemap (6 faces x 5 mips), irradiance cubemap, and BRDF integration LUT.
 
 ## Running Tests
 
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 260 tests
+# 338 tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.

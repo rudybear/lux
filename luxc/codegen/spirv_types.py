@@ -72,6 +72,16 @@ class TypeRegistry:
         key = "sampled_image"
         return self._ensure_type(key, f"OpTypeSampledImage {img}")
 
+    def cube_image_type(self) -> str:
+        f32 = self.float32()
+        key = "image_cube"
+        return self._ensure_type(key, f"OpTypeImage {f32} Cube 0 0 0 1 Unknown")
+
+    def sampled_cube_image_type(self) -> str:
+        img = self.cube_image_type()
+        key = "sampled_cube_image"
+        return self._ensure_type(key, f"OpTypeSampledImage {img}")
+
     def acceleration_structure_type(self) -> str:
         key = "accel_struct"
         return self._ensure_type(key, "OpTypeAccelerationStructureKHR")
@@ -180,6 +190,7 @@ class TypeRegistry:
             "mat4": lambda: self.mat(4),
             "mat4x3": lambda: self.mat_cols_rows(4, 3),
             "sampler2d": self.sampled_image_type,
+            "samplerCube": self.sampled_cube_image_type,
             "acceleration_structure": self.acceleration_structure_type,
             "storage_image": self._storage_image_type,
         }

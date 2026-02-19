@@ -252,7 +252,10 @@ class LuxTransformer(Transformer):
         return BlockField(str(args[0]), _extract_type(args[1]))
 
     def sampler_decl(self, args):
-        return SamplerDecl(str(args[0]), loc=_tok_loc(args[0]))
+        # args[0] is the sampler type token ("sampler2d" or "samplerCube"), args[1] is the name
+        sampler_type = str(args[0])
+        name = str(args[1])
+        return SamplerDecl(name, type_name=sampler_type, loc=_tok_loc(args[1]))
 
     # --- RT declarations ---
 

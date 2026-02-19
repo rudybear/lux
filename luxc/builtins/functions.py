@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from luxc.builtins.types import (
     LuxType, SCALAR, INT, UINT, BOOL, VOID,
-    VEC2, VEC3, VEC4, MAT2, MAT3, MAT4, SAMPLER2D,
+    VEC2, VEC3, VEC4, MAT2, MAT3, MAT4, SAMPLER2D, SAMPLER_CUBE,
     ACCELERATION_STRUCTURE, STORAGE_IMAGE, IVEC2, UVEC2,
     VectorType, MatrixType, ScalarType,
 )
@@ -88,8 +88,36 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     for vt in [SCALAR, VEC2, VEC3, VEC4]:
         add([FuncSig("refract", (vt, vt, SCALAR), vt)])
 
+    # faceforward(N, I, Nref) — returns N flipped to face Nref relative to I
+    for vt in [SCALAR, VEC2, VEC3, VEC4]:
+        add([FuncSig("faceforward", (vt, vt, vt), vt)])
+
+    # --- Additional GLSL.std.450 math functions ---
+    # 1-arg: round, trunc, radians, degrees, sinh, cosh, tanh, asinh, acosh, atanh
+    for fn in ["round", "trunc", "radians", "degrees",
+               "sinh", "cosh", "tanh", "asinh", "acosh", "atanh"]:
+        add(_float_overloads_1(fn))
+
+    # --- Matrix functions ---
+    # determinant(matN) -> scalar
+    for mt in [MAT2, MAT3, MAT4]:
+        add([FuncSig("determinant", (mt,), SCALAR)])
+
+    # inverse(matN) -> matN
+    for mt in [MAT2, MAT3, MAT4]:
+        add([FuncSig("inverse", (mt,), mt)])
+
+    # transpose(matN) -> matN
+    for mt in [MAT2, MAT3, MAT4]:
+        add([FuncSig("transpose", (mt,), mt)])
+
     # texture sampling
     add([FuncSig("sample", (SAMPLER2D, VEC2), VEC4)])
+    add([FuncSig("sample", (SAMPLER_CUBE, VEC3), VEC4)])
+
+    # texture sampling with explicit LOD
+    add([FuncSig("sample_lod", (SAMPLER2D, VEC2, SCALAR), VEC4)])
+    add([FuncSig("sample_lod", (SAMPLER_CUBE, VEC3, SCALAR), VEC4)])
 
     # --- RT instructions ---
     # trace_ray(accel, ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,

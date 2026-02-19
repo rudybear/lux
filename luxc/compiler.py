@@ -7,6 +7,7 @@ from luxc.optimization.const_fold import constant_fold
 from luxc.analysis.layout_assigner import assign_layouts
 from luxc.codegen.spirv_builder import generate_spirv
 from luxc.codegen.spv_assembler import assemble_and_validate
+from luxc.codegen.reflection import generate_reflection, emit_reflection_json
 from luxc.builtins.types import clear_type_aliases
 
 # Standard library search path
@@ -68,6 +69,9 @@ def compile_source(
     dump_ast: bool = False,
     emit_asm: bool = False,
     validate: bool = True,
+    emit_reflection: bool = True,
+    debug: bool = False,
+    source_name: str = "",
 ) -> None:
     # Clear type aliases from previous compilations
     clear_type_aliases()
@@ -111,7 +115,7 @@ def compile_source(
         stage_name = stage.stage_type
         suffix = _SUFFIX_MAP[stage_name]
 
-        asm_text = generate_spirv(module, stage)
+        asm_text = generate_spirv(module, stage, debug=debug, source_name=source_name or f"{stem}.lux")
 
         if emit_asm:
             asm_path = output_dir / f"{stem}.{suffix}.spvasm"
@@ -121,6 +125,12 @@ def compile_source(
         spv_path = output_dir / f"{stem}.{suffix}.spv"
         assemble_and_validate(asm_text, spv_path, validate=validate)
         print(f"Wrote {spv_path}")
+
+        if emit_reflection:
+            reflection = generate_reflection(module, stage, source_name=source_name or f"{stem}.lux")
+            json_path = output_dir / f"{stem}.{suffix}.json"
+            json_path.write_text(emit_reflection_json(reflection), encoding="utf-8")
+            print(f"Wrote {json_path}")
 
 
 def _dump_ast(module):

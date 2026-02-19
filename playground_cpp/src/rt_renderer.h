@@ -4,8 +4,11 @@
 #include "vk_mem_alloc.h"
 #include "vulkan_context.h"
 #include "scene.h"
+#include "gltf_loader.h"
+#include "reflected_pipeline.h"
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 class RTRenderer {
 public:
@@ -13,7 +16,8 @@ public:
               const std::string& rgenSpvPath,
               const std::string& rmissSpvPath,
               const std::string& rchitSpvPath,
-              uint32_t width, uint32_t height);
+              uint32_t width, uint32_t height,
+              const std::string& sceneSource = "sphere");
 
     void render(VulkanContext& ctx);
 
@@ -28,6 +32,8 @@ public:
 private:
     uint32_t renderWidth = 512;
     uint32_t renderHeight = 512;
+    std::string m_pipelineBase; // for reflection JSON lookup
+    std::string m_sceneSource;  // scene source (sphere, .glb/.gltf path)
 
     // Storage image (RT output)
     VkImage storageImage = VK_NULL_HANDLE;
@@ -56,9 +62,14 @@ private:
     // RT pipeline
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout descSetLayout = VK_NULL_HANDLE;
+
+    // Reflection-driven descriptor sets
+    std::unordered_map<int, VkDescriptorSetLayout> reflectedSetLayouts;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    std::unordered_map<int, VkDescriptorSet> reflectedDescSets;
+
+    // Reflection data from JSON
+    std::vector<ReflectionData> stageReflections;
 
     // Shader Binding Table
     VkBuffer sbtBuffer = VK_NULL_HANDLE;
