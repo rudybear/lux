@@ -1324,9 +1324,11 @@ fn render_pbr(
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
+    // Negative viewport height (VK_KHR_maintenance1) to match wgpu Y convention
     let viewport = vk::Viewport::default()
+        .y(height as f32)
         .width(width as f32)
-        .height(height as f32)
+        .height(-(height as f32))
         .max_depth(1.0);
 
     let scissor = vk::Rect2D::default().extent(vk::Extent2D { width, height });
@@ -1337,7 +1339,7 @@ fn render_pbr(
 
     let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::BACK)
+        .cull_mode(vk::CullModeFlags::NONE)
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
 

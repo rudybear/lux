@@ -614,11 +614,12 @@ void RasterRenderer::createPipelinePBR(VulkanContext& ctx) {
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
+    // Negative viewport height (VK_KHR_maintenance1) to match wgpu Y convention
     VkViewport viewport = {};
     viewport.x = 0.0f;
-    viewport.y = 0.0f;
+    viewport.y = static_cast<float>(renderHeight);
     viewport.width = static_cast<float>(renderWidth);
-    viewport.height = static_cast<float>(renderHeight);
+    viewport.height = -static_cast<float>(renderHeight);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
 
@@ -637,7 +638,7 @@ void RasterRenderer::createPipelinePBR(VulkanContext& ctx) {
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 
     VkPipelineMultisampleStateCreateInfo multisampling = {};
