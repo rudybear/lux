@@ -139,7 +139,7 @@ class ReflectedPipeline:
             primitive=wgpu.PrimitiveState(
                 topology=wgpu.PrimitiveTopology.triangle_list,
                 cull_mode=cull_mode,
-                front_face=wgpu.FrontFace.ccw,
+                front_face=wgpu.FrontFace.cw,
             ),
             depth_stencil=wgpu.DepthStencilState(
                 format=depth_format,

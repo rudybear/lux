@@ -18,6 +18,73 @@
 namespace fs = std::filesystem;
 
 // --------------------------------------------------------------------------
+// Orbit camera for interactive mode
+// --------------------------------------------------------------------------
+
+struct OrbitCamera {
+    float yaw = 0.0f;        // horizontal angle (radians)
+    float pitch = 0.15f;     // vertical angle (radians), slight default elevation
+    float distance = 3.0f;   // distance from target
+    glm::vec3 target{0.0f};
+    glm::vec3 up{0.0f, 1.0f, 0.0f};
+    float fovY = glm::radians(45.0f);
+    float nearPlane = 0.1f;
+    float farPlane = 100.0f;
+
+    bool dragging = false;
+    double lastX = 0, lastY = 0;
+
+    glm::vec3 getEye() const {
+        float x = distance * cosf(pitch) * sinf(yaw);
+        float y = distance * sinf(pitch);
+        float z = distance * cosf(pitch) * cosf(yaw);
+        return target + glm::vec3(x, y, z);
+    }
+
+    void initFromAutoCamera(const glm::vec3& eye, const glm::vec3& tgt,
+                            const glm::vec3& u, float far_) {
+        target = tgt;
+        up = u;
+        farPlane = far_;
+        glm::vec3 dir = eye - tgt;
+        distance = glm::length(dir);
+        if (distance > 0.001f) {
+            dir /= distance;
+            pitch = asinf(glm::clamp(dir.y, -1.0f, 1.0f));
+            yaw = atan2f(dir.x, dir.z);
+        }
+    }
+};
+
+static OrbitCamera g_orbit;
+
+static void mouseButtonCallback(GLFWwindow* window, int button, int action, int /*mods*/) {
+    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        g_orbit.dragging = (action == GLFW_PRESS);
+        if (g_orbit.dragging) {
+            glfwGetCursorPos(window, &g_orbit.lastX, &g_orbit.lastY);
+        }
+    }
+}
+
+static void cursorPosCallback(GLFWwindow* /*window*/, double xpos, double ypos) {
+    if (!g_orbit.dragging) return;
+    float dx = static_cast<float>(xpos - g_orbit.lastX);
+    float dy = static_cast<float>(ypos - g_orbit.lastY);
+    g_orbit.lastX = xpos;
+    g_orbit.lastY = ypos;
+
+    g_orbit.yaw += dx * 0.005f;
+    g_orbit.pitch += dy * 0.005f;
+    g_orbit.pitch = glm::clamp(g_orbit.pitch, -1.5f, 1.5f);
+}
+
+static void scrollCallback(GLFWwindow* /*window*/, double /*xoff*/, double yoff) {
+    g_orbit.distance *= (1.0f - 0.1f * static_cast<float>(yoff));
+    g_orbit.distance = glm::clamp(g_orbit.distance, 0.01f, 1000.0f);
+}
+
+// --------------------------------------------------------------------------
 // CLI argument parsing (scene/pipeline architecture)
 // --------------------------------------------------------------------------
 
@@ -226,7 +293,12 @@ static int runHeadless(const CLIOptions& opts) {
 // Interactive rendering
 // --------------------------------------------------------------------------
 
-static int runInteractive(const CLIOptions& opts) {
+static int runInteractive(CLIOptions opts) {
+    // Use larger window for interactive mode if user didn't specify
+    if (opts.width == 512 && opts.height == 512) {
+        opts.width = 1024;
+        opts.height = 768;
+    }
     std::string renderPath = detectRenderPath(opts.shaderBase);
     bool needRT = (renderPath == "rt");
 
@@ -325,7 +397,22 @@ static int runInteractive(const CLIOptions& opts) {
         return 1;
     }
 
+    // Initialize orbit camera from auto-camera
+    if (!useRT && rasterRenderer.hasSceneBounds()) {
+        g_orbit.initFromAutoCamera(
+            rasterRenderer.getAutoEye(),
+            rasterRenderer.getAutoTarget(),
+            rasterRenderer.getAutoUp(),
+            rasterRenderer.getAutoFar());
+    }
+
+    // Register GLFW input callbacks
+    glfwSetMouseButtonCallback(window, mouseButtonCallback);
+    glfwSetCursorPosCallback(window, cursorPosCallback);
+    glfwSetScrollCallback(window, scrollCallback);
+
     std::cout << "[info] Starting render loop. Press ESC or close the window to quit." << std::endl;
+    std::cout << "[info] Mouse: drag to orbit, scroll to zoom." << std::endl;
 
     // Render loop
     while (!glfwWindowShouldClose(window)) {
@@ -372,6 +459,15 @@ static int runInteractive(const CLIOptions& opts) {
         }
 
         vkResetFences(ctx.device, 1, &inFlightFence);
+
+        // Update orbit camera matrices each frame
+        if (!useRT) {
+            float aspect = static_cast<float>(ctx.swapchainExtent.width) /
+                           static_cast<float>(ctx.swapchainExtent.height);
+            rasterRenderer.updateCamera(ctx, g_orbit.getEye(), g_orbit.target,
+                                        g_orbit.up, g_orbit.fovY, aspect,
+                                        g_orbit.nearPlane, g_orbit.farPlane);
+        }
 
         if (useRT) {
             // RT rendering: render to storage image, then copy to swapchain
@@ -442,9 +538,11 @@ static int runInteractive(const CLIOptions& opts) {
                 imageAvailableSem, renderFinishedSem, inFlightFence);
         }
 
-        // Present
+        // Present (wait for rendering to finish before presenting)
         VkPresentInfoKHR presentInfo = {};
         presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        presentInfo.waitSemaphoreCount = 1;
+        presentInfo.pWaitSemaphores = &renderFinishedSem;
         presentInfo.swapchainCount = 1;
         presentInfo.pSwapchains = &ctx.swapchain;
         presentInfo.pImageIndices = &imageIndex;

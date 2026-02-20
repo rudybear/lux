@@ -88,6 +88,7 @@ class SceneData:
     camera: CameraData = field(default_factory=CameraData)
     lights: list[LightData] = field(default_factory=list)
     render_path: str = "raster"  # hint: "raster", "fullscreen"
+    camera_elevation: float = 5.0  # degrees; 0 = straight-on
 
 
 @dataclass
@@ -103,7 +104,7 @@ class GPUScene:
 # Scene loading
 # ---------------------------------------------------------------------------
 
-def load_scene(source: str) -> SceneData:
+def load_scene(source: str, camera_elevation: float = 5.0) -> SceneData:
     """Load a scene from a source specifier."""
     if source == "sphere":
         return _builtin_sphere()
@@ -112,7 +113,7 @@ def load_scene(source: str) -> SceneData:
     elif source == "triangle":
         return _builtin_triangle()
     elif source.endswith((".glb", ".gltf")):
-        return _load_gltf_scene(source)
+        return _load_gltf_scene(source, camera_elevation=camera_elevation)
     else:
         raise ValueError(f"Unknown scene source: {source}")
 
@@ -157,17 +158,67 @@ def _builtin_triangle() -> SceneData:
     return SceneData(meshes=[mesh], render_path="raster")
 
 
-def _load_gltf_scene(path: str) -> SceneData:
+def _transform_vertices(vertex_data: bytes, vertex_stride: int, num_vertices: int,
+                        transform: np.ndarray) -> bytes:
+    """Apply a 4x4 world transform to vertex positions and normals.
+
+    Uses row-vector convention: v_transformed = v @ M (translation in last row).
+    """
+    if np.allclose(transform, np.eye(4)):
+        return vertex_data
+    stride_floats = vertex_stride // 4
+    vdata = np.frombuffer(vertex_data, dtype=np.float32).copy().reshape(-1, stride_floats)
+    # Transform positions (first 3 floats): row-vector * matrix
+    pos = vdata[:, :3]
+    ones = np.ones((num_vertices, 1), dtype=np.float32)
+    pos_h = np.hstack([pos, ones])  # (N, 4)
+    pos_transformed = (pos_h @ transform)[:, :3]
+    vdata[:, :3] = pos_transformed
+    # Transform normals (floats 3-5) using upper 3x3 (row-vector)
+    upper3x3 = transform[:3, :3]
+    normal_mat = np.linalg.inv(upper3x3).T  # inverse-transpose for normals
+    normals = vdata[:, 3:6]
+    normals_transformed = normals @ normal_mat
+    norms = np.linalg.norm(normals_transformed, axis=1, keepdims=True)
+    normals_transformed /= np.maximum(norms, 1e-8)
+    vdata[:, 3:6] = normals_transformed
+    # Transform tangent direction (floats 8-10 if stride >= 48)
+    if stride_floats >= 12:
+        tangent_dir = vdata[:, 8:11]
+        tangent_transformed = tangent_dir @ upper3x3
+        tnorms = np.linalg.norm(tangent_transformed, axis=1, keepdims=True)
+        tangent_transformed /= np.maximum(tnorms, 1e-8)
+        vdata[:, 8:11] = tangent_transformed
+    return vdata.tobytes()
+
+
+def _load_gltf_scene(path: str, camera_elevation: float = 5.0) -> SceneData:
     from gltf_loader import load_gltf, flatten_scene
     gltf_scene = load_gltf(Path(path))
     draw_items = flatten_scene(gltf_scene)
 
-    scene = SceneData(render_path="raster")
+    scene = SceneData(render_path="raster", camera_elevation=camera_elevation)
 
-    for mesh in gltf_scene.meshes:
+    # Use draw_items to apply per-node world transforms to vertices
+    for item in draw_items:
+        mesh = gltf_scene.meshes[item.mesh_index]
+        vdata = _transform_vertices(
+            mesh.vertex_data, getattr(mesh, 'vertex_stride', 32),
+            mesh.num_vertices, item.world_transform,
+        )
+        # Detect negative-determinant transforms (reflections/axis swaps)
+        # which flip triangle winding order.  Reverse winding to compensate.
+        idata = mesh.index_data
+        upper3x3 = item.world_transform[:3, :3]
+        if np.linalg.det(upper3x3) < 0 and mesh.num_indices > 0:
+            indices = np.frombuffer(idata, dtype=np.uint32).copy()
+            # Swap 2nd and 3rd vertex of every triangle: (v0,v1,v2) -> (v0,v2,v1)
+            for tri in range(0, len(indices) - 2, 3):
+                indices[tri + 1], indices[tri + 2] = indices[tri + 2], indices[tri + 1]
+            idata = indices.tobytes()
         scene.meshes.append(MeshData(
-            vertex_data=mesh.vertex_data,
-            index_data=mesh.index_data,
+            vertex_data=vdata,
+            index_data=idata,
             num_vertices=mesh.num_vertices,
             num_indices=mesh.num_indices,
             vertex_stride=getattr(mesh, 'vertex_stride', 32),
@@ -193,10 +244,76 @@ def _load_gltf_scene(path: str) -> SceneData:
             mdata.textures["emissive_tex"] = mat.emissive_texture
         scene.materials.append(mdata)
 
-    # Extract camera from glTF if available
+    # Extract camera from glTF if available, or compute from scene bounds
     if gltf_scene.cameras:
         cam = gltf_scene.cameras[0]
         scene.camera = CameraData(fov_y=cam.fov_y, near=cam.near, far=cam.far)
+    elif scene.meshes:
+        # Auto-compute camera using node transform to find model's front.
+        # Blender exports apply a rotation (±90° X) to convert Z-up to Y-up;
+        # we use that rotation to determine where the model's "front" and "up" are.
+        all_positions = []
+        for mesh in scene.meshes:
+            stride_floats = mesh.vertex_stride // 4
+            vdata = np.frombuffer(mesh.vertex_data, dtype=np.float32).reshape(-1, stride_floats)
+            all_positions.append(vdata[:, :3])
+        all_positions = np.concatenate(all_positions, axis=0)
+        bbox_min = all_positions.min(axis=0)
+        bbox_max = all_positions.max(axis=0)
+        center = (bbox_min + bbox_max) / 2.0
+        extent = bbox_max - bbox_min
+
+        # Determine camera direction from node transform
+        cam_dir = np.array([0, 0, 1], dtype=np.float32)   # default: +Z
+        cam_up = np.array([0, 1, 0], dtype=np.float32)    # default: +Y
+        if draw_items:
+            upper3x3 = draw_items[0].world_transform[:3, :3]
+            row_norms = np.linalg.norm(upper3x3, axis=1, keepdims=True)
+            R_approx = upper3x3 / np.maximum(row_norms, 1e-8)
+            # Blender front (-Y local) and up (+Z local) in world space
+            # R_approx is R_col^T (row-vector convention); use R_approx @ v
+            # to compute R_col^T * v, matching the C++/Rust engines.
+            front = R_approx @ np.array([0, -1, 0], dtype=np.float32)
+            up_w = R_approx @ np.array([0, 0, 1], dtype=np.float32)
+            fl = float(np.linalg.norm(front))
+            ul = float(np.linalg.norm(up_w))
+            if fl > 0.5 and ul > 0.5:
+                candidate_dir = front / fl
+                candidate_up = up_w / ul
+                # Skip if view direction is nearly vertical
+                if abs(float(candidate_dir[1])) < 0.9:
+                    cam_dir = candidate_dir
+                    cam_up = candidate_up
+                    if abs(float(np.dot(cam_dir, cam_up))) > 0.9:
+                        cam_up = np.array([0, 1, 0], dtype=np.float32)
+
+        # Compute perpendicular extent for distance calculation
+        view_right = np.cross(-cam_dir, cam_up)
+        vr_len = float(np.linalg.norm(view_right))
+        if vr_len < 1e-6:
+            cam_up = np.array([0, 0, 1], dtype=np.float32)
+            view_right = np.cross(-cam_dir, cam_up)
+            vr_len = float(np.linalg.norm(view_right))
+        view_right /= vr_len
+        view_up = np.cross(view_right, -cam_dir)
+        view_up /= max(float(np.linalg.norm(view_up)), 1e-8)
+
+        proj_right = sum(abs(float(view_right[i])) * float(extent[i]) for i in range(3))
+        proj_up = sum(abs(float(view_up[i])) * float(extent[i]) for i in range(3))
+        max_perp_extent = max(proj_right, proj_up)
+
+        distance = (max_perp_extent / 2.0) / math.tan(scene.camera.fov_y / 2.0)
+        distance *= 1.1  # slight margin
+
+        # Position camera along front direction with elevation
+        eye = center + distance * cam_dir
+        elev_rad = math.radians(scene.camera_elevation)
+        eye = eye + distance * math.sin(elev_rad) * view_up
+
+        scene.camera.eye = eye.astype(np.float32)
+        scene.camera.target = center.astype(np.float32)
+        scene.camera.up = cam_up.astype(np.float32)
+        scene.camera.far = max(distance * 3.0, 100.0)
 
     # Extract lights
     for light in gltf_scene.lights:
@@ -329,7 +446,8 @@ def upload_scene(device: wgpu.GPUDevice, scene: SceneData, width: int, height: i
     return gpu
 
 
-def _upload_texture(device: wgpu.GPUDevice, data: np.ndarray):
+def _upload_texture(device: wgpu.GPUDevice, data: np.ndarray,
+                    address_mode: str = "repeat"):
     """Upload a texture image to GPU. Returns (sampler, texture_view)."""
     h, w = data.shape[:2]
     texture = device.create_texture(
@@ -344,9 +462,13 @@ def _upload_texture(device: wgpu.GPUDevice, data: np.ndarray):
         (w, h, 1),
     )
     view = texture.create_view()
+    addr = wgpu.AddressMode.repeat if address_mode == "repeat" else wgpu.AddressMode.clamp_to_edge
     sampler = device.create_sampler(
         mag_filter=wgpu.FilterMode.linear,
         min_filter=wgpu.FilterMode.linear,
+        address_mode_u=addr,
+        address_mode_v=addr,
+        address_mode_w=addr,
     )
     return sampler, view
 
@@ -357,10 +479,61 @@ def _create_default_texture(device: wgpu.GPUDevice):
     return _upload_texture(device, data)
 
 
+def _create_default_normal_texture(device: wgpu.GPUDevice):
+    """Create a 1x1 flat normal map texture (0.5, 0.5, 1.0, 1.0).
+
+    In tangent space, this decodes to (0, 0, 1) — no perturbation.
+    A white default (1,1,1) would decode to a 45-degree tilted normal.
+    """
+    data = np.array([[128, 128, 255, 255]], dtype=np.uint8).reshape(1, 1, 4)
+    return _upload_texture(device, data)
+
+
+def _create_black_texture(device: wgpu.GPUDevice):
+    """Create a 1x1 black RGBA texture for emissive/additive defaults.
+
+    Emissive textures default to black (no emission). Using white would add
+    (1,1,1) to every pixel's HDR output, completely washing out materials.
+    """
+    data = np.array([[0, 0, 0, 255]], dtype=np.uint8).reshape(1, 1, 4)
+    return _upload_texture(device, data)
+
+
+def _create_default_brdf_lut(device: wgpu.GPUDevice):
+    """Create a 1x1 BRDF LUT with sensible PBR defaults.
+
+    Values (0.5, 0.0) approximate the BRDF integral at mid-range NdotV
+    and roughness, avoiding the over-bright result of (1.0, 1.0).
+    """
+    brdf_rgba = np.array([[0.5, 0.0, 0.0, 0.0]], dtype=np.float16).reshape(1, 1, 4)
+    texture = device.create_texture(
+        size=(1, 1, 1),
+        format=wgpu.TextureFormat.rgba16float,
+        usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+    )
+    device.queue.write_texture(
+        wgpu.TexelCopyTextureInfo(texture=texture),
+        brdf_rgba.tobytes(),
+        wgpu.TexelCopyBufferLayout(offset=0, bytes_per_row=8, rows_per_image=1),
+        (1, 1, 1),
+    )
+    view = texture.create_view()
+    sampler = device.create_sampler(
+        mag_filter=wgpu.FilterMode.linear,
+        min_filter=wgpu.FilterMode.linear,
+    )
+    return sampler, view
+
+
 def _create_default_cubemap(device: wgpu.GPUDevice, face_size: int = 1):
-    """Create a 1x1 black cubemap for missing cubemap bindings."""
-    return _upload_cubemap_f16(device, face_size, num_faces=6,
-                               data=np.zeros((6, face_size, face_size, 4), dtype=np.float16))
+    """Create a 1x1 dim grey cubemap for missing cubemap bindings.
+
+    Uses (0.2, 0.2, 0.2) instead of black so metallic surfaces have
+    minimal ambient light to reflect even without IBL assets.
+    """
+    data = np.full((6, face_size, face_size, 4), 0.2, dtype=np.float16)
+    data[:, :, :, 3] = 1.0  # alpha = 1
+    return _upload_cubemap_f16(device, face_size, num_faces=6, data=data)
 
 
 def _upload_cubemap_f16(device: wgpu.GPUDevice, face_size: int, num_faces: int,
@@ -604,8 +777,18 @@ def bind_scene_to_pipeline(
                 cube_names.add(b["name"])
 
     # Fill missing textures with defaults (cube or 2D as appropriate)
+    # Different textures need different defaults:
+    #   white (1,1,1): base_color_tex, occlusion_tex (AO=1 means no occlusion)
+    #   flat normal (0.5, 0.5, 1.0): normal_tex
+    #   black (0,0,0): emissive_tex (no emission by default)
+    #   BRDF LUT (0.5, 0.0): brdf_lut
+    #   grey (0.2): cubemaps
     default_tex = None
     default_cube = None
+    default_brdf = None
+    default_normal = None
+    default_black = None
+    _BLACK_TEX_NAMES = {"emissive_tex"}
     for set_idx, bindings in reflected._binding_info.items():
         for b in bindings:
             if b["type"] in ("sampler", "sampled_image", "sampled_cube_image") and b["name"] not in resources:
@@ -613,6 +796,18 @@ def bind_scene_to_pipeline(
                     if default_cube is None:
                         default_cube = _create_default_cubemap(device)
                     resources[b["name"]] = default_cube
+                elif b["name"] == "normal_tex":
+                    if default_normal is None:
+                        default_normal = _create_default_normal_texture(device)
+                    resources[b["name"]] = default_normal
+                elif b["name"] in _BLACK_TEX_NAMES:
+                    if default_black is None:
+                        default_black = _create_black_texture(device)
+                    resources[b["name"]] = default_black
+                elif b["name"] == "brdf_lut":
+                    if default_brdf is None:
+                        default_brdf = _create_default_brdf_lut(device)
+                    resources[b["name"]] = default_brdf
                 else:
                     if default_tex is None:
                         default_tex = _create_default_texture(device)
@@ -642,11 +837,12 @@ def render(
     width: int = 512,
     height: int = 512,
     ibl_name: str = "",
+    camera_elevation: float = 5.0,
 ) -> np.ndarray:
     """Main rendering entry point: load scene, create pipeline, bind, render."""
 
     # Load scene
-    scene = load_scene(scene_source)
+    scene = load_scene(scene_source, camera_elevation=camera_elevation)
 
     # Detect render path
     render_path = detect_render_path(pipeline_base)
@@ -682,15 +878,18 @@ def render(
         for name, tex in ibl_textures.items():
             gpu_scene.textures[name] = tex
     else:
-        # Auto-detect: use first available IBL directory
+        # Auto-detect: prefer "pisa" then "neutral", matching C++/Rust engines
         ibl_dir = Path(__file__).parent / "assets" / "ibl"
         if ibl_dir.exists():
-            for d in sorted(ibl_dir.iterdir()):
-                if d.is_dir() and (d / "manifest.json").exists():
-                    ibl_textures = _load_ibl_assets(device, d.name)
-                    for name, tex in ibl_textures.items():
-                        gpu_scene.textures[name] = tex
-                    break
+            preferred = ["pisa", "neutral"]
+            candidates = [d.name for d in ibl_dir.iterdir()
+                          if d.is_dir() and (d / "manifest.json").exists()]
+            ordered = [n for n in preferred if n in candidates]
+            ordered += [n for n in sorted(candidates) if n not in preferred]
+            if ordered:
+                ibl_textures = _load_ibl_assets(device, ordered[0])
+                for name, tex in ibl_textures.items():
+                    gpu_scene.textures[name] = tex
 
     # Phase 2: Create pipeline from reflection
     print(f"Creating pipeline from '{pipeline_base}'...")
@@ -827,11 +1026,13 @@ def main():
     parser.add_argument("--width", type=int, default=512, help="Render width")
     parser.add_argument("--height", type=int, default=512, help="Render height")
     parser.add_argument("--ibl", default="", help="IBL environment name (from playground/assets/ibl/)")
+    parser.add_argument("--camera-elevation", type=float, default=5.0,
+                        help="Camera elevation angle in degrees (0 = straight-on)")
     args = parser.parse_args()
 
     pipeline_base = resolve_pipeline(args.pipeline, args.scene)
     pixels = render(args.scene, pipeline_base, args.output, args.width, args.height,
-                    ibl_name=args.ibl)
+                    ibl_name=args.ibl, camera_elevation=args.camera_elevation)
 
     # Stats
     non_black = (pixels[:, :, :3].sum(axis=2) > 10).sum()

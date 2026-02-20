@@ -123,7 +123,8 @@ def flatten_scene(scene: GltfScene) -> list[DrawItem]:
 
     def _traverse(node_idx: int, parent_world: np.ndarray):
         node = scene.nodes[node_idx]
-        node.world_transform = parent_world @ node.transform
+        # Row-vector convention: child_world = child_local @ parent_world
+        node.world_transform = node.transform @ parent_world
 
         if node.mesh_index >= 0:
             mesh = scene.meshes[node.mesh_index]
@@ -286,7 +287,8 @@ def _node_transform(node) -> np.ndarray:
         s[1, 1] = node.scale[1]
         s[2, 2] = node.scale[2]
 
-    return t @ r @ s
+    # Row-vector convention: v' = v @ S @ R @ T (scale, then rotate, then translate)
+    return s @ r @ t
 
 
 def _quat_to_mat4(q) -> np.ndarray:

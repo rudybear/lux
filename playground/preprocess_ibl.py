@@ -4,7 +4,7 @@ Converts .exr or .hdr equirectangular panorama images into pre-filtered IBL
 assets suitable for real-time PBR rendering with the split-sum approximation.
 
 Output structure (playground/assets/ibl/<name>/):
-    specular.bin    -- float16 RGBA, 6 faces x 5 mip levels (256..16)
+    specular.bin    -- float16 RGBA, 6 faces x 9 mip levels (256..1)
     irradiance.bin  -- float16 RGBA, 6 faces x 1 mip level (32x32)
     brdf_lut.bin    -- float16 RG, 512x512
     manifest.json   -- metadata
@@ -37,7 +37,7 @@ PLAYGROUND_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = PLAYGROUND_DIR / "assets"
 
 SPECULAR_FACE_SIZE = 256
-SPECULAR_MIP_COUNT = 5  # 256, 128, 64, 32, 16
+SPECULAR_MIP_COUNT = 9  # 256, 128, 64, 32, 16, 8, 4, 2, 1
 IRRADIANCE_FACE_SIZE = 32
 BRDF_LUT_SIZE = 512
 
@@ -50,26 +50,28 @@ BRDF_LUT_SAMPLES = 1024
 CUBEMAP_FACES = {
     0: {"name": "+X", "forward": np.array([1, 0, 0], dtype=np.float32),
         "right": np.array([0, 0, -1], dtype=np.float32),
-        "up": np.array([0, 1, 0], dtype=np.float32)},
+        "up": np.array([0, -1, 0], dtype=np.float32)},
     1: {"name": "-X", "forward": np.array([-1, 0, 0], dtype=np.float32),
         "right": np.array([0, 0, 1], dtype=np.float32),
-        "up": np.array([0, 1, 0], dtype=np.float32)},
+        "up": np.array([0, -1, 0], dtype=np.float32)},
     2: {"name": "+Y", "forward": np.array([0, 1, 0], dtype=np.float32),
         "right": np.array([1, 0, 0], dtype=np.float32),
-        "up": np.array([0, 0, -1], dtype=np.float32)},
+        "up": np.array([0, 0, 1], dtype=np.float32)},
     3: {"name": "-Y", "forward": np.array([0, -1, 0], dtype=np.float32),
         "right": np.array([1, 0, 0], dtype=np.float32),
-        "up": np.array([0, 0, 1], dtype=np.float32)},
+        "up": np.array([0, 0, -1], dtype=np.float32)},
     4: {"name": "+Z", "forward": np.array([0, 0, 1], dtype=np.float32),
         "right": np.array([1, 0, 0], dtype=np.float32),
-        "up": np.array([0, 1, 0], dtype=np.float32)},
+        "up": np.array([0, -1, 0], dtype=np.float32)},
     5: {"name": "-Z", "forward": np.array([0, 0, -1], dtype=np.float32),
         "right": np.array([-1, 0, 0], dtype=np.float32),
-        "up": np.array([0, 1, 0], dtype=np.float32)},
+        "up": np.array([0, -1, 0], dtype=np.float32)},
 }
 
 # HDR environment download URLs
-HDR_BASE_URL = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Environments/main"
+# Note: These files are stored in Git LFS, so we use media.githubusercontent.com
+# which resolves LFS pointers to actual file content.
+HDR_BASE_URL = "https://media.githubusercontent.com/media/KhronosGroup/glTF-Sample-Environments/main"
 AVAILABLE_ENVS = {
     "neutral": f"{HDR_BASE_URL}/neutral.hdr",
     "pisa": f"{HDR_BASE_URL}/pisa.hdr",
@@ -95,6 +97,94 @@ GLTF_MODELS = {
 # HDR/EXR loading
 # ---------------------------------------------------------------------------
 
+def _load_radiance_hdr(path: Path) -> np.ndarray:
+    """Load a Radiance .hdr (RGBE) file as float32 RGB.
+
+    Implements the RGBE format reader without external dependencies.
+    Returns array of shape (H, W, 3) in linear HDR.
+    """
+    with open(path, "rb") as f:
+        # Read header lines until empty line
+        header_lines = []
+        while True:
+            line = f.readline()
+            if not line or line.strip() == b"":
+                break
+            header_lines.append(line.decode("ascii", errors="replace").strip())
+
+        # Parse resolution line: "-Y height +X width"
+        res_line = f.readline().decode("ascii").strip()
+        parts = res_line.split()
+        if len(parts) != 4:
+            raise ValueError(f"Cannot parse resolution: {res_line}")
+        height = int(parts[1])
+        width = int(parts[3])
+
+        # Read scanlines (adaptive RLE or uncompressed)
+        img = np.zeros((height, width, 3), dtype=np.float32)
+
+        for y in range(height):
+            # Read scanline header
+            b0 = f.read(1)
+            b1 = f.read(1)
+            if not b0 or not b1:
+                raise ValueError(f"Unexpected EOF at scanline {y}")
+
+            if b0[0] == 2 and b1[0] == 2:
+                # New-style adaptive RLE
+                b2 = f.read(1)
+                b3 = f.read(1)
+                scanline_width = (b2[0] << 8) | b3[0]
+                if scanline_width != width:
+                    raise ValueError(f"Scanline width mismatch: {scanline_width} vs {width}")
+
+                # Read 4 channels separately (R, G, B, E)
+                channels = []
+                for ch in range(4):
+                    channel_data = bytearray()
+                    while len(channel_data) < width:
+                        count_byte = f.read(1)[0]
+                        if count_byte > 128:
+                            # RLE run
+                            run_len = count_byte - 128
+                            val = f.read(1)[0]
+                            channel_data.extend([val] * run_len)
+                        else:
+                            # Literal run
+                            channel_data.extend(f.read(count_byte))
+                    channels.append(channel_data[:width])
+
+                # Convert RGBE to float
+                for x in range(width):
+                    r, g, b, e = channels[0][x], channels[1][x], channels[2][x], channels[3][x]
+                    if e > 0:
+                        scale = 2.0 ** (e - 128 - 8)
+                        img[y, x, 0] = r * scale
+                        img[y, x, 1] = g * scale
+                        img[y, x, 2] = b * scale
+            else:
+                # Old-style: 4 bytes per pixel (RGBE)
+                b2 = f.read(1)
+                b3 = f.read(1)
+                r, g, b_val, e = b0[0], b1[0], b2[0], b3[0]
+                if e > 0:
+                    scale = 2.0 ** (e - 128 - 8)
+                    img[y, 0, 0] = r * scale
+                    img[y, 0, 1] = g * scale
+                    img[y, 0, 2] = b_val * scale
+                # Read remaining pixels
+                for x in range(1, width):
+                    pixel = f.read(4)
+                    r, g, b_val, e = pixel[0], pixel[1], pixel[2], pixel[3]
+                    if e > 0:
+                        scale = 2.0 ** (e - 128 - 8)
+                        img[y, x, 0] = r * scale
+                        img[y, x, 1] = g * scale
+                        img[y, x, 2] = b_val * scale
+
+    return img
+
+
 def load_panorama(path: Path) -> np.ndarray:
     """Load an equirectangular panorama image as float32 RGB(A).
 
@@ -103,7 +193,17 @@ def load_panorama(path: Path) -> np.ndarray:
     path = Path(path)
     suffix = path.suffix.lower()
 
-    # Try imageio first
+    # Native HDR loader for Radiance .hdr files
+    if suffix == ".hdr":
+        try:
+            img = _load_radiance_hdr(path)
+            print(f"  Loaded via native HDR reader: {img.shape[1]}x{img.shape[0]}, "
+                  f"range [{img.min():.3f}, {img.max():.3f}]")
+            return img
+        except Exception as e_hdr:
+            print(f"  Native HDR reader failed: {e_hdr}")
+
+    # Try imageio
     try:
         import imageio.v3 as iio
         img = iio.imread(str(path))
@@ -145,8 +245,8 @@ def load_panorama(path: Path) -> np.ndarray:
             print(f"  OpenEXR fallback failed: {e_exr}")
 
     raise RuntimeError(
-        f"Cannot load '{path}'. Install imageio (pip install imageio) "
-        f"or OpenEXR+Imath for .exr files."
+        f"Cannot load '{path}'. Supported formats: .hdr (native), "
+        f".exr (needs OpenEXR+Imath), or any format supported by imageio."
     )
 
 
@@ -160,7 +260,7 @@ def direction_to_equirect_uv(direction: np.ndarray) -> Tuple[float, float]:
     Returns (u, v) in [0,1] range.
     """
     x, y, z = direction[0], direction[1], direction[2]
-    u = 0.5 + atan2(z, x) / (2.0 * pi)
+    u = 0.5 + atan2(x, z) / (2.0 * pi)
     v = 0.5 - np.arcsin(np.clip(y, -1.0, 1.0)) / pi
     return u, v
 
@@ -210,7 +310,7 @@ def sample_panorama_vectorized(panorama: np.ndarray,
     y = directions[:, 1]
     z = directions[:, 2]
 
-    u = 0.5 + np.arctan2(z, x) / (2.0 * pi)
+    u = 0.5 + np.arctan2(x, z) / (2.0 * pi)
     v = 0.5 - np.arcsin(np.clip(y, -1.0, 1.0)) / pi
 
     px = u * w - 0.5
@@ -268,7 +368,7 @@ def cubemap_face_directions(face_idx: int, size: int) -> np.ndarray:
     coords = np.linspace(-1.0 + 1.0 / size, 1.0 - 1.0 / size, size,
                          dtype=np.float32)
     # u varies along columns, v varies along rows (v is flipped for top-to-bottom)
-    uu, vv = np.meshgrid(coords, -coords)  # negate v so row 0 = top = +v
+    uu, vv = np.meshgrid(coords, coords)  # Vulkan/WebGPU: row 0 = top = v=0
 
     directions = (face["forward"][np.newaxis, np.newaxis, :]
                   + uu[:, :, np.newaxis] * face["right"][np.newaxis, np.newaxis, :]
@@ -355,17 +455,23 @@ def importance_sample_ggx_batch(xi: np.ndarray, roughness: float,
 # Geometry / visibility functions for BRDF LUT
 # ---------------------------------------------------------------------------
 
-def geometry_schlick_ggx(n_dot_v: float, roughness: float) -> float:
-    """Schlick-GGX geometry term for IBL (k = roughness^2 / 2)."""
-    k = (roughness * roughness) / 2.0
-    return n_dot_v / (n_dot_v * (1.0 - k) + k)
+def v_smith_ggx_correlated(n_dot_v: float, n_dot_l: float,
+                           roughness: float) -> float:
+    """Exact height-correlated Smith GGX visibility (V form).
 
+    This is the V term (already includes 1/(4*NdotL*NdotV) denominator),
+    matching the Khronos glTF Sample Renderer and our runtime v_ggx_correlated.
 
-def geometry_smith(n_dot_v: float, n_dot_l: float, roughness: float) -> float:
-    """Smith geometry function (separable, Schlick-GGX)."""
-    ggx_v = geometry_schlick_ggx(n_dot_v, roughness)
-    ggx_l = geometry_schlick_ggx(n_dot_l, roughness)
-    return ggx_v * ggx_l
+    Uses a2 = roughness^4 (perceptualRoughness -> alpha -> alpha^2).
+    """
+    a = roughness * roughness
+    a2 = a * a  # roughness^4
+    ggxv = n_dot_l * sqrt(n_dot_v * n_dot_v * (1.0 - a2) + a2)
+    ggxl = n_dot_v * sqrt(n_dot_l * n_dot_l * (1.0 - a2) + a2)
+    denom = ggxv + ggxl
+    if denom < 1e-8:
+        return 0.0
+    return 0.5 / denom
 
 
 # ---------------------------------------------------------------------------
@@ -572,13 +678,16 @@ def integrate_brdf(n_dot_v: float, roughness: float,
                    num_samples: int, xi_seq: np.ndarray) -> Tuple[float, float]:
     """Integrate the BRDF for a single (NdotV, roughness) pair.
 
+    Uses exact height-correlated Smith GGX visibility (V form), matching
+    the Khronos glTF Sample Renderer's BRDF LUT generation.
+
     Returns (scale, bias) for the split-sum approximation.
     """
     V = np.array([sqrt(1.0 - n_dot_v * n_dot_v), 0.0, n_dot_v], dtype=np.float64)
     N = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
-    scale = 0.0
-    bias = 0.0
+    A = 0.0
+    B = 0.0
 
     # Importance sample GGX
     H_batch = importance_sample_ggx_batch(xi_seq, roughness, N)
@@ -591,14 +700,17 @@ def integrate_brdf(n_dot_v: float, roughness: float,
 
         if NdotL > 0.0:
             NdotH = max(H[2], 0.0)
-            G = geometry_smith(n_dot_v, NdotL, roughness)
-            G_vis = G * VdotH / max(NdotH * n_dot_v, 1e-8)
+            # Exact Smith visibility (V form, includes 1/(4*NdotL*NdotV))
+            V_smith = v_smith_ggx_correlated(n_dot_v, NdotL, roughness)
+            # Khronos formula: V * VdotH * NdotL / NdotH
+            V_pdf = V_smith * VdotH * NdotL / max(NdotH, 1e-8)
             Fc = (1.0 - VdotH) ** 5.0
-            scale += G_vis * (1.0 - Fc)
-            bias += G_vis * Fc
+            A += (1.0 - Fc) * V_pdf
+            B += Fc * V_pdf
 
-    scale /= num_samples
-    bias /= num_samples
+    # Factor of 4 compensates for the 1/4 in the V form
+    scale = 4.0 * A / num_samples
+    bias = 4.0 * B / num_samples
     return scale, bias
 
 

@@ -35,6 +35,17 @@ public:
                            VkFormat swapFormat, VkExtent2D extent,
                            VkSemaphore waitSem, VkSemaphore signalSem, VkFence fence);
 
+    // Orbit camera support: update MVP + Light buffers per frame
+    void updateCamera(VulkanContext& ctx, const glm::vec3& eye, const glm::vec3& target,
+                      const glm::vec3& up, float fovY, float aspect, float nearPlane, float farPlane);
+
+    // Auto-camera getters for orbit initialization
+    glm::vec3 getAutoEye() const { return m_autoEye; }
+    glm::vec3 getAutoTarget() const { return m_autoTarget; }
+    glm::vec3 getAutoUp() const { return m_autoUp; }
+    float getAutoFar() const { return m_autoFar; }
+    bool hasSceneBounds() const { return m_hasSceneBounds; }
+
     void cleanup(VulkanContext& ctx);
 
 private:
@@ -84,8 +95,10 @@ private:
     // IBL cubemap textures: keyed by "env_specular", "env_irradiance", "brdf_lut"
     std::unordered_map<std::string, GPUTexture> iblTextures;
 
-    // Default 1x1 white texture for missing bindings
+    // Default 1x1 textures for missing bindings
     GPUTexture defaultWhiteTexture = {};
+    GPUTexture defaultBlackTexture = {};   // for emissive (no emission)
+    GPUTexture defaultNormalTexture = {};  // flat normal (128,128,255)
 
     // Triangle vertex buffer
     VkBuffer triangleVB = VK_NULL_HANDLE;
@@ -107,6 +120,15 @@ private:
     // glTF scene data (for texture extraction)
     GltfScene m_gltfScene;
     bool m_hasGltfScene = false;
+
+    // Scene bounds for auto-camera (computed from transformed vertices)
+    glm::vec3 m_sceneBboxMin{0.0f};
+    glm::vec3 m_sceneBboxMax{0.0f};
+    glm::vec3 m_autoEye{0.0f, 0.0f, 3.0f};
+    glm::vec3 m_autoTarget{0.0f};
+    glm::vec3 m_autoUp{0.0f, 1.0f, 0.0f};
+    float m_autoFar = 100.0f;
+    bool m_hasSceneBounds = false;
 
     void createOffscreenTarget(VulkanContext& ctx);
     void createRenderPass(VulkanContext& ctx);

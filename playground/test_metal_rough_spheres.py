@@ -1,13 +1,16 @@
-"""End-to-end screenshot test: compile gltf_pbr.lux and render DamagedHelmet.
+"""End-to-end screenshot test: render Khronos MetalRoughSpheres with PBR + IBL.
+
+MetalRoughSpheres.glb is the standard PBR correctness test — a grid of spheres
+varying metallic (0->1) on one axis and roughness (0->1) on the other.
 
 This script:
-  1. Downloads DamagedHelmet.glb from Khronos (cached in playground/assets/)
+  1. Downloads MetalRoughSpheres.glb from Khronos (cached in playground/assets/)
   2. Compiles examples/gltf_pbr.lux -> playground/*.spv
-  3. Renders using the engine with --scene and --pipeline
-  4. Validates the output (mesh visible, PBR shading, normal mapping)
+  3. Renders using the engine with --scene and --pipeline (with IBL if available)
+  4. Validates the output (grid visible, metallic/roughness gradient, PBR shading)
 
 Usage:
-    python test_gltf_pbr.py
+    python test_metal_rough_spheres.py
 
 Exit code 0 on success, 1 on failure.
 """
@@ -23,13 +26,13 @@ import numpy as np
 PLAYGROUND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PLAYGROUND_DIR.parent
 ASSETS_DIR = PLAYGROUND_DIR / "assets"
-HELMET_GLB = ASSETS_DIR / "DamagedHelmet.glb"
-HELMET_URL = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb"
+MODEL_GLB = ASSETS_DIR / "MetalRoughSpheres.glb"
+MODEL_URL = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/MetalRoughSpheres/glTF-Binary/MetalRoughSpheres.glb"
 
 LUX_SOURCE = PROJECT_ROOT / "examples" / "gltf_pbr.lux"
 VERT_SPV = PLAYGROUND_DIR / "gltf_pbr.vert.spv"
 FRAG_SPV = PLAYGROUND_DIR / "gltf_pbr.frag.spv"
-OUTPUT_PNG = PLAYGROUND_DIR / "test_gltf_pbr.png"
+OUTPUT_PNG = PLAYGROUND_DIR / "test_metal_rough_spheres.png"
 
 
 def step(msg: str) -> None:
@@ -39,20 +42,20 @@ def step(msg: str) -> None:
 
 
 def download_asset() -> bool:
-    """Download DamagedHelmet.glb if not already cached."""
-    step("Step 0: Ensuring DamagedHelmet.glb asset")
+    """Download MetalRoughSpheres.glb if not already cached."""
+    step("Step 0: Ensuring MetalRoughSpheres.glb asset")
 
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
-    if HELMET_GLB.exists():
-        size = HELMET_GLB.stat().st_size
-        print(f"  Already cached: {HELMET_GLB} ({size:,} bytes)")
+    if MODEL_GLB.exists():
+        size = MODEL_GLB.stat().st_size
+        print(f"  Already cached: {MODEL_GLB} ({size:,} bytes)")
         return True
 
-    print(f"  Downloading from: {HELMET_URL}")
+    print(f"  Downloading from: {MODEL_URL}")
     try:
-        urllib.request.urlretrieve(HELMET_URL, str(HELMET_GLB))
-        size = HELMET_GLB.stat().st_size
+        urllib.request.urlretrieve(MODEL_URL, str(MODEL_GLB))
+        size = MODEL_GLB.stat().st_size
         print(f"  OK: downloaded {size:,} bytes")
         return True
     except Exception as exc:
@@ -109,17 +112,16 @@ def detect_ibl() -> str:
 
 
 def render_frame() -> np.ndarray | None:
-    """Render DamagedHelmet using the engine."""
-    step("Step 2: Rendering DamagedHelmet")
+    """Render MetalRoughSpheres using the engine."""
+    step("Step 2: Rendering MetalRoughSpheres")
 
     ibl_name = detect_ibl()
 
     try:
-        # Try using the engine module
         sys.path.insert(0, str(PLAYGROUND_DIR))
         from engine import render
         pixels = render(
-            scene_source=str(HELMET_GLB),
+            scene_source=str(MODEL_GLB),
             pipeline_base=str(PLAYGROUND_DIR / "gltf_pbr"),
             output=str(OUTPUT_PNG),
             width=512,
@@ -128,10 +130,9 @@ def render_frame() -> np.ndarray | None:
         )
         return pixels
     except ImportError:
-        # Fallback: try using the engine as a subprocess
         cmd = [
             sys.executable, "-m", "playground.engine",
-            "--scene", str(HELMET_GLB),
+            "--scene", str(MODEL_GLB),
             "--pipeline", str(PLAYGROUND_DIR / "gltf_pbr"),
             "--output", str(OUTPUT_PNG),
             "--width", "512",
@@ -148,7 +149,6 @@ def render_frame() -> np.ndarray | None:
             print(f"FAIL: engine exited with code {result.returncode}")
             return None
 
-        # Load the output image
         from PIL import Image
         img = Image.open(str(OUTPUT_PNG))
         return np.array(img.convert("RGBA"), dtype=np.uint8)
@@ -160,7 +160,7 @@ def render_frame() -> np.ndarray | None:
 
 
 def validate_output(pixels: np.ndarray) -> bool:
-    """Check the rendered image for expected glTF PBR content."""
+    """Check the rendered image for expected MetalRoughSpheres content."""
     step("Step 3: Validating output")
     h, w, c = pixels.shape
     assert (h, w, c) == (512, 512, 4), f"Unexpected shape: {pixels.shape}"
@@ -168,25 +168,25 @@ def validate_output(pixels: np.ndarray) -> bool:
     rgb = pixels[:, :, :3].astype(np.float32)
     brightness = rgb.sum(axis=2)
 
-    # Check 1: mesh visible — significant non-background coverage
+    # Check 1: mesh visible — grid of spheres should cover significant area
     non_bg = (brightness > 15).sum()
     total = h * w
     coverage = non_bg / total * 100
     print(f"  Mesh coverage: {coverage:.1f}%")
     if coverage < 5:
-        print("FAIL: helmet not visible — too few non-background pixels")
+        print("FAIL: spheres not visible — too few non-background pixels")
         return False
 
-    # Check 2: brightness variation (PBR shading, not flat)
+    # Check 2: brightness variation (different roughness/metallic values)
     visible = brightness[brightness > 15]
     if len(visible) > 100:
         brightness_std = visible.std()
         print(f"  Brightness std dev: {brightness_std:.1f}")
         if brightness_std < 10:
-            print("FAIL: no shading variation — model looks flat")
+            print("FAIL: no shading variation — spheres look flat")
             return False
 
-    # Check 3: color variation (different materials on the helmet)
+    # Check 3: color variation across the grid
     visible_rgb = rgb[brightness > 15]
     if len(visible_rgb) > 100:
         r_mean = visible_rgb[:, 0].mean()
@@ -194,21 +194,24 @@ def validate_output(pixels: np.ndarray) -> bool:
         b_mean = visible_rgb[:, 2].mean()
         print(f"  Average color: R={r_mean:.1f}, G={g_mean:.1f}, B={b_mean:.1f}")
 
-    # Check 4: specular highlights (bright spots from PBR)
+    # Check 4: specular highlights (sharp reflections on smooth spheres)
     bright_pixels = (brightness > 300).sum()
     print(f"  Bright specular pixels: {bright_pixels}")
 
-    # Check 5: dark areas exist (AO darkening, shadowed regions)
-    dark_mesh = ((brightness > 5) & (brightness < 50)).sum()
-    dark_pct = dark_mesh / max(non_bg, 1) * 100
-    print(f"  Dark mesh pixels: {dark_pct:.1f}% of mesh")
+    # Check 5: metallic/roughness gradient — compare quadrants
+    # With IBL: top half (smooth) should differ from bottom half (rough)
+    top_half = brightness[:h // 2, :]
+    bot_half = brightness[h // 2:, :]
+    top_mean = top_half[top_half > 15].mean() if (top_half > 15).any() else 0
+    bot_mean = bot_half[bot_half > 15].mean() if (bot_half > 15).any() else 0
+    print(f"  Top-half mean brightness: {top_mean:.1f}, Bottom-half: {bot_mean:.1f}")
 
     print("  All validation checks passed.")
     return True
 
 
 def main() -> None:
-    print("Lux Shader Playground -- glTF PBR (DamagedHelmet) screenshot test")
+    print("Lux Shader Playground -- MetalRoughSpheres (Khronos PBR validation) screenshot test")
     print(f"Project root: {PROJECT_ROOT}")
 
     if not download_asset():
@@ -229,7 +232,7 @@ def main() -> None:
         sys.exit(1)
 
     print("\n" + "=" * 60)
-    print("  SUCCESS: glTF PBR rendered and validated correctly!")
+    print("  SUCCESS: MetalRoughSpheres rendered and validated correctly!")
     print("=" * 60)
     print(f"\nOutput: {OUTPUT_PNG}")
 

@@ -382,7 +382,15 @@ void RasterRenderer::createDefaultWhiteTexture(VulkanContext& ctx) {
     std::vector<uint8_t> white = {255, 255, 255, 255};
     defaultWhiteTexture = Scene::uploadTexture(ctx.allocator, ctx.device, ctx.commandPool,
                                                 ctx.graphicsQueue, white, 1, 1);
-    std::cout << "[info] Created default 1x1 white fallback texture" << std::endl;
+    // Black texture for emissive (no emission by default)
+    std::vector<uint8_t> black = {0, 0, 0, 255};
+    defaultBlackTexture = Scene::uploadTexture(ctx.allocator, ctx.device, ctx.commandPool,
+                                                ctx.graphicsQueue, black, 1, 1);
+    // Flat normal texture (128,128,255) = tangent-space (0,0,1)
+    std::vector<uint8_t> flatNormal = {128, 128, 255, 255};
+    defaultNormalTexture = Scene::uploadTexture(ctx.allocator, ctx.device, ctx.commandPool,
+                                                ctx.graphicsQueue, flatNormal, 1, 1);
+    std::cout << "[info] Created default fallback textures (white, black, flat-normal)" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -592,22 +600,40 @@ void RasterRenderer::loadIBLAssets(VulkanContext& ctx, const std::string& iblNam
     ss << manifestFile.rdbuf();
     std::string manifestContent = ss.str();
 
-    // Simple JSON parsing for manifest fields
-    // Expected fields: specular_size, specular_mips, irradiance_size, brdf_lut_size
+    // Simple JSON parsing for nested manifest fields
+    // Manifest structure: { "specular": { "face_size": N, "mip_count": N }, "irradiance": { "face_size": N }, "brdf_lut": { "size": N } }
     auto extractInt = [&](const std::string& json, const std::string& key) -> int {
         auto pos = json.find("\"" + key + "\"");
         if (pos == std::string::npos) return 0;
         pos = json.find(":", pos);
         if (pos == std::string::npos) return 0;
         pos++;
-        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) pos++;
         return std::stoi(json.substr(pos));
     };
 
-    int specSize = extractInt(manifestContent, "specular_size");
-    int specMips = extractInt(manifestContent, "specular_mips");
-    int irrSize = extractInt(manifestContent, "irradiance_size");
-    int brdfSize = extractInt(manifestContent, "brdf_lut_size");
+    // Find the "specular" section and extract face_size and mip_count within it
+    auto extractNestedInt = [&](const std::string& json, const std::string& section, const std::string& key) -> int {
+        auto secPos = json.find("\"" + section + "\"");
+        if (secPos == std::string::npos) return 0;
+        auto bracePos = json.find("{", secPos);
+        if (bracePos == std::string::npos) return 0;
+        // Find the closing brace
+        int depth = 1;
+        size_t endPos = bracePos + 1;
+        while (endPos < json.size() && depth > 0) {
+            if (json[endPos] == '{') depth++;
+            else if (json[endPos] == '}') depth--;
+            endPos++;
+        }
+        std::string sub = json.substr(bracePos, endPos - bracePos);
+        return extractInt(sub, key);
+    };
+
+    int specSize = extractNestedInt(manifestContent, "specular", "face_size");
+    int specMips = extractNestedInt(manifestContent, "specular", "mip_count");
+    int irrSize = extractNestedInt(manifestContent, "irradiance", "face_size");
+    int brdfSize = extractNestedInt(manifestContent, "brdf_lut", "size");
 
     if (specSize <= 0 || specMips <= 0 || irrSize <= 0 || brdfSize <= 0) {
         std::cerr << "[warn] Invalid IBL manifest values" << std::endl;
@@ -832,6 +858,17 @@ GPUTexture& RasterRenderer::getTextureForBinding(const std::string& name) {
         }
     }
 
+    // Use semantically correct defaults for missing textures:
+    // - emissive: black (no emission) — white would wash out everything
+    // - normal: flat normal (128,128,255) — white would tilt all normals 45°
+    // - everything else: white (identity for multiplicative textures)
+    if (name == "emissive_tex") {
+        return defaultBlackTexture;
+    }
+    if (name == "normal_tex") {
+        return defaultNormalTexture;
+    }
+
     return defaultWhiteTexture;
 }
 
@@ -841,7 +878,6 @@ GPUTexture& RasterRenderer::getTextureForBinding(const std::string& name) {
 
 void RasterRenderer::setupPBRResources(VulkanContext& ctx) {
     float aspect = static_cast<float>(renderWidth) / static_cast<float>(renderHeight);
-    auto cam = Camera::getDefaultMatrices(aspect);
 
     // Create MVP uniform buffer (3 x mat4 = 192 bytes)
     struct MVPData {
@@ -849,7 +885,17 @@ void RasterRenderer::setupPBRResources(VulkanContext& ctx) {
         glm::mat4 view;
         glm::mat4 projection;
     };
-    MVPData mvpData = {cam.model, cam.view, cam.projection};
+    MVPData mvpData;
+    if (m_hasSceneBounds) {
+        // Use auto-camera computed from scene bounds
+        mvpData.model = glm::mat4(1.0f); // identity - transforms already baked into vertices
+        mvpData.view = glm::lookAt(m_autoEye, m_autoTarget, m_autoUp);
+        mvpData.projection = glm::perspective(glm::radians(45.0f), aspect, 0.1f, m_autoFar);
+        mvpData.projection[1][1] *= -1.0f; // Vulkan Y-flip
+    } else {
+        auto cam = Camera::getDefaultMatrices(aspect);
+        mvpData = {cam.model, cam.view, cam.projection};
+    }
 
     VkBufferCreateInfo mvpBufInfo = {};
     mvpBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -876,7 +922,8 @@ void RasterRenderer::setupPBRResources(VulkanContext& ctx) {
     };
 
     glm::vec3 lightDir = glm::normalize(glm::vec3(1.0f, 0.8f, 0.6f));
-    LightData lightData = {lightDir, 0.0f, Camera::DEFAULT_EYE, 0.0f};
+    glm::vec3 viewPos = m_hasSceneBounds ? m_autoEye : Camera::DEFAULT_EYE;
+    LightData lightData = {lightDir, 0.0f, viewPos, 0.0f};
 
     VkBufferCreateInfo lightBufInfo = {};
     lightBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -1005,6 +1052,19 @@ void RasterRenderer::setupPBRResources(VulkanContext& ctx) {
 
     // Upload glTF textures if available
     uploadGltfTextures(ctx);
+
+    // Auto-detect and load IBL assets for glTF scenes
+    if (m_hasGltfScene) {
+        std::string iblNames[] = {"pisa", "neutral"};
+        for (auto& name : iblNames) {
+            std::string testPath = "playground/assets/ibl/" + name + "/manifest.json";
+            std::ifstream testFile(testPath);
+            if (testFile.good()) {
+                loadIBLAssets(ctx, name);
+                break;
+            }
+        }
+    }
 
     // If no named textures at all (non-glTF scene), create a procedural one as "albedo_tex"/"base_color_tex"
     if (namedTextures.empty()) {
@@ -1139,6 +1199,7 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
         writes.push_back(w);
     }
 
+
     if (!writes.empty()) {
         vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()),
                                writes.data(), 0, nullptr);
@@ -1185,12 +1246,11 @@ void RasterRenderer::createPipelinePBR(VulkanContext& ctx) {
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
-    // Negative viewport height (VK_KHR_maintenance1) to match wgpu Y convention
     VkViewport viewport = {};
     viewport.x = 0.0f;
-    viewport.y = static_cast<float>(renderHeight);
+    viewport.y = 0.0f;
     viewport.width = static_cast<float>(renderWidth);
-    viewport.height = -static_cast<float>(renderHeight);
+    viewport.height = static_cast<float>(renderHeight);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
 
@@ -1336,33 +1396,133 @@ void RasterRenderer::uploadScene(VulkanContext& ctx, const std::string& sceneSou
         m_hasGltfScene = true;
         auto drawItems = flattenScene(m_gltfScene);
 
-        if (!m_gltfScene.meshes.empty()) {
-            // Pack vertices to 48-byte stride (pos+normal+uv+tangent) to match
-            // the Lux PBR vertex layout expected by reflection-driven pipelines
-            auto& gmesh = m_gltfScene.meshes[0];
+        if (!drawItems.empty()) {
+            // Pack ALL meshes with world transforms into 48-byte stride vertices
             std::vector<float> vdata;
-            vdata.reserve(gmesh.vertices.size() * 12); // 12 floats = 48 bytes per vertex
-            for (size_t i = 0; i < gmesh.vertices.size(); i++) {
-                auto& gv = gmesh.vertices[i];
-                vdata.push_back(gv.position.x);
-                vdata.push_back(gv.position.y);
-                vdata.push_back(gv.position.z);
-                vdata.push_back(gv.normal.x);
-                vdata.push_back(gv.normal.y);
-                vdata.push_back(gv.normal.z);
-                vdata.push_back(gv.uv.x);
-                vdata.push_back(gv.uv.y);
-                if (gmesh.hasTangents) {
-                    vdata.push_back(gv.tangent.x);
-                    vdata.push_back(gv.tangent.y);
-                    vdata.push_back(gv.tangent.z);
-                    vdata.push_back(gv.tangent.w);
-                } else {
-                    vdata.push_back(1.0f);
-                    vdata.push_back(0.0f);
-                    vdata.push_back(0.0f);
-                    vdata.push_back(1.0f);
+            std::vector<uint32_t> allIndices;
+            uint32_t vertexOffset = 0;
+            glm::vec3 bboxMin(FLT_MAX), bboxMax(-FLT_MAX);
+            int positiveNormals = 0, negativeNormals = 0;
+
+            for (auto& item : drawItems) {
+                auto& gmesh = m_gltfScene.meshes[item.meshIndex];
+                glm::mat4 world = item.worldTransform;
+                glm::mat3 upper3x3 = glm::mat3(world);
+                glm::mat3 normalMat = glm::transpose(glm::inverse(upper3x3));
+
+                for (size_t i = 0; i < gmesh.vertices.size(); i++) {
+                    auto& gv = gmesh.vertices[i];
+                    // Transform position
+                    glm::vec4 pos4 = world * glm::vec4(gv.position, 1.0f);
+                    glm::vec3 pos(pos4);
+                    // Transform normal
+                    glm::vec3 norm = glm::normalize(normalMat * gv.normal);
+                    // Track bounds
+                    bboxMin = glm::min(bboxMin, pos);
+                    bboxMax = glm::max(bboxMax, pos);
+
+                    vdata.push_back(pos.x);
+                    vdata.push_back(pos.y);
+                    vdata.push_back(pos.z);
+                    vdata.push_back(norm.x);
+                    vdata.push_back(norm.y);
+                    vdata.push_back(norm.z);
+                    vdata.push_back(gv.uv.x);
+                    vdata.push_back(gv.uv.y);
+                    if (gmesh.hasTangents) {
+                        glm::vec3 tang = glm::normalize(upper3x3 * glm::vec3(gv.tangent));
+                        vdata.push_back(tang.x);
+                        vdata.push_back(tang.y);
+                        vdata.push_back(tang.z);
+                        vdata.push_back(gv.tangent.w);
+                    } else {
+                        vdata.push_back(1.0f);
+                        vdata.push_back(0.0f);
+                        vdata.push_back(0.0f);
+                        vdata.push_back(1.0f);
+                    }
                 }
+
+                // Add indices with offset
+                for (auto idx : gmesh.indices) {
+                    allIndices.push_back(idx + vertexOffset);
+                }
+                vertexOffset += static_cast<uint32_t>(gmesh.vertices.size());
+            }
+
+            // Compute auto-camera from scene bounds using node transform
+            m_sceneBboxMin = bboxMin;
+            m_sceneBboxMax = bboxMax;
+            m_hasSceneBounds = true;
+            {
+                glm::vec3 center = (bboxMin + bboxMax) * 0.5f;
+                glm::vec3 extent = bboxMax - bboxMin;
+
+                // Determine camera direction from first node's transform
+                // (matches Python engine and Rust PersistentRenderer)
+                glm::vec3 camDir(0.0f, 0.0f, 1.0f);   // default: +Z
+                glm::vec3 camUp(0.0f, 1.0f, 0.0f);     // default: +Y
+
+                if (!drawItems.empty()) {
+                    glm::mat4 world = drawItems[0].worldTransform;
+                    glm::mat3 upper3x3(world);
+                    // Normalize rows to get rotation only
+                    glm::vec3 row0 = glm::vec3(upper3x3[0]);
+                    glm::vec3 row1 = glm::vec3(upper3x3[1]);
+                    glm::vec3 row2 = glm::vec3(upper3x3[2]);
+                    float n0 = glm::length(row0), n1 = glm::length(row1), n2 = glm::length(row2);
+                    if (n0 > 1e-8f) upper3x3[0] /= n0;
+                    if (n1 > 1e-8f) upper3x3[1] /= n1;
+                    if (n2 > 1e-8f) upper3x3[2] /= n2;
+
+                    // Blender front (-Y local) and up (+Z local) in world space
+                    // Row-vector convention: v' = v @ R^T = transpose(R) * v
+                    glm::mat3 Rt = glm::transpose(upper3x3);
+                    glm::vec3 front = Rt * glm::vec3(0.0f, -1.0f, 0.0f);
+                    glm::vec3 upW = Rt * glm::vec3(0.0f, 0.0f, 1.0f);
+
+                    float fl = glm::length(front);
+                    float ul = glm::length(upW);
+                    if (fl > 0.5f && ul > 0.5f) {
+                        glm::vec3 candidateDir = front / fl;
+                        glm::vec3 candidateUp = upW / ul;
+                        if (std::abs(candidateDir.y) < 0.9f) {
+                            camDir = candidateDir;
+                            camUp = candidateUp;
+                            if (std::abs(glm::dot(camDir, camUp)) > 0.9f) {
+                                camUp = glm::vec3(0.0f, 1.0f, 0.0f);
+                            }
+                        }
+                    }
+                }
+
+                // Compute perpendicular extent for distance calculation
+                glm::vec3 viewRight = glm::cross(-camDir, camUp);
+                float vrLen = glm::length(viewRight);
+                if (vrLen < 1e-6f) {
+                    camUp = glm::vec3(0.0f, 0.0f, 1.0f);
+                    viewRight = glm::cross(-camDir, camUp);
+                    vrLen = glm::length(viewRight);
+                }
+                viewRight /= vrLen;
+                glm::vec3 viewUp = glm::normalize(glm::cross(viewRight, -camDir));
+
+                float projRight = std::abs(viewRight.x) * extent.x + std::abs(viewRight.y) * extent.y + std::abs(viewRight.z) * extent.z;
+                float projUp = std::abs(viewUp.x) * extent.x + std::abs(viewUp.y) * extent.y + std::abs(viewUp.z) * extent.z;
+                float maxPerpExtent = glm::max(projRight, projUp);
+
+                float fovY = glm::radians(45.0f);
+                float distance = (maxPerpExtent / 2.0f) / std::tan(fovY / 2.0f) * 1.1f;
+
+                float elevRad = glm::radians(5.0f);
+                glm::vec3 eye = center + distance * camDir + distance * std::sin(elevRad) * viewUp;
+
+                m_autoEye = eye;
+                m_autoTarget = center;
+                m_autoUp = camUp;
+                m_autoFar = glm::max(distance * 3.0f, 100.0f);
+                std::cout << "[info] Auto-camera: eye=(" << eye.x << "," << eye.y << "," << eye.z
+                          << ") target=(" << center.x << "," << center.y << "," << center.z << ")" << std::endl;
             }
 
             // Upload raw vertex data directly (bypasses Scene::uploadMesh which uses 32-byte Vertex)
@@ -1399,7 +1559,7 @@ void RasterRenderer::uploadScene(VulkanContext& ctx, const std::string& sceneSou
             vmaUnmapMemory(ctx.allocator, vStagingAlloc);
 
             // Upload index data
-            VkDeviceSize ibufSize = gmesh.indices.size() * sizeof(uint32_t);
+            VkDeviceSize ibufSize = allIndices.size() * sizeof(uint32_t);
             VkBufferCreateInfo ibufInfo = {};
             ibufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
             ibufInfo.size = ibufSize;
@@ -1427,7 +1587,7 @@ void RasterRenderer::uploadScene(VulkanContext& ctx, const std::string& sceneSou
 
             void* iMapped;
             vmaMapMemory(ctx.allocator, iStagingAlloc, &iMapped);
-            memcpy(iMapped, gmesh.indices.data(), ibufSize);
+            memcpy(iMapped, allIndices.data(), ibufSize);
             vmaUnmapMemory(ctx.allocator, iStagingAlloc);
 
             // Copy staging -> device
@@ -1443,8 +1603,9 @@ void RasterRenderer::uploadScene(VulkanContext& ctx, const std::string& sceneSou
             vmaDestroyBuffer(ctx.allocator, vStagingBuffer, vStagingAlloc);
             vmaDestroyBuffer(ctx.allocator, iStagingBuffer, iStagingAlloc);
 
-            mesh.vertexCount = static_cast<uint32_t>(gmesh.vertices.size());
-            mesh.indexCount = static_cast<uint32_t>(gmesh.indices.size());
+            mesh.vertexCount = vertexOffset;
+            mesh.indexCount = static_cast<uint32_t>(allIndices.size());
+
 
             std::cout << "[info] Uploaded glTF mesh with 48-byte stride ("
                       << mesh.vertexCount << " verts, " << mesh.indexCount << " indices)" << std::endl;
@@ -1529,7 +1690,7 @@ void RasterRenderer::bindSceneToPipeline(VulkanContext& ctx) {
                 if (f.name == "light_dir" && static_cast<uint32_t>(f.offset) + 12 <= pushConstantSize) {
                     memcpy(pushConstantData.data() + f.offset, &lightDir, sizeof(glm::vec3));
                 } else if (f.name == "view_pos" && static_cast<uint32_t>(f.offset) + 12 <= pushConstantSize) {
-                    glm::vec3 eye = Camera::DEFAULT_EYE;
+                    glm::vec3 eye = m_hasSceneBounds ? m_autoEye : Camera::DEFAULT_EYE;
                     memcpy(pushConstantData.data() + f.offset, &eye, sizeof(glm::vec3));
                 }
             }
@@ -1625,14 +1786,85 @@ void RasterRenderer::renderToSwapchain(VulkanContext& ctx,
                                        VkFormat swapFormat, VkExtent2D extent,
                                        VkSemaphore waitSem, VkSemaphore signalSem,
                                        VkFence fence) {
-    // For interactive mode, we render to offscreen then blit to swapchain
-    // First do the offscreen render
-    render(ctx);
+    // Record all commands (offscreen render + blit to swapchain) into a single
+    // command buffer and submit with proper semaphore/fence synchronization.
 
-    // Then blit offscreen -> swapchain
-    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = ctx.commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
 
-    // Transition swapchain image to TRANSFER_DST
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(ctx.device, &allocInfo, &cmd);
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    // --- Offscreen render pass ---
+    std::vector<VkClearValue> clearValues;
+    VkClearValue colorClear = {};
+    if (m_needsDepth) {
+        colorClear.color = {{0.05f, 0.05f, 0.08f, 1.0f}};
+    } else {
+        colorClear.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    }
+    clearValues.push_back(colorClear);
+    if (m_needsDepth) {
+        VkClearValue depthClear = {};
+        depthClear.depthStencil = {1.0f, 0};
+        clearValues.push_back(depthClear);
+    }
+
+    VkRenderPassBeginInfo rpBeginInfo = {};
+    rpBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpBeginInfo.renderPass = renderPass;
+    rpBeginInfo.framebuffer = framebuffer;
+    rpBeginInfo.renderArea.offset = {0, 0};
+    rpBeginInfo.renderArea.extent = {renderWidth, renderHeight};
+    rpBeginInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
+    rpBeginInfo.pClearValues = clearValues.data();
+
+    vkCmdBeginRenderPass(cmd, &rpBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+    if (pushConstantSize > 0 && pushConstantStageFlags != 0) {
+        vkCmdPushConstants(cmd, pipelineLayout, pushConstantStageFlags,
+                           0, pushConstantSize, pushConstantData.data());
+    }
+
+    if (m_sceneSource == "triangle") {
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &triangleVB, &offset);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    } else if (m_sceneSource == "fullscreen" || m_renderPath == "fullscreen") {
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    } else {
+        int maxSet = -1;
+        for (auto& [idx, _] : reflectedDescSets) {
+            maxSet = std::max(maxSet, idx);
+        }
+        for (int i = 0; i <= maxSet; i++) {
+            auto it = reflectedDescSets.find(i);
+            if (it != reflectedDescSets.end()) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        pipelineLayout, static_cast<uint32_t>(i),
+                                        1, &it->second, 0, nullptr);
+            }
+        }
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &offset);
+        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+    }
+
+    vkCmdEndRenderPass(cmd);
+
+    // --- Blit offscreen -> swapchain ---
+
+    // Transition swapchain image: UNDEFINED -> TRANSFER_DST
     VkImageMemoryBarrier barrier = {};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1649,11 +1881,10 @@ void RasterRenderer::renderToSwapchain(VulkanContext& ctx,
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 
     vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    // Blit
     VkImageBlit blitRegion = {};
     blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     blitRegion.srcSubresource.layerCount = 1;
@@ -1669,7 +1900,7 @@ void RasterRenderer::renderToSwapchain(VulkanContext& ctx,
         swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         1, &blitRegion, VK_FILTER_LINEAR);
 
-    // Transition swapchain image to PRESENT
+    // Transition swapchain image: TRANSFER_DST -> PRESENT_SRC
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1680,10 +1911,59 @@ void RasterRenderer::renderToSwapchain(VulkanContext& ctx,
         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    ctx.endSingleTimeCommands(cmd);
+    vkEndCommandBuffer(cmd);
+
+    // Submit with proper semaphore/fence synchronization
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = &waitSem;
+    submitInfo.pWaitDstStageMask = &waitStage;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = &signalSem;
+
+    vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, fence);
 }
 
 // --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
+// Orbit camera: update MVP + Light uniform buffers per frame
+// --------------------------------------------------------------------------
+
+void RasterRenderer::updateCamera(VulkanContext& ctx, const glm::vec3& eye,
+                                  const glm::vec3& target, const glm::vec3& up,
+                                  float fovY, float aspect, float nearPlane, float farPlane) {
+    if (!mvpBuffer || !lightBuffer) return;
+
+    // Update MVP
+    struct MVPData { glm::mat4 model, view, projection; };
+    MVPData mvp;
+    mvp.model = glm::mat4(1.0f);
+    mvp.view = Camera::lookAt(eye, target, up);
+    mvp.projection = Camera::perspective(fovY, aspect, nearPlane, farPlane);
+
+    void* mapped;
+    vmaMapMemory(ctx.allocator, mvpAllocation, &mapped);
+    memcpy(mapped, &mvp, sizeof(MVPData));
+    vmaUnmapMemory(ctx.allocator, mvpAllocation);
+
+    // Update Light uniform (preserve light_dir, update view_pos)
+    struct LightData {
+        glm::vec3 lightDir; float _pad0;
+        glm::vec3 viewPos; float _pad1;
+    };
+    LightData light;
+    vmaMapMemory(ctx.allocator, lightAllocation, &mapped);
+    memcpy(&light, mapped, sizeof(LightData));
+    light.viewPos = eye;
+    memcpy(mapped, &light, sizeof(LightData));
+    vmaUnmapMemory(ctx.allocator, lightAllocation);
+}
+
+
 // Cleanup
 // --------------------------------------------------------------------------
 
@@ -1745,4 +2025,6 @@ void RasterRenderer::cleanup(VulkanContext& ctx) {
     iblTextures.clear();
 
     Scene::destroyTexture(ctx.allocator, ctx.device, defaultWhiteTexture);
+    Scene::destroyTexture(ctx.allocator, ctx.device, defaultBlackTexture);
+    Scene::destroyTexture(ctx.allocator, ctx.device, defaultNormalTexture);
 }
