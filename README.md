@@ -77,6 +77,24 @@ pipeline GltfRT {
 }
 ```
 
+### Cartoon / Toon Shader — Custom `@layer`
+
+User-defined layers via `@layer` annotation — cel-shading with quantized NdotL and rim lighting, applied to glTF PBR models. One `@layer fn cartoon(...)` plugs into the standard layer compositing pipeline.
+
+<p align="center"><img src="screenshots/test_cartoon_rt_cpp.png" width="400"></p>
+
+```lux
+import toon;
+
+surface ToonSurface {
+    sampler2d albedo_tex,
+    layers [
+        base(albedo: sample(albedo_tex, uv).xyz, roughness: 0.8, metallic: 0.0),
+        cartoon(bands: 4.0, rim_power: 3.0, rim_color: vec3(0.3, 0.3, 0.5)),
+    ]
+}
+```
+
 ### Ray Tracing
 
 Real-time ray traced sphere with barycentric shading and sky gradient — compiled from a single `.lux` file to three SPIR-V stages (raygen, closest-hit, miss).
@@ -224,6 +242,7 @@ All three engines support reflection-driven descriptor binding, glTF loading, cu
 
 - **Declarative materials** — `surface`, `geometry`, `pipeline` blocks expand to full shader stages
 - **Layered surfaces** — `layers [base, normal_map, ibl, emission]` with automatic energy conservation, compiles to both raster and RT from one declaration
+- **Custom `@layer` functions** — user-defined layers via `@layer fn name(base, n, v, l, ...custom_params) -> vec3`, validated at compile time and composited in declaration order
 - **Compile-time features** — `features { has_normal_map: bool }` with `if` guards on any declaration; `--features` and `--all-permutations` for shader permutation generation
 - **Algorithm/schedule separation** — swap BRDF variants and tonemapping without touching material code
 - **Math-first syntax** — `scalar` not `float`, `builtin_position` not `gl_Position`
@@ -491,6 +510,35 @@ pipeline GltfRT {
 
 Layers are listed bottom-to-top (base first, outermost last). The compiler generates energy-conserving evaluation with `sample()` auto-rewritten to `sample_lod()` for RT.
 
+#### Custom Layers with `@layer`
+
+Define custom layers as annotated functions. The first 4 parameters (base color, normal, view, light) are provided automatically; remaining parameters come from layer arguments:
+
+```
+import toon;
+
+@layer
+fn cartoon(base: vec3, n: vec3, v: vec3, l: vec3,
+           bands: scalar, rim_power: scalar, rim_color: vec3) -> vec3 {
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let quantized: scalar = floor(n_dot_l * bands + 0.5) / bands;
+    let cel: vec3 = base * quantized;
+    let n_dot_v: scalar = max(dot(n, v), 0.0);
+    let rim: scalar = pow(1.0 - n_dot_v, rim_power);
+    return cel + rim_color * rim;
+}
+
+surface ToonSurface {
+    sampler2d albedo_tex,
+    layers [
+        base(albedo: sample(albedo_tex, uv).xyz, roughness: 0.8, metallic: 0.0),
+        cartoon(bands: 4.0, rim_power: 3.0, rim_color: vec3(0.3, 0.3, 0.5)),
+    ]
+}
+```
+
+Custom layers are validated at compile time (signature, return type, no name collision with built-in layers) and inserted in declaration order after built-in layers, before emission.
+
 Built-in layer types:
 
 | Layer | Purpose | Parameters |
@@ -499,8 +547,9 @@ Built-in layer types:
 | `normal_map` | TBN normal perturbation | map |
 | `ibl` | Image-based lighting | specular_map, irradiance_map, brdf_lut |
 | `emission` | Additive emission | color |
-| `coat` | Clearcoat (Phase 2) | factor, roughness |
-| `sheen` | Sheen/fuzz (Phase 2) | color, roughness |
+| `coat` | Clearcoat | factor, roughness |
+| `sheen` | Sheen/fuzz | color, roughness |
+| *custom* | User-defined `@layer` function | function-specific |
 
 ### Compile-Time Features
 
@@ -670,6 +719,8 @@ Import modules with `import <name>;` — functions are inlined at the call site.
 | `color` | 5 | linear-to-sRGB, sRGB-to-linear, luminance, Reinhard tonemap, ACES tonemap |
 | `colorspace` | 8 | RGB-to-HSV, HSV-to-RGB, contrast, saturation, hue shift, brightness, gamma correction |
 | `texture` | 11 | TBN normal perturbation, normal unpacking, triplanar projection (weights, UVs, blending), parallax offset, UV rotation, UV tiling |
+| `toon` | 1 | Cartoon cel-shading with quantized NdotL + rim lighting (`@layer` function) |
+| `compositing` | 2 | IBL multi-scattering (Fdez-Aguera 2019), layer compositing helpers |
 
 ### Built-in Functions
 
@@ -772,6 +823,8 @@ luxc/
         texture.lux          # normal maps, triplanar, UV utils
         ibl.lux              # image-based lighting + multi-scattering
         lighting.lux         # multi-light shading (directional, point, spot)
+        toon.lux             # @layer cartoon cel-shading + rim lighting
+        compositing.lux      # IBL multi-scattering, layer compositing helpers
     transpiler/
         glsl_ast.py          # GLSL AST nodes
         glsl_parser.py       # GLSL subset parser
@@ -794,6 +847,7 @@ examples/
     gltf_pbr.lux             # glTF 2.0 PBR with IBL + normal mapping
     gltf_pbr_rt.lux          # ray traced glTF PBR
     gltf_pbr_layered.lux     # layered surface — unified raster + RT pipeline
+    cartoon_toon.lux         # @layer custom functions — cel-shading + rim lighting
     lighting_demo.lux        # multi-light PBR (directional, point, spot)
     ibl_demo.lux             # image-based lighting demo
     math_builtins_demo.lux   # built-in function visualizer
@@ -809,8 +863,11 @@ playground_cpp/
     src/                     # native Vulkan C++ renderer (raster + RT, GLFW)
 playground_rust/
     src/                     # native Vulkan Rust renderer (ash, winit, raster + RT)
-run_interactive_cpp.bat      # launch interactive C++ viewer
-run_interactive_rust.bat     # launch interactive Rust viewer
+run_interactive_cpp.bat      # launch interactive C++ raster viewer
+run_interactive_rust.bat     # launch interactive Rust raster viewer
+run_interactive_cpp_rt.bat   # launch interactive C++ RT viewer
+run_interactive_rust_rt.bat  # launch interactive Rust RT viewer
+run_interactive_cartoon_*.bat  # cartoon shader viewers (raster + RT, C++ + Rust)
 compile_gltf_*.bat           # compile + render glTF pipelines (forward, RT, layered)
 screenshots/                 # rendered gallery screenshots (gitignored)
 shadercache/                 # compiled SPV + reflection JSON (generated, gitignored)
@@ -826,6 +883,8 @@ tests/
     test_p5_builtins.py
     test_p5_3_advanced.py
     test_p6_raytracing.py
+    test_custom_layers.py
+    test_gltf_extensions.py
 tools/
     generate_training_data.py
 ```
@@ -851,6 +910,7 @@ tools/
 | `gltf_pbr.lux` | glTF 2.0 PBR: tangent normal mapping, metallic-roughness, IBL cubemaps, multi-scattering |
 | `gltf_pbr_rt.lux` | Ray traced glTF PBR: same material model with RT stages |
 | `gltf_pbr_layered.lux` | Layered surface: unified raster + RT from one surface declaration |
+| `cartoon_toon.lux` | Custom `@layer` function: cel-shading + rim lighting (raster + RT) |
 | `lighting_demo.lux` | Multi-light: directional, point, spot lights with PBR |
 | `ibl_demo.lux` | Image-based lighting showcase: specular + diffuse IBL |
 | `math_builtins_demo.lux` | Built-in function visualizer: sin, smoothstep, fract, etc. |
@@ -908,8 +968,10 @@ playground_rust/target/release/lux-playground.exe --scene assets/DamagedHelmet.g
 
 **Batch files for quick launch:**
 ```bash
-run_interactive_cpp.bat     # Interactive C++ viewer (auto-detects RT vs raster)
-run_interactive_rust.bat    # Interactive Rust viewer (auto-detects RT vs raster)
+run_interactive_cpp.bat     # Interactive C++ raster viewer
+run_interactive_rust.bat    # Interactive Rust raster viewer
+run_interactive_cpp_rt.bat  # Interactive C++ RT viewer
+run_interactive_rust_rt.bat # Interactive Rust RT viewer
 compile_gltf_rt.bat         # Compile + render glTF RT (headless, both engines)
 compile_gltf_forward.bat    # Compile + render glTF raster (all 3 engines)
 compile_gltf_all.bat        # Compile + render all pipeline variants
@@ -945,7 +1007,7 @@ Output: specular cubemap (6 faces x 5 mips), irradiance cubemap, and BRDF integr
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 338 tests
+# 379 tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.

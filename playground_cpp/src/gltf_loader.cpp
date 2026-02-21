@@ -190,6 +190,49 @@ GltfScene loadGltf(const std::string& path) {
         gmat.alphaCutoff = mat.alpha_cutoff;
         gmat.doubleSided = mat.double_sided;
 
+        // --- KHR_materials_* extensions ---
+        if (mat.has_clearcoat) {
+            gmat.hasClearcoat = true;
+            gmat.clearcoatFactor = mat.clearcoat.clearcoat_factor;
+            gmat.clearcoatRoughnessFactor = mat.clearcoat.clearcoat_roughness_factor;
+            if (mat.clearcoat.clearcoat_texture.texture) {
+                std::cout << "[info] Extracting clearcoat texture for material: " << gmat.name << std::endl;
+                gmat.clearcoat_tex = extractTextureData(mat.clearcoat.clearcoat_texture);
+            }
+            if (mat.clearcoat.clearcoat_roughness_texture.texture) {
+                std::cout << "[info] Extracting clearcoat roughness texture for material: " << gmat.name << std::endl;
+                gmat.clearcoat_roughness_tex = extractTextureData(mat.clearcoat.clearcoat_roughness_texture);
+            }
+        }
+        if (mat.has_sheen) {
+            gmat.hasSheen = true;
+            gmat.sheenColorFactor = glm::vec3(mat.sheen.sheen_color_factor[0],
+                                               mat.sheen.sheen_color_factor[1],
+                                               mat.sheen.sheen_color_factor[2]);
+            gmat.sheenRoughnessFactor = mat.sheen.sheen_roughness_factor;
+            if (mat.sheen.sheen_color_texture.texture) {
+                std::cout << "[info] Extracting sheen color texture for material: " << gmat.name << std::endl;
+                gmat.sheen_color_tex = extractTextureData(mat.sheen.sheen_color_texture);
+            }
+        }
+        if (mat.has_transmission) {
+            gmat.hasTransmission = true;
+            gmat.transmissionFactor = mat.transmission.transmission_factor;
+            if (mat.transmission.transmission_texture.texture) {
+                std::cout << "[info] Extracting transmission texture for material: " << gmat.name << std::endl;
+                gmat.transmission_tex = extractTextureData(mat.transmission.transmission_texture);
+            }
+        }
+        if (mat.has_ior) {
+            gmat.ior = mat.ior.ior;
+        }
+        if (mat.has_emissive_strength) {
+            gmat.emissiveStrength = mat.emissive_strength.emissive_strength;
+        }
+        if (mat.unlit) {
+            gmat.isUnlit = true;
+        }
+
         scene.materials.push_back(gmat);
     }
 

@@ -342,6 +342,13 @@ Functions defined at module level are visible to all stages and are exported whe
 
 All user-defined function calls are **inlined** at the call site. There is no SPIR-V `OpFunctionCall` emitted. Recursion is not supported (except for recursive `trace_ray` in RT stages, which is handled by the hardware).
 
+**Annotations**: Functions may be prefixed with `@` annotations. Supported annotations:
+
+| Annotation | Purpose | Reference |
+|---|---|---|
+| `@differentiable` | Auto-generate gradient functions via forward-mode autodiff | Section 13 |
+| `@layer` | Register as a custom layer function for use in `layers [...]` blocks | Section 12.2.2 |
+
 ### 4.4 Type Aliases
 
 ```
@@ -1268,6 +1275,14 @@ Normal mapping, triplanar projection, parallax mapping, and UV utilities.
 | `rotate_uv` | `(uv: vec2, angle: scalar, center: vec2) -> vec2` | Rotate UV coordinates around center |
 | `tile_uv` | `(uv: vec2, scale: vec2) -> vec2` | Tile UV coordinates with scale |
 
+### 11.7 Module: toon
+
+Custom `@layer` functions for non-photorealistic rendering.
+
+| Function | Signature | Description |
+|---|---|---|
+| `cartoon` | `(base: vec3, n: vec3, v: vec3, l: vec3, bands: scalar, rim_power: scalar, rim_color: vec3) -> vec3` | Cel-shading with quantized NdotL lighting bands and Fresnel rim lighting. Annotated with `@layer` for use in `layers [...]` blocks. |
+
 ---
 
 ## 12. Declarative Syntax
@@ -1408,6 +1423,32 @@ surface PBRMaterial {
 ```
 
 **Energy conservation**: The layer system ensures energy conservation automatically. The `ibl` layer adds indirect illumination that is scaled by the surface's albedo and Fresnel response, while the `base` layer provides direct illumination. The compiler evaluates layers from top to bottom, with each layer modifying the surface appearance in a physically-consistent manner.
+
+**Custom layers via `@layer`**: Users can define custom layer functions using the `@layer` annotation on a regular function. The function must have at least 4 parameters (`base: vec3, n: vec3, v: vec3, l: vec3`) and return `vec3`. Additional parameters are mapped by name from `LayerArg` entries in the `layers [...]` block:
+
+```
+@layer
+fn cartoon(base: vec3, n: vec3, v: vec3, l: vec3,
+           bands: scalar, rim_power: scalar, rim_color: vec3) -> vec3 {
+    // Cel-shading: quantized NdotL + rim lighting
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let quantized: scalar = floor(n_dot_l * bands + 0.5) / bands;
+    let cel: vec3 = base * quantized;
+    let n_dot_v: scalar = max(dot(n, v), 0.0);
+    let rim: scalar = pow(1.0 - n_dot_v, rim_power);
+    return cel + rim_color * rim;
+}
+
+surface ToonSurface {
+    sampler2d albedo_tex,
+    layers [
+        base(albedo: sample(albedo_tex, uv).xyz, roughness: 0.8, metallic: 0.0),
+        cartoon(bands: 4.0, rim_power: 3.0, rim_color: vec3(0.3, 0.3, 0.5)),
+    ]
+}
+```
+
+Custom layers are validated at compile time: the function must have ≥4 parameters with the correct types, must return `vec3`, and must not collide with a built-in layer name (`base`, `normal_map`, `ibl`, `emission`, `coat`, `sheen`, `transmission`). Custom layers are inserted in declaration order after all built-in layers and before `emission`. In RT mode, any `sample()` calls within custom layer arguments are automatically rewritten to `sample_lod()`.
 
 #### 12.2.3 RT Unification
 

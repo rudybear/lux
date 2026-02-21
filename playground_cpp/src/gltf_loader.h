@@ -50,6 +50,26 @@ struct GltfMaterial {
     float alphaCutoff = 0.5f;
     bool doubleSided = false;
 
+    // --- KHR_materials_* extension fields ---
+    bool hasClearcoat = false;
+    float clearcoatFactor = 0.0f;
+    float clearcoatRoughnessFactor = 0.0f;
+    GltfTextureData clearcoat_tex;
+    GltfTextureData clearcoat_roughness_tex;
+
+    bool hasSheen = false;
+    glm::vec3 sheenColorFactor{0.0f};
+    float sheenRoughnessFactor = 0.0f;
+    GltfTextureData sheen_color_tex;
+
+    bool hasTransmission = false;
+    float transmissionFactor = 0.0f;
+    GltfTextureData transmission_tex;
+
+    float ior = 1.5f;
+    float emissiveStrength = 1.0f;
+    bool isUnlit = false;
+
     // Decoded texture image data (RGBA8) extracted from GLB
     GltfTextureData base_color_tex;
     GltfTextureData normal_tex;

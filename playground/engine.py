@@ -90,6 +90,7 @@ class SceneData:
     lights: list[LightData] = field(default_factory=list)
     render_path: str = "raster"  # hint: "raster", "fullscreen"
     camera_elevation: float = 5.0  # degrees; 0 = straight-on
+    scene_features: set = field(default_factory=set)  # detected material features
 
 
 @dataclass
@@ -243,6 +244,22 @@ def _load_gltf_scene(path: str, camera_elevation: float = 5.0) -> SceneData:
             mdata.textures["occlusion_tex"] = mat.occlusion_texture
         if mat.emissive_texture is not None:
             mdata.textures["emissive_tex"] = mat.emissive_texture
+        # Extension textures
+        if hasattr(mat, 'extensions'):
+            if 'clearcoat' in mat.extensions:
+                cc = mat.extensions['clearcoat']
+                if 'texture' in cc and cc['texture'] is not None:
+                    mdata.textures["clearcoat_tex"] = cc['texture']
+                if 'roughness_texture' in cc and cc['roughness_texture'] is not None:
+                    mdata.textures["clearcoat_roughness_tex"] = cc['roughness_texture']
+            if 'sheen' in mat.extensions:
+                sh = mat.extensions['sheen']
+                if 'color_texture' in sh and sh['color_texture'] is not None:
+                    mdata.textures["sheen_color_tex"] = sh['color_texture']
+            if 'transmission' in mat.extensions:
+                tr = mat.extensions['transmission']
+                if 'texture' in tr and tr['texture'] is not None:
+                    mdata.textures["transmission_tex"] = tr['texture']
         scene.materials.append(mdata)
 
     # Extract camera from glTF if available, or compute from scene bounds
@@ -328,18 +345,60 @@ def _load_gltf_scene(path: str, camera_elevation: float = 5.0) -> SceneData:
     if not scene.lights:
         scene.lights.append(LightData())
 
+    # Detect scene material features
+    for mat in gltf_scene.materials:
+        if mat.normal_texture is not None:
+            scene.scene_features.add("has_normal_map")
+        if mat.emissive_texture is not None or (mat.emissive and any(e > 0 for e in mat.emissive)):
+            scene.scene_features.add("has_emission")
+        if hasattr(mat, 'extensions'):
+            if 'clearcoat' in mat.extensions:
+                scene.scene_features.add("has_clearcoat")
+            if 'sheen' in mat.extensions:
+                scene.scene_features.add("has_sheen")
+            if 'transmission' in mat.extensions:
+                scene.scene_features.add("has_transmission")
+    if scene.scene_features:
+        print(f"[info] Detected material features: {scene.scene_features}")
+
     return scene
+
+
+def detect_scene_features(scene_source: str, scene: SceneData, gltf_scene) -> set:
+    """Detect which material features are used across the scene."""
+    features = set()
+    if not hasattr(gltf_scene, 'materials'):
+        return features
+    for mat in gltf_scene.materials:
+        if mat.normal_texture is not None:
+            features.add("has_normal_map")
+        if mat.emissive_texture is not None or (mat.emissive and any(e > 0 for e in mat.emissive)):
+            features.add("has_emission")
+        if hasattr(mat, 'extensions'):
+            if 'clearcoat' in mat.extensions:
+                features.add("has_clearcoat")
+            if 'sheen' in mat.extensions:
+                features.add("has_sheen")
+            if 'transmission' in mat.extensions:
+                features.add("has_transmission")
+    return features
 
 
 # ---------------------------------------------------------------------------
 # Pipeline resolution
 # ---------------------------------------------------------------------------
 
-def resolve_pipeline(pipeline_arg: Optional[str], scene_source: str) -> str:
+def resolve_pipeline(pipeline_arg: Optional[str], scene_source: str,
+                     scene_features: set = None) -> str:
     """If no --pipeline given, pick a sensible default for the scene type."""
     if pipeline_arg:
         return pipeline_arg
     if scene_source.endswith((".glb", ".gltf")):
+        if scene_features:
+            suffix = "+".join(sorted(f.replace("has_", "") for f in scene_features))
+            candidate = f"shadercache/gltf_pbr_layered+{suffix}"
+            if Path(candidate + ".frag.spv").exists():
+                return candidate
         return "shadercache/gltf_pbr"
     elif scene_source == "fullscreen":
         raise ValueError("--pipeline is required for fullscreen scenes")
@@ -350,14 +409,17 @@ def resolve_pipeline(pipeline_arg: Optional[str], scene_source: str) -> str:
 
 
 def detect_render_path(pipeline_base: str) -> str:
-    """Auto-detect rendering path from available shader files."""
+    """Auto-detect rendering path from available shader files.
+
+    Prefers raster over RT since the Python/wgpu engine only supports raster.
+    """
     base = Path(pipeline_base)
-    if base.with_suffix(".rgen.spv").exists():
-        return "rt"
-    elif base.with_suffix(".vert.spv").exists() and base.with_suffix(".frag.spv").exists():
+    if base.with_suffix(".vert.spv").exists() and base.with_suffix(".frag.spv").exists():
         return "raster"
     elif base.with_suffix(".frag.spv").exists():
         return "fullscreen"
+    elif base.with_suffix(".rgen.spv").exists():
+        return "rt"
     else:
         raise FileNotFoundError(
             f"No shader files found for pipeline base: {pipeline_base}\n"
@@ -789,7 +851,7 @@ def bind_scene_to_pipeline(
     default_brdf = None
     default_normal = None
     default_black = None
-    _BLACK_TEX_NAMES = {"emissive_tex"}
+    _BLACK_TEX_NAMES = {"emissive_tex", "sheen_color_tex", "transmission_tex"}
     for set_idx, bindings in reflected._binding_info.items():
         for b in bindings:
             if b["type"] in ("sampler", "sampled_image", "sampled_cube_image") and b["name"] not in resources:
@@ -844,6 +906,15 @@ def render(
 
     # Load scene
     scene = load_scene(scene_source, camera_elevation=camera_elevation)
+
+    # Auto-select pipeline variant based on detected features
+    # Only override when the user's pipeline is a gltf_pbr_layered base
+    if scene.scene_features and "gltf_pbr_layered" in pipeline_base:
+        suffix = "+".join(sorted(f.replace("has_", "") for f in scene.scene_features))
+        candidate = f"shadercache/gltf_pbr_layered+{suffix}"
+        if Path(candidate + ".frag.spv").exists():
+            print(f"[info] Auto-selected pipeline variant: {candidate}")
+            pipeline_base = candidate
 
     # Detect render path
     render_path = detect_render_path(pipeline_base)

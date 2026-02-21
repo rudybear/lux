@@ -51,6 +51,7 @@ class GltfMaterial:
     alpha_mode: str = "OPAQUE"
     alpha_cutoff: float = 0.5
     double_sided: bool = False
+    extensions: dict = field(default_factory=dict)  # KHR_materials_* extension data
 
 
 @dataclass
@@ -189,6 +190,70 @@ def load_gltf(path: Path) -> GltfScene:
                 gmat.occlusion_texture = _load_texture_image(gltf, mat.occlusionTexture.index)
             if mat.emissiveTexture:
                 gmat.emissive_texture = _load_texture_image(gltf, mat.emissiveTexture.index)
+            # --- KHR_materials_* extensions ---
+            if hasattr(mat, 'extensions') and mat.extensions:
+                if isinstance(mat.extensions, dict):
+                    ext = mat.extensions
+                elif hasattr(mat.extensions, '__dict__'):
+                    ext = {k: v for k, v in vars(mat.extensions).items() if v is not None}
+                else:
+                    ext = {}
+
+                if 'KHR_materials_clearcoat' in ext:
+                    cc = ext['KHR_materials_clearcoat']
+                    gmat.extensions['clearcoat'] = {
+                        'factor': cc.get('clearcoatFactor', 0.0) if isinstance(cc, dict) else getattr(cc, 'clearcoatFactor', 0.0),
+                        'roughnessFactor': cc.get('clearcoatRoughnessFactor', 0.0) if isinstance(cc, dict) else getattr(cc, 'clearcoatRoughnessFactor', 0.0),
+                    }
+                    # Load clearcoat textures if present
+                    cc_tex = cc.get('clearcoatTexture', None) if isinstance(cc, dict) else getattr(cc, 'clearcoatTexture', None)
+                    if cc_tex is not None:
+                        tex_idx = cc_tex.get('index', None) if isinstance(cc_tex, dict) else getattr(cc_tex, 'index', None)
+                        if tex_idx is not None:
+                            gmat.extensions['clearcoat']['texture'] = _load_texture_image(gltf, tex_idx)
+                    cc_rtex = cc.get('clearcoatRoughnessTexture', None) if isinstance(cc, dict) else getattr(cc, 'clearcoatRoughnessTexture', None)
+                    if cc_rtex is not None:
+                        tex_idx = cc_rtex.get('index', None) if isinstance(cc_rtex, dict) else getattr(cc_rtex, 'index', None)
+                        if tex_idx is not None:
+                            gmat.extensions['clearcoat']['roughness_texture'] = _load_texture_image(gltf, tex_idx)
+
+                if 'KHR_materials_sheen' in ext:
+                    sh = ext['KHR_materials_sheen']
+                    gmat.extensions['sheen'] = {
+                        'colorFactor': (sh.get('sheenColorFactor', [0,0,0]) if isinstance(sh, dict) else getattr(sh, 'sheenColorFactor', [0,0,0])),
+                        'roughnessFactor': (sh.get('sheenRoughnessFactor', 0.0) if isinstance(sh, dict) else getattr(sh, 'sheenRoughnessFactor', 0.0)),
+                    }
+                    sh_ctex = sh.get('sheenColorTexture', None) if isinstance(sh, dict) else getattr(sh, 'sheenColorTexture', None)
+                    if sh_ctex is not None:
+                        tex_idx = sh_ctex.get('index', None) if isinstance(sh_ctex, dict) else getattr(sh_ctex, 'index', None)
+                        if tex_idx is not None:
+                            gmat.extensions['sheen']['color_texture'] = _load_texture_image(gltf, tex_idx)
+
+                if 'KHR_materials_transmission' in ext:
+                    tr = ext['KHR_materials_transmission']
+                    gmat.extensions['transmission'] = {
+                        'factor': tr.get('transmissionFactor', 0.0) if isinstance(tr, dict) else getattr(tr, 'transmissionFactor', 0.0),
+                    }
+                    tr_tex = tr.get('transmissionTexture', None) if isinstance(tr, dict) else getattr(tr, 'transmissionTexture', None)
+                    if tr_tex is not None:
+                        tex_idx = tr_tex.get('index', None) if isinstance(tr_tex, dict) else getattr(tr_tex, 'index', None)
+                        if tex_idx is not None:
+                            gmat.extensions['transmission']['texture'] = _load_texture_image(gltf, tex_idx)
+
+                if 'KHR_materials_ior' in ext:
+                    ior_ext = ext['KHR_materials_ior']
+                    gmat.extensions['ior'] = {
+                        'ior': ior_ext.get('ior', 1.5) if isinstance(ior_ext, dict) else getattr(ior_ext, 'ior', 1.5),
+                    }
+
+                if 'KHR_materials_emissive_strength' in ext:
+                    es = ext['KHR_materials_emissive_strength']
+                    gmat.extensions['emissive_strength'] = {
+                        'emissiveStrength': es.get('emissiveStrength', 1.0) if isinstance(es, dict) else getattr(es, 'emissiveStrength', 1.0),
+                    }
+
+                if 'KHR_materials_unlit' in ext:
+                    gmat.extensions['unlit'] = {}
             scene.materials.append(gmat)
     else:
         scene.materials.append(GltfMaterial(name="default"))

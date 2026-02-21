@@ -377,6 +377,12 @@ void SceneManager::uploadGltfTextures(VulkanContext& ctx) {
     uploadIfValid(mat.metallic_roughness_tex, "metallic_roughness_tex");
     uploadIfValid(mat.occlusion_tex, "occlusion_tex");
     uploadIfValid(mat.emissive_tex, "emissive_tex");
+
+    // Upload extension textures
+    uploadIfValid(mat.clearcoat_tex, "clearcoat_tex");
+    uploadIfValid(mat.clearcoat_roughness_tex, "clearcoat_roughness_tex");
+    uploadIfValid(mat.sheen_color_tex, "sheen_color_tex");
+    uploadIfValid(mat.transmission_tex, "transmission_tex");
 }
 
 // --------------------------------------------------------------------------
@@ -774,6 +780,12 @@ GPUTexture& SceneManager::getTextureForBinding(const std::string& name) {
     if (name == "emissive_tex") return m_defaultBlackTexture;
     if (name == "normal_tex") return m_defaultNormalTexture;
 
+    // Extension textures default to black (no effect)
+    if (name == "clearcoat_tex" || name == "clearcoat_roughness_tex" ||
+        name == "sheen_color_tex" || name == "transmission_tex") {
+        return m_defaultBlackTexture;
+    }
+
     return m_defaultWhiteTexture;
 }
 
@@ -861,6 +873,51 @@ void SceneManager::computeAutoCamera(const std::vector<Vertex>& vertices) {
     std::cout << "[info] Auto-camera: eye=(" << m_autoEye.x << "," << m_autoEye.y << "," << m_autoEye.z
               << ") target=(" << m_autoTarget.x << "," << m_autoTarget.y << "," << m_autoTarget.z
               << ") distance=" << distance << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Scene feature detection
+// --------------------------------------------------------------------------
+
+std::set<std::string> SceneManager::detectSceneFeatures() const {
+    std::set<std::string> features;
+    if (!m_hasGltfScene) return features;
+
+    for (auto& mat : m_gltfScene.materials) {
+        if (mat.normal_tex.valid()) features.insert("has_normal_map");
+        if (mat.emissive_tex.valid() || glm::length(mat.emissive) > 0.0f)
+            features.insert("has_emission");
+        if (mat.hasClearcoat) features.insert("has_clearcoat");
+        if (mat.hasSheen) features.insert("has_sheen");
+        if (mat.hasTransmission) features.insert("has_transmission");
+    }
+
+    if (!features.empty()) {
+        std::cout << "[info] Detected material features:";
+        for (auto& f : features) std::cout << " " << f;
+        std::cout << std::endl;
+    }
+    return features;
+}
+
+std::string SceneManager::buildPipelinePath(const std::string& basePath,
+                                             const std::set<std::string>& features) {
+    if (features.empty()) return basePath;
+
+    std::string suffix;
+    for (auto& f : features) {
+        if (!suffix.empty()) suffix += "+";
+        // Strip "has_" prefix
+        suffix += f.substr(4);
+    }
+    std::string candidate = "shadercache/gltf_pbr_layered+" + suffix;
+    // Check if compiled variant exists
+    namespace fs = std::filesystem;
+    if (fs::exists(candidate + ".frag.spv") || fs::exists(candidate + ".rgen.spv")) {
+        std::cout << "[info] Auto-selected pipeline variant: " << candidate << std::endl;
+        return candidate;
+    }
+    return basePath;
 }
 
 // --------------------------------------------------------------------------

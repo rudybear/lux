@@ -327,12 +327,20 @@ procedural MetaBalls {
 | `coat` layer (clearcoat as composable layer) | Medium | glTF clearcoat via layer system |
 | `sheen` layer (fabric sheen as composable layer) | Medium | glTF sheen via layer system |
 
-### Future — P7–P9: Extended layer system
+### ✅ COMPLETE — P8: `@layer` custom functions
+
+| Item | Effort | Impact | Status |
+|---|---|---|---|
+| `@layer` annotation on user-defined functions | Small | User-extensible layer system | ✅ |
+| `_collect_layer_functions()` + `_emit_custom_layer()` | Medium | Custom layer dispatch in raster + RT | ✅ |
+| `toon.lux` stdlib module | Small | Cartoon cel-shading example | ✅ |
+| `cartoon_toon.lux` example | Small | End-to-end @layer demo | ✅ |
+| Signature validation (≥4 params, vec3 return, no name collision) | Small | Compile-time safety | ✅ |
+
+### Future — P9: Deferred pipeline
 
 | Item | Phase | Impact |
 |---|---|---|
-| `transmission` layer (BTDF + volume) | P7 | Glass, liquids via layer system |
-| `@layer` custom functions | P8 | User-extensible layer system |
 | Deferred pipeline mode (`--pipeline deferred`) | P9 | G-buffer rendering path |
 
 ### ✅ COMPLETE — P10: Ray tracing pipeline (full)

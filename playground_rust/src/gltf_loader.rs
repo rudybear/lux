@@ -64,6 +64,26 @@ pub struct GltfMaterial {
     pub occlusion_image: Option<TextureImage>,
     /// Emissive texture (RGBA pixels).
     pub emissive_image: Option<TextureImage>,
+
+    // --- KHR_materials_* extension fields ---
+    pub has_clearcoat: bool,
+    pub clearcoat_factor: f32,
+    pub clearcoat_roughness_factor: f32,
+    pub clearcoat_image: Option<TextureImage>,
+    pub clearcoat_roughness_image: Option<TextureImage>,
+
+    pub has_sheen: bool,
+    pub sheen_color_factor: [f32; 3],
+    pub sheen_roughness_factor: f32,
+    pub sheen_color_image: Option<TextureImage>,
+
+    pub has_transmission: bool,
+    pub transmission_factor: f32,
+    pub transmission_image: Option<TextureImage>,
+
+    pub ior: f32,
+    pub emissive_strength: f32,
+    pub is_unlit: bool,
 }
 
 impl Default for GltfMaterial {
@@ -82,6 +102,21 @@ impl Default for GltfMaterial {
             metallic_roughness_image: None,
             occlusion_image: None,
             emissive_image: None,
+            has_clearcoat: false,
+            clearcoat_factor: 0.0,
+            clearcoat_roughness_factor: 0.0,
+            clearcoat_image: None,
+            clearcoat_roughness_image: None,
+            has_sheen: false,
+            sheen_color_factor: [0.0, 0.0, 0.0],
+            sheen_roughness_factor: 0.0,
+            sheen_color_image: None,
+            has_transmission: false,
+            transmission_factor: 0.0,
+            transmission_image: None,
+            ior: 1.5,
+            emissive_strength: 1.0,
+            is_unlit: false,
         }
     }
 }
@@ -316,6 +351,7 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
     };
 
     // --- Materials (with texture extraction) ---
+    let all_textures: Vec<gltf::Texture> = document.textures().collect();
     for mat in document.materials() {
         let pbr = mat.pbr_metallic_roughness();
         let bc = pbr.base_color_factor();
@@ -325,6 +361,68 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
         let metallic_roughness_image = extract_texture(&images, pbr.metallic_roughness_texture().map(|t| t.texture()));
         let occlusion_image = extract_texture(&images, mat.occlusion_texture().map(|t| t.texture()));
         let emissive_image = extract_texture(&images, mat.emissive_texture().map(|t| t.texture()));
+
+        // --- KHR_materials_* extensions ---
+        // Clearcoat: parsed from raw extension JSON (gltf crate v1.4.1 lacks built-in support)
+        let (has_clearcoat, clearcoat_factor, clearcoat_roughness_factor,
+             clearcoat_image, clearcoat_roughness_image) =
+            if let Some(cc_val) = mat.extension_value("KHR_materials_clearcoat") {
+                let cc_factor = cc_val.get("clearcoatFactor")
+                    .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let cc_rough = cc_val.get("clearcoatRoughnessFactor")
+                    .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let cc_tex = cc_val.get("clearcoatTexture")
+                    .and_then(|t| t.get("index"))
+                    .and_then(|v| v.as_u64())
+                    .and_then(|idx| all_textures.get(idx as usize))
+                    .and_then(|tex| extract_texture(&images, Some(tex.clone())));
+                let cc_rough_tex = cc_val.get("clearcoatRoughnessTexture")
+                    .and_then(|t| t.get("index"))
+                    .and_then(|v| v.as_u64())
+                    .and_then(|idx| all_textures.get(idx as usize))
+                    .and_then(|tex| extract_texture(&images, Some(tex.clone())));
+                (true, cc_factor, cc_rough, cc_tex, cc_rough_tex)
+            } else {
+                (false, 0.0, 0.0, None, None)
+            };
+
+        // Sheen: parsed from raw extension JSON (gltf crate v1.4.1 lacks built-in support)
+        let (has_sheen, sheen_color_factor, sheen_roughness_factor, sheen_color_image) =
+            if let Some(sh_val) = mat.extension_value("KHR_materials_sheen") {
+                let sh_color = if let Some(arr) = sh_val.get("sheenColorFactor").and_then(|v| v.as_array()) {
+                    let r = arr.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                    let g = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                    let b = arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                    [r, g, b]
+                } else {
+                    [0.0, 0.0, 0.0]
+                };
+                let sh_rough = sh_val.get("sheenRoughnessFactor")
+                    .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let sh_tex = sh_val.get("sheenColorTexture")
+                    .and_then(|t| t.get("index"))
+                    .and_then(|v| v.as_u64())
+                    .and_then(|idx| all_textures.get(idx as usize))
+                    .and_then(|tex| extract_texture(&images, Some(tex.clone())));
+                (true, sh_color, sh_rough, sh_tex)
+            } else {
+                (false, [0.0, 0.0, 0.0], 0.0, None)
+            };
+
+        // Transmission: uses gltf crate's built-in API
+        let (has_transmission, transmission_factor, transmission_image) =
+            if let Some(tr) = mat.transmission() {
+                let tr_tex = tr.transmission_texture().and_then(|t| {
+                    extract_texture(&images, Some(t.texture()))
+                });
+                (true, tr.transmission_factor(), tr_tex)
+            } else {
+                (false, 0.0, None)
+            };
+
+        let ior = mat.ior().unwrap_or(1.5);
+        let emissive_strength = mat.emissive_strength().unwrap_or(1.0);
+        let is_unlit = mat.unlit();
 
         let mat_name = mat.name().unwrap_or("unnamed").to_string();
         info!(
@@ -356,6 +454,21 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
             metallic_roughness_image,
             occlusion_image,
             emissive_image,
+            has_clearcoat,
+            clearcoat_factor,
+            clearcoat_roughness_factor,
+            clearcoat_image,
+            clearcoat_roughness_image,
+            has_sheen,
+            sheen_color_factor,
+            sheen_roughness_factor,
+            sheen_color_image,
+            has_transmission,
+            transmission_factor,
+            transmission_image,
+            ior,
+            emissive_strength,
+            is_unlit,
         });
     }
     if scene.materials.is_empty() {

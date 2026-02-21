@@ -1006,12 +1006,15 @@ fn render_pbr_scene(
                 vdata.push(norm.x); vdata.push(norm.y); vdata.push(norm.z);
                 vdata.push(gv.uv[0]); vdata.push(gv.uv[1]);
 
-                if gmesh.has_tangents {
-                    let tang3 = (upper3x3 * glam::Vec3::new(gv.tangent[0], gv.tangent[1], gv.tangent[2])).normalize();
-                    vdata.push(tang3.x); vdata.push(tang3.y); vdata.push(tang3.z);
-                    vdata.push(gv.tangent[3]);
-                } else {
-                    vdata.push(1.0); vdata.push(0.0); vdata.push(0.0); vdata.push(1.0);
+                // Only pack tangent data when the shader expects 48-byte vertices
+                if pipeline_vertex_stride >= 48 {
+                    if gmesh.has_tangents {
+                        let tang3 = (upper3x3 * glam::Vec3::new(gv.tangent[0], gv.tangent[1], gv.tangent[2])).normalize();
+                        vdata.push(tang3.x); vdata.push(tang3.y); vdata.push(tang3.z);
+                        vdata.push(gv.tangent[3]);
+                    } else {
+                        vdata.push(1.0); vdata.push(0.0); vdata.push(0.0); vdata.push(1.0);
+                    }
                 }
             }
 
@@ -1035,10 +1038,11 @@ fn render_pbr_scene(
             if ext[2] < ext[thin_axis] { thin_axis = 2; }
 
             // Count normals to determine front direction
-            // vdata is packed as 12 floats per vertex: pos(3) + norm(3) + uv(2) + tang(4)
-            let num_verts = vdata.len() / 12;
+            // Floats per vertex depends on stride: 12 (48B) or 8 (32B)
+            let floats_per_vert = (pipeline_vertex_stride / 4) as usize;
+            let num_verts = vdata.len() / floats_per_vert;
             for i in 0..num_verts {
-                let n_comp = vdata[i * 12 + 3 + thin_axis];
+                let n_comp = vdata[i * floats_per_vert + 3 + thin_axis];
                 if n_comp > 0.0 { positive_normals += 1; }
                 else if n_comp < 0.0 { negative_normals += 1; }
             }
@@ -1928,12 +1932,15 @@ impl PersistentRenderer {
                     vdata.push(norm.x); vdata.push(norm.y); vdata.push(norm.z);
                     vdata.push(gv.uv[0]); vdata.push(gv.uv[1]);
 
-                    if gmesh.has_tangents {
-                        let tang3 = (upper3x3 * glam::Vec3::new(gv.tangent[0], gv.tangent[1], gv.tangent[2])).normalize();
-                        vdata.push(tang3.x); vdata.push(tang3.y); vdata.push(tang3.z);
-                        vdata.push(gv.tangent[3]);
-                    } else {
-                        vdata.push(1.0); vdata.push(0.0); vdata.push(0.0); vdata.push(1.0);
+                    // Only pack tangent data when the shader expects 48-byte vertices
+                    if pipeline_vertex_stride >= 48 {
+                        if gmesh.has_tangents {
+                            let tang3 = (upper3x3 * glam::Vec3::new(gv.tangent[0], gv.tangent[1], gv.tangent[2])).normalize();
+                            vdata.push(tang3.x); vdata.push(tang3.y); vdata.push(tang3.z);
+                            vdata.push(gv.tangent[3]);
+                        } else {
+                            vdata.push(1.0); vdata.push(0.0); vdata.push(0.0); vdata.push(1.0);
+                        }
                     }
                 }
 

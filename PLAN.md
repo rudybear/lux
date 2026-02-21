@@ -295,7 +295,7 @@ General-purpose compile-time feature system for shader permutation generation.
 - Reflection: `features` dict and `feature_suffix` in JSON output
 - Permutation manifest: `*.manifest.json` with all combinations
 
-**Status:** Implemented and verified. All 338 existing tests pass. 16 permutations of gltf_pbr_layered.lux compile successfully.
+**Status:** Implemented and verified. All 379 tests pass. 16 permutations of gltf_pbr_layered.lux compile successfully.
 
 ---
 
@@ -322,24 +322,34 @@ Requires LOD-aware background sampling for raster mode and recursive tracing for
 
 ---
 
-## Phase 8: `@layer` Custom Functions
+## Phase 8: `@layer` Custom Functions ✅ COMPLETE
 
-Allow users to define custom layers via annotated functions:
+User-defined layers via `@layer` annotation. Custom layer functions receive the accumulated color, geometric vectors (n, v, l), and user-defined parameters, returning an updated color. The compiler validates signatures (≥4 params, returns `vec3`, no name collision with built-in layers) and inserts them in declaration order after built-in layers, before emission — in both raster and RT paths.
 
 ```lux
 @layer
-fn subsurface(params: SurfaceParams, n: vec3, v: vec3, l: vec3) -> vec3 {
-    // custom SSS evaluation
-    return burley_subsurface(params.base_color, params.roughness, n, v, l);
+fn cartoon(base: vec3, n: vec3, v: vec3, l: vec3,
+           bands: scalar, rim_power: scalar, rim_color: vec3) -> vec3 {
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let quantized: scalar = floor(n_dot_l * bands + 0.5) / bands;
+    let cel: vec3 = base * quantized;
+    let n_dot_v: scalar = max(dot(n, v), 0.0);
+    let rim: scalar = pow(1.0 - n_dot_v, rim_power);
+    return cel + rim_color * rim;
 }
 
-surface SkinMaterial {
-    params { ... },
-    layers [base, normal_map, subsurface, ibl],
+surface ToonSurface {
+    sampler2d albedo_tex,
+    layers [
+        base(albedo: sample(albedo_tex, uv).xyz, roughness: 0.8, metallic: 0.0),
+        cartoon(bands: 4.0, rim_power: 3.0, rim_color: vec3(0.3, 0.3, 0.5)),
+    ]
 }
 ```
 
-Custom `@layer` functions receive the surface parameters and geometric vectors, and return an additive color contribution. The compiler validates their signature and inserts them into the energy-conserving layer composition chain.
+Implementation: `_collect_layer_functions()` and `_emit_custom_layer()` helpers in `surface_expander.py`. Validated and rendered across all three engines (Python, C++, Rust) in both raster and RT modes.
+
+New files: `luxc/stdlib/toon.lux`, `examples/cartoon_toon.lux`, `tests/test_custom_layers.py` (15 tests). Total: 379 tests pass.
 
 ---
 
@@ -803,13 +813,13 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P5.3** | Advanced materials (transmission, iridescence, dispersion, texture) | ✅ Complete |
 | **P5.5** | Layered surface system (`layers [...]`, energy conservation, RT/raster unification, `samplerCube`, `--pipeline` CLI) | ✅ Complete |
 | **P5.6** | Compile-time features & shader permutations (`features {}`, `--all-permutations`, manifest generation) | ✅ Complete |
-| **P6** | Coat & sheen layers (clearcoat, sheen as composable layers) | Planned |
-| **P7** | Transmission layer (microfacet BTDF, volume attenuation) | Planned |
-| **P8** | `@layer` custom functions (user-defined layer extensibility) | Planned |
+| **P6** | Coat & sheen layers (clearcoat, sheen as composable layers) | ✅ Complete |
+| **P7** | Transmission layer (microfacet BTDF, volume attenuation) | ✅ Complete |
+| **P8** | `@layer` custom functions (user-defined layer extensibility) | ✅ Complete |
 | **P9** | Deferred pipeline mode (`--pipeline deferred`, G-buffer pass) | Planned |
 | **P10** | Ray tracing pipeline — full (RT stages, SPIR-V codegen, surface→RT expansion) | ✅ Complete |
 | **P11** | Metal backend via SPIR-V cross-compilation (SPIRV-Cross → MSL) | Planned |
-| **P12** | Official glTF PBR extensions in engine materials (auto-detect, permutation selection) | Planned |
+| **P12** | Official glTF PBR extensions in engine materials (auto-detect, permutation selection) | ✅ Complete |
 | **P13** | Mesh shader support (`task`/`mesh` stages, meshlet-based geometry) | Planned |
 | **P14** | Gaussian splatting representation (splat sorting, tile-based rasterizer, SH evaluation) | Planned |
 | **P15** | BRDF & layer visualization (lobe plots, transfer function graphs, energy conservation tests) | Planned |

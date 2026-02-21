@@ -3,12 +3,14 @@
 // One surface declaration → both forward and RT pipelines.
 //
 // Uses compile-time features for optional material extensions:
-//   --features has_normal_map,has_emission     (common)
-//   --features has_normal_map,has_clearcoat    (clearcoat)
-//   --all-permutations                          (all 2^4 variants)
+//   --features has_normal_map,has_emission                    (common)
+//   --features has_normal_map,has_clearcoat                   (clearcoat)
+//   --features has_normal_map,has_emission,has_clearcoat,has_sheen,has_transmission  (all)
+//   --all-permutations                                         (all 2^5 variants)
 
 import brdf;
 import color;
+import compositing;
 import ibl;
 import texture;
 
@@ -17,6 +19,7 @@ features {
     has_clearcoat: bool,
     has_sheen: bool,
     has_emission: bool,
+    has_transmission: bool,
 }
 
 geometry StandardMesh {
@@ -46,7 +49,9 @@ surface GltfPBR {
     sampler2d occlusion_tex,
     sampler2d emissive_tex if has_emission,
     sampler2d clearcoat_tex if has_clearcoat,
-    sampler2d sheen_tex if has_sheen,
+    sampler2d clearcoat_roughness_tex if has_clearcoat,
+    sampler2d sheen_color_tex if has_sheen,
+    sampler2d transmission_tex if has_transmission,
     samplerCube env_specular,
     samplerCube env_irradiance,
     sampler2d brdf_lut,
@@ -56,8 +61,14 @@ surface GltfPBR {
              roughness: sample(metallic_roughness_tex, uv).y,
              metallic: sample(metallic_roughness_tex, uv).z),
         normal_map(map: sample(normal_tex, uv).xyz) if has_normal_map,
+        transmission(factor: sample(transmission_tex, uv).x,
+                     ior: 1.5) if has_transmission,
         ibl(specular_map: env_specular, irradiance_map: env_irradiance,
             brdf_lut: brdf_lut),
+        sheen(color: srgb_to_linear(sample(sheen_color_tex, uv).xyz),
+              roughness: 0.5) if has_sheen,
+        coat(factor: sample(clearcoat_tex, uv).x,
+             roughness: sample(clearcoat_roughness_tex, uv).y) if has_clearcoat,
         emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)) if has_emission,
     ]
 }

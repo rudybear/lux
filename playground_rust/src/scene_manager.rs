@@ -284,6 +284,48 @@ pub fn is_gltf_file(scene_source: &str) -> bool {
     scene_source.ends_with(".glb") || scene_source.ends_with(".gltf")
 }
 
+/// Detect which material features are used across the scene.
+pub fn detect_scene_features(scene: &crate::gltf_loader::GltfScene) -> std::collections::BTreeSet<String> {
+    let mut features = std::collections::BTreeSet::new();
+    for mat in &scene.materials {
+        if mat.normal_image.is_some() {
+            features.insert("has_normal_map".to_string());
+        }
+        if mat.emissive_image.is_some() || mat.emissive.iter().any(|&e| e > 0.0) {
+            features.insert("has_emission".to_string());
+        }
+        if mat.has_clearcoat {
+            features.insert("has_clearcoat".to_string());
+        }
+        if mat.has_sheen {
+            features.insert("has_sheen".to_string());
+        }
+        if mat.has_transmission {
+            features.insert("has_transmission".to_string());
+        }
+    }
+    if !features.is_empty() {
+        info!("Detected material features: {:?}", features);
+    }
+    features
+}
+
+/// Build a pipeline path from detected features.
+pub fn build_pipeline_path(base_path: &str, features: &std::collections::BTreeSet<String>) -> String {
+    if features.is_empty() {
+        return base_path.to_string();
+    }
+    let suffix: Vec<String> = features.iter().map(|f| f.strip_prefix("has_").unwrap_or(f).to_string()).collect();
+    let candidate = format!("shadercache/gltf_pbr_layered+{}", suffix.join("+"));
+    let frag = format!("{}.frag.spv", candidate);
+    let rgen = format!("{}.rgen.spv", candidate);
+    if std::path::Path::new(&frag).exists() || std::path::Path::new(&rgen).exists() {
+        info!("Auto-selected pipeline variant: {}", candidate);
+        return candidate;
+    }
+    base_path.to_string()
+}
+
 /// Compute auto-camera from scene bounds using node transforms (for glTF scenes).
 ///
 /// This code is shared between RT and raster renderers. Both use the same

@@ -7,6 +7,7 @@
 #include "gltf_loader.h"
 #include <string>
 #include <vector>
+#include <set>
 #include <unordered_map>
 
 // Shared scene management: loads scenes, uploads meshes/textures/IBL, computes auto-camera.
@@ -40,6 +41,11 @@ public:
     std::unordered_map<std::string, GPUTexture>& getNamedTextures() { return m_namedTextures; }
 
     void cleanup(VulkanContext& ctx);
+
+    // Scene feature detection for dynamic pipeline selection
+    std::set<std::string> detectSceneFeatures() const;
+    static std::string buildPipelinePath(const std::string& basePath,
+                                          const std::set<std::string>& features);
 
     static bool isGltfFile(const std::string& source);
 

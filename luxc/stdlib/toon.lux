@@ -1,0 +1,13 @@
+// Lux Standard Library: Toon / Cel-Shading Layers
+// Example @layer functions for cartoon-style rendering.
+
+@layer
+fn cartoon(base: vec3, n: vec3, v: vec3, l: vec3,
+           bands: scalar, rim_power: scalar, rim_color: vec3) -> vec3 {
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let quantized: scalar = floor(n_dot_l * bands + 0.5) / bands;
+    let cel: vec3 = base * quantized;
+    let n_dot_v: scalar = max(dot(n, v), 0.0);
+    let rim: scalar = pow(1.0 - n_dot_v, rim_power);
+    return cel + rim_color * rim;
+}

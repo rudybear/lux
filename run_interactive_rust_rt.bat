@@ -1,5 +1,5 @@
 @echo off
-REM Interactive glTF PBR viewer — Rust Vulkan engine
+REM Interactive glTF PBR viewer — Rust Vulkan engine (Ray Tracing)
 REM Controls: mouse drag to orbit, scroll to zoom, ESC to exit
 
 if not exist playground_rust\target\release\lux-playground.exe (
@@ -11,20 +11,20 @@ if not exist playground_rust\target\release\lux-playground.exe (
 set SCENE=assets/DamagedHelmet.glb
 set IBL=pisa
 
-REM Prefer layered raster pipeline, fall back to hand-written raster
-if exist shadercache\gltf_pbr_layered+emission+normal_map.frag.spv (
+REM Prefer layered RT pipeline, fall back to hand-written RT
+if exist shadercache\gltf_pbr_layered+emission+normal_map.rgen.spv (
     set PIPELINE=shadercache/gltf_pbr_layered+emission+normal_map
-    echo Using layered PBR raster pipeline
-) else if exist shadercache\gltf_pbr.frag.spv (
-    set PIPELINE=shadercache/gltf_pbr
-    echo Using hand-written PBR raster pipeline
+    echo Using layered PBR RT pipeline
+) else if exist shadercache\gltf_pbr_rt.rgen.spv (
+    set PIPELINE=shadercache/gltf_pbr_rt
+    echo Using hand-written PBR RT pipeline
 ) else (
-    echo No compiled shaders found. Compile first with:
-    echo   python -m luxc examples/gltf_pbr_layered.lux -o shadercache/ --pipeline GltfForward --features has_normal_map,has_emission
+    echo No compiled RT shaders found. Compile first with:
+    echo   python -m luxc examples/gltf_pbr_layered.lux -o shadercache/ --pipeline GltfRT --features has_normal_map,has_emission
     exit /b 1
 )
 
-echo === Interactive Rust Viewer ===
+echo === Interactive Rust RT Viewer ===
 echo   Scene:    %SCENE%
 echo   Pipeline: %PIPELINE%
 echo   IBL:      %IBL%

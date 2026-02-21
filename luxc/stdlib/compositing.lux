@@ -1,0 +1,101 @@
+// Lux Standard Library: Layer Compositing Functions
+// High-level compositing functions called by the surface expander.
+// Separates math (here) from texture sampling (expander's job).
+
+import brdf;
+import ibl;
+
+// --- IBL Multi-Scattering (Fdez-Aguera 2019) ---
+// Replaces ~120 lines of hardcoded Python AST in surface_expander.py.
+// The surface expander samples textures and passes results here.
+
+fn ibl_contribution(
+    albedo: vec3, roughness: scalar, metallic: scalar,
+    n_dot_v: scalar, prefiltered: vec3, irradiance: vec3,
+    brdf_sample: vec2
+) -> vec3 {
+    let f0: vec3 = mix(vec3(0.04), albedo, metallic);
+
+    // Roughness-dependent Fresnel
+    let fr: vec3 = max(vec3(1.0 - roughness), f0) - f0;
+    let k_s: vec3 = f0 + fr * pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 5.0);
+
+    // Multi-scattering energy compensation
+    let e_ss: scalar = brdf_sample.x + brdf_sample.y;
+    let f_single: vec3 = k_s * brdf_sample.x + vec3(brdf_sample.y);
+    let f_avg: vec3 = f0 + (vec3(1.0) - f0) * (1.0 / 21.0);
+    let f_ms: vec3 = f_single * f_avg / (vec3(1.0) - f_avg * (1.0 - e_ss));
+    let f_total: vec3 = f_single + f_ms * (1.0 - e_ss);
+
+    // Specular IBL
+    let ibl_spec: vec3 = f_total * prefiltered;
+
+    // Energy-conserving diffuse IBL
+    let kd: vec3 = (vec3(1.0) - f_total) * (1.0 - metallic);
+    let ibl_diff: vec3 = kd * albedo * irradiance;
+
+    return ibl_diff + ibl_spec;
+}
+
+// --- Clearcoat Compositing (Khronos spec) ---
+// Outermost layer: attenuates base by (1 - cc * Fc), adds coat specular.
+
+fn coat_over(
+    base: vec3, n: vec3, v: vec3, l: vec3,
+    coat_factor: scalar, coat_roughness: scalar
+) -> vec3 {
+    let n_dot_v: scalar = max(dot(n, v), 0.001);
+    let coat_spec: scalar = clearcoat_brdf(n, v, l, coat_factor, coat_roughness);
+    let coat_fresnel: scalar = fresnel_schlick(n_dot_v, vec3(0.04)).x * coat_factor;
+    return base * (1.0 - coat_fresnel) + vec3(coat_spec);
+}
+
+// --- Clearcoat IBL Contribution ---
+// When IBL and coat coexist, adds a coat specular IBL lobe.
+
+fn coat_ibl(
+    coat_factor: scalar, coat_roughness: scalar,
+    n: vec3, v: vec3, prefiltered_coat: vec3
+) -> vec3 {
+    let n_dot_v: scalar = max(dot(n, v), 0.001);
+    let coat_fresnel: scalar = fresnel_schlick(n_dot_v, vec3(0.04)).x * coat_factor;
+    return prefiltered_coat * coat_fresnel;
+}
+
+// --- Sheen Compositing (Khronos spec) ---
+// Additive with energy conservation: scales base by albedo sheen scaling.
+
+fn sheen_over(
+    base: vec3, n: vec3, v: vec3, l: vec3,
+    sheen_color: vec3, sheen_roughness: scalar
+) -> vec3 {
+    let h: vec3 = normalize(v + l);
+    let n_dot_h: scalar = max(dot(n, h), 0.001);
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let n_dot_v: scalar = max(dot(n, v), 0.001);
+
+    let sheen: vec3 = sheen_brdf(sheen_color, sheen_roughness,
+                                  n_dot_h, n_dot_l, n_dot_v);
+
+    // Energy conservation (analytical approx of Khronos albedoSheenScalingLUT)
+    let e_sheen: scalar = 0.09 + 0.42 * sheen_roughness;
+    let max_sc: scalar = max(sheen_color.x, max(sheen_color.y, sheen_color.z));
+    let scaling: scalar = 1.0 - max_sc * e_sheen;
+
+    return base * scaling + sheen;
+}
+
+// --- Transmission Compositing (Khronos spec) ---
+// Replaces diffuse proportionally: mix(direct, transmission, factor).
+
+fn transmission_replace(
+    base: vec3, albedo: vec3, roughness: scalar,
+    trans_factor: scalar, ior: scalar,
+    n: vec3, v: vec3, l: vec3,
+    thickness: scalar, atten_color: vec3, atten_dist: scalar
+) -> vec3 {
+    let btdf: scalar = transmission_btdf(n, v, l, roughness, ior);
+    let trans: vec3 = transmission_color(albedo, btdf, trans_factor);
+    let atten: vec3 = volume_attenuation(thickness, atten_color, atten_dist);
+    return mix(base, trans * atten, trans_factor);
+}

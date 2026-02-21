@@ -1,0 +1,48 @@
+// Cartoon / Toon Shader — demonstrates custom @layer functions.
+// Uses the @layer fn cartoon() from luxc/stdlib/toon.lux for
+// cel-shading (quantized NdotL) + rim lighting.
+
+import brdf;
+import color;
+import toon;
+
+geometry SimpleMesh {
+    position: vec3,
+    normal: vec3,
+    uv: vec2,
+    transform: MVP { model: mat4, view: mat4, projection: mat4 }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        frag_uv: uv,
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+surface ToonSurface {
+    sampler2d albedo_tex,
+    layers [
+        base(albedo: sample(albedo_tex, uv).xyz, roughness: 0.8, metallic: 0.0),
+        cartoon(bands: 4.0, rim_power: 3.0, rim_color: vec3(0.3, 0.3, 0.5)),
+    ]
+}
+
+environment ToonSky {
+    color: mix(vec3(0.8, 0.85, 0.9), vec3(0.3, 0.5, 0.8),
+              world_ray_direction.y * 0.5 + 0.5),
+}
+
+schedule Toon { tonemap: aces }
+
+pipeline ToonForward {
+    geometry: SimpleMesh,
+    surface: ToonSurface,
+    schedule: Toon,
+}
+
+pipeline ToonRT {
+    mode: raytrace,
+    surface: ToonSurface,
+    environment: ToonSky,
+    schedule: Toon,
+}

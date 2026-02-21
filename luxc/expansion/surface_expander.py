@@ -21,7 +21,7 @@ from luxc.parser.ast_nodes import (
     AssignTarget, SurfaceDecl, SurfaceSampler, LayerCall, LayerArg,
     GeometryDecl, PipelineDecl,
     ScheduleDecl, EnvironmentDecl, ProceduralDecl,
-    RayPayloadDecl, HitAttributeDecl, AccelDecl,
+    RayPayloadDecl, HitAttributeDecl, AccelDecl, StorageImageDecl,
     StorageBufferDecl, IndexAccess, FieldAccess,
     IfStmt,
 )
@@ -283,7 +283,7 @@ def _expand_surface_to_fragment(
 
     # Generate main function body - use layered path if surface has layers
     if surface.layers is not None:
-        body = _generate_layered_main(surface, frag_inputs, schedule)
+        body = _generate_layered_main(surface, frag_inputs, schedule, module=module)
     else:
         body = _generate_surface_main(surface, frag_inputs, schedule)
     stage.functions.append(FunctionDef("main", [], None, body))
@@ -387,10 +387,68 @@ def _get_layer_args(layer: LayerCall) -> dict:
     return {arg.name: arg.value for arg in layer.args}
 
 
+# --- Custom @layer function support ---
+
+_BUILTIN_LAYER_NAMES = frozenset({
+    "base", "normal_map", "ibl", "emission", "coat", "sheen", "transmission",
+})
+
+
+def _collect_layer_functions(module: Module) -> dict:
+    """Scan module functions for @layer annotations, validate, return dict[name, FunctionDef]."""
+    layer_fns = {}
+    for fn in module.functions:
+        if "layer" not in fn.attributes:
+            continue
+        if len(fn.params) < 4:
+            raise ValueError(
+                f"@layer function '{fn.name}' needs ≥4 params (base, n, v, l)"
+            )
+        if fn.return_type != "vec3":
+            raise ValueError(
+                f"@layer function '{fn.name}' must return vec3"
+            )
+        if fn.name in _BUILTIN_LAYER_NAMES:
+            raise ValueError(
+                f"@layer function '{fn.name}' conflicts with built-in layer"
+            )
+        layer_fns[fn.name] = fn
+    return layer_fns
+
+
+def _emit_custom_layer(layer, fn, result_var, body, prefix, rewrite_for_rt=False):
+    """Generate LetStmts + CallExpr for one custom @layer function call.
+
+    Maps LayerArg names to function params (after the 4 implicit ones: base, n, v, l).
+    Returns the new result variable name.
+    """
+    layer_args = _get_layer_args(layer)
+    custom_params = fn.params[4:]  # skip base, n, v, l
+
+    call_args = [VarRef(result_var), VarRef("n"), VarRef("v"), VarRef("l")]
+    for p in custom_params:
+        expr = layer_args.get(p.name, None)
+        if expr is None:
+            raise ValueError(
+                f"Layer '{layer.name}': missing arg '{p.name}' "
+                f"required by @layer function '{fn.name}'"
+            )
+        if rewrite_for_rt:
+            expr = _rewrite_sample_to_lod(expr)
+        var_name = f"{prefix}_{p.name}"
+        body.append(LetStmt(var_name, p.type_name, expr))
+        call_args.append(VarRef(var_name))
+
+    out_var = f"{prefix}_result"
+    body.append(LetStmt(out_var, "vec3", CallExpr(VarRef(fn.name), call_args)))
+    return out_var
+
+
 def _generate_layered_main(
     surface: SurfaceDecl,
     frag_inputs: list[tuple[str, str]],
     schedule: dict[str, str] | None = None,
+    module: Module | None = None,
 ) -> list:
     """Generate main() body for a layered surface-expanded fragment shader.
 
@@ -481,6 +539,34 @@ def _generate_layered_main(
         )))
         result_var = "direct_lit"
 
+    # --- Transmission layer (replaces diffuse proportionally) ---
+    if "transmission" in layers_by_name:
+        trans_args = _get_layer_args(layers_by_name["transmission"])
+        factor_expr = trans_args.get("factor", NumberLit("0.0"))
+        ior_expr = trans_args.get("ior", NumberLit("1.5"))
+        thickness_expr = trans_args.get("thickness", NumberLit("0.0"))
+        atten_color_expr = trans_args.get("attenuation_color",
+            ConstructorExpr("vec3", [NumberLit("1.0")]))
+        atten_dist_expr = trans_args.get("attenuation_distance",
+            NumberLit("1000000.0"))
+
+        body.append(LetStmt("trans_factor", "scalar", factor_expr))
+        body.append(LetStmt("trans_ior", "scalar", ior_expr))
+        body.append(LetStmt("trans_thickness", "scalar", thickness_expr))
+        body.append(LetStmt("trans_atten_color", "vec3", atten_color_expr))
+        body.append(LetStmt("trans_atten_dist", "scalar", atten_dist_expr))
+
+        body.append(LetStmt("transmitted", "vec3", CallExpr(
+            VarRef("transmission_replace"), [
+                VarRef(result_var), VarRef("layer_albedo"),
+                VarRef("layer_roughness"),
+                VarRef("trans_factor"), VarRef("trans_ior"),
+                VarRef("n"), VarRef("v"), VarRef("l"),
+                VarRef("trans_thickness"), VarRef("trans_atten_color"),
+                VarRef("trans_atten_dist"),
+            ])))
+        result_var = "transmitted"
+
     # --- IBL layer: image-based lighting ---
     if "ibl" in layers_by_name:
         ibl_args = _get_layer_args(layers_by_name["ibl"])
@@ -488,20 +574,13 @@ def _generate_layered_main(
         irradiance_map = ibl_args.get("irradiance_map")
         brdf_lut_ref = ibl_args.get("brdf_lut")
 
-        # F0 = mix(0.04, albedo, metallic)
-        body.append(LetStmt("f0", "vec3", CallExpr(VarRef("mix"), [
-            ConstructorExpr("vec3", [NumberLit("0.04")]),
-            VarRef("layer_albedo"),
-            VarRef("layer_metallic"),
-        ])))
-
         # Reflection vector
         body.append(LetStmt("r", "vec3", CallExpr(VarRef("reflect"), [
             BinaryOp("*", VarRef("v"), UnaryOp("-", NumberLit("1.0"))),
             VarRef("n"),
         ])))
 
-        # Sample IBL textures
+        # Sample IBL textures (surface expander's job)
         body.append(LetStmt("prefiltered", "vec3", SwizzleAccess(
             CallExpr(VarRef("sample_lod"), [
                 specular_map, VarRef("r"),
@@ -523,87 +602,90 @@ def _generate_layered_main(
             "xy",
         )))
 
-        # Roughness-dependent Fresnel (Fdez-Aguera 2019)
-        body.append(LetStmt("fr", "vec3", BinaryOp("-",
-            CallExpr(VarRef("max"), [
-                ConstructorExpr("vec3", [
-                    BinaryOp("-", NumberLit("1.0"), VarRef("layer_roughness")),
+        # Delegate math to compositing.lux::ibl_contribution()
+        body.append(LetStmt("ambient", "vec3", CallExpr(
+            VarRef("ibl_contribution"), [
+                VarRef("layer_albedo"), VarRef("layer_roughness"),
+                VarRef("layer_metallic"),
+                VarRef("n_dot_v"), VarRef("prefiltered"), VarRef("irradiance"),
+                VarRef("brdf_sample"),
+            ])))
+
+        # Coat IBL contribution (if coat layer present)
+        if "coat" in layers_by_name:
+            coat_args = _get_layer_args(layers_by_name["coat"])
+            coat_factor_expr = coat_args.get("factor", NumberLit("1.0"))
+            coat_rough_expr = coat_args.get("roughness", NumberLit("0.0"))
+            body.append(LetStmt("coat_ibl_factor", "scalar", coat_factor_expr))
+            body.append(LetStmt("coat_ibl_roughness", "scalar", coat_rough_expr))
+            body.append(LetStmt("prefiltered_coat", "vec3", SwizzleAccess(
+                CallExpr(VarRef("sample_lod"), [
+                    specular_map, VarRef("r"),
+                    BinaryOp("*", VarRef("coat_ibl_roughness"),
+                             NumberLit("8.0")),
                 ]),
-                VarRef("f0"),
-            ]),
-            VarRef("f0"),
-        )))
-        body.append(LetStmt("k_s", "vec3", BinaryOp("+",
-            VarRef("f0"),
-            BinaryOp("*",
-                VarRef("fr"),
-                CallExpr(VarRef("pow"), [
-                    CallExpr(VarRef("clamp"), [
-                        BinaryOp("-", NumberLit("1.0"), VarRef("n_dot_v")),
-                        NumberLit("0.0"),
-                        NumberLit("1.0"),
-                    ]),
-                    NumberLit("5.0"),
-                ]),
-            ),
-        )))
-
-        # Multi-scattering energy compensation (Fdez-Aguera 2019)
-        body.append(LetStmt("e_ss", "scalar", BinaryOp("+",
-            SwizzleAccess(VarRef("brdf_sample"), "x"),
-            SwizzleAccess(VarRef("brdf_sample"), "y"),
-        )))
-        body.append(LetStmt("f_single", "vec3", BinaryOp("+",
-            BinaryOp("*", VarRef("k_s"),
-                SwizzleAccess(VarRef("brdf_sample"), "x")),
-            ConstructorExpr("vec3", [
-                SwizzleAccess(VarRef("brdf_sample"), "y"),
-            ]),
-        )))
-        body.append(LetStmt("f_avg", "vec3", BinaryOp("+",
-            VarRef("f0"),
-            BinaryOp("*",
-                BinaryOp("-",
-                    ConstructorExpr("vec3", [NumberLit("1.0")]),
-                    VarRef("f0")),
-                BinaryOp("/", NumberLit("1.0"), NumberLit("21.0")),
-            ),
-        )))
-        body.append(LetStmt("f_ms", "vec3", BinaryOp("/",
-            BinaryOp("*", VarRef("f_single"), VarRef("f_avg")),
-            BinaryOp("-",
-                ConstructorExpr("vec3", [NumberLit("1.0")]),
-                BinaryOp("*", VarRef("f_avg"),
-                    BinaryOp("-", NumberLit("1.0"), VarRef("e_ss"))),
-            ),
-        )))
-        body.append(LetStmt("f_total", "vec3", BinaryOp("+",
-            VarRef("f_single"),
-            BinaryOp("*", VarRef("f_ms"),
-                BinaryOp("-", NumberLit("1.0"), VarRef("e_ss"))),
-        )))
-        body.append(LetStmt("ibl_spec", "vec3",
-            BinaryOp("*", VarRef("f_total"), VarRef("prefiltered"))))
-
-        # Energy-conserving diffuse
-        body.append(LetStmt("kd", "vec3", BinaryOp("*",
-            BinaryOp("-",
-                ConstructorExpr("vec3", [NumberLit("1.0")]),
-                VarRef("f_total")),
-            BinaryOp("-", NumberLit("1.0"), VarRef("layer_metallic")),
-        )))
-        body.append(LetStmt("ibl_diff", "vec3", BinaryOp("*",
-            BinaryOp("*", VarRef("kd"), VarRef("layer_albedo")),
-            VarRef("irradiance"),
-        )))
-
-        body.append(LetStmt("ambient", "vec3",
-            BinaryOp("+", VarRef("ibl_diff"), VarRef("ibl_spec"))))
-
-        # Combine direct + ambient
-        body.append(LetStmt("hdr_partial", "vec3",
-            BinaryOp("+", VarRef(result_var), VarRef("ambient"))))
+                "xyz",
+            )))
+            body.append(LetStmt("coat_ibl_contrib", "vec3", CallExpr(
+                VarRef("coat_ibl"), [
+                    VarRef("coat_ibl_factor"), VarRef("coat_ibl_roughness"),
+                    VarRef("n"), VarRef("v"), VarRef("prefiltered_coat"),
+                ])))
+            body.append(LetStmt("ambient_with_coat", "vec3",
+                BinaryOp("+", VarRef("ambient"), VarRef("coat_ibl_contrib"))))
+            body.append(LetStmt("hdr_partial", "vec3",
+                BinaryOp("+", VarRef(result_var),
+                         VarRef("ambient_with_coat"))))
+        else:
+            body.append(LetStmt("hdr_partial", "vec3",
+                BinaryOp("+", VarRef(result_var), VarRef("ambient"))))
         result_var = "hdr_partial"
+
+    # --- Sheen layer (additive with energy conservation) ---
+    if "sheen" in layers_by_name:
+        sheen_args = _get_layer_args(layers_by_name["sheen"])
+        color_expr = sheen_args.get("color",
+            ConstructorExpr("vec3", [NumberLit("0.0")]))
+        rough_expr = sheen_args.get("roughness", NumberLit("0.5"))
+
+        body.append(LetStmt("sheen_color_val", "vec3", color_expr))
+        body.append(LetStmt("sheen_roughness_val", "scalar", rough_expr))
+
+        body.append(LetStmt("sheened", "vec3", CallExpr(
+            VarRef("sheen_over"), [
+                VarRef(result_var), VarRef("n"), VarRef("v"), VarRef("l"),
+                VarRef("sheen_color_val"), VarRef("sheen_roughness_val"),
+            ])))
+        result_var = "sheened"
+
+    # --- Coat layer (outermost, attenuates everything + adds specular) ---
+    if "coat" in layers_by_name:
+        coat_args = _get_layer_args(layers_by_name["coat"])
+        factor_expr = coat_args.get("factor", NumberLit("1.0"))
+        rough_expr = coat_args.get("roughness", NumberLit("0.0"))
+        coat_normal = coat_args.get("normal", None)
+
+        body.append(LetStmt("coat_factor", "scalar", factor_expr))
+        body.append(LetStmt("coat_roughness", "scalar", rough_expr))
+        coat_n = VarRef("coat_n") if coat_normal else VarRef("n")
+        if coat_normal:
+            body.append(LetStmt("coat_n", "vec3", coat_normal))
+
+        body.append(LetStmt("coated", "vec3", CallExpr(
+            VarRef("coat_over"), [
+                VarRef(result_var), coat_n, VarRef("v"), VarRef("l"),
+                VarRef("coat_factor"), VarRef("coat_roughness"),
+            ])))
+        result_var = "coated"
+
+    # --- Custom @layer functions (declaration order, after coat, before emission) ---
+    if module is not None:
+        layer_fns = _collect_layer_functions(module)
+        for layer in surface.layers:
+            if layer.name in layer_fns:
+                result_var = _emit_custom_layer(
+                    layer, layer_fns[layer.name], result_var, body,
+                    prefix=f"custom_{layer.name}", rewrite_for_rt=False)
 
     # --- Emission layer (additive) ---
     if "emission" in layers_by_name:
@@ -784,43 +866,34 @@ def _expand_raygen(
     # Ray payload: color result
     stage.ray_payloads.append(RayPayloadDecl("payload", "vec4"))
 
-    # Camera uniform
+    # Camera uniform (matches engine layout: 2 x mat4, 128 bytes)
     stage.uniforms.append(UniformBlock("Camera", [
-        BlockField("camera_pos", "vec3"),
-        BlockField("camera_inv_view", "mat4"),
-        BlockField("camera_inv_proj", "mat4"),
+        BlockField("inv_view", "mat4"),
+        BlockField("inv_proj", "mat4"),
     ]))
 
-    # Output image (out variable for now; in real RT this would be a storage image)
-    out = VarDecl("result_color", "vec4")
-    out._is_input = False
-    stage.outputs.append(out)
+    # Output storage image (RT shaders cannot use Output storage class)
+    stage.storage_images.append(StorageImageDecl("result_color"))
 
-    # Main body: compute ray and trace
+    # Main body: compute ray and trace (matches hand-written gltf_pbr_rt.lux)
     body = []
 
-    # Compute normalized pixel coordinates from launch_id / launch_size
-    # let pixel: vec2 = vec2(launch_id.x, launch_id.y) + vec2(0.5);
-    body.append(LetStmt("pixel", "vec2", BinaryOp("+",
-        ConstructorExpr("vec2", [
-            SwizzleAccess(VarRef("launch_id"), "x"),
-            SwizzleAccess(VarRef("launch_id"), "y"),
-        ]),
-        ConstructorExpr("vec2", [NumberLit("0.5")]),
-    )))
+    # let pixel: vec2 = vec2(launch_id.xy);
+    body.append(LetStmt("pixel", "vec2",
+        ConstructorExpr("vec2", [SwizzleAccess(VarRef("launch_id"), "xy")])))
 
-    # let uv: vec2 = pixel / vec2(launch_size.x, launch_size.y);
-    body.append(LetStmt("uv", "vec2", BinaryOp("/",
-        VarRef("pixel"),
-        ConstructorExpr("vec2", [
-            SwizzleAccess(VarRef("launch_size"), "x"),
-            SwizzleAccess(VarRef("launch_size"), "y"),
-        ]),
-    )))
+    # let dims: vec2 = vec2(launch_size.xy);
+    body.append(LetStmt("dims", "vec2",
+        ConstructorExpr("vec2", [SwizzleAccess(VarRef("launch_size"), "xy")])))
 
-    # let ndc: vec2 = uv * 2.0 - vec2(1.0);
+    # let ndc: vec2 = (pixel + vec2(0.5)) / dims * 2.0 - vec2(1.0);
     body.append(LetStmt("ndc", "vec2", BinaryOp("-",
-        BinaryOp("*", VarRef("uv"), NumberLit("2.0")),
+        BinaryOp("*",
+            BinaryOp("/",
+                BinaryOp("+", VarRef("pixel"),
+                         ConstructorExpr("vec2", [NumberLit("0.5")])),
+                VarRef("dims")),
+            NumberLit("2.0")),
         ConstructorExpr("vec2", [NumberLit("1.0")]),
     )))
 
@@ -830,10 +903,9 @@ def _expand_raygen(
         ConstructorExpr("vec4", [NumberLit("0.0")]),
     ))
 
-    # Compute ray origin and direction using camera matrices
-    # let target: vec4 = camera_inv_proj * vec4(ndc.x, ndc.y, 1.0, 1.0);
+    # let target: vec4 = inv_proj * vec4(ndc.x, ndc.y, 1.0, 1.0);
     body.append(LetStmt("target", "vec4", BinaryOp("*",
-        VarRef("camera_inv_proj"),
+        VarRef("inv_proj"),
         ConstructorExpr("vec4", [
             SwizzleAccess(VarRef("ndc"), "x"),
             SwizzleAccess(VarRef("ndc"), "y"),
@@ -842,16 +914,31 @@ def _expand_raygen(
         ]),
     )))
 
-    # let ray_dir: vec4 = camera_inv_view * vec4(normalize(target.xyz), 0.0);
-    body.append(LetStmt("ray_dir", "vec4", BinaryOp("*",
-        VarRef("camera_inv_view"),
+    # let direction: vec4 = inv_view * vec4(normalize(target.xyz), 0.0);
+    body.append(LetStmt("direction", "vec4", BinaryOp("*",
+        VarRef("inv_view"),
         ConstructorExpr("vec4", [
             CallExpr(VarRef("normalize"), [SwizzleAccess(VarRef("target"), "xyz")]),
             NumberLit("0.0"),
         ]),
     )))
 
-    # trace_ray(tlas, 0xff, 0xff, 0, 0, 0, camera_pos, 0.001, ray_dir.xyz, 10000.0, 0);
+    # let origin: vec3 = (inv_view * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    body.append(LetStmt("origin", "vec3", SwizzleAccess(
+        BinaryOp("*", VarRef("inv_view"),
+                 ConstructorExpr("vec4", [
+                     NumberLit("0.0"), NumberLit("0.0"),
+                     NumberLit("0.0"), NumberLit("1.0"),
+                 ])),
+        "xyz",
+    )))
+
+    # let dir: vec3 = normalize(direction.xyz);
+    body.append(LetStmt("dir", "vec3",
+        CallExpr(VarRef("normalize"), [
+            SwizzleAccess(VarRef("direction"), "xyz")])))
+
+    # trace_ray(tlas, 0, 255, 0, 0, 0, origin, 0.001, dir, 1000.0, 0);
     body.append(ExprStmt(CallExpr(VarRef("trace_ray"), [
         VarRef("tlas"),
         NumberLit("0"),    # ray_flags
@@ -859,18 +946,19 @@ def _expand_raygen(
         NumberLit("0"),    # sbt_offset
         NumberLit("0"),    # sbt_stride
         NumberLit("0"),    # miss_index
-        VarRef("camera_pos"),
+        VarRef("origin"),
         NumberLit("0.001"),  # tmin
-        SwizzleAccess(VarRef("ray_dir"), "xyz"),
-        NumberLit("10000.0"),  # tmax
+        VarRef("dir"),
+        NumberLit("1000.0"),  # tmax
         NumberLit("0"),    # payload location
     ])))
 
-    # result_color = payload;
-    body.append(AssignStmt(
-        AssignTarget(VarRef("result_color")),
+    # image_store(result_color, launch_id.xy, payload);
+    body.append(ExprStmt(CallExpr(VarRef("image_store"), [
+        VarRef("result_color"),
+        SwizzleAccess(VarRef("launch_id"), "xy"),
         VarRef("payload"),
-    ))
+    ])))
 
     stage.functions.append(FunctionDef("main", [], None, body))
     return stage
@@ -1148,6 +1236,35 @@ def _expand_layered_closest_hit(
         )))
         result_var = "direct_lit"
 
+    # --- Transmission layer (replaces diffuse proportionally) ---
+    if "transmission" in layers_by_name:
+        trans_args = _get_layer_args(layers_by_name["transmission"])
+        factor_expr = _rewrite_sample_to_lod(
+            trans_args.get("factor", NumberLit("0.0")))
+        ior_expr = trans_args.get("ior", NumberLit("1.5"))
+        thickness_expr = trans_args.get("thickness", NumberLit("0.0"))
+        atten_color_expr = trans_args.get("attenuation_color",
+            ConstructorExpr("vec3", [NumberLit("1.0")]))
+        atten_dist_expr = trans_args.get("attenuation_distance",
+            NumberLit("1000000.0"))
+
+        body.append(LetStmt("trans_factor", "scalar", factor_expr))
+        body.append(LetStmt("trans_ior", "scalar", ior_expr))
+        body.append(LetStmt("trans_thickness", "scalar", thickness_expr))
+        body.append(LetStmt("trans_atten_color", "vec3", atten_color_expr))
+        body.append(LetStmt("trans_atten_dist", "scalar", atten_dist_expr))
+
+        body.append(LetStmt("transmitted", "vec3", CallExpr(
+            VarRef("transmission_replace"), [
+                VarRef(result_var), VarRef("layer_albedo"),
+                VarRef("layer_roughness"),
+                VarRef("trans_factor"), VarRef("trans_ior"),
+                VarRef("n"), VarRef("v"), VarRef("l"),
+                VarRef("trans_thickness"), VarRef("trans_atten_color"),
+                VarRef("trans_atten_dist"),
+            ])))
+        result_var = "transmitted"
+
     # --- IBL layer ---
     if "ibl" in layers_by_name:
         ibl_args = _get_layer_args(layers_by_name["ibl"])
@@ -1155,10 +1272,6 @@ def _expand_layered_closest_hit(
         irradiance_map = ibl_args.get("irradiance_map")
         brdf_lut_ref = ibl_args.get("brdf_lut")
 
-        body.append(LetStmt("f0", "vec3", CallExpr(VarRef("mix"), [
-            ConstructorExpr("vec3", [NumberLit("0.04")]),
-            VarRef("layer_albedo"), VarRef("layer_metallic"),
-        ])))
         body.append(LetStmt("r", "vec3", CallExpr(VarRef("reflect"), [
             BinaryOp("*", VarRef("v"), UnaryOp("-", NumberLit("1.0"))),
             VarRef("n"),
@@ -1183,71 +1296,98 @@ def _expand_layered_closest_hit(
                 NumberLit("0.0"),
             ]), "xy")))
 
-        # Roughness-dependent Fresnel
-        body.append(LetStmt("fr", "vec3", BinaryOp("-",
-            CallExpr(VarRef("max"), [
-                ConstructorExpr("vec3", [
-                    BinaryOp("-", NumberLit("1.0"), VarRef("layer_roughness")),
+        # Delegate math to compositing.lux::ibl_contribution()
+        body.append(LetStmt("ambient", "vec3", CallExpr(
+            VarRef("ibl_contribution"), [
+                VarRef("layer_albedo"), VarRef("layer_roughness"),
+                VarRef("layer_metallic"),
+                VarRef("n_dot_v"), VarRef("prefiltered"), VarRef("irradiance"),
+                VarRef("brdf_sample"),
+            ])))
+
+        # Coat IBL contribution (if coat layer present)
+        if "coat" in layers_by_name:
+            coat_args = _get_layer_args(layers_by_name["coat"])
+            coat_factor_expr = _rewrite_sample_to_lod(
+                coat_args.get("factor", NumberLit("1.0")))
+            coat_rough_expr = _rewrite_sample_to_lod(
+                coat_args.get("roughness", NumberLit("0.0")))
+            body.append(LetStmt("coat_ibl_factor", "scalar", coat_factor_expr))
+            body.append(LetStmt("coat_ibl_roughness", "scalar",
+                                coat_rough_expr))
+            body.append(LetStmt("prefiltered_coat", "vec3", SwizzleAccess(
+                CallExpr(VarRef("sample_lod"), [
+                    specular_map, VarRef("r"),
+                    BinaryOp("*", VarRef("coat_ibl_roughness"),
+                             NumberLit("8.0")),
                 ]),
-                VarRef("f0"),
-            ]),
-            VarRef("f0"),
-        )))
-        body.append(LetStmt("k_s", "vec3", BinaryOp("+",
-            VarRef("f0"),
-            BinaryOp("*", VarRef("fr"),
-                CallExpr(VarRef("pow"), [
-                    CallExpr(VarRef("clamp"), [
-                        BinaryOp("-", NumberLit("1.0"), VarRef("n_dot_v")),
-                        NumberLit("0.0"), NumberLit("1.0"),
-                    ]),
-                    NumberLit("5.0"),
-                ])),
-        )))
-
-        # Multi-scattering energy compensation
-        body.append(LetStmt("e_ss", "scalar", BinaryOp("+",
-            SwizzleAccess(VarRef("brdf_sample"), "x"),
-            SwizzleAccess(VarRef("brdf_sample"), "y"))))
-        body.append(LetStmt("f_single", "vec3", BinaryOp("+",
-            BinaryOp("*", VarRef("k_s"),
-                SwizzleAccess(VarRef("brdf_sample"), "x")),
-            ConstructorExpr("vec3", [
-                SwizzleAccess(VarRef("brdf_sample"), "y")]))))
-        body.append(LetStmt("f_avg", "vec3", BinaryOp("+",
-            VarRef("f0"),
-            BinaryOp("*",
-                BinaryOp("-",
-                    ConstructorExpr("vec3", [NumberLit("1.0")]),
-                    VarRef("f0")),
-                BinaryOp("/", NumberLit("1.0"), NumberLit("21.0"))))))
-        body.append(LetStmt("f_ms", "vec3", BinaryOp("/",
-            BinaryOp("*", VarRef("f_single"), VarRef("f_avg")),
-            BinaryOp("-",
-                ConstructorExpr("vec3", [NumberLit("1.0")]),
-                BinaryOp("*", VarRef("f_avg"),
-                    BinaryOp("-", NumberLit("1.0"), VarRef("e_ss")))))))
-        body.append(LetStmt("f_total", "vec3", BinaryOp("+",
-            VarRef("f_single"),
-            BinaryOp("*", VarRef("f_ms"),
-                BinaryOp("-", NumberLit("1.0"), VarRef("e_ss"))))))
-        body.append(LetStmt("ibl_spec", "vec3",
-            BinaryOp("*", VarRef("f_total"), VarRef("prefiltered"))))
-
-        # Energy-conserving diffuse
-        body.append(LetStmt("kd", "vec3", BinaryOp("*",
-            BinaryOp("-",
-                ConstructorExpr("vec3", [NumberLit("1.0")]),
-                VarRef("f_total")),
-            BinaryOp("-", NumberLit("1.0"), VarRef("layer_metallic")))))
-        body.append(LetStmt("ibl_diff", "vec3", BinaryOp("*",
-            BinaryOp("*", VarRef("kd"), VarRef("layer_albedo")),
-            VarRef("irradiance"))))
-        body.append(LetStmt("ambient", "vec3",
-            BinaryOp("+", VarRef("ibl_diff"), VarRef("ibl_spec"))))
-        body.append(LetStmt("hdr_partial", "vec3",
-            BinaryOp("+", VarRef(result_var), VarRef("ambient"))))
+                "xyz",
+            )))
+            body.append(LetStmt("coat_ibl_contrib", "vec3", CallExpr(
+                VarRef("coat_ibl"), [
+                    VarRef("coat_ibl_factor"), VarRef("coat_ibl_roughness"),
+                    VarRef("n"), VarRef("v"), VarRef("prefiltered_coat"),
+                ])))
+            body.append(LetStmt("ambient_with_coat", "vec3",
+                BinaryOp("+", VarRef("ambient"),
+                         VarRef("coat_ibl_contrib"))))
+            body.append(LetStmt("hdr_partial", "vec3",
+                BinaryOp("+", VarRef(result_var),
+                         VarRef("ambient_with_coat"))))
+        else:
+            body.append(LetStmt("hdr_partial", "vec3",
+                BinaryOp("+", VarRef(result_var), VarRef("ambient"))))
         result_var = "hdr_partial"
+
+    # --- Sheen layer (additive with energy conservation) ---
+    if "sheen" in layers_by_name:
+        sheen_args = _get_layer_args(layers_by_name["sheen"])
+        color_expr = _rewrite_sample_to_lod(
+            sheen_args.get("color",
+                ConstructorExpr("vec3", [NumberLit("0.0")])))
+        rough_expr = _rewrite_sample_to_lod(
+            sheen_args.get("roughness", NumberLit("0.5")))
+
+        body.append(LetStmt("sheen_color_val", "vec3", color_expr))
+        body.append(LetStmt("sheen_roughness_val", "scalar", rough_expr))
+
+        body.append(LetStmt("sheened", "vec3", CallExpr(
+            VarRef("sheen_over"), [
+                VarRef(result_var), VarRef("n"), VarRef("v"), VarRef("l"),
+                VarRef("sheen_color_val"), VarRef("sheen_roughness_val"),
+            ])))
+        result_var = "sheened"
+
+    # --- Coat layer (outermost, attenuates everything + adds specular) ---
+    if "coat" in layers_by_name:
+        coat_args = _get_layer_args(layers_by_name["coat"])
+        factor_expr = _rewrite_sample_to_lod(
+            coat_args.get("factor", NumberLit("1.0")))
+        rough_expr = _rewrite_sample_to_lod(
+            coat_args.get("roughness", NumberLit("0.0")))
+        coat_normal = coat_args.get("normal", None)
+
+        body.append(LetStmt("coat_factor", "scalar", factor_expr))
+        body.append(LetStmt("coat_roughness", "scalar", rough_expr))
+        coat_n = VarRef("coat_n") if coat_normal else VarRef("n")
+        if coat_normal:
+            body.append(LetStmt("coat_n", "vec3",
+                                _rewrite_sample_to_lod(coat_normal)))
+
+        body.append(LetStmt("coated", "vec3", CallExpr(
+            VarRef("coat_over"), [
+                VarRef(result_var), coat_n, VarRef("v"), VarRef("l"),
+                VarRef("coat_factor"), VarRef("coat_roughness"),
+            ])))
+        result_var = "coated"
+
+    # --- Custom @layer functions (declaration order, after coat, before emission) ---
+    layer_fns = _collect_layer_functions(module)
+    for layer in surface.layers:
+        if layer.name in layer_fns:
+            result_var = _emit_custom_layer(
+                layer, layer_fns[layer.name], result_var, body,
+                prefix=f"custom_{layer.name}", rewrite_for_rt=True)
 
     # --- Emission layer ---
     if "emission" in layers_by_name:
