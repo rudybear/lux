@@ -16,7 +16,8 @@ public:
     void loadScene(VulkanContext& ctx, const std::string& sceneSource);
     void uploadToGPU(VulkanContext& ctx, int vertexStride = 32);
     void uploadTextures(VulkanContext& ctx);
-    void loadIBLAssets(VulkanContext& ctx, VkPipelineStageFlags dstStage);
+    void loadIBLAssets(VulkanContext& ctx, VkPipelineStageFlags dstStage,
+                       const std::string& requestedName = "");
 
     // Auto-camera
     bool hasSceneBounds() const { return m_hasSceneBounds; }

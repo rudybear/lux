@@ -73,6 +73,7 @@ pub fn render_rt(
     width: u32,
     height: u32,
     output_path: &Path,
+    ibl_name: &str,
 ) -> Result<(), String> {
     info!("RT render: {}x{}, scene='{}'", width, height, scene_source);
 
@@ -80,7 +81,7 @@ pub fn render_rt(
         return Err("Ray tracing is not supported on this GPU".to_string());
     }
 
-    let mut renderer = RTRenderer::new(ctx, shader_base, scene_source, width, height)?;
+    let mut renderer = RTRenderer::new(ctx, shader_base, scene_source, width, height, ibl_name)?;
 
     // Record command buffer
     let device_clone = ctx.device.clone();
@@ -126,6 +127,7 @@ impl RTRenderer {
         scene_source: &str,
         width: u32,
         height: u32,
+        ibl_name: &str,
     ) -> Result<Self, String> {
         // Verify RT support is available
         if ctx.accel_struct_loader.is_none() {
@@ -357,7 +359,7 @@ impl RTRenderer {
         }
 
         // Load IBL assets (cubemaps + BRDF LUT)
-        load_rt_ibl_assets(ctx, &mut texture_map, &mut texture_images);
+        load_rt_ibl_assets(ctx, &mut texture_map, &mut texture_images, ibl_name);
 
         // Compute scene bounds and update camera UBO with auto-camera (shared function)
         // Get draw_items from glTF scene for node-transform camera
@@ -2021,6 +2023,7 @@ fn load_rt_ibl_assets(
     ctx: &mut VulkanContext,
     texture_map: &mut HashMap<String, (vk::ImageView, vk::Sampler)>,
     texture_images: &mut Vec<(vk::Image, Option<Allocation>, vk::ImageView, vk::Sampler)>,
+    ibl_name: &str,
 ) {
     let ibl_base = std::path::Path::new("assets/ibl");
     if !ibl_base.exists() {
@@ -2028,14 +2031,33 @@ fn load_rt_ibl_assets(
         return;
     }
 
-    // Find IBL directory: prefer "pisa" then "neutral"
-    let preferred = ["pisa", "neutral"];
-    let ibl_dir = preferred.iter()
-        .map(|n| ibl_base.join(n))
-        .find(|p| p.join("manifest.json").exists());
+    // If a specific IBL name was requested, try it first
+    let ibl_dir = if !ibl_name.is_empty() {
+        let requested = ibl_base.join(ibl_name);
+        if requested.join("manifest.json").exists() {
+            info!("Using requested IBL: {}", ibl_name);
+            Some(requested)
+        } else {
+            info!("Requested IBL '{}' not found, falling back to auto-detect", ibl_name);
+            None
+        }
+    } else {
+        None
+    };
+
+    // Auto-detect: prefer "pisa" then "neutral"
+    let ibl_dir = ibl_dir.or_else(|| {
+        let preferred = ["pisa", "neutral"];
+        preferred.iter()
+            .map(|n| ibl_base.join(n))
+            .find(|p| p.join("manifest.json").exists())
+    });
 
     let ibl_dir = match ibl_dir {
-        Some(d) => d,
+        Some(d) => {
+            info!("Auto-detected IBL: {:?}", d.file_name().unwrap_or_default());
+            d
+        }
         None => {
             info!("No IBL manifest found");
             return;

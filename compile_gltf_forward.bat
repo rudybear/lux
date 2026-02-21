@@ -13,14 +13,14 @@ echo.
 REM Render with C++ engine (if built)
 if exist playground_cpp\build\Release\lux-playground.exe (
     echo === Rendering with C++ engine ===
-    playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr --output screenshots/test_gltf_forward_cpp.png --width 512 --height 512
+    playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr --ibl pisa --output screenshots/test_gltf_forward_cpp.png --width 512 --height 512
     echo.
 )
 
 REM Render with Rust engine (if built)
 if exist playground_rust\target\release\lux-playground.exe (
     echo === Rendering with Rust engine ===
-    playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr --output screenshots/test_gltf_forward_rust.png --width 512 --height 512
+    playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr --ibl pisa --output screenshots/test_gltf_forward_rust.png --width 512 --height 512
     echo.
 )
 

@@ -57,6 +57,10 @@ struct Args {
     /// Force headless (offscreen) rendering. This is the default.
     #[arg(long)]
     headless: bool,
+
+    /// IBL environment name (default: auto-detect pisa/neutral from assets/ibl/).
+    #[arg(long)]
+    ibl: Option<String>,
 }
 
 fn main() {
@@ -139,6 +143,8 @@ fn run(args: Args) -> Result<(), String> {
     info!("Resolution: {}x{}", args.width, args.height);
     info!("Output: {}", args.output);
 
+    let ibl_name = args.ibl.as_deref().unwrap_or("");
+
     if args.interactive && !args.headless {
         // Use larger window for interactive mode if user didn't specify
         let (iw, ih) = if args.width == 512 && args.height == 512 {
@@ -146,9 +152,9 @@ fn run(args: Args) -> Result<(), String> {
         } else {
             (args.width, args.height)
         };
-        run_interactive(&pipeline_base, &scene_source, render_path, iw, ih)?;
+        run_interactive(&pipeline_base, &scene_source, render_path, iw, ih, ibl_name)?;
     } else {
-        run_headless(&pipeline_base, &scene_source, render_path, args.width, args.height, &args.output)?;
+        run_headless(&pipeline_base, &scene_source, render_path, args.width, args.height, &args.output, ibl_name)?;
     }
 
     Ok(())
@@ -162,6 +168,7 @@ fn run_headless(
     width: u32,
     height: u32,
     output: &str,
+    ibl_name: &str,
 ) -> Result<(), String> {
     let enable_rt = render_path == "rt";
 
@@ -180,6 +187,7 @@ fn run_headless(
                 width,
                 height,
                 output_path,
+                ibl_name,
             )
         }
         "fullscreen" => {
@@ -190,6 +198,7 @@ fn run_headless(
                 width,
                 height,
                 output_path,
+                ibl_name,
             )
         }
         "rt" => {
@@ -202,7 +211,7 @@ fn run_headless(
                 );
             }
             info!("Rendering ray traced image...");
-            rt_renderer::render_rt(&mut ctx, pipeline_base, scene_source, width, height, output_path)
+            rt_renderer::render_rt(&mut ctx, pipeline_base, scene_source, width, height, output_path, ibl_name)
         }
         _ => Err(format!("Unknown render path: {}", render_path)),
     };
@@ -289,6 +298,7 @@ fn run_interactive(
     render_path: &str,
     width: u32,
     height: u32,
+    ibl_name: &str,
 ) -> Result<(), String> {
     use ash::vk;
     use scene_manager::Renderer;
@@ -307,6 +317,7 @@ fn run_interactive(
         width: u32,
         height: u32,
         use_rt: bool,
+        ibl_name: String,
         // Vulkan state (initialized after window creation)
         ctx: Option<vulkan_context::VulkanContext>,
         renderer: Option<Box<dyn Renderer>>,
@@ -358,6 +369,7 @@ fn run_interactive(
                     &self.scene_source,
                     self.width,
                     self.height,
+                    &self.ibl_name,
                 ).map(|r| Box::new(r) as Box<dyn Renderer>)
             } else {
                 info!("Initializing persistent renderer...");
@@ -367,6 +379,7 @@ fn run_interactive(
                     &self.scene_source,
                     self.width,
                     self.height,
+                    &self.ibl_name,
                 ).map(|r| Box::new(r) as Box<dyn Renderer>)
             };
 
@@ -626,6 +639,7 @@ fn run_interactive(
         width,
         height,
         use_rt,
+        ibl_name: ibl_name.to_string(),
         ctx: None,
         renderer: None,
         orbit: OrbitCamera::new(),

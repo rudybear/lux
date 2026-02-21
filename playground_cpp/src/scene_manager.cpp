@@ -515,19 +515,36 @@ GPUTexture SceneManager::uploadCubemapF16(VulkanContext& ctx, uint32_t faceSize,
 // IBL asset loading
 // --------------------------------------------------------------------------
 
-void SceneManager::loadIBLAssets(VulkanContext& ctx, VkPipelineStageFlags dstStage) {
+void SceneManager::loadIBLAssets(VulkanContext& ctx, VkPipelineStageFlags dstStage,
+                                 const std::string& requestedName) {
     namespace fs = std::filesystem;
 
-    // Auto-detect IBL assets: prefer "pisa" then "neutral"
-    std::string iblNames[] = {"pisa", "neutral"};
     std::string iblDir;
-    for (auto& name : iblNames) {
-        std::string testPath = "assets/ibl/" + name + "/manifest.json";
+
+    // If a specific IBL name was requested, use it
+    if (!requestedName.empty()) {
+        std::string testPath = "assets/ibl/" + requestedName + "/manifest.json";
         if (fs::exists(testPath)) {
-            iblDir = "assets/ibl/" + name;
-            break;
+            iblDir = "assets/ibl/" + requestedName;
+            std::cout << "[info] Using requested IBL: " << requestedName << std::endl;
+        } else {
+            std::cerr << "[warn] Requested IBL '" << requestedName << "' not found at " << testPath << std::endl;
         }
     }
+
+    // Auto-detect IBL assets: prefer "pisa" then "neutral"
+    if (iblDir.empty()) {
+        std::string iblNames[] = {"pisa", "neutral"};
+        for (auto& name : iblNames) {
+            std::string testPath = "assets/ibl/" + name + "/manifest.json";
+            if (fs::exists(testPath)) {
+                iblDir = "assets/ibl/" + name;
+                std::cout << "[info] Auto-detected IBL: " << name << std::endl;
+                break;
+            }
+        }
+    }
+
     if (iblDir.empty()) {
         std::cout << "[info] No IBL assets found, skipping IBL loading" << std::endl;
         return;

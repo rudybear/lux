@@ -95,6 +95,7 @@ static void scrollCallback(GLFWwindow* /*window*/, double /*xoff*/, double yoff)
 struct CLIOptions {
     std::string shaderBase;    // --pipeline value (resolved from scene if not given)
     std::string sceneSource;   // --scene value (required)
+    std::string iblName;       // --ibl value (optional, auto-detects if empty)
     uint32_t width = 512;
     uint32_t height = 512;
     std::string output = "output.png";
@@ -111,6 +112,7 @@ static void printUsage(const char* program) {
               << "Options:\n"
               << "  --scene <SOURCE>       Scene source: sphere, fullscreen, triangle, or path to .glb/.gltf\n"
               << "  --pipeline <BASE>      Compiled shader base path (auto-resolved from scene if omitted)\n"
+              << "  --ibl <NAME>           IBL environment name (default: auto-detect pisa/neutral)\n"
               << "  --mode <MODE>          (Legacy) Rendering mode: triangle|fullscreen|pbr|rt\n"
               << "  --width <N>            Output width in pixels (default: 512)\n"
               << "  --height <N>           Output height in pixels (default: 512)\n"
@@ -140,6 +142,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.sceneSource = argv[++i];
         } else if (arg == "--pipeline" && i + 1 < argc) {
             opts.shaderBase = argv[++i];
+        } else if (arg == "--ibl" && i + 1 < argc) {
+            opts.iblName = argv[++i];
         } else if (arg == "--mode" && i + 1 < argc) {
             // Legacy --mode support: map to --scene
             i++;
@@ -269,7 +273,7 @@ static int runHeadless(const CLIOptions& opts) {
 
         scene.uploadToGPU(ctx, vertexStride);
         scene.uploadTextures(ctx);
-        scene.loadIBLAssets(ctx, dstStage);
+        scene.loadIBLAssets(ctx, dstStage, opts.iblName);
 
         std::unique_ptr<IRenderer> renderer;
         if (needRT) {
@@ -408,7 +412,7 @@ static int runInteractive(CLIOptions opts) {
 
         scene.uploadToGPU(ctx, vertexStride);
         scene.uploadTextures(ctx);
-        scene.loadIBLAssets(ctx, dstStage);
+        scene.loadIBLAssets(ctx, dstStage, opts.iblName);
 
         if (useRT) {
             auto rt = std::make_unique<RTRenderer>();

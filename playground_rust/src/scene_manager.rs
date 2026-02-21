@@ -962,7 +962,7 @@ pub fn create_cubemap_image(
 /// Try to find and load IBL assets from assets/ibl/<name>/ directories.
 ///
 /// `dst_stage` controls the final pipeline barrier for all uploaded textures.
-pub fn load_ibl_assets(ctx: &mut VulkanContext, dst_stage: vk::PipelineStageFlags) -> IblAssets {
+pub fn load_ibl_assets(ctx: &mut VulkanContext, dst_stage: vk::PipelineStageFlags, ibl_name: &str) -> IblAssets {
     // Search for IBL asset directories
     let ibl_base = Path::new("assets/ibl");
     if !ibl_base.exists() {
@@ -970,15 +970,31 @@ pub fn load_ibl_assets(ctx: &mut VulkanContext, dst_stage: vk::PipelineStageFlag
         return IblAssets::empty();
     }
 
-    // Find IBL directory: prefer "pisa" then "neutral", matching C++ engine
+    // If a specific IBL name was requested, try it first
+    let requested = if !ibl_name.is_empty() {
+        let path = ibl_base.join(ibl_name);
+        if path.is_dir() && path.join("manifest.json").exists() {
+            info!("Using requested IBL: {}", ibl_name);
+            Some(path)
+        } else {
+            info!("Requested IBL '{}' not found, falling back to auto-detect", ibl_name);
+            None
+        }
+    } else {
+        None
+    };
+
+    // Find IBL directory: prefer requested, then "pisa" then "neutral", matching C++ engine
     let ibl_dir = {
-        let preferred = ["pisa", "neutral"];
-        let mut found = None;
-        for name in &preferred {
-            let path = ibl_base.join(name);
-            if path.is_dir() && path.join("manifest.json").exists() {
-                found = Some(path);
-                break;
+        let mut found = requested;
+        if found.is_none() {
+            let preferred = ["pisa", "neutral"];
+            for name in &preferred {
+                let path = ibl_base.join(name);
+                if path.is_dir() && path.join("manifest.json").exists() {
+                    found = Some(path);
+                    break;
+                }
             }
         }
         // Fall back to alphabetical

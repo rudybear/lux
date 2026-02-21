@@ -41,20 +41,20 @@ echo.
 REM C++ renders (raster + RT)
 if exist playground_cpp\build\Release\lux-playground.exe (
     echo --- C++ engine (raster + RT) ---
-    playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr --output screenshots/test_gltf_forward_cpp.png --width 512 --height 512
-    playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_rt --output screenshots/test_gltf_rt_cpp.png --width 512 --height 512 --mode rt
-    playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_layered+emission+normal_map --output screenshots/test_gltf_layered_forward_cpp.png --width 512 --height 512
-    playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_layered+emission+normal_map --output screenshots/test_gltf_layered_rt_cpp.png --width 512 --height 512 --mode rt
+    playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr --ibl pisa --output screenshots/test_gltf_forward_cpp.png --width 512 --height 512
+    playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_rt --ibl pisa --output screenshots/test_gltf_rt_cpp.png --width 512 --height 512
+    playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_layered+emission+normal_map --ibl pisa --output screenshots/test_gltf_layered_forward_cpp.png --width 512 --height 512
+    playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_layered+emission+normal_map --ibl pisa --output screenshots/test_gltf_layered_rt_cpp.png --width 512 --height 512
     echo.
 )
 
 REM Rust renders (raster + RT)
 if exist playground_rust\target\release\lux-playground.exe (
     echo --- Rust engine (raster + RT) ---
-    playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr --output screenshots/test_gltf_forward_rust.png --width 512 --height 512
-    playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_rt --output screenshots/test_gltf_rt_rust.png --width 512 --height 512 --mode rt
-    playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_layered+emission+normal_map --output screenshots/test_gltf_layered_forward_rust.png --width 512 --height 512
-    playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_layered+emission+normal_map --output screenshots/test_gltf_layered_rt_rust.png --width 512 --height 512 --mode rt
+    playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr --ibl pisa --output screenshots/test_gltf_forward_rust.png --width 512 --height 512
+    playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_rt --ibl pisa --output screenshots/test_gltf_rt_rust.png --width 512 --height 512
+    playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_layered+emission+normal_map --ibl pisa --output screenshots/test_gltf_layered_forward_rust.png --width 512 --height 512
+    playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_layered+emission+normal_map --ibl pisa --output screenshots/test_gltf_layered_rt_rust.png --width 512 --height 512
     echo.
 )
 

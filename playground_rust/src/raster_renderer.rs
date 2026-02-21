@@ -154,6 +154,7 @@ pub fn render_raster(
     width: u32,
     height: u32,
     output_path: &Path,
+    ibl_name: &str,
 ) -> Result<(), String> {
     info!(
         "Raster render: scene='{}', pipeline='{}', {}x{}",
@@ -186,7 +187,7 @@ pub fn render_raster(
             let frag_module = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
 
             // For glTF, use the PBR rendering path with glTF mesh data
-            render_pbr_scene(ctx, vert_module, frag_module, pipeline_base, scene_source, width, height, output_path)?;
+            render_pbr_scene(ctx, vert_module, frag_module, pipeline_base, scene_source, width, height, output_path, ibl_name)?;
 
             unsafe {
                 ctx.device.destroy_shader_module(frag_module, None);
@@ -202,7 +203,7 @@ pub fn render_raster(
             let vert_module = spv_loader::create_shader_module(&ctx.device, &vert_code)?;
             let frag_module = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
 
-            render_pbr_scene(ctx, vert_module, frag_module, pipeline_base, scene_source, width, height, output_path)?;
+            render_pbr_scene(ctx, vert_module, frag_module, pipeline_base, scene_source, width, height, output_path, ibl_name)?;
 
             unsafe {
                 ctx.device.destroy_shader_module(frag_module, None);
@@ -221,6 +222,7 @@ pub fn render_fullscreen(
     width: u32,
     height: u32,
     output_path: &Path,
+    _ibl_name: &str,
 ) -> Result<(), String> {
     info!(
         "Fullscreen render: pipeline='{}', {}x{}",
@@ -785,8 +787,8 @@ fn create_texture_image_raw(
 }
 
 /// Delegate to scene_manager::load_ibl_assets with FRAGMENT_SHADER dst_stage.
-fn load_ibl_assets(ctx: &mut VulkanContext) -> IblAssets {
-    scene_manager::load_ibl_assets(ctx, vk::PipelineStageFlags::FRAGMENT_SHADER)
+fn load_ibl_assets(ctx: &mut VulkanContext, ibl_name: &str) -> IblAssets {
+    scene_manager::load_ibl_assets(ctx, vk::PipelineStageFlags::FRAGMENT_SHADER, ibl_name)
 }
 
 fn render_pbr_scene(
@@ -798,6 +800,7 @@ fn render_pbr_scene(
     width: u32,
     height: u32,
     output_path: &Path,
+    ibl_name: &str,
 ) -> Result<(), String> {
     let device_owned = ctx.device.clone();
     let device = &device_owned;
@@ -1244,7 +1247,7 @@ fn render_pbr_scene(
     }
 
     // Load IBL assets (specular cubemap, irradiance cubemap, BRDF LUT)
-    let mut ibl_assets = load_ibl_assets(ctx);
+    let mut ibl_assets = load_ibl_assets(ctx, ibl_name);
 
     // =====================================================================
     // Phase 3: Write descriptor sets from reflection data
@@ -1759,6 +1762,7 @@ impl PersistentRenderer {
         scene_source: &str,
         width: u32,
         height: u32,
+        ibl_name: &str,
     ) -> Result<Self, String> {
         let device = ctx.device.clone();
 
@@ -2066,7 +2070,7 @@ impl PersistentRenderer {
             texture_images.insert("base_color_tex".to_string(), proc_texture2);
         }
 
-        let ibl_assets = load_ibl_assets(ctx);
+        let ibl_assets = load_ibl_assets(ctx, ibl_name);
 
         // Phase 3: Write descriptor sets
         let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();

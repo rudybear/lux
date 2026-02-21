@@ -806,9 +806,12 @@ playground/
     test_*.py                # screenshot tests (15 tests)
 assets/                      # glTF models, IBL maps (downloaded separately, gitignored)
 playground_cpp/
-    src/                     # native Vulkan C++ renderer (raster + RT)
+    src/                     # native Vulkan C++ renderer (raster + RT, GLFW)
 playground_rust/
-    src/                     # native Vulkan Rust renderer (ash, raster + RT)
+    src/                     # native Vulkan Rust renderer (ash, winit, raster + RT)
+run_interactive_cpp.bat      # launch interactive C++ viewer
+run_interactive_rust.bat     # launch interactive Rust viewer
+compile_gltf_*.bat           # compile + render glTF pipelines (forward, RT, layered)
 screenshots/                 # rendered gallery screenshots (gitignored)
 shadercache/                 # compiled SPV + reflection JSON (generated, gitignored)
 tests/
@@ -874,20 +877,54 @@ python playground/test_math_builtins.py
 
 Each test compiles the shader, renders to a 512x512 PNG, and validates pixel-level properties (coverage, color distribution, spatial variation).
 
-### Rendering Engine
+### Rendering Engines
 
-The `playground/engine.py` provides a unified rendering engine with scene/pipeline separation:
+Three rendering backends share the same compiled shaders and reflection JSON:
 
+**Python (wgpu) — headless only:**
 ```bash
-# Render a glTF model with PBR shading
-python -m playground.engine --scene path/to/model.glb --pipeline shadercache/gltf_pbr --output render.png
-
-# Render a procedural sphere
+python -m playground.engine --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr --output render.png
 python -m playground.engine --scene sphere --pipeline shadercache/pbr_surface --output sphere.png
-
-# Render with IBL environment lighting
-python -m playground.engine --scene path/to/model.glb --pipeline shadercache/gltf_pbr --ibl neutral --output render_ibl.png
+python -m playground.engine --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr --ibl pisa --output render_ibl.png
 ```
+
+**C++ (Vulkan/GLFW) — headless and interactive:**
+```bash
+# Headless render to PNG
+playground_cpp/build/Release/lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_rt --ibl pisa --output render.png
+
+# Interactive viewer (orbit camera: drag to rotate, scroll to zoom, ESC to exit)
+playground_cpp/build/Release/lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_rt --ibl pisa --interactive
+```
+
+**Rust (ash/winit) — headless and interactive:**
+```bash
+# Headless render to PNG
+playground_rust/target/release/lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_rt --ibl pisa --output render.png
+
+# Interactive viewer (orbit camera: drag to rotate, scroll to zoom, ESC to exit)
+playground_rust/target/release/lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_rt --ibl pisa --interactive
+```
+
+**Batch files for quick launch:**
+```bash
+run_interactive_cpp.bat     # Interactive C++ viewer (auto-detects RT vs raster)
+run_interactive_rust.bat    # Interactive Rust viewer (auto-detects RT vs raster)
+compile_gltf_rt.bat         # Compile + render glTF RT (headless, both engines)
+compile_gltf_forward.bat    # Compile + render glTF raster (all 3 engines)
+compile_gltf_all.bat        # Compile + render all pipeline variants
+```
+
+**Common CLI flags** (C++ and Rust engines):
+| Flag | Description |
+|------|-------------|
+| `--scene <PATH>` | Scene source: `.glb`/`.gltf` file, `sphere`, `triangle`, `fullscreen` |
+| `--pipeline <BASE>` | Shader base path (auto-resolved from scene if omitted) |
+| `--ibl <NAME>` | IBL environment name from `assets/ibl/` (default: auto-detect `pisa`) |
+| `--interactive` | Open a window with orbit camera |
+| `--width <N>` | Output width (default: 512, interactive: 1024) |
+| `--height <N>` | Output height (default: 512, interactive: 768) |
+| `--output <PATH>` | Output PNG path for headless mode |
 
 ### IBL Preprocessing
 
