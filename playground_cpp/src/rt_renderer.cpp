@@ -9,6 +9,8 @@
 #include <cstring>
 #include <array>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 
 // --------------------------------------------------------------------------
 // Alignment helper
@@ -86,45 +88,53 @@ void RTRenderer::createStorageImage(VulkanContext& ctx) {
 }
 
 // --------------------------------------------------------------------------
-// BLAS creation from sphere mesh
+// BLAS creation from scene mesh (vertices/indices from SceneManager)
 // --------------------------------------------------------------------------
 
-static bool isGltfFileRT(const std::string& source) {
-    if (source.size() > 4 && source.substr(source.size()-4) == ".glb") return true;
-    if (source.size() > 5 && source.substr(source.size()-5) == ".gltf") return true;
-    return false;
-}
-
 void RTRenderer::createBLAS(VulkanContext& ctx) {
-    // Load mesh from glTF or generate procedural sphere
-    std::vector<Vertex> vertices;
-    std::vector<uint32_t> indices;
-
-    if (isGltfFileRT(m_sceneSource)) {
-        std::cout << "[info] Loading glTF for RT BLAS: " << m_sceneSource << std::endl;
-        GltfScene gltfScene = loadGltf(m_sceneSource);
-
-        if (!gltfScene.meshes.empty()) {
-            auto& gmesh = gltfScene.meshes[0];
-            vertices.resize(gmesh.vertices.size());
-            for (size_t i = 0; i < gmesh.vertices.size(); i++) {
-                vertices[i].position = gmesh.vertices[i].position;
-                vertices[i].normal = gmesh.vertices[i].normal;
-                vertices[i].uv = gmesh.vertices[i].uv;
-            }
-            indices = gmesh.indices;
-            std::cout << "[info] Loaded glTF mesh for BLAS: " << vertices.size()
-                      << " vertices, " << indices.size() << " indices" << std::endl;
-        } else {
-            std::cout << "[warn] glTF has no meshes, falling back to sphere" << std::endl;
-            Scene::generateSphere(32, 32, vertices, indices);
-        }
-    } else {
-        Scene::generateSphere(32, 32, vertices, indices);
-    }
+    const auto& vertices = m_scene->getVertices();
+    const auto& indices = m_scene->getIndices();
 
     sphereMesh = Scene::uploadMesh(ctx.allocator, ctx.device, ctx.commandPool,
                                    ctx.graphicsQueue, vertices, indices);
+
+    // Create SoA storage buffers for closest_hit vertex interpolation
+    {
+        std::vector<glm::vec4> posVec4(vertices.size());
+        std::vector<glm::vec4> norVec4(vertices.size());
+        std::vector<glm::vec2> uvVec2(vertices.size());
+        for (size_t i = 0; i < vertices.size(); i++) {
+            posVec4[i] = glm::vec4(vertices[i].position, 1.0f);
+            norVec4[i] = glm::vec4(vertices[i].normal, 0.0f);
+            uvVec2[i] = vertices[i].uv;
+        }
+
+        VkBufferUsageFlags ssboUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+        positionsSize = posVec4.size() * sizeof(glm::vec4);
+        Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                            posVec4.data(), positionsSize, ssboUsage,
+                            positionsBuffer, positionsAllocation);
+
+        normalsSize = norVec4.size() * sizeof(glm::vec4);
+        Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                            norVec4.data(), normalsSize, ssboUsage,
+                            normalsBuffer, normalsAllocation);
+
+        texCoordsSize = uvVec2.size() * sizeof(glm::vec2);
+        Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                            uvVec2.data(), texCoordsSize, ssboUsage,
+                            texCoordsBuffer, texCoordsAllocation);
+
+        indexStorageSize = indices.size() * sizeof(uint32_t);
+        Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                            indices.data(), indexStorageSize, ssboUsage,
+                            indexStorageBuffer, indexStorageAllocation);
+
+        std::cout << "[info] Created SoA storage buffers: positions=" << positionsSize
+                  << "B, normals=" << normalsSize << "B, texCoords=" << texCoordsSize
+                  << "B, indices=" << indexStorageSize << "B" << std::endl;
+    }
 
     // Set up geometry description for triangles
     VkDeviceAddress vertexAddress = ctx.getBufferDeviceAddress(sphereMesh.vertexBuffer);
@@ -588,6 +598,7 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
         else if (b.type == "sampled_image") vkType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         else if (b.type == "sampled_cube_image") vkType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         else if (b.type == "storage_image") vkType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        else if (b.type == "storage_buffer") vkType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         else if (b.type == "acceleration_structure") vkType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         else vkType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         typeCounts[vkType]++;
@@ -665,6 +676,33 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
             writeInfos[i].imageInfo.imageView = storageImageView;
             writeInfos[i].imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             w.pImageInfo = &writeInfos[i].imageInfo;
+        } else if (b.type == "storage_buffer") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            VkBuffer buf = VK_NULL_HANDLE;
+            VkDeviceSize bufSize = 0;
+            if (b.name == "positions") { buf = positionsBuffer; bufSize = positionsSize; }
+            else if (b.name == "normals") { buf = normalsBuffer; bufSize = normalsSize; }
+            else if (b.name == "tex_coords") { buf = texCoordsBuffer; bufSize = texCoordsSize; }
+            else if (b.name == "indices") { buf = indexStorageBuffer; bufSize = indexStorageSize; }
+            if (buf == VK_NULL_HANDLE) {
+                std::cout << "[warn] Unknown storage buffer name: " << b.name << std::endl;
+                continue;
+            }
+            writeInfos[i].bufferInfo = {buf, 0, bufSize};
+            w.pBufferInfo = &writeInfos[i].bufferInfo;
+        } else if (b.type == "sampler") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            auto& tex = m_scene->getTextureForBinding(b.name);
+            writeInfos[i].imageInfo = {};
+            writeInfos[i].imageInfo.sampler = tex.sampler;
+            w.pImageInfo = &writeInfos[i].imageInfo;
+        } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            auto& tex = m_scene->getTextureForBinding(b.name);
+            writeInfos[i].imageInfo = {};
+            writeInfos[i].imageInfo.imageView = tex.imageView;
+            writeInfos[i].imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            w.pImageInfo = &writeInfos[i].imageInfo;
         } else {
             continue; // Skip unsupported types
         }
@@ -688,7 +726,15 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
 
 void RTRenderer::updateCameraUBO(VulkanContext& ctx) {
     float aspect = static_cast<float>(renderWidth) / static_cast<float>(renderHeight);
-    Camera::RTCameraData camData = Camera::getRTCameraData(aspect);
+    Camera::RTCameraData camData;
+    if (m_scene && m_scene->hasSceneBounds()) {
+        camData = Camera::getRTCameraData(aspect, m_scene->getAutoEye(),
+                                           m_scene->getAutoTarget(),
+                                           m_scene->getAutoUp(),
+                                           m_scene->getAutoFar());
+    } else {
+        camData = Camera::getRTCameraData(aspect);
+    }
 
     void* mapped;
     vmaMapMemory(ctx.allocator, cameraAllocation, &mapped);
@@ -696,6 +742,85 @@ void RTRenderer::updateCameraUBO(VulkanContext& ctx) {
     memcpy(dst, &camData.inverseView, sizeof(glm::mat4));
     memcpy(dst + sizeof(glm::mat4), &camData.inverseProjection, sizeof(glm::mat4));
     vmaUnmapMemory(ctx.allocator, cameraAllocation);
+}
+
+void RTRenderer::updateCamera(VulkanContext& ctx, glm::vec3 eye, glm::vec3 target,
+                               glm::vec3 up, float fovY, float aspect,
+                               float nearPlane, float farPlane) {
+    // Build inverse view/projection from orbit camera parameters
+    glm::mat4 view = glm::lookAt(eye, target, up);
+    glm::mat4 proj = glm::perspective(fovY, aspect, nearPlane, farPlane);
+    proj[1][1] *= -1.0f; // Vulkan Y flip
+
+    Camera::RTCameraData camData;
+    camData.inverseView = glm::inverse(view);
+    camData.inverseProjection = glm::inverse(proj);
+
+    void* mapped;
+    vmaMapMemory(ctx.allocator, cameraAllocation, &mapped);
+    uint8_t* dst = static_cast<uint8_t*>(mapped);
+    memcpy(dst, &camData.inverseView, sizeof(glm::mat4));
+    memcpy(dst + sizeof(glm::mat4), &camData.inverseProjection, sizeof(glm::mat4));
+    vmaUnmapMemory(ctx.allocator, cameraAllocation);
+}
+
+// --------------------------------------------------------------------------
+// Blit to swapchain
+// --------------------------------------------------------------------------
+
+void RTRenderer::blitToSwapchain(VulkanContext& ctx, VkCommandBuffer cmd,
+                                  VkImage swapImage, VkExtent2D extent) {
+    // Transition swapchain image to TRANSFER_DST
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = swapImage;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    // Blit RT output to swapchain
+    VkImageBlit blitRegion = {};
+    blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blitRegion.srcSubresource.layerCount = 1;
+    blitRegion.srcOffsets[1] = {
+        static_cast<int32_t>(renderWidth),
+        static_cast<int32_t>(renderHeight), 1
+    };
+    blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blitRegion.dstSubresource.layerCount = 1;
+    blitRegion.dstOffsets[1] = {
+        static_cast<int32_t>(extent.width),
+        static_cast<int32_t>(extent.height), 1
+    };
+
+    vkCmdBlitImage(cmd,
+        storageImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blitRegion, VK_FILTER_LINEAR);
+
+    // Transition swapchain image to PRESENT
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = 0;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
 // --------------------------------------------------------------------------
@@ -707,14 +832,14 @@ void RTRenderer::init(VulkanContext& ctx,
                       const std::string& rmissSpvPath,
                       const std::string& rchitSpvPath,
                       uint32_t width, uint32_t height,
-                      const std::string& sceneSource) {
+                      SceneManager& scene) {
     if (!ctx.supportsRT()) {
         throw std::runtime_error("Ray tracing is not supported on this device");
     }
 
     renderWidth = width;
     renderHeight = height;
-    m_sceneSource = sceneSource;
+    m_scene = &scene;
 
     std::cout << "[info] Initializing RT renderer (" << width << "x" << height << ")" << std::endl;
 
@@ -766,6 +891,10 @@ void RTRenderer::init(VulkanContext& ctx,
     createSBT(ctx);
     createDescriptorSet(ctx);
 
+    // Set initial camera from scene auto-camera (used by headless path;
+    // interactive path overrides via updateCamera() before render())
+    updateCameraUBO(ctx);
+
     std::cout << "[info] RT renderer initialized successfully" << std::endl;
 }
 
@@ -774,9 +903,6 @@ void RTRenderer::init(VulkanContext& ctx,
 // --------------------------------------------------------------------------
 
 void RTRenderer::render(VulkanContext& ctx) {
-    // Update camera UBO each frame
-    updateCameraUBO(ctx);
-
     VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
 
     // Transition storage image to GENERAL for writing
@@ -880,6 +1006,12 @@ void RTRenderer::cleanup(VulkanContext& ctx) {
     if (storageImageView) vkDestroyImageView(ctx.device, storageImageView, nullptr);
     if (storageImage) vmaDestroyImage(ctx.allocator, storageImage, storageAllocation);
 
-    // Sphere mesh
+    // RT-local mesh (BLAS geometry copy)
     Scene::destroyMesh(ctx.allocator, sphereMesh);
+
+    // SoA storage buffers
+    if (positionsBuffer) vmaDestroyBuffer(ctx.allocator, positionsBuffer, positionsAllocation);
+    if (normalsBuffer) vmaDestroyBuffer(ctx.allocator, normalsBuffer, normalsAllocation);
+    if (texCoordsBuffer) vmaDestroyBuffer(ctx.allocator, texCoordsBuffer, texCoordsAllocation);
+    if (indexStorageBuffer) vmaDestroyBuffer(ctx.allocator, indexStorageBuffer, indexStorageAllocation);
 }

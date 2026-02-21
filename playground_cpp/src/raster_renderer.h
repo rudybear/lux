@@ -6,54 +6,49 @@
 #include "scene.h"
 #include "gltf_loader.h"
 #include "reflected_pipeline.h"
+#include "renderer_interface.h"
+#include "scene_manager.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
 
-class RasterRenderer {
+class RasterRenderer : public IRenderer {
 public:
-    // Three-phase initialization: scene/pipeline architecture
-    void init(VulkanContext& ctx, const std::string& sceneSource,
-              const std::string& pipelineBase, const std::string& renderPath,
-              uint32_t width, uint32_t height);
+    // Initialize with SceneManager
+    void init(VulkanContext& ctx, SceneManager& scene, const std::string& pipelineBase,
+              const std::string& renderPath, uint32_t width, uint32_t height);
 
-    // Three-phase rendering methods
-    void uploadScene(VulkanContext& ctx, const std::string& sceneSource);
-    void createPipeline(VulkanContext& ctx, const std::string& pipelineBase, const std::string& renderPath);
-    void bindSceneToPipeline(VulkanContext& ctx);
+    void render(VulkanContext& ctx) override;
 
-    void render(VulkanContext& ctx);
+    // IRenderer interface
+    VkImage getOutputImage() const override { return offscreenImage; }
+    VkFormat getOutputFormat() const override { return VK_FORMAT_R8G8B8A8_UNORM; }
+    uint32_t getWidth() const override { return renderWidth; }
+    uint32_t getHeight() const override { return renderHeight; }
+    void cleanup(VulkanContext& ctx) override;
+    void updateCamera(VulkanContext& ctx, glm::vec3 eye, glm::vec3 target,
+                      glm::vec3 up, float fovY, float aspect,
+                      float nearPlane, float farPlane) override;
+    void blitToSwapchain(VulkanContext& ctx, VkCommandBuffer cmd,
+                          VkImage swapImage, VkExtent2D extent) override;
 
-    // Get the offscreen image for screenshot
+    // Legacy accessors (still needed for getOffscreenImage in existing code)
     VkImage getOffscreenImage() const { return offscreenImage; }
     VkFormat getOffscreenFormat() const { return VK_FORMAT_R8G8B8A8_UNORM; }
-    uint32_t getWidth() const { return renderWidth; }
-    uint32_t getHeight() const { return renderHeight; }
 
     // Render to a swapchain image (interactive mode)
     void renderToSwapchain(VulkanContext& ctx, VkImage swapImage, VkImageView swapView,
                            VkFormat swapFormat, VkExtent2D extent,
                            VkSemaphore waitSem, VkSemaphore signalSem, VkFence fence);
 
-    // Orbit camera support: update MVP + Light buffers per frame
-    void updateCamera(VulkanContext& ctx, const glm::vec3& eye, const glm::vec3& target,
-                      const glm::vec3& up, float fovY, float aspect, float nearPlane, float farPlane);
-
-    // Auto-camera getters for orbit initialization
-    glm::vec3 getAutoEye() const { return m_autoEye; }
-    glm::vec3 getAutoTarget() const { return m_autoTarget; }
-    glm::vec3 getAutoUp() const { return m_autoUp; }
-    float getAutoFar() const { return m_autoFar; }
-    bool hasSceneBounds() const { return m_hasSceneBounds; }
-
-    void cleanup(VulkanContext& ctx);
-
 private:
-    std::string m_sceneSource;
     std::string m_renderPath;  // "raster", "fullscreen", "rt"
     std::string m_pipelineBase; // pipeline base path for reflection JSON lookup
     uint32_t renderWidth = 512;
     uint32_t renderHeight = 512;
+
+    // Scene manager (owned externally)
+    SceneManager* m_scene = nullptr;
 
     // Offscreen render target
     VkImage offscreenImage = VK_NULL_HANDLE;
@@ -85,21 +80,6 @@ private:
     VkBuffer lightBuffer = VK_NULL_HANDLE;
     VmaAllocation lightAllocation = VK_NULL_HANDLE;
 
-    // Mesh data (scene GPU resources)
-    GPUMesh mesh = {};
-
-    // Textures: keyed by binding name from reflection JSON
-    // (e.g. "base_color_tex", "normal_tex", "metallic_roughness_tex", etc.)
-    std::unordered_map<std::string, GPUTexture> namedTextures;
-
-    // IBL cubemap textures: keyed by "env_specular", "env_irradiance", "brdf_lut"
-    std::unordered_map<std::string, GPUTexture> iblTextures;
-
-    // Default 1x1 textures for missing bindings
-    GPUTexture defaultWhiteTexture = {};
-    GPUTexture defaultBlackTexture = {};   // for emissive (no emission)
-    GPUTexture defaultNormalTexture = {};  // flat normal (128,128,255)
-
     // Triangle vertex buffer
     VkBuffer triangleVB = VK_NULL_HANDLE;
     VmaAllocation triangleVBAllocation = VK_NULL_HANDLE;
@@ -117,19 +97,6 @@ private:
     VkShaderStageFlags pushConstantStageFlags = 0;
     uint32_t pushConstantSize = 0;
 
-    // glTF scene data (for texture extraction)
-    GltfScene m_gltfScene;
-    bool m_hasGltfScene = false;
-
-    // Scene bounds for auto-camera (computed from transformed vertices)
-    glm::vec3 m_sceneBboxMin{0.0f};
-    glm::vec3 m_sceneBboxMax{0.0f};
-    glm::vec3 m_autoEye{0.0f, 0.0f, 3.0f};
-    glm::vec3 m_autoTarget{0.0f};
-    glm::vec3 m_autoUp{0.0f, 1.0f, 0.0f};
-    float m_autoFar = 100.0f;
-    bool m_hasSceneBounds = false;
-
     void createOffscreenTarget(VulkanContext& ctx);
     void createRenderPass(VulkanContext& ctx);
     void createFramebuffer(VulkanContext& ctx);
@@ -140,10 +107,4 @@ private:
 
     // Reflection-driven descriptor setup
     void setupReflectedDescriptors(VulkanContext& ctx);
-    void createDefaultWhiteTexture(VulkanContext& ctx);
-    void uploadGltfTextures(VulkanContext& ctx);
-    void loadIBLAssets(VulkanContext& ctx, const std::string& iblName);
-    GPUTexture uploadCubemapF16(VulkanContext& ctx, uint32_t faceSize, uint32_t mipCount,
-                                const std::vector<uint16_t>& data);
-    GPUTexture& getTextureForBinding(const std::string& name);
 };

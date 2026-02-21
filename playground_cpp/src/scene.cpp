@@ -376,6 +376,15 @@ GPUTexture uploadTexture(VmaAllocator allocator, VkDevice device,
     return tex;
 }
 
+void uploadBuffer(VmaAllocator allocator, VkDevice device,
+                  VkCommandPool cmdPool, VkQueue queue,
+                  const void* data, VkDeviceSize size,
+                  VkBufferUsageFlags usage,
+                  VkBuffer& outBuffer, VmaAllocation& outAllocation) {
+    createBufferWithData(allocator, device, cmdPool, queue,
+                         data, size, usage, outBuffer, outAllocation);
+}
+
 void destroyMesh(VmaAllocator allocator, GPUMesh& mesh) {
     if (mesh.vertexBuffer) vmaDestroyBuffer(allocator, mesh.vertexBuffer, mesh.vertexAllocation);
     if (mesh.indexBuffer) vmaDestroyBuffer(allocator, mesh.indexBuffer, mesh.indexAllocation);

@@ -71,6 +71,13 @@ GPUTexture uploadTexture(VmaAllocator allocator, VkDevice device,
                          const std::vector<uint8_t>& pixels,
                          uint32_t width, uint32_t height);
 
+// Upload raw data to a GPU buffer with specified usage flags
+void uploadBuffer(VmaAllocator allocator, VkDevice device,
+                  VkCommandPool cmdPool, VkQueue queue,
+                  const void* data, VkDeviceSize size,
+                  VkBufferUsageFlags usage,
+                  VkBuffer& outBuffer, VmaAllocation& outAllocation);
+
 // Cleanup GPU resources
 void destroyMesh(VmaAllocator allocator, GPUMesh& mesh);
 void destroyTexture(VmaAllocator allocator, VkDevice device, GPUTexture& tex);

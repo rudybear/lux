@@ -59,6 +59,7 @@ set(SOURCES
     src/spv_loader.cpp
     src/raster_renderer.cpp
     src/rt_renderer.cpp
+    src/scene_manager.cpp
     src/scene.cpp
     src/camera.cpp
     src/screenshot.cpp

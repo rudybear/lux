@@ -55,4 +55,14 @@ RTCameraData getRTCameraData(float aspect) {
     return data;
 }
 
+RTCameraData getRTCameraData(float aspect, glm::vec3 eye, glm::vec3 target,
+                             glm::vec3 up, float farPlane) {
+    RTCameraData data;
+    glm::mat4 view = lookAt(eye, target, up);
+    glm::mat4 proj = perspective(glm::radians(DEFAULT_FOV), aspect, DEFAULT_NEAR, farPlane);
+    data.inverseView = glm::inverse(view);
+    data.inverseProjection = glm::inverse(proj);
+    return data;
+}
+
 } // namespace Camera

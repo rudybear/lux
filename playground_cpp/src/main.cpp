@@ -2,6 +2,9 @@
 #include "spv_loader.h"
 #include "raster_renderer.h"
 #include "rt_renderer.h"
+#include "scene_manager.h"
+#include "renderer_interface.h"
+#include "reflected_pipeline.h"
 #include "scene.h"
 #include "camera.h"
 #include "screenshot.h"
@@ -10,6 +13,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <memory>
 #include <filesystem>
 #include <algorithm>
 #include <cstring>
@@ -221,6 +225,9 @@ static std::string detectRenderPath(const std::string& base) {
 static int runHeadless(const CLIOptions& opts) {
     std::string renderPath = detectRenderPath(opts.shaderBase);
     bool needRT = (renderPath == "rt");
+    VkPipelineStageFlags dstStage = needRT
+        ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+        : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 
     std::cout << "[info] Headless render: scene=\"" << opts.sceneSource
               << "\" pipeline=\"" << opts.shaderBase
@@ -243,41 +250,47 @@ static int runHeadless(const CLIOptions& opts) {
     }
 
     try {
-        if (needRT) {
-            // RT rendering
-            std::string rgenPath = opts.shaderBase + ".rgen.spv";
-            std::string rmissPath = opts.shaderBase + ".rmiss.spv";
-            std::string rchitPath = opts.shaderBase + ".rchit.spv";
+        // Shared scene setup
+        SceneManager scene;
+        scene.loadScene(ctx, opts.sceneSource);
 
-            RTRenderer renderer;
-            renderer.init(ctx, rgenPath, rmissPath, rchitPath,
-                          opts.width, opts.height, opts.sceneSource);
-            renderer.render(ctx);
-
-            // Save screenshot
-            Screenshot::saveImageToPNG(ctx,
-                renderer.getOutputImage(), renderer.getOutputFormat(),
-                renderer.getWidth(), renderer.getHeight(),
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                opts.output);
-
-            renderer.cleanup(ctx);
-        } else {
-            // Raster rendering (three-phase: upload scene, create pipeline, bind)
-            RasterRenderer renderer;
-            renderer.init(ctx, opts.sceneSource, opts.shaderBase, renderPath,
-                          opts.width, opts.height);
-            renderer.render(ctx);
-
-            // Save screenshot
-            Screenshot::saveImageToPNG(ctx,
-                renderer.getOffscreenImage(), renderer.getOffscreenFormat(),
-                renderer.getWidth(), renderer.getHeight(),
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                opts.output);
-
-            renderer.cleanup(ctx);
+        // Determine vertex stride: for raster path, check if reflection wants 48-byte stride
+        int vertexStride = 32;
+        if (!needRT && renderPath == "raster") {
+            // Check if vertex reflection requires 48-byte stride
+            std::string vertJsonPath = opts.shaderBase + ".vert.json";
+            if (fs::exists(vertJsonPath)) {
+                auto vertRefl = parseReflectionJson(vertJsonPath);
+                if (vertRefl.vertex_stride == 48) {
+                    vertexStride = 48;
+                }
+            }
         }
+
+        scene.uploadToGPU(ctx, vertexStride);
+        scene.uploadTextures(ctx);
+        scene.loadIBLAssets(ctx, dstStage);
+
+        std::unique_ptr<IRenderer> renderer;
+        if (needRT) {
+            auto rt = std::make_unique<RTRenderer>();
+            rt->init(ctx, opts.shaderBase + ".rgen.spv", opts.shaderBase + ".rmiss.spv",
+                     opts.shaderBase + ".rchit.spv", opts.width, opts.height, scene);
+            renderer = std::move(rt);
+        } else {
+            auto raster = std::make_unique<RasterRenderer>();
+            raster->init(ctx, scene, opts.shaderBase, renderPath, opts.width, opts.height);
+            renderer = std::move(raster);
+        }
+
+        renderer->render(ctx);
+
+        Screenshot::saveImageToPNG(ctx, renderer->getOutputImage(), renderer->getOutputFormat(),
+                                    renderer->getWidth(), renderer->getHeight(),
+                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, opts.output);
+
+        renderer->cleanup(ctx);
+        scene.cleanup(ctx);
     } catch (const std::exception& e) {
         std::cerr << "[error] Rendering failed: " << e.what() << std::endl;
         ctx.cleanup();
@@ -301,6 +314,9 @@ static int runInteractive(CLIOptions opts) {
     }
     std::string renderPath = detectRenderPath(opts.shaderBase);
     bool needRT = (renderPath == "rt");
+    VkPipelineStageFlags dstStage = needRT
+        ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+        : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 
     std::cout << "[info] Interactive render: scene=\"" << opts.sceneSource
               << "\" pipeline=\"" << opts.shaderBase
@@ -370,21 +386,43 @@ static int runInteractive(CLIOptions opts) {
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     vkCreateFence(ctx.device, &fenceInfo, nullptr, &inFlightFence);
 
-    // Initialize renderers
-    RasterRenderer rasterRenderer;
-    RTRenderer rtRenderer;
+    // Initialize shared scene
+    SceneManager scene;
+    std::unique_ptr<IRenderer> renderer;
     bool useRT = needRT;
 
     try {
+        scene.loadScene(ctx, opts.sceneSource);
+
+        // Determine vertex stride for raster
+        int vertexStride = 32;
+        if (!useRT && renderPath == "raster") {
+            std::string vertJsonPath = opts.shaderBase + ".vert.json";
+            if (fs::exists(vertJsonPath)) {
+                auto vertRefl = parseReflectionJson(vertJsonPath);
+                if (vertRefl.vertex_stride == 48) {
+                    vertexStride = 48;
+                }
+            }
+        }
+
+        scene.uploadToGPU(ctx, vertexStride);
+        scene.uploadTextures(ctx);
+        scene.loadIBLAssets(ctx, dstStage);
+
         if (useRT) {
+            auto rt = std::make_unique<RTRenderer>();
             std::string rgenPath = opts.shaderBase + ".rgen.spv";
             std::string rmissPath = opts.shaderBase + ".rmiss.spv";
             std::string rchitPath = opts.shaderBase + ".rchit.spv";
-            rtRenderer.init(ctx, rgenPath, rmissPath, rchitPath,
-                           opts.width, opts.height, opts.sceneSource);
+            rt->init(ctx, rgenPath, rmissPath, rchitPath,
+                     opts.width, opts.height, scene);
+            renderer = std::move(rt);
         } else {
-            rasterRenderer.init(ctx, opts.sceneSource, opts.shaderBase, renderPath,
-                                opts.width, opts.height);
+            auto raster = std::make_unique<RasterRenderer>();
+            raster->init(ctx, scene, opts.shaderBase, renderPath,
+                         opts.width, opts.height);
+            renderer = std::move(raster);
         }
     } catch (const std::exception& e) {
         std::cerr << "[error] Failed to initialize renderer: " << e.what() << std::endl;
@@ -397,13 +435,13 @@ static int runInteractive(CLIOptions opts) {
         return 1;
     }
 
-    // Initialize orbit camera from auto-camera
-    if (!useRT && rasterRenderer.hasSceneBounds()) {
+    // Initialize orbit camera from scene auto-camera
+    if (scene.hasSceneBounds()) {
         g_orbit.initFromAutoCamera(
-            rasterRenderer.getAutoEye(),
-            rasterRenderer.getAutoTarget(),
-            rasterRenderer.getAutoUp(),
-            rasterRenderer.getAutoFar());
+            scene.getAutoEye(),
+            scene.getAutoTarget(),
+            scene.getAutoUp(),
+            scene.getAutoFar());
     }
 
     // Register GLFW input callbacks
@@ -413,6 +451,8 @@ static int runInteractive(CLIOptions opts) {
 
     std::cout << "[info] Starting render loop. Press ESC or close the window to quit." << std::endl;
     std::cout << "[info] Mouse: drag to orbit, scroll to zoom." << std::endl;
+
+    VkCommandBuffer rtBlitCmd = VK_NULL_HANDLE; // Track RT blit cmd for deferred free
 
     // Render loop
     while (!glfwWindowShouldClose(window)) {
@@ -434,6 +474,12 @@ static int runInteractive(CLIOptions opts) {
 
         // Wait for previous frame to finish
         vkWaitForFences(ctx.device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
+
+        // Free previous RT blit command buffer (now safe after fence)
+        if (rtBlitCmd != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &rtBlitCmd);
+            rtBlitCmd = VK_NULL_HANDLE;
+        }
 
         // Acquire swapchain image
         uint32_t imageIndex;
@@ -461,77 +507,44 @@ static int runInteractive(CLIOptions opts) {
         vkResetFences(ctx.device, 1, &inFlightFence);
 
         // Update orbit camera matrices each frame
-        if (!useRT) {
+        {
             float aspect = static_cast<float>(ctx.swapchainExtent.width) /
                            static_cast<float>(ctx.swapchainExtent.height);
-            rasterRenderer.updateCamera(ctx, g_orbit.getEye(), g_orbit.target,
-                                        g_orbit.up, g_orbit.fovY, aspect,
-                                        g_orbit.nearPlane, g_orbit.farPlane);
+            renderer->updateCamera(ctx, g_orbit.getEye(), g_orbit.target,
+                                   g_orbit.up, g_orbit.fovY, aspect,
+                                   g_orbit.nearPlane, g_orbit.farPlane);
         }
 
         if (useRT) {
-            // RT rendering: render to storage image, then copy to swapchain
-            rtRenderer.render(ctx);
+            // RT rendering: render to storage image (synchronous)
+            renderer->render(ctx);
 
-            // Copy RT output to swapchain image
-            VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+            // Blit RT output to swapchain with proper semaphore synchronization
+            rtBlitCmd = ctx.beginSingleTimeCommands();
+            VkCommandBuffer cmd = rtBlitCmd;
 
-            // Transition swapchain image to TRANSFER_DST
-            VkImageMemoryBarrier barrier = {};
-            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = ctx.swapchainImages[imageIndex];
-            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier.subresourceRange.baseMipLevel = 0;
-            barrier.subresourceRange.levelCount = 1;
-            barrier.subresourceRange.baseArrayLayer = 0;
-            barrier.subresourceRange.layerCount = 1;
-            barrier.srcAccessMask = 0;
-            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            renderer->blitToSwapchain(ctx, cmd, ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
 
-            vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &barrier);
+            vkEndCommandBuffer(cmd);
 
-            // Blit RT output to swapchain
-            VkImageBlit blitRegion = {};
-            blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            blitRegion.srcSubresource.layerCount = 1;
-            blitRegion.srcOffsets[1] = {
-                static_cast<int32_t>(rtRenderer.getWidth()),
-                static_cast<int32_t>(rtRenderer.getHeight()), 1
-            };
-            blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            blitRegion.dstSubresource.layerCount = 1;
-            blitRegion.dstOffsets[1] = {
-                static_cast<int32_t>(ctx.swapchainExtent.width),
-                static_cast<int32_t>(ctx.swapchainExtent.height), 1
-            };
+            // Submit with semaphore sync: wait on imageAvailable, signal renderFinished + fence
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSubmitInfo submitInfo = {};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.waitSemaphoreCount = 1;
+            submitInfo.pWaitSemaphores = &imageAvailableSem;
+            submitInfo.pWaitDstStageMask = &waitStage;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &cmd;
+            submitInfo.signalSemaphoreCount = 1;
+            submitInfo.pSignalSemaphores = &renderFinishedSem;
 
-            vkCmdBlitImage(cmd,
-                rtRenderer.getOutputImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                ctx.swapchainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                1, &blitRegion, VK_FILTER_LINEAR);
-
-            // Transition swapchain image to PRESENT
-            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.dstAccessMask = 0;
-
-            vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-            ctx.endSingleTimeCommands(cmd);
+            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, inFlightFence);
         } else {
             // Raster rendering to swapchain
-            rasterRenderer.renderToSwapchain(ctx,
+            // Cast to RasterRenderer for renderToSwapchain (uses internal command buffer)
+            auto* rasterPtr = static_cast<RasterRenderer*>(renderer.get());
+            rasterPtr->renderToSwapchain(ctx,
                 ctx.swapchainImages[imageIndex],
                 ctx.swapchainImageViews[imageIndex],
                 ctx.swapchainFormat, ctx.swapchainExtent,
@@ -565,11 +578,8 @@ static int runInteractive(CLIOptions opts) {
     // Cleanup
     vkDeviceWaitIdle(ctx.device);
 
-    if (useRT) {
-        rtRenderer.cleanup(ctx);
-    } else {
-        rasterRenderer.cleanup(ctx);
-    }
+    renderer->cleanup(ctx);
+    scene.cleanup(ctx);
 
     vkDestroySemaphore(ctx.device, imageAvailableSem, nullptr);
     vkDestroySemaphore(ctx.device, renderFinishedSem, nullptr);

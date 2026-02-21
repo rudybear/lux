@@ -35,4 +35,8 @@ struct RTCameraData {
 
 RTCameraData getRTCameraData(float aspect);
 
+// Get RT camera data with custom eye/target/up (for auto-framing scenes)
+RTCameraData getRTCameraData(float aspect, glm::vec3 eye, glm::vec3 target,
+                             glm::vec3 up, float farPlane);
+
 } // namespace Camera

@@ -6,34 +6,42 @@
 #include "scene.h"
 #include "gltf_loader.h"
 #include "reflected_pipeline.h"
+#include "renderer_interface.h"
+#include "scene_manager.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
 
-class RTRenderer {
+class RTRenderer : public IRenderer {
 public:
     void init(VulkanContext& ctx,
               const std::string& rgenSpvPath,
               const std::string& rmissSpvPath,
               const std::string& rchitSpvPath,
               uint32_t width, uint32_t height,
-              const std::string& sceneSource = "sphere");
+              SceneManager& scene);
 
-    void render(VulkanContext& ctx);
+    void render(VulkanContext& ctx) override;
 
-    // Get the storage image for screenshot
-    VkImage getOutputImage() const { return storageImage; }
-    VkFormat getOutputFormat() const { return VK_FORMAT_R8G8B8A8_UNORM; }
-    uint32_t getWidth() const { return renderWidth; }
-    uint32_t getHeight() const { return renderHeight; }
-
-    void cleanup(VulkanContext& ctx);
+    // IRenderer interface
+    VkImage getOutputImage() const override { return storageImage; }
+    VkFormat getOutputFormat() const override { return VK_FORMAT_R8G8B8A8_UNORM; }
+    uint32_t getWidth() const override { return renderWidth; }
+    uint32_t getHeight() const override { return renderHeight; }
+    void cleanup(VulkanContext& ctx) override;
+    void updateCamera(VulkanContext& ctx, glm::vec3 eye, glm::vec3 target,
+                      glm::vec3 up, float fovY, float aspect,
+                      float nearPlane, float farPlane) override;
+    void blitToSwapchain(VulkanContext& ctx, VkCommandBuffer cmd,
+                          VkImage swapImage, VkExtent2D extent) override;
 
 private:
     uint32_t renderWidth = 512;
     uint32_t renderHeight = 512;
     std::string m_pipelineBase; // for reflection JSON lookup
-    std::string m_sceneSource;  // scene source (sphere, .glb/.gltf path)
+
+    // Scene manager (owned externally)
+    SceneManager* m_scene = nullptr;
 
     // Storage image (RT output)
     VkImage storageImage = VK_NULL_HANDLE;
@@ -83,8 +91,25 @@ private:
     VkBuffer cameraBuffer = VK_NULL_HANDLE;
     VmaAllocation cameraAllocation = VK_NULL_HANDLE;
 
-    // Mesh for BLAS
+    // Mesh for BLAS (owned by SceneManager, but we keep a local reference for BLAS geometry)
     GPUMesh sphereMesh = {};
+
+    // SoA storage buffers for closest_hit vertex interpolation
+    VkBuffer positionsBuffer = VK_NULL_HANDLE;
+    VmaAllocation positionsAllocation = VK_NULL_HANDLE;
+    VkDeviceSize positionsSize = 0;
+
+    VkBuffer normalsBuffer = VK_NULL_HANDLE;
+    VmaAllocation normalsAllocation = VK_NULL_HANDLE;
+    VkDeviceSize normalsSize = 0;
+
+    VkBuffer texCoordsBuffer = VK_NULL_HANDLE;
+    VmaAllocation texCoordsAllocation = VK_NULL_HANDLE;
+    VkDeviceSize texCoordsSize = 0;
+
+    VkBuffer indexStorageBuffer = VK_NULL_HANDLE;
+    VmaAllocation indexStorageAllocation = VK_NULL_HANDLE;
+    VkDeviceSize indexStorageSize = 0;
 
     // Shader modules
     VkShaderModule rgenModule = VK_NULL_HANDLE;

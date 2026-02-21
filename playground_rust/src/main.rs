@@ -9,6 +9,7 @@ mod raster_renderer;
 pub mod reflected_pipeline;
 mod rt_renderer;
 mod scene;
+pub mod scene_manager;
 mod screenshot;
 mod spv_loader;
 mod vulkan_context;
@@ -290,17 +291,14 @@ fn run_interactive(
     height: u32,
 ) -> Result<(), String> {
     use ash::vk;
+    use scene_manager::Renderer;
     use winit::application::ApplicationHandler;
     use winit::event::{ElementState, MouseButton, WindowEvent};
     use winit::event_loop::{ActiveEventLoop, EventLoop};
     use winit::keyboard::{KeyCode, PhysicalKey};
     use winit::window::{Window, WindowId};
 
-    // Only raster scenes support interactive mode for now
-    if render_path != "raster" {
-        info!("Interactive mode only supports raster scenes, falling back to headless");
-        return run_headless(pipeline_base, scene_source, render_path, width, height, "interactive_output.png");
-    }
+    let use_rt = render_path == "rt";
 
     struct App {
         window: Option<Window>,
@@ -308,9 +306,10 @@ fn run_interactive(
         scene_source: String,
         width: u32,
         height: u32,
+        use_rt: bool,
         // Vulkan state (initialized after window creation)
         ctx: Option<vulkan_context::VulkanContext>,
-        renderer: Option<raster_renderer::PersistentRenderer>,
+        renderer: Option<Box<dyn Renderer>>,
         orbit: OrbitCamera,
         // Frame sync
         image_available_sem: vk::Semaphore,
@@ -327,7 +326,7 @@ fn run_interactive(
             };
 
             info!("Initializing Vulkan with window surface...");
-            let mut ctx = match vulkan_context::VulkanContext::new_with_window(window, false) {
+            let mut ctx = match vulkan_context::VulkanContext::new_with_window(window, self.use_rt) {
                 Ok(c) => c,
                 Err(e) => {
                     error!("Failed to create Vulkan context: {}", e);
@@ -350,18 +349,31 @@ fn run_interactive(
                 ctx.device.create_fence(&fence_info, None).unwrap()
             };
 
-            // Initialize persistent renderer
-            info!("Initializing persistent renderer...");
-            let renderer = match raster_renderer::PersistentRenderer::init(
-                &mut ctx,
-                &self.pipeline_base,
-                &self.scene_source,
-                self.width,
-                self.height,
-            ) {
+            // Create the renderer (unified via Renderer trait)
+            let renderer_result: Result<Box<dyn Renderer>, String> = if self.use_rt {
+                info!("Initializing RT renderer...");
+                rt_renderer::RTRenderer::new(
+                    &mut ctx,
+                    &self.pipeline_base,
+                    &self.scene_source,
+                    self.width,
+                    self.height,
+                ).map(|r| Box::new(r) as Box<dyn Renderer>)
+            } else {
+                info!("Initializing persistent renderer...");
+                raster_renderer::PersistentRenderer::init(
+                    &mut ctx,
+                    &self.pipeline_base,
+                    &self.scene_source,
+                    self.width,
+                    self.height,
+                ).map(|r| Box::new(r) as Box<dyn Renderer>)
+            };
+
+            let renderer = match renderer_result {
                 Ok(r) => r,
                 Err(e) => {
-                    error!("Failed to init persistent renderer: {}", e);
+                    error!("Failed to init renderer: {}", e);
                     unsafe {
                         ctx.device.destroy_semaphore(image_available, None);
                         ctx.device.destroy_semaphore(render_finished, None);
@@ -373,12 +385,12 @@ fn run_interactive(
             };
 
             // Init orbit camera from auto-camera
-            if renderer.has_scene_bounds {
+            if renderer.has_scene_bounds() {
                 self.orbit.init_from_auto_camera(
-                    renderer.auto_eye,
-                    renderer.auto_target,
-                    renderer.auto_up,
-                    renderer.auto_far,
+                    renderer.auto_eye(),
+                    renderer.auto_target(),
+                    renderer.auto_up(),
+                    renderer.auto_far(),
                 );
             }
 
@@ -395,10 +407,6 @@ fn run_interactive(
         fn render_frame(&mut self) {
             let ctx = match self.ctx.as_ref() {
                 Some(c) => c,
-                None => return,
-            };
-            let renderer = match self.renderer.as_mut() {
-                Some(r) => r,
                 None => return,
             };
 
@@ -421,8 +429,14 @@ fn run_interactive(
                 }
             };
 
-            // Update camera
             let extent = ctx.swapchain_extent;
+
+            let renderer = match self.renderer.as_mut() {
+                Some(r) => r,
+                None => return,
+            };
+
+            // Update camera
             let aspect = extent.width as f32 / extent.height as f32;
             renderer.update_camera(
                 self.orbit.eye(),
@@ -434,8 +448,8 @@ fn run_interactive(
                 self.orbit.far_plane,
             );
 
-            // Render offscreen
-            let cmd = match renderer.render_frame(ctx) {
+            // Render (returns a command buffer that is still recording)
+            let cmd = match renderer.render(ctx) {
                 Ok(c) => c,
                 Err(e) => {
                     error!("Render failed: {}", e);
@@ -443,9 +457,9 @@ fn run_interactive(
                 }
             };
 
-            // Blit to swapchain image (still in same command buffer)
+            // Blit to swapchain image
             let swapchain_image = ctx.swapchain_images[image_index as usize];
-            renderer.cmd_blit_to_swapchain(&ctx.device, cmd, swapchain_image, extent);
+            renderer.blit_to_swapchain(&ctx.device, cmd, swapchain_image, extent);
 
             // End and submit
             unsafe {
@@ -454,7 +468,7 @@ fn run_interactive(
 
             let wait_semaphores = [self.image_available_sem];
             let signal_semaphores = [self.render_finished_sem];
-            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let wait_stages = [renderer.wait_stage()];
             let cmd_bufs = [cmd];
             let submit_info = vk::SubmitInfo::default()
                 .wait_semaphores(&wait_semaphores)
@@ -481,7 +495,7 @@ fn run_interactive(
                 }
             }
 
-            // Free the command buffer
+            // Free the command buffer after GPU is done
             unsafe {
                 let _ = ctx.device.device_wait_idle();
                 ctx.device.free_command_buffers(ctx.command_pool, &cmd_bufs);
@@ -495,7 +509,7 @@ fn run_interactive(
 
             if let Some(ref mut renderer) = self.renderer {
                 if let Some(ref mut ctx) = self.ctx {
-                    renderer.cleanup(ctx);
+                    renderer.destroy(ctx);
                 }
             }
 
@@ -611,6 +625,7 @@ fn run_interactive(
         scene_source: scene_source.to_string(),
         width,
         height,
+        use_rt,
         ctx: None,
         renderer: None,
         orbit: OrbitCamera::new(),

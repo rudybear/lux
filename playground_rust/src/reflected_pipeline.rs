@@ -166,6 +166,7 @@ fn binding_type_to_vk(btype: &str) -> vk::DescriptorType {
         "sampled_image" => vk::DescriptorType::SAMPLED_IMAGE,
         "sampled_cube_image" => vk::DescriptorType::SAMPLED_IMAGE,
         "storage_image" => vk::DescriptorType::STORAGE_IMAGE,
+        "storage_buffer" => vk::DescriptorType::STORAGE_BUFFER,
         "acceleration_structure" => vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
         _ => vk::DescriptorType::UNIFORM_BUFFER,
     }

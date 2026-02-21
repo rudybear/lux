@@ -134,6 +134,50 @@ pub fn cmd_transition_image(
     }
 }
 
+/// Transition an image with custom mip level count and layer count.
+pub fn cmd_transition_image_layers(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    src_access: vk::AccessFlags,
+    dst_access: vk::AccessFlags,
+    src_stage: vk::PipelineStageFlags,
+    dst_stage: vk::PipelineStageFlags,
+    level_count: u32,
+    layer_count: u32,
+) {
+    let barrier = vk::ImageMemoryBarrier::default()
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(level_count)
+                .base_array_layer(0)
+                .layer_count(layer_count),
+        )
+        .src_access_mask(src_access)
+        .dst_access_mask(dst_access);
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            src_stage,
+            dst_stage,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
+    }
+}
+
 /// Record a command to copy an image to a staging buffer.
 pub fn cmd_copy_image_to_buffer(
     device: &ash::Device,

@@ -348,6 +348,7 @@ static VkDescriptorType bindingTypeToVkDescriptorType(const std::string& type) {
     if (type == "sampled_image") return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     if (type == "sampled_cube_image") return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     if (type == "storage_image") return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    if (type == "storage_buffer") return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     if (type == "acceleration_structure") return VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 }

@@ -11,26 +11,10 @@ use std::path::Path;
 use crate::camera::DefaultCamera;
 use crate::reflected_pipeline;
 use crate::scene;
+use crate::scene_manager::{self, GpuBuffer};
 use crate::screenshot;
 use crate::spv_loader;
 use crate::vulkan_context::VulkanContext;
-
-/// GPU buffer with its allocation (mirrors raster_renderer pattern).
-struct GpuBuffer {
-    buffer: vk::Buffer,
-    allocation: Option<Allocation>,
-}
-
-impl GpuBuffer {
-    fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
-        if let Some(alloc) = self.allocation.take() {
-            let _ = allocator.free(alloc);
-        }
-        unsafe {
-            device.destroy_buffer(self.buffer, None);
-        }
-    }
-}
 
 /// Ray tracing renderer state.
 pub struct RTRenderer {
@@ -54,15 +38,31 @@ pub struct RTRenderer {
     miss_region: vk::StridedDeviceAddressRegionKHR,
     hit_region: vk::StridedDeviceAddressRegionKHR,
 
-    storage_image: vk::Image,
+    pub storage_image: vk::Image,
     storage_image_view: vk::ImageView,
     storage_image_allocation: Option<Allocation>,
 
     camera_buffer: vk::Buffer,
     camera_allocation: Option<Allocation>,
 
-    width: u32,
-    height: u32,
+    // SoA storage buffers for closest_hit vertex interpolation
+    positions_buffer: GpuBuffer,
+    normals_buffer: GpuBuffer,
+    tex_coords_buffer: GpuBuffer,
+    index_storage_buffer: GpuBuffer,
+
+    // Texture images for RT (image, allocation, view, sampler)
+    texture_images: Vec<(vk::Image, Option<Allocation>, vk::ImageView, vk::Sampler)>,
+
+    pub width: u32,
+    pub height: u32,
+
+    // Auto-camera from scene bounds (for interactive orbit init)
+    pub has_scene_bounds: bool,
+    pub auto_eye: glam::Vec3,
+    pub auto_target: glam::Vec3,
+    pub auto_up: glam::Vec3,
+    pub auto_far: f32,
 }
 
 /// Render using the ray tracing pipeline and save the result as a PNG.
@@ -85,7 +85,7 @@ pub fn render_rt(
     // Record command buffer
     let device_clone = ctx.device.clone();
     let cmd = ctx.begin_single_commands()?;
-    renderer.render(&device_clone, ctx.rt_pipeline_loader.as_ref().unwrap(), cmd);
+    renderer.render_internal(&device_clone, ctx.rt_pipeline_loader.as_ref().unwrap(), cmd);
 
     // Copy storage image to staging buffer for readback
     let mut staging =
@@ -109,7 +109,7 @@ pub fn render_rt(
 
     // Cleanup
     staging.destroy(&device_clone, ctx.allocator_mut());
-    renderer.destroy(ctx);
+    renderer.destroy_internal(ctx);
 
     Ok(())
 }
@@ -182,32 +182,213 @@ impl RTRenderer {
             create_storage_image(&device, ctx.allocator_mut(), width, height)?;
 
         // --- 2. Create camera UBO (128 bytes: inverse_view + inverse_proj) ---
-        let (camera_buffer, camera_allocation) =
-            create_camera_ubo(&device, ctx.allocator_mut(), width, height)?;
+        // Auto-camera will be set after loading vertices (below); use default for now
+        let (camera_buffer, mut camera_allocation) =
+            create_camera_ubo(&device, ctx.allocator_mut(), width, height, None)?;
 
         // --- 3. Build BLAS from scene geometry ---
         let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
 
-        let (blas, blas_buffer, blas_allocation, blas_device_address) = if is_gltf {
+        let mut gltf_scene_opt: Option<crate::gltf_loader::GltfScene> = if is_gltf {
             info!("Loading glTF mesh for RT BLAS: {}", scene_source);
-            let gltf_scene = crate::gltf_loader::load_gltf(Path::new(scene_source))?;
-            if gltf_scene.meshes.is_empty() {
+            let gs = crate::gltf_loader::load_gltf(Path::new(scene_source))?;
+            if gs.meshes.is_empty() {
                 return Err(format!("No meshes found in glTF file: {}", scene_source));
             }
-            let mesh = &gltf_scene.meshes[0];
-            // Convert GltfVertex to PbrVertex for BLAS (position is at offset 0 in both)
-            let verts: Vec<scene::PbrVertex> = mesh.vertices.iter().map(|v| {
-                scene::PbrVertex {
-                    position: v.position,
-                    normal: v.normal,
-                    uv: v.uv,
-                }
-            }).collect();
-            build_blas(ctx, &verts, &mesh.indices)?
+            Some(gs)
         } else {
-            let (sphere_verts, sphere_indices) = scene::generate_sphere(32, 32);
-            build_blas(ctx, &sphere_verts, &sphere_indices)?
+            None
         };
+
+        let (vertices, indices): (Vec<scene::PbrVertex>, Vec<u32>) = if let Some(ref mut gltf_scene) = gltf_scene_opt {
+            // Flatten scene to get draw items with world transforms (matches raster renderer)
+            let draw_items = crate::gltf_loader::flatten_scene(gltf_scene);
+            let mut all_verts: Vec<scene::PbrVertex> = Vec::new();
+            let mut all_indices: Vec<u32> = Vec::new();
+            let mut vertex_offset: u32 = 0;
+            for item in &draw_items {
+                let mesh = &gltf_scene.meshes[item.mesh_index];
+                let world = item.world_transform;
+                let normal_mat = glam::Mat3::from_mat4(world).inverse().transpose();
+                for v in &mesh.vertices {
+                    let pos = world.transform_point3(glam::Vec3::from(v.position));
+                    let norm = (normal_mat * glam::Vec3::from(v.normal)).normalize();
+                    all_verts.push(scene::PbrVertex {
+                        position: pos.into(),
+                        normal: norm.into(),
+                        uv: v.uv,
+                    });
+                }
+                for &idx in &mesh.indices {
+                    all_indices.push(idx + vertex_offset);
+                }
+                vertex_offset += mesh.vertices.len() as u32;
+            }
+            (all_verts, all_indices)
+        } else {
+            scene::generate_sphere(32, 32)
+        };
+
+        let (blas, blas_buffer, blas_allocation, blas_device_address) =
+            build_blas(ctx, &vertices, &indices)?;
+
+        // Create SoA storage buffers for closest_hit vertex interpolation
+        let positions_data: Vec<[f32; 4]> = vertices.iter()
+            .map(|v| [v.position[0], v.position[1], v.position[2], 1.0])
+            .collect();
+        let normals_data: Vec<[f32; 4]> = vertices.iter()
+            .map(|v| [v.normal[0], v.normal[1], v.normal[2], 0.0])
+            .collect();
+        let tex_coords_data: Vec<[f32; 2]> = vertices.iter()
+            .map(|v| v.uv)
+            .collect();
+
+        let positions_buffer = create_device_address_buffer(
+            &device, ctx.allocator_mut(),
+            bytemuck::cast_slice(&positions_data),
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "rt_positions",
+        )?;
+        let normals_buffer = create_device_address_buffer(
+            &device, ctx.allocator_mut(),
+            bytemuck::cast_slice(&normals_data),
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "rt_normals",
+        )?;
+        let tex_coords_buffer = create_device_address_buffer(
+            &device, ctx.allocator_mut(),
+            bytemuck::cast_slice(&tex_coords_data),
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "rt_tex_coords",
+        )?;
+        let index_storage_buffer = create_device_address_buffer(
+            &device, ctx.allocator_mut(),
+            bytemuck::cast_slice(&indices),
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "rt_indices",
+        )?;
+
+        info!(
+            "Created SoA storage buffers: positions={}B, normals={}B, texCoords={}B, indices={}B",
+            positions_data.len() * 16, normals_data.len() * 16,
+            tex_coords_data.len() * 8, indices.len() * 4
+        );
+
+        // Upload glTF textures and create default textures
+        let mut texture_images: Vec<(vk::Image, Option<Allocation>, vk::ImageView, vk::Sampler)> = Vec::new();
+        let mut texture_map: HashMap<String, (vk::ImageView, vk::Sampler)> = HashMap::new();
+
+        // Create shared sampler for textures
+        let tex_sampler = {
+            let sampler_create = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                .address_mode_w(vk::SamplerAddressMode::REPEAT);
+            unsafe {
+                device
+                    .create_sampler(&sampler_create, None)
+                    .map_err(|e| format!("Failed to create RT texture sampler: {:?}", e))?
+            }
+        };
+
+        // Create 1x1 white default texture (for base_color, metallic_roughness, occlusion)
+        let white_pixel: [u8; 4] = [255, 255, 255, 255];
+        let default_white = create_rt_texture_image(ctx, 1, 1, &white_pixel, "rt_default_white")?;
+        let default_white_view = default_white.1;
+        texture_images.push((default_white.0, Some(default_white.2), default_white.1, tex_sampler));
+
+        // Create 1x1 black default texture (for emissive)
+        let black_pixel: [u8; 4] = [0, 0, 0, 255];
+        let default_black = create_rt_texture_image(ctx, 1, 1, &black_pixel, "rt_default_black")?;
+        let default_black_view = default_black.1;
+        texture_images.push((default_black.0, Some(default_black.2), default_black.1, tex_sampler));
+
+        // Upload glTF material textures
+        if let Some(ref gltf_scene) = gltf_scene_opt {
+            let gltf_material = if !gltf_scene.materials.is_empty() {
+                Some(&gltf_scene.materials[0])
+            } else {
+                None
+            };
+
+            let tex_slots: &[(&str, Box<dyn Fn(&crate::gltf_loader::GltfMaterial) -> &Option<crate::gltf_loader::TextureImage>>)] = &[
+                ("base_color_tex", Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.base_color_image)),
+                ("metallic_roughness_tex", Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.metallic_roughness_image)),
+                ("occlusion_tex", Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.occlusion_image)),
+                ("emissive_tex", Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.emissive_image)),
+            ];
+
+            for (tex_name, accessor) in tex_slots {
+                let tex_data_opt = gltf_material.and_then(|m| accessor(m).as_ref());
+
+                if let Some(tex_data) = tex_data_opt {
+                    info!(
+                        "RT: Uploading texture '{}': {}x{}",
+                        tex_name, tex_data.width, tex_data.height
+                    );
+                    let gpu_tex = create_rt_texture_image(
+                        ctx,
+                        tex_data.width,
+                        tex_data.height,
+                        &tex_data.pixels,
+                        tex_name,
+                    )?;
+                    let view = gpu_tex.1;
+                    texture_images.push((gpu_tex.0, Some(gpu_tex.2), gpu_tex.1, tex_sampler));
+                    texture_map.insert(tex_name.to_string(), (view, tex_sampler));
+                } else {
+                    // Use appropriate default
+                    let fallback_view = if *tex_name == "emissive_tex" {
+                        default_black_view
+                    } else {
+                        default_white_view
+                    };
+                    texture_map.insert(tex_name.to_string(), (fallback_view, tex_sampler));
+                }
+            }
+        } else {
+            // Non-glTF scene: all textures get defaults
+            texture_map.insert("base_color_tex".to_string(), (default_white_view, tex_sampler));
+            texture_map.insert("metallic_roughness_tex".to_string(), (default_white_view, tex_sampler));
+            texture_map.insert("occlusion_tex".to_string(), (default_white_view, tex_sampler));
+            texture_map.insert("emissive_tex".to_string(), (default_black_view, tex_sampler));
+        }
+
+        // Load IBL assets (cubemaps + BRDF LUT)
+        load_rt_ibl_assets(ctx, &mut texture_map, &mut texture_images);
+
+        // Compute scene bounds and update camera UBO with auto-camera (shared function)
+        // Get draw_items from glTF scene for node-transform camera
+        let draw_items: Vec<crate::gltf_loader::DrawItem> = if let Some(ref mut gltf_s) = gltf_scene_opt {
+            crate::gltf_loader::flatten_scene(gltf_s)
+        } else {
+            Vec::new()
+        };
+
+        let vertex_positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+        let (saved_eye, saved_target, saved_up, saved_far) = scene_manager::compute_auto_camera_from_draw_items(
+            &vertex_positions,
+            &draw_items,
+        );
+        {
+            // Overwrite the camera UBO with auto-camera data
+            let aspect = width as f32 / height as f32;
+            let fov_y = DefaultCamera::FOV_Y_DEG.to_radians();
+            let view = crate::camera::look_at(saved_eye, saved_target, saved_up);
+            let proj = crate::camera::perspective(fov_y, aspect, DefaultCamera::NEAR, saved_far);
+            let inv_view = view.inverse();
+            let inv_proj = proj.inverse();
+
+            let mut ubo_data = [0u8; 128];
+            ubo_data[0..64].copy_from_slice(bytemuck::cast_slice(inv_view.as_ref()));
+            ubo_data[64..128].copy_from_slice(bytemuck::cast_slice(inv_proj.as_ref()));
+
+            if let Some(mapped) = camera_allocation.mapped_slice_mut() {
+                mapped[..128].copy_from_slice(&ubo_data);
+            }
+        }
 
         // --- 4. Build TLAS with single instance ---
         let (tlas, tlas_buffer, tlas_allocation) =
@@ -297,6 +478,13 @@ impl RTRenderer {
         }
 
         // --- 9. Write descriptors from reflection data ---
+        let ssbo_map: HashMap<String, (vk::Buffer, u64)> = [
+            ("positions".to_string(), (positions_buffer.buffer, positions_data.len() as u64 * 16)),
+            ("normals".to_string(), (normals_buffer.buffer, normals_data.len() as u64 * 16)),
+            ("tex_coords".to_string(), (tex_coords_buffer.buffer, tex_coords_data.len() as u64 * 8)),
+            ("indices".to_string(), (index_storage_buffer.buffer, indices.len() as u64 * 4)),
+        ].into_iter().collect();
+
         write_rt_descriptors(
             &device,
             &merged,
@@ -304,6 +492,8 @@ impl RTRenderer {
             tlas,
             storage_image_view,
             camera_buffer,
+            &ssbo_map,
+            &texture_map,
         )?;
 
         info!("RT renderer initialized successfully (reflection-driven)");
@@ -330,16 +520,53 @@ impl RTRenderer {
             storage_image_allocation: Some(storage_image_allocation),
             camera_buffer,
             camera_allocation: Some(camera_allocation),
+            positions_buffer,
+            normals_buffer,
+            tex_coords_buffer,
+            index_storage_buffer,
+            texture_images,
             width,
             height,
+            has_scene_bounds: true,
+            auto_eye: saved_eye,
+            auto_target: saved_target,
+            auto_up: saved_up,
+            auto_far: saved_far,
         })
+    }
+
+    /// Update the RT camera UBO from orbit camera parameters.
+    pub fn update_camera_internal(
+        &mut self,
+        eye: glam::Vec3,
+        target: glam::Vec3,
+        up: glam::Vec3,
+        fov_y: f32,
+        aspect: f32,
+        near: f32,
+        far: f32,
+    ) {
+        let view = crate::camera::look_at(eye, target, up);
+        let proj = crate::camera::perspective(fov_y, aspect, near, far);
+        let inv_view = view.inverse();
+        let inv_proj = proj.inverse();
+
+        let mut ubo_data = [0u8; 128];
+        ubo_data[0..64].copy_from_slice(bytemuck::cast_slice(inv_view.as_ref()));
+        ubo_data[64..128].copy_from_slice(bytemuck::cast_slice(inv_proj.as_ref()));
+
+        if let Some(alloc) = &mut self.camera_allocation {
+            if let Some(mapped) = alloc.mapped_slice_mut() {
+                mapped[..128].copy_from_slice(&ubo_data);
+            }
+        }
     }
 
     /// Record ray tracing commands into the given command buffer.
     ///
     /// The storage image is transitioned to GENERAL for the trace, then to
     /// TRANSFER_SRC_OPTIMAL for readback.
-    pub fn render(
+    pub fn render_internal(
         &self,
         device: &ash::Device,
         rt_loader: &ash::khr::ray_tracing_pipeline::Device,
@@ -406,7 +633,7 @@ impl RTRenderer {
     }
 
     /// Destroy all resources owned by this renderer.
-    pub fn destroy(&mut self, ctx: &mut VulkanContext) {
+    pub fn destroy_internal(&mut self, ctx: &mut VulkanContext) {
         unsafe {
             ctx.device.destroy_pipeline(self.pipeline, None);
             ctx.device
@@ -469,6 +696,222 @@ impl RTRenderer {
         unsafe {
             ctx.device.destroy_buffer(self.camera_buffer, None);
         }
+
+        // Free SoA storage buffers
+        {
+            let dev = ctx.device.clone();
+            self.positions_buffer.destroy(&dev, ctx.allocator_mut());
+            self.normals_buffer.destroy(&dev, ctx.allocator_mut());
+            self.tex_coords_buffer.destroy(&dev, ctx.allocator_mut());
+            self.index_storage_buffer.destroy(&dev, ctx.allocator_mut());
+        }
+
+        // Free texture images and samplers
+        {
+            // Collect unique samplers to avoid double-destroy
+            let mut destroyed_samplers = std::collections::HashSet::new();
+            for (image, alloc, view, sampler) in self.texture_images.drain(..) {
+                unsafe {
+                    ctx.device.destroy_image_view(view, None);
+                }
+                if let Some(a) = alloc {
+                    let _ = ctx.allocator_mut().free(a);
+                }
+                unsafe {
+                    ctx.device.destroy_image(image, None);
+                    if destroyed_samplers.insert(sampler) {
+                        ctx.device.destroy_sampler(sampler, None);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Renderer trait implementation
+// ===========================================================================
+
+impl scene_manager::Renderer for RTRenderer {
+    fn render(&mut self, ctx: &VulkanContext) -> Result<vk::CommandBuffer, String> {
+        let device = &ctx.device;
+
+        // Allocate a command buffer
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(ctx.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+
+        let cmd = unsafe {
+            device
+                .allocate_command_buffers(&alloc_info)
+                .map_err(|e| format!("Failed to allocate RT command buffer: {:?}", e))?[0]
+        };
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe {
+            device
+                .begin_command_buffer(cmd, &begin_info)
+                .map_err(|e| format!("Failed to begin RT command buffer: {:?}", e))?;
+        }
+
+        // Record trace commands using the internal method
+        let rt_loader = ctx.rt_pipeline_loader.as_ref()
+            .ok_or("RT pipeline loader not available")?;
+        self.render_internal(device, rt_loader, cmd);
+
+        // Return the command buffer still recording (so blit_to_swapchain can be appended)
+        Ok(cmd)
+    }
+
+    fn update_camera(
+        &mut self,
+        eye: glam::Vec3,
+        target: glam::Vec3,
+        up: glam::Vec3,
+        fov_y: f32,
+        aspect: f32,
+        near: f32,
+        far: f32,
+    ) {
+        self.update_camera_internal(eye, target, up, fov_y, aspect, near, far);
+    }
+
+    fn blit_to_swapchain(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        swap_image: vk::Image,
+        extent: vk::Extent2D,
+    ) {
+        unsafe {
+            // Transition swapchain image: UNDEFINED -> TRANSFER_DST
+            let barrier = vk::ImageMemoryBarrier::default()
+                .image(swap_image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[], &[], &[barrier],
+            );
+
+            // Blit storage image -> swapchain (storage_image is already in TRANSFER_SRC_OPTIMAL)
+            let blit_region = vk::ImageBlit::default()
+                .src_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .src_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: self.width as i32,
+                        y: self.height as i32,
+                        z: 1,
+                    },
+                ])
+                .dst_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .dst_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: extent.width as i32,
+                        y: extent.height as i32,
+                        z: 1,
+                    },
+                ]);
+
+            device.cmd_blit_image(
+                cmd,
+                self.storage_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                swap_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[blit_region],
+                vk::Filter::LINEAR,
+            );
+
+            // Transition swapchain image: TRANSFER_DST -> PRESENT_SRC
+            let barrier = vk::ImageMemoryBarrier::default()
+                .image(swap_image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[], &[], &[barrier],
+            );
+        }
+    }
+
+    fn output_image(&self) -> vk::Image {
+        self.storage_image
+    }
+
+    fn output_format(&self) -> vk::Format {
+        vk::Format::R8G8B8A8_UNORM
+    }
+
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn has_scene_bounds(&self) -> bool {
+        self.has_scene_bounds
+    }
+
+    fn auto_eye(&self) -> glam::Vec3 {
+        self.auto_eye
+    }
+
+    fn auto_target(&self) -> glam::Vec3 {
+        self.auto_target
+    }
+
+    fn auto_up(&self) -> glam::Vec3 {
+        self.auto_up
+    }
+
+    fn auto_far(&self) -> f32 {
+        self.auto_far
+    }
+
+    fn wait_stage(&self) -> vk::PipelineStageFlags {
+        vk::PipelineStageFlags::TRANSFER
+    }
+
+    fn destroy(&mut self, ctx: &mut VulkanContext) {
+        self.destroy_internal(ctx);
     }
 }
 
@@ -552,9 +995,17 @@ fn create_camera_ubo(
     allocator: &mut Allocator,
     width: u32,
     height: u32,
+    auto_cam: Option<(glam::Vec3, glam::Vec3, glam::Vec3, f32)>,
 ) -> Result<(vk::Buffer, Allocation), String> {
-    let view = DefaultCamera::view();
-    let proj = DefaultCamera::projection(width as f32 / height as f32);
+    let aspect = width as f32 / height as f32;
+    let (view, proj) = if let Some((eye, target, up, far)) = auto_cam {
+        (
+            crate::camera::look_at(eye, target, up),
+            crate::camera::perspective(DefaultCamera::FOV_Y_DEG.to_radians(), aspect, DefaultCamera::NEAR, far),
+        )
+    } else {
+        (DefaultCamera::view(), DefaultCamera::projection(aspect))
+    };
     let inv_view = view.inverse();
     let inv_proj = proj.inverse();
 
@@ -1191,6 +1642,7 @@ fn create_sbt(
 /// - "Camera" / "Light" uniform_buffer -> camera_buffer (128 bytes)
 /// - "tlas" acceleration_structure -> tlas
 /// - "output_image" storage_image -> storage_image_view
+/// - sampler / sampled_image -> texture_map entries
 fn write_rt_descriptors(
     device: &ash::Device,
     merged: &HashMap<u32, Vec<reflected_pipeline::BindingInfo>>,
@@ -1198,6 +1650,8 @@ fn write_rt_descriptors(
     tlas: vk::AccelerationStructureKHR,
     storage_image_view: vk::ImageView,
     camera_buffer: vk::Buffer,
+    ssbo_map: &HashMap<String, (vk::Buffer, u64)>,
+    texture_map: &HashMap<String, (vk::ImageView, vk::Sampler)>,
 ) -> Result<(), String> {
     // We need to hold the AS write info alive across the update_descriptor_sets call.
     // Use a Vec of all writes, but handle acceleration structure specially since
@@ -1210,6 +1664,11 @@ fn write_rt_descriptors(
 
     // Track AS binding for special handling
     let mut as_bindings: Vec<(u32, u32)> = Vec::new(); // (set_idx, binding)
+
+    // Pre-allocate to keep pointers stable
+    let total_bindings: usize = merged.values().map(|v| v.len()).sum();
+    buffer_infos.reserve(total_bindings);
+    image_infos.reserve(total_bindings);
 
     for (&set_idx, bindings) in merged {
         let ds = match ds_map.get(&set_idx) {
@@ -1263,6 +1722,93 @@ fn write_rt_descriptors(
                             }),
                     );
                 }
+                vk::DescriptorType::STORAGE_BUFFER => {
+                    if let Some(&(buf, size)) = ssbo_map.get(&binding.name) {
+                        let buf_info_idx = buffer_infos.len();
+                        buffer_infos.push(
+                            vk::DescriptorBufferInfo::default()
+                                .buffer(buf)
+                                .offset(0)
+                                .range(size),
+                        );
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds)
+                                .dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                .buffer_info(unsafe {
+                                    std::slice::from_raw_parts(
+                                        &buffer_infos[buf_info_idx] as *const _,
+                                        1,
+                                    )
+                                }),
+                        );
+                    } else {
+                        info!("Unknown storage buffer name: '{}'", binding.name);
+                    }
+                }
+                vk::DescriptorType::SAMPLER => {
+                    // Look up the sampler from texture_map by name (strip _sampler suffix if present)
+                    let tex_name = binding.name.trim_end_matches("_sampler").to_string();
+                    let actual_sampler = texture_map
+                        .get(&tex_name)
+                        .or_else(|| texture_map.get(&binding.name))
+                        .map(|t| t.1)
+                        .unwrap_or_else(|| {
+                            // Fall back to any sampler in the map
+                            texture_map.values().next().map(|t| t.1).unwrap_or(vk::Sampler::null())
+                        });
+
+                    let img_info_idx = image_infos.len();
+                    image_infos.push(
+                        vk::DescriptorImageInfo::default().sampler(actual_sampler),
+                    );
+
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(ds)
+                            .dst_binding(binding.binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .image_info(unsafe {
+                                std::slice::from_raw_parts(
+                                    &image_infos[img_info_idx] as *const _,
+                                    1,
+                                )
+                            }),
+                    );
+                }
+                vk::DescriptorType::SAMPLED_IMAGE => {
+                    // Look up the image view from texture_map by name (strip _image suffix if present)
+                    let tex_name = binding.name.trim_end_matches("_image").to_string();
+                    let view = texture_map
+                        .get(&tex_name)
+                        .or_else(|| texture_map.get(&binding.name))
+                        .map(|t| t.0)
+                        .unwrap_or_else(|| {
+                            // Fall back to first texture view in the map
+                            texture_map.values().next().map(|t| t.0).unwrap_or(vk::ImageView::null())
+                        });
+
+                    let img_info_idx = image_infos.len();
+                    image_infos.push(
+                        vk::DescriptorImageInfo::default()
+                            .image_view(view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                    );
+
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(ds)
+                            .dst_binding(binding.binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .image_info(unsafe {
+                                std::slice::from_raw_parts(
+                                    &image_infos[img_info_idx] as *const _,
+                                    1,
+                                )
+                            }),
+                    );
+                }
                 vk::DescriptorType::ACCELERATION_STRUCTURE_KHR => {
                     as_bindings.push((set_idx, binding.binding));
                 }
@@ -1308,6 +1854,574 @@ fn write_rt_descriptors(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// IBL cubemap utilities
+// ---------------------------------------------------------------------------
+
+/// Create a cubemap image for IBL (Float16 RGBA, 6 layers, optional mipmaps).
+fn create_rt_cubemap_image(
+    ctx: &mut VulkanContext,
+    face_size: u32,
+    mip_count: u32,
+    data: &[u8],
+    name: &str,
+) -> Result<(vk::Image, vk::ImageView, Allocation, vk::Sampler), String> {
+    let device = ctx.device.clone();
+
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(vk::Format::R16G16B16A16_SFLOAT)
+        .extent(vk::Extent3D { width: face_size, height: face_size, depth: 1 })
+        .mip_levels(mip_count)
+        .array_layers(6)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .flags(vk::ImageCreateFlags::CUBE_COMPATIBLE);
+
+    let image = unsafe {
+        device.create_image(&image_info, None)
+            .map_err(|e| format!("Failed to create cubemap '{}': {:?}", name, e))?
+    };
+
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+    let allocation = ctx.allocator_mut()
+        .allocate(&AllocationCreateDesc {
+            name,
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("Failed to allocate cubemap '{}': {:?}", name, e))?;
+
+    unsafe {
+        device.bind_image_memory(image, allocation.memory(), allocation.offset())
+            .map_err(|e| format!("Failed to bind cubemap '{}': {:?}", name, e))?;
+    }
+
+    // Staging buffer
+    let staging_info = vk::BufferCreateInfo::default()
+        .size(data.len() as u64)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC);
+    let staging_buffer = unsafe {
+        device.create_buffer(&staging_info, None)
+            .map_err(|e| format!("Failed to create staging for '{}': {:?}", name, e))?
+    };
+    let staging_reqs = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
+    let mut staging_alloc = ctx.allocator_mut()
+        .allocate(&AllocationCreateDesc {
+            name: "ibl_staging",
+            requirements: staging_reqs,
+            location: MemoryLocation::CpuToGpu,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("staging alloc failed: {:?}", e))?;
+    unsafe {
+        device.bind_buffer_memory(staging_buffer, staging_alloc.memory(), staging_alloc.offset())
+            .map_err(|e| format!("staging bind failed: {:?}", e))?;
+    }
+    if let Some(mapped) = staging_alloc.mapped_slice_mut() {
+        mapped[..data.len()].copy_from_slice(data);
+    }
+
+    // Transfer
+    let cmd = ctx.begin_single_commands()?;
+
+    screenshot::cmd_transition_image_layers(
+        &device, cmd, image,
+        vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER,
+        mip_count, 6,
+    );
+
+    // Copy each mip level, each face
+    let mut offset: u64 = 0;
+    let mut regions = Vec::new();
+    for mip in 0..mip_count {
+        let mip_size = (face_size >> mip).max(1);
+        let face_bytes = (mip_size as u64) * (mip_size as u64) * 8; // 4 channels * 2 bytes
+        for face in 0..6u32 {
+            regions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(offset)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(mip)
+                            .base_array_layer(face)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D { width: mip_size, height: mip_size, depth: 1 }),
+            );
+            offset += face_bytes;
+        }
+    }
+    unsafe {
+        device.cmd_copy_buffer_to_image(cmd, staging_buffer, image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL, &regions);
+    }
+
+    screenshot::cmd_transition_image_layers(
+        &device, cmd, image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ,
+        vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+        mip_count, 6,
+    );
+
+    ctx.end_single_commands(cmd)?;
+
+    let _ = ctx.allocator_mut().free(staging_alloc);
+    unsafe { device.destroy_buffer(staging_buffer, None); }
+
+    // Cube image view
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::CUBE)
+        .format(vk::Format::R16G16B16A16_SFLOAT)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(mip_count)
+                .base_array_layer(0)
+                .layer_count(6),
+        );
+    let view = unsafe {
+        device.create_image_view(&view_info, None)
+            .map_err(|e| format!("Failed to create cubemap view '{}': {:?}", name, e))?
+    };
+
+    // Sampler with mipmap support
+    let sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .max_lod(mip_count as f32);
+    let sampler = unsafe {
+        device.create_sampler(&sampler_info, None)
+            .map_err(|e| format!("Failed to create cubemap sampler '{}': {:?}", name, e))?
+    };
+
+    Ok((image, view, allocation, sampler))
+}
+
+/// Load IBL assets (specular, irradiance cubemaps + BRDF LUT) and add to texture_map.
+fn load_rt_ibl_assets(
+    ctx: &mut VulkanContext,
+    texture_map: &mut HashMap<String, (vk::ImageView, vk::Sampler)>,
+    texture_images: &mut Vec<(vk::Image, Option<Allocation>, vk::ImageView, vk::Sampler)>,
+) {
+    let ibl_base = std::path::Path::new("playground/assets/ibl");
+    if !ibl_base.exists() {
+        info!("No IBL assets directory, skipping RT IBL");
+        return;
+    }
+
+    // Find IBL directory: prefer "pisa" then "neutral"
+    let preferred = ["pisa", "neutral"];
+    let ibl_dir = preferred.iter()
+        .map(|n| ibl_base.join(n))
+        .find(|p| p.join("manifest.json").exists());
+
+    let ibl_dir = match ibl_dir {
+        Some(d) => d,
+        None => {
+            info!("No IBL manifest found");
+            return;
+        }
+    };
+
+    info!("Loading RT IBL assets from {:?}", ibl_dir);
+
+    // Parse manifest
+    let manifest_str = match std::fs::read_to_string(ibl_dir.join("manifest.json")) {
+        Ok(s) => s,
+        Err(_) => { info!("Failed to read IBL manifest"); return; }
+    };
+    let manifest: serde_json::Value = match serde_json::from_str(&manifest_str) {
+        Ok(v) => v,
+        Err(_) => { info!("Failed to parse IBL manifest"); return; }
+    };
+
+    let spec_face_size = manifest["specular"]["face_size"].as_u64().unwrap_or(256) as u32;
+    let spec_mip_count = manifest["specular"]["mip_count"].as_u64().unwrap_or(9) as u32;
+    let irr_face_size = manifest["irradiance"]["face_size"].as_u64().unwrap_or(32) as u32;
+    let brdf_size = manifest["brdf_lut"]["size"].as_u64().unwrap_or(512) as u32;
+
+    // Load specular cubemap
+    let spec_path = ibl_dir.join("specular.bin");
+    if spec_path.exists() {
+        if let Ok(data) = std::fs::read(&spec_path) {
+            match create_rt_cubemap_image(ctx, spec_face_size, spec_mip_count, &data, "rt_ibl_specular") {
+                Ok((image, view, alloc, sampler)) => {
+                    texture_map.insert("env_specular".to_string(), (view, sampler));
+                    texture_images.push((image, Some(alloc), view, sampler));
+                    info!("Loaded RT IBL specular: {}x{}, {} mips", spec_face_size, spec_face_size, spec_mip_count);
+                }
+                Err(e) => info!("Failed to load RT IBL specular: {}", e),
+            }
+        }
+    }
+
+    // Load irradiance cubemap
+    let irr_path = ibl_dir.join("irradiance.bin");
+    if irr_path.exists() {
+        if let Ok(data) = std::fs::read(&irr_path) {
+            match create_rt_cubemap_image(ctx, irr_face_size, 1, &data, "rt_ibl_irradiance") {
+                Ok((image, view, alloc, sampler)) => {
+                    texture_map.insert("env_irradiance".to_string(), (view, sampler));
+                    texture_images.push((image, Some(alloc), view, sampler));
+                    info!("Loaded RT IBL irradiance: {}x{}", irr_face_size, irr_face_size);
+                }
+                Err(e) => info!("Failed to load RT IBL irradiance: {}", e),
+            }
+        }
+    }
+
+    // Load BRDF LUT (2D, RG16F padded to RGBA16F)
+    let brdf_path = ibl_dir.join("brdf_lut.bin");
+    if brdf_path.exists() {
+        if let Ok(raw_data) = std::fs::read(&brdf_path) {
+            let total_pixels = (brdf_size as usize) * (brdf_size as usize);
+            let raw_u16: &[u16] = bytemuck::cast_slice(&raw_data);
+
+            let rgba_data: Vec<u16> = if raw_u16.len() == total_pixels * 2 {
+                let mut rgba = vec![0u16; total_pixels * 4];
+                for p in 0..total_pixels {
+                    rgba[p * 4 + 0] = raw_u16[p * 2 + 0];
+                    rgba[p * 4 + 1] = raw_u16[p * 2 + 1];
+                    rgba[p * 4 + 2] = 0;
+                    rgba[p * 4 + 3] = 0x3C00; // 1.0 in half-float
+                }
+                rgba
+            } else {
+                raw_u16.to_vec()
+            };
+
+            let rgba_bytes: &[u8] = bytemuck::cast_slice(&rgba_data);
+
+            let device = ctx.device.clone();
+            let format = vk::Format::R16G16B16A16_SFLOAT;
+            let data_size = rgba_bytes.len() as u64;
+
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D { width: brdf_size, height: brdf_size, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+
+            let image = match unsafe { device.create_image(&image_info, None) } {
+                Ok(i) => i,
+                Err(e) => { info!("Failed to create BRDF LUT image: {:?}", e); return; }
+            };
+
+            let requirements = unsafe { device.get_image_memory_requirements(image) };
+            let allocation = match ctx.allocator_mut().allocate(&AllocationCreateDesc {
+                name: "rt_brdf_lut",
+                requirements,
+                location: MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            }) {
+                Ok(a) => a,
+                Err(e) => { info!("Failed to allocate BRDF LUT: {:?}", e); return; }
+            };
+
+            if unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()) }.is_err() {
+                return;
+            }
+
+            // Staging
+            let staging_info = vk::BufferCreateInfo::default()
+                .size(data_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC);
+            let staging_buffer = match unsafe { device.create_buffer(&staging_info, None) } {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            let staging_reqs = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
+            let mut staging_alloc = match ctx.allocator_mut().allocate(&AllocationCreateDesc {
+                name: "brdf_staging",
+                requirements: staging_reqs,
+                location: MemoryLocation::CpuToGpu,
+                linear: true,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            }) {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let _ = unsafe { device.bind_buffer_memory(staging_buffer, staging_alloc.memory(), staging_alloc.offset()) };
+            if let Some(mapped) = staging_alloc.mapped_slice_mut() {
+                mapped[..rgba_bytes.len()].copy_from_slice(rgba_bytes);
+            }
+
+            let cmd = match ctx.begin_single_commands() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            screenshot::cmd_transition_image(
+                &device, cmd, image,
+                vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE,
+                vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER,
+            );
+
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D { width: brdf_size, height: brdf_size, depth: 1 });
+
+            unsafe {
+                device.cmd_copy_buffer_to_image(cmd, staging_buffer, image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+            }
+
+            screenshot::cmd_transition_image(
+                &device, cmd, image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+            );
+
+            let _ = ctx.end_single_commands(cmd);
+            let _ = ctx.allocator_mut().free(staging_alloc);
+            unsafe { device.destroy_buffer(staging_buffer, None); }
+
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            let view = match unsafe { device.create_image_view(&view_info, None) } {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+
+            let sampler_info = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .mipmap_mode(vk::SamplerMipmapMode::LINEAR);
+            let sampler = match unsafe { device.create_sampler(&sampler_info, None) } {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+
+            texture_map.insert("brdf_lut".to_string(), (view, sampler));
+            texture_images.push((image, Some(allocation), view, sampler));
+            info!("Loaded RT IBL BRDF LUT: {}x{}", brdf_size, brdf_size);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Texture utilities
+// ---------------------------------------------------------------------------
+
+/// Create a 2D RGBA8 texture image, upload pixels via staging buffer, and return
+/// (vk::Image, vk::ImageView, Allocation).
+///
+/// The image is transitioned to SHADER_READ_ONLY_OPTIMAL for sampling.
+fn create_rt_texture_image(
+    ctx: &mut VulkanContext,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    name: &str,
+) -> Result<(vk::Image, vk::ImageView, Allocation), String> {
+    let format = vk::Format::R8G8B8A8_UNORM;
+    let data_size = (width * height * 4) as u64;
+    let device = ctx.device.clone();
+
+    // Create staging buffer
+    let staging_info = vk::BufferCreateInfo::default()
+        .size(data_size)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let staging_buffer = unsafe {
+        device
+            .create_buffer(&staging_info, None)
+            .map_err(|e| format!("Failed to create RT texture staging buffer: {:?}", e))?
+    };
+
+    let staging_reqs = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
+
+    let mut staging_alloc = ctx
+        .allocator_mut()
+        .allocate(&AllocationCreateDesc {
+            name: "rt_texture_staging",
+            requirements: staging_reqs,
+            location: MemoryLocation::CpuToGpu,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("Failed to allocate RT texture staging memory: {:?}", e))?;
+
+    unsafe {
+        device
+            .bind_buffer_memory(staging_buffer, staging_alloc.memory(), staging_alloc.offset())
+            .map_err(|e| format!("Failed to bind RT texture staging memory: {:?}", e))?;
+    }
+
+    if let Some(mapped) = staging_alloc.mapped_slice_mut() {
+        mapped[..pixels.len()].copy_from_slice(pixels);
+    }
+
+    // Create GPU image
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+
+    let image = unsafe {
+        device
+            .create_image(&image_info, None)
+            .map_err(|e| format!("Failed to create RT texture image '{}': {:?}", name, e))?
+    };
+
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+
+    let allocation = ctx
+        .allocator_mut()
+        .allocate(&AllocationCreateDesc {
+            name,
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("Failed to allocate RT texture image memory '{}': {:?}", name, e))?;
+
+    unsafe {
+        device
+            .bind_image_memory(image, allocation.memory(), allocation.offset())
+            .map_err(|e| format!("Failed to bind RT texture image memory '{}': {:?}", name, e))?;
+    }
+
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .components(vk::ComponentMapping::default())
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1),
+        );
+
+    let view = unsafe {
+        device
+            .create_image_view(&view_info, None)
+            .map_err(|e| format!("Failed to create RT texture image view '{}': {:?}", name, e))?
+    };
+
+    // Copy staging -> image via command buffer
+    let cmd = ctx.begin_single_commands()?;
+
+    screenshot::cmd_transition_image(
+        &ctx.device,
+        cmd,
+        image,
+        vk::ImageLayout::UNDEFINED,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::AccessFlags::empty(),
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::TOP_OF_PIPE,
+        vk::PipelineStageFlags::TRANSFER,
+    );
+
+    let region = vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D::default())
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        });
+
+    unsafe {
+        ctx.device.cmd_copy_buffer_to_image(
+            cmd,
+            staging_buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+    }
+
+    screenshot::cmd_transition_image(
+        &ctx.device,
+        cmd,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::AccessFlags::SHADER_READ,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+    );
+
+    ctx.end_single_commands(cmd)?;
+
+    // Cleanup staging
+    let _ = ctx.allocator_mut().free(staging_alloc);
+    unsafe {
+        ctx.device.destroy_buffer(staging_buffer, None);
+    }
+
+    Ok((image, view, allocation))
 }
 
 // ---------------------------------------------------------------------------
