@@ -14,6 +14,8 @@ start: module_item*
             | schedule_decl
             | environment_decl
             | procedural_decl
+            | features_decl
+            | conditional_block
 
 // --- Top-level declarations ---
 
@@ -27,13 +29,36 @@ type_alias: "type" IDENT "=" type ";"
 
 import_decl: "import" IDENT ";"
 
+// --- Features declarations (compile-time feature flags) ---
+
+features_decl: "features" "{" feature_field ("," feature_field)* ","? "}"
+feature_field: IDENT ":" "bool"
+
+// --- Module-level conditional block ---
+
+conditional_block: "if" feature_expr "{" module_item* "}"
+
+// --- Feature expressions (compile-time boolean) ---
+
+?feature_expr: feature_or
+?feature_or: feature_and ("||" feature_and)*
+?feature_and: feature_not ("&&" feature_not)*
+?feature_not: "!" feature_not -> feature_negate
+            | feature_primary
+?feature_primary: IDENT -> feature_ref
+                | "(" feature_expr ")"
+
 // --- Surface declarations ---
 
 surface_decl: "surface" IDENT "{" surface_item ("," surface_item)* ","? "}"
 
-?surface_item: surface_sampler | surface_member
-surface_sampler: "sampler2d" IDENT
+?surface_item: surface_sampler | surface_member | surface_layers
+surface_sampler: SAMPLER_KW IDENT ("if" feature_expr)?
+SAMPLER_KW: "sampler2d" | "samplerCube"
 surface_member: IDENT ":" expr
+surface_layers: "layers" "[" layer_call ("," layer_call)* ","? "]"
+layer_call: IDENT "(" layer_arg ("," layer_arg)* ","? ")" ("if" feature_expr)?
+layer_arg: IDENT ":" expr
 
 // --- Geometry declarations ---
 
@@ -43,22 +68,22 @@ geometry_decl: "geometry" IDENT "{" geometry_item* "}"
               | geometry_transform
               | geometry_outputs
 
-geometry_field: IDENT ":" type ","
+geometry_field: IDENT ":" type ("if" feature_expr)? ","
 geometry_transform: "transform" ":" IDENT "{" block_field ("," block_field)* ","? "}"
 geometry_outputs: "outputs" "{" output_binding ("," output_binding)* ","? "}"
 
-output_binding: IDENT ":" expr
+output_binding: IDENT ":" expr ("if" feature_expr)?
 
 // --- Pipeline declarations ---
 
 pipeline_decl: "pipeline" IDENT "{" pipeline_member ("," pipeline_member)* ","? "}"
 
-pipeline_member: IDENT ":" expr
+pipeline_member: IDENT ":" expr ("if" feature_expr)?
 
 // --- Schedule declarations ---
 
 schedule_decl: "schedule" IDENT "{" schedule_member ("," schedule_member)* ","? "}"
-schedule_member: IDENT ":" IDENT
+schedule_member: IDENT ":" IDENT ("if" feature_expr)?
 
 // --- Environment declarations (maps to miss shader in RT) ---
 
@@ -86,6 +111,7 @@ STAGE_TYPE: "vertex" | "fragment" | "raygen" | "closest_hit" | "any_hit" | "miss
            | callable_data_decl
            | accel_decl
            | storage_image_decl
+           | storage_buffer_decl
 
 in_decl: "in" IDENT ":" type ";"
 out_decl: "out" IDENT ":" type ";"
@@ -104,6 +130,7 @@ hit_attribute_decl: "hit_attribute" IDENT ":" type ";"
 callable_data_decl: "callable_data" IDENT ":" type ";"
 accel_decl: "acceleration_structure" IDENT ";"
 storage_image_decl: "storage_image" IDENT ";"
+storage_buffer_decl: "storage_buffer" IDENT ":" type ";"
 
 // --- Functions ---
 

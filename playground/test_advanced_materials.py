@@ -1,9 +1,9 @@
 """End-to-end screenshot test: compile advanced_materials_demo.lux and render to PNG.
 
 This script:
-  1. Compiles examples/advanced_materials_demo.lux -> playground/*.spv
+  1. Compiles examples/advanced_materials_demo.lux -> shadercache/*.spv
   2. Loads the fragment SPIR-V via the fullscreen render harness
-  3. Renders a 512x512 frame and saves playground/advanced_materials_demo.png
+  3. Renders a 512x512 frame and saves screenshots/advanced_materials_demo.png
   4. Validates the output (4 quadrants with distinct color signatures)
 
 Usage:
@@ -21,9 +21,11 @@ import numpy as np
 
 PLAYGROUND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PLAYGROUND_DIR.parent
+SHADERCACHE = PROJECT_ROOT / "shadercache"
+SCREENSHOTS = PROJECT_ROOT / "screenshots"
 LUX_SOURCE = PROJECT_ROOT / "examples" / "advanced_materials_demo.lux"
-FRAG_SPV = PLAYGROUND_DIR / "advanced_materials_demo.frag.spv"
-OUTPUT_PNG = PLAYGROUND_DIR / "advanced_materials_demo.png"
+FRAG_SPV = SHADERCACHE / "advanced_materials_demo.frag.spv"
+OUTPUT_PNG = SCREENSHOTS / "advanced_materials_demo.png"
 
 
 def step(msg: str) -> None:
@@ -43,7 +45,7 @@ def compile_shader() -> bool:
     cmd = [
         sys.executable, "-m", "luxc",
         str(LUX_SOURCE),
-        "-o", str(PLAYGROUND_DIR),
+        "-o", str(SHADERCACHE),
     ]
     print(f"  Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))

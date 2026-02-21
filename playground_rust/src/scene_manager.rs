@@ -959,12 +959,12 @@ pub fn create_cubemap_image(
 // IBL loading (parameterized by dst_stage)
 // ===========================================================================
 
-/// Try to find and load IBL assets from playground/assets/ibl/<name>/ directories.
+/// Try to find and load IBL assets from assets/ibl/<name>/ directories.
 ///
 /// `dst_stage` controls the final pipeline barrier for all uploaded textures.
 pub fn load_ibl_assets(ctx: &mut VulkanContext, dst_stage: vk::PipelineStageFlags) -> IblAssets {
     // Search for IBL asset directories
-    let ibl_base = Path::new("playground/assets/ibl");
+    let ibl_base = Path::new("assets/ibl");
     if !ibl_base.exists() {
         info!("IBL assets directory not found at {:?}, using defaults", ibl_base);
         return IblAssets::empty();

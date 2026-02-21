@@ -7,7 +7,7 @@ from luxc.parser.ast_nodes import (
     CallExpr, ConstructorExpr, FieldAccess, SwizzleAccess, IndexAccess,
     TernaryExpr, AssignTarget,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
-    StorageImageDecl,
+    StorageImageDecl, StorageBufferDecl,
 )
 from luxc.codegen.spirv_types import TypeRegistry
 from luxc.codegen.glsl_ext import GLSL_STD_450, LUX_TO_GLSL
@@ -83,6 +83,10 @@ class SpvGenerator:
         self.push_field_indices: dict[str, int] = {}
         self.push_block_for_field: dict[str, str] = {}
 
+        # Storage buffer info
+        self.storage_buffer_var_ids: dict[str, str] = {}     # buffer name -> %id
+        self.storage_buffer_element_types: dict[str, str] = {} # buffer name -> element type name
+
         # gl_PerVertex output block for vertex shader
         self.per_vertex_var_id: str | None = None
         self.per_vertex_struct_id: str | None = None
@@ -116,6 +120,10 @@ class SpvGenerator:
         lines.append("OpCapability Shader")
         if is_rt:
             lines.append("OpCapability RayTracingKHR")
+        has_storage_buffers = bool(getattr(self.stage, 'storage_buffers', []))
+        if has_storage_buffers:
+            lines.append('OpExtension "SPV_KHR_storage_buffer_storage_class"')
+        if is_rt:
             lines.append('OpExtension "SPV_KHR_ray_tracing"')
         lines.append(f"{self.glsl_ext_id} = OpExtInstImport \"GLSL.std.450\"")
         lines.append("OpMemoryModel Logical GLSL450")
@@ -395,6 +403,60 @@ class SpvGenerator:
             self.var_storage[si.name] = storage
             self.interface_ids.append(var_id)
 
+        # --- Storage buffer variables (runtime arrays) ---
+        for sb in getattr(self.stage, 'storage_buffers', []):
+            elem_type_id = self.reg.lux_type_to_spirv(sb.element_type)
+
+            # Compute array stride from element type
+            _ELEM_BYTE_SIZES = {
+                "scalar": 4, "int": 4, "uint": 4, "bool": 4,
+                "vec2": 8, "vec3": 12, "vec4": 16,
+                "ivec2": 8, "ivec3": 12, "ivec4": 16,
+                "uvec2": 8, "uvec3": 12, "uvec4": 16,
+                "mat2": 32, "mat3": 48, "mat4": 64,
+            }
+            # std430 array stride: element aligned to its own size,
+            # but vec3 has stride 16 (padded to vec4 alignment in arrays)
+            _ELEM_STRIDE = dict(_ELEM_BYTE_SIZES)
+            _ELEM_STRIDE["vec3"] = 16
+            _ELEM_STRIDE["ivec3"] = 16
+            _ELEM_STRIDE["uvec3"] = 16
+            stride = _ELEM_STRIDE.get(sb.element_type, 16)
+
+            # OpTypeRuntimeArray
+            rtarr_key = f"_rtarr_{sb.element_type}"
+            if rtarr_key not in self.reg._types:
+                rtarr_id = self.reg.next_id()
+                self.reg._types[rtarr_key] = rtarr_id
+                self.reg._decls.append(f"{rtarr_id} = OpTypeRuntimeArray {elem_type_id}")
+                self.decorations.append(f"OpDecorate {rtarr_id} ArrayStride {stride}")
+            else:
+                rtarr_id = self.reg._types[rtarr_key]
+
+            # Struct wrapping the runtime array
+            struct_name = f"_SB_{sb.name}"
+            struct_id = self.reg.struct(struct_name, [rtarr_id])
+
+            # Variable in StorageBuffer storage class
+            ptr_type = self.reg.pointer("StorageBuffer", struct_id)
+            var_id = self.reg.next_id()
+            self.global_vars.append(f"{var_id} = OpVariable {ptr_type} StorageBuffer")
+
+            # Decorations
+            self.decorations.append(f"OpDecorate {struct_id} Block")
+            self.decorations.append(f"OpMemberDecorate {struct_id} 0 Offset 0")
+            if sb.set_number is not None:
+                self.decorations.append(f"OpDecorate {var_id} DescriptorSet {sb.set_number}")
+            if sb.binding is not None:
+                self.decorations.append(f"OpDecorate {var_id} Binding {sb.binding}")
+
+            self.storage_buffer_var_ids[sb.name] = var_id
+            self.storage_buffer_element_types[sb.name] = sb.element_type
+            self.var_map[sb.name] = var_id
+            self.var_types[sb.name] = f"_rtarr_{sb.element_type}"
+            self.var_storage[sb.name] = "StorageBuffer"
+            self.interface_ids.append(var_id)
+
         # --- RT: Built-in variables ---
         if self.stage.stage_type in _RT_STAGES:
             emitted_builtins: dict[str, str] = {}  # spv_builtin -> var_id
@@ -669,8 +731,12 @@ class SpvGenerator:
             lines.append(f"{result} = OpLoad {type_id} {self.local_vars[name]}")
             return result, lines
 
-        # Check global vars (inputs/outputs)
+        # Check global vars (inputs/outputs) - skip storage buffers (accessed via index)
         if name in self.var_map:
+            if name in self.storage_buffer_var_ids:
+                # Storage buffers must be accessed via indexing, not direct load.
+                # Return the variable pointer so IndexAccess can use it.
+                return self.var_map[name], lines
             type_name = self.var_types[name]
             type_id = self.reg.lux_type_to_spirv(type_name)
             result = self.reg.next_id()
@@ -1229,6 +1295,35 @@ class SpvGenerator:
         return result, lines
 
     def _gen_index_access(self, expr: IndexAccess, lines: list[str]) -> tuple[str, list[str]]:
+        # Check for storage buffer access: buffer[index]
+        if isinstance(expr.object, VarRef) and expr.object.name in self.storage_buffer_var_ids:
+            buf_name = expr.object.name
+            buf_var_id = self.storage_buffer_var_ids[buf_name]
+            elem_type_name = self.storage_buffer_element_types[buf_name]
+            elem_type_id = self.reg.lux_type_to_spirv(elem_type_name)
+
+            # Generate index expression
+            idx_id, idx_lines = self._gen_expr(expr.index)
+            lines.extend(idx_lines)
+
+            # Convert index to int if it's a float
+            idx_lux_type = self._resolve_expr_lux_type(expr.index)
+            if idx_lux_type in ("scalar", "vec2", "vec3", "vec4"):
+                conv_id = self.reg.next_id()
+                int_type = self.reg.int32()
+                lines.append(f"{conv_id} = OpConvertFToS {int_type} {idx_id}")
+                idx_id = conv_id
+
+            # OpAccessChain: struct_ptr -> member[0] -> array[idx]
+            ptr_elem = self.reg.pointer("StorageBuffer", elem_type_id)
+            const_0 = self.reg.const_int(0, signed=True)
+            ac_id = self.reg.next_id()
+            lines.append(f"{ac_id} = OpAccessChain {ptr_elem} {buf_var_id} {const_0} {idx_id}")
+            result = self.reg.next_id()
+            lines.append(f"{result} = OpLoad {elem_type_id} {ac_id}")
+            return result, lines
+
+        # Default: composite extract (vectors, matrices)
         obj_id, obj_lines = self._gen_expr(expr.object)
         lines.extend(obj_lines)
         idx_id, idx_lines = self._gen_expr(expr.index)

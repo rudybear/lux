@@ -54,6 +54,12 @@ class StorageImageType(LuxType):
     pass
 
 
+@dataclass(frozen=True)
+class RuntimeArrayType(LuxType):
+    """Type representing a runtime-sized array (storage buffer element type)."""
+    element_type_name: str  # name of the element type (e.g., "vec4", "uint")
+
+
 # Singleton type instances
 VOID = VoidType("void")
 BOOL = BoolType("bool")

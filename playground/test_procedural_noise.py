@@ -1,9 +1,9 @@
 """End-to-end screenshot test: compile procedural_noise.lux and render to PNG.
 
 This script:
-  1. Compiles examples/procedural_noise.lux -> playground/*.spv
+  1. Compiles examples/procedural_noise.lux -> shadercache/*.spv
   2. Loads the fragment SPIR-V via the fullscreen render harness
-  3. Renders a 512x512 frame and saves playground/procedural_noise.png
+  3. Renders a 512x512 frame and saves screenshots/procedural_noise.png
   4. Validates the output (coverage, variation, color range)
 
 Usage:
@@ -21,9 +21,11 @@ import numpy as np
 
 PLAYGROUND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PLAYGROUND_DIR.parent
+SHADERCACHE = PROJECT_ROOT / "shadercache"
+SCREENSHOTS = PROJECT_ROOT / "screenshots"
 LUX_SOURCE = PROJECT_ROOT / "examples" / "procedural_noise.lux"
-FRAG_SPV = PLAYGROUND_DIR / "procedural_noise.frag.spv"
-OUTPUT_PNG = PLAYGROUND_DIR / "procedural_noise.png"
+FRAG_SPV = SHADERCACHE / "procedural_noise.frag.spv"
+OUTPUT_PNG = SCREENSHOTS / "procedural_noise.png"
 
 
 def step(msg: str) -> None:
@@ -43,7 +45,7 @@ def compile_shader() -> bool:
     cmd = [
         sys.executable, "-m", "luxc",
         str(LUX_SOURCE),
-        "-o", str(PLAYGROUND_DIR),
+        "-o", str(SHADERCACHE),
     ]
     print(f"  Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))

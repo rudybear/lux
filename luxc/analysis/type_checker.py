@@ -13,6 +13,7 @@ from luxc.builtins.types import (
     VEC2, VEC3, VEC4, MAT2, MAT3, MAT4,
     VectorType, MatrixType, ScalarType, is_numeric,
     register_type_alias, clear_type_aliases,
+    RuntimeArrayType,
 )
 from luxc.builtins.functions import lookup_builtin
 from luxc.analysis.symbols import Scope, Symbol
@@ -128,6 +129,14 @@ class TypeChecker:
         for si in getattr(stage, 'storage_images', []):
             from luxc.builtins.types import STORAGE_IMAGE
             scope.define(Symbol(si.name, STORAGE_IMAGE, "storage_image"))
+
+        # Register storage buffer variables (runtime arrays)
+        for sb in getattr(stage, 'storage_buffers', []):
+            elem_t = resolve_type(sb.element_type)
+            if elem_t is None:
+                raise TypeCheckError(f"Unknown element type '{sb.element_type}' in storage_buffer '{sb.name}'")
+            arr_type = RuntimeArrayType(f"_rtarr_{sb.element_type}", sb.element_type)
+            scope.define(Symbol(sb.name, arr_type, "storage_buffer"))
 
         # Register RT built-in variables
         _RT_STAGE_TYPES = {"raygen", "closest_hit", "any_hit", "miss", "intersection", "callable"}
@@ -291,8 +300,13 @@ class TypeChecker:
         elif isinstance(expr, IndexAccess):
             obj_type = self._check_expr(expr.object, scope)
             self._check_expr(expr.index, scope)
+            # storage_buffer[i] -> element_type
+            if isinstance(obj_type, RuntimeArrayType):
+                result = resolve_type(obj_type.element_type_name)
+                if result is None:
+                    result = SCALAR
             # mat[i] -> vecN, vec[i] -> scalar
-            if isinstance(obj_type, MatrixType):
+            elif isinstance(obj_type, MatrixType):
                 result = {2: VEC2, 3: VEC3, 4: VEC4}[obj_type.size]
             elif isinstance(obj_type, VectorType):
                 result = resolve_type(obj_type.component)
@@ -333,6 +347,9 @@ def _check_binary_op(op: str, left: LuxType, right: LuxType) -> LuxType:
     if op in ("+", "-", "/", "%"):
         if left.name == right.name and is_numeric(left):
             return left
+        # Mixed scalar types (int/uint/scalar) -> scalar (codegen handles conversion)
+        if isinstance(left, ScalarType) and isinstance(right, ScalarType):
+            return SCALAR
         # scalar op vec -> vec, vec op scalar -> vec
         if isinstance(left, ScalarType) and isinstance(right, VectorType):
             return right
@@ -344,6 +361,9 @@ def _check_binary_op(op: str, left: LuxType, right: LuxType) -> LuxType:
         # Same types
         if left.name == right.name and is_numeric(left):
             return left
+        # Mixed scalar types (int/uint/scalar) -> scalar (codegen handles conversion)
+        if isinstance(left, ScalarType) and isinstance(right, ScalarType):
+            return SCALAR
         # scalar * vec -> vec
         if isinstance(left, ScalarType) and isinstance(right, VectorType):
             return right

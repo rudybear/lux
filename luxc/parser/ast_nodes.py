@@ -11,6 +11,27 @@ class SourceLocation:
     column: int
 
 
+# --- Feature expressions (compile-time) ---
+
+@dataclass
+class FeatureRef:
+    name: str
+
+@dataclass
+class FeatureAnd:
+    left: object  # FeatureExpr
+    right: object  # FeatureExpr
+
+@dataclass
+class FeatureOr:
+    left: object  # FeatureExpr
+    right: object  # FeatureExpr
+
+@dataclass
+class FeatureNot:
+    operand: object  # FeatureExpr
+
+
 # --- Module ---
 
 @dataclass
@@ -27,6 +48,7 @@ class Module:
     schedules: list[ScheduleDecl] = field(default_factory=list)
     environments: list[EnvironmentDecl] = field(default_factory=list)
     procedurals: list[ProceduralDecl] = field(default_factory=list)
+    features_decls: list[FeaturesDecl] = field(default_factory=list)
 
 
 # --- Top-level declarations ---
@@ -65,13 +87,46 @@ class ImportDecl:
     loc: Optional[SourceLocation] = None
 
 
+@dataclass
+class FeaturesDecl:
+    features: list[str]  # feature flag names
+    loc: Optional[SourceLocation] = None
+
+@dataclass
+class ConditionalBlock:
+    condition: object  # FeatureExpr
+    items: list  # list of module_items
+    loc: Optional[SourceLocation] = None
+
+
 # --- Surface declarations ---
+
+@dataclass
+class SurfaceSampler:
+    name: str
+    type_name: str = "sampler2d"  # "sampler2d" or "samplerCube"
+    condition: object = None
+
+
+@dataclass
+class LayerArg:
+    name: str
+    value: Expr
+
+
+@dataclass
+class LayerCall:
+    name: str
+    args: list[LayerArg]
+    condition: object = None
+
 
 @dataclass
 class SurfaceDecl:
     name: str
     members: list[SurfaceMember]
-    samplers: list[str] = field(default_factory=list)
+    samplers: list[SurfaceSampler] = field(default_factory=list)
+    layers: Optional[list[LayerCall]] = None
     loc: Optional[SourceLocation] = None
 
 
@@ -96,6 +151,7 @@ class GeometryDecl:
 class GeometryField:
     name: str
     type_name: str
+    condition: object = None
 
 
 @dataclass
@@ -113,6 +169,7 @@ class GeometryOutputs:
 class OutputBinding:
     name: str
     value: Expr
+    condition: object = None
 
 
 # --- Pipeline declarations ---
@@ -128,6 +185,7 @@ class PipelineDecl:
 class PipelineMember:
     name: str
     value: Expr
+    condition: object = None
 
 
 # --- Schedule declarations ---
@@ -143,6 +201,7 @@ class ScheduleDecl:
 class ScheduleMember:
     name: str
     value: str
+    condition: object = None
 
 
 # --- Environment declarations (RT miss shader) ---
@@ -151,7 +210,7 @@ class ScheduleMember:
 class EnvironmentDecl:
     name: str
     members: list[SurfaceMember]
-    samplers: list[str] = field(default_factory=list)
+    samplers: list[SurfaceSampler] = field(default_factory=list)
     loc: Optional[SourceLocation] = None
 
 
@@ -186,6 +245,7 @@ class StageBlock:
     callable_data: list[CallableDataDecl] = field(default_factory=list)
     accel_structs: list[AccelDecl] = field(default_factory=list)
     storage_images: list[StorageImageDecl] = field(default_factory=list)
+    storage_buffers: list[StorageBufferDecl] = field(default_factory=list)
     loc: Optional[SourceLocation] = None
 
 
@@ -265,6 +325,15 @@ class AccelDecl:
 @dataclass
 class StorageImageDecl:
     name: str
+    set_number: Optional[int] = None
+    binding: Optional[int] = None
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class StorageBufferDecl:
+    name: str
+    element_type: str  # type of each element in the runtime array
     set_number: Optional[int] = None
     binding: Optional[int] = None
     loc: Optional[SourceLocation] = None

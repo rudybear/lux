@@ -31,6 +31,7 @@ from PIL import Image
 # Ensure playground/ is on sys.path so lazy imports of sibling modules work
 # regardless of whether we're run as `python -m playground.engine` or directly.
 _PLAYGROUND_DIR = str(Path(__file__).resolve().parent)
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PLAYGROUND_DIR not in sys.path:
     sys.path.insert(0, _PLAYGROUND_DIR)
 
@@ -339,13 +340,13 @@ def resolve_pipeline(pipeline_arg: Optional[str], scene_source: str) -> str:
     if pipeline_arg:
         return pipeline_arg
     if scene_source.endswith((".glb", ".gltf")):
-        return "examples/gltf_pbr"
+        return "shadercache/gltf_pbr"
     elif scene_source == "fullscreen":
         raise ValueError("--pipeline is required for fullscreen scenes")
     elif scene_source == "triangle":
-        return "examples/hello_triangle"
+        return "shadercache/hello_triangle"
     else:
-        return "examples/pbr_basic"
+        return "shadercache/pbr_basic"
 
 
 def detect_render_path(pipeline_base: str) -> str:
@@ -568,7 +569,7 @@ def _upload_cubemap_f16(device: wgpu.GPUDevice, face_size: int, num_faces: int,
 def _load_ibl_assets(device: wgpu.GPUDevice, ibl_name: str) -> dict:
     """Load preprocessed IBL assets and upload cubemaps. Returns name -> (sampler, view) dict."""
     import json
-    assets_dir = Path(__file__).parent / "assets" / "ibl" / ibl_name
+    assets_dir = Path(_PROJECT_ROOT) / "assets" / "ibl" / ibl_name
     manifest_path = assets_dir / "manifest.json"
     if not manifest_path.exists():
         print(f"[warn] IBL assets not found at {assets_dir}, using defaults")
@@ -879,7 +880,7 @@ def render(
             gpu_scene.textures[name] = tex
     else:
         # Auto-detect: prefer "pisa" then "neutral", matching C++/Rust engines
-        ibl_dir = Path(__file__).parent / "assets" / "ibl"
+        ibl_dir = Path(_PROJECT_ROOT) / "assets" / "ibl"
         if ibl_dir.exists():
             preferred = ["pisa", "neutral"]
             candidates = [d.name for d in ibl_dir.iterdir()
@@ -1025,7 +1026,7 @@ def main():
     parser.add_argument("--output", "-o", default="output.png", help="Output PNG path")
     parser.add_argument("--width", type=int, default=512, help="Render width")
     parser.add_argument("--height", type=int, default=512, help="Render height")
-    parser.add_argument("--ibl", default="", help="IBL environment name (from playground/assets/ibl/)")
+    parser.add_argument("--ibl", default="", help="IBL environment name (from assets/ibl/)")
     parser.add_argument("--camera-elevation", type=float, default=5.0,
                         help="Camera elevation angle in degrees (0 = straight-on)")
     args = parser.parse_args()

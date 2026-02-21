@@ -91,9 +91,9 @@ The following identifiers are reserved as keywords and may not be used as user-d
 | Declarations | `fn`, `let`, `const`, `type`, `struct`, `import` |
 | Control flow | `return`, `if`, `else` |
 | Stage types | `vertex`, `fragment`, `raygen`, `closest_hit`, `any_hit`, `miss`, `intersection`, `callable` |
-| Stage items | `in`, `out`, `uniform`, `push`, `sampler2d` |
+| Stage items | `in`, `out`, `uniform`, `push`, `sampler2d`, `samplerCube` |
 | RT items | `ray_payload`, `hit_attribute`, `callable_data`, `acceleration_structure` |
-| Declarative | `surface`, `geometry`, `pipeline`, `schedule`, `environment`, `procedural` |
+| Declarative | `surface`, `geometry`, `pipeline`, `schedule`, `environment`, `procedural`, `layers` |
 | Boolean | `true`, `false` |
 
 ### 2.6 Literals
@@ -228,6 +228,7 @@ All matrices are column-major. Matrices use `ColMajor` layout with a `MatrixStri
 | Lux Type | Description | SPIR-V Mapping |
 |---|---|---|
 | `sampler2d` | 2D texture sampler | `OpTypeSampledImage` (split into `OpTypeSampler` + `OpTypeImage` for codegen) |
+| `samplerCube` | Cube map texture sampler | `OpTypeSampledImage` with `Cube` dimensionality (split into `OpTypeSampler` + `OpTypeImage Cube` for codegen) |
 | `acceleration_structure` | RT top-level acceleration structure | `OpTypeAccelerationStructureKHR` |
 
 ### 3.5 Type Aliases
@@ -385,6 +386,47 @@ Imports bring all exported symbols (functions, constants, type aliases, schedule
 import brdf;
 import noise;
 ```
+
+### 4.7 Features Declarations
+
+```
+features_decl: "features" "{" feature_field ("," feature_field)* ","? "}"
+feature_field: IDENT ":" "bool"
+```
+
+Features blocks declare compile-time boolean flags. Multiple blocks are merged.
+
+### 4.8 Conditional Blocks
+
+```
+conditional_block: "if" feature_expr "{" module_item* "}"
+```
+
+Module-level `if` blocks conditionally include top-level declarations.
+
+### 4.9 Feature Expressions
+
+```
+?feature_expr: feature_or
+?feature_or: feature_and ("||" feature_and)*
+?feature_and: feature_not ("&&" feature_not)*
+?feature_not: "!" feature_not -> feature_negate
+            | feature_primary
+?feature_primary: IDENT -> feature_ref
+                | "(" feature_expr ")"
+```
+
+Feature expressions evaluate at compile time against the active feature set. They support `&&` (and), `||` (or), `!` (not), and parenthesized grouping.
+
+### 4.10 `if` Guard Suffix
+
+The `("if" feature_expr)?` suffix is supported on:
+- `surface_sampler` — conditional texture bindings
+- `layer_call` — conditional material layers
+- `geometry_field` — conditional vertex attributes
+- `output_binding` — conditional vertex outputs
+- `schedule_member` — conditional schedule overrides
+- `pipeline_member` — conditional pipeline configuration
 
 ---
 
@@ -667,9 +709,12 @@ Declares a push constant block. Fields follow std140 layout. Push constant field
 
 ```
 sampler2d name;
+samplerCube name;
 ```
 
-Declares a 2D texture sampler. Each sampler declaration generates two bindings: one for the sampler state and one for the texture image (for WebGPU/Vulkan compatibility). Samplers are automatically assigned descriptor set and binding numbers.
+Declares a 2D texture sampler or a cube map texture sampler. Each sampler declaration generates two bindings: one for the sampler state and one for the texture image (for WebGPU/Vulkan compatibility). Samplers are automatically assigned descriptor set and binding numbers.
+
+A `sampler2d` samples a 2D texture image with `vec2` UV coordinates. A `samplerCube` samples a cube map texture with a `vec3` direction vector.
 
 #### 7.2.6 Functions
 
@@ -866,8 +911,13 @@ Where `T` is any of `scalar`, `vec2`, `vec3`, `vec4`. `distance` and `dot` are d
 | Function | Signature | Description | SPIR-V Mapping |
 |---|---|---|---|
 | `sample(tex, uv)` | `sampler2d, vec2 -> vec4` | Sample a 2D texture at UV coordinates | `OpImageSampleImplicitLod` |
+| `sample(tex, dir)` | `samplerCube, vec3 -> vec4` | Sample a cube map texture with a direction vector | `OpImageSampleImplicitLod` |
+| `sample_lod(tex, uv, lod)` | `sampler2d, vec2, scalar -> vec4` | Sample a 2D texture at an explicit mip level | `OpImageSampleExplicitLod` with `Lod` operand |
+| `sample_lod(tex, dir, lod)` | `samplerCube, vec3, scalar -> vec4` | Sample a cube map at an explicit mip level | `OpImageSampleExplicitLod` with `Lod` operand |
 
-The `sample` function internally loads the separate sampler and texture image, combines them with `OpSampledImage`, then performs `OpImageSampleImplicitLod`.
+The `sample` function internally loads the separate sampler and texture image, combines them with `OpSampledImage`, then performs `OpImageSampleImplicitLod`. The `sample_lod` variant uses `OpImageSampleExplicitLod` with the `Lod` operand, which is required in ray tracing stages where implicit derivatives are not available.
+
+**RT auto-rewrite**: When a surface declaration containing `sample()` calls is compiled for a ray tracing pipeline, the compiler automatically rewrites all `sample()` calls to `sample_lod()` with LOD 0. This allows the same surface declaration to work in both raster and RT modes without modification.
 
 ### 9.5 Ray Tracing Functions
 
@@ -1264,7 +1314,9 @@ Output expressions may reference input fields, transform uniforms, and built-in 
 
 ### 12.2 Surface Block
 
-A surface block declares material properties and the BRDF evaluation function.
+A surface block declares material properties and the BRDF evaluation function. There are two syntax forms: the **member syntax** (using `brdf:`) and the **layered syntax** (using `layers [...]`).
+
+#### 12.2.1 Member Syntax (Basic)
 
 ```
 surface Name {
@@ -1274,7 +1326,7 @@ surface Name {
 }
 ```
 
-**Sampler declarations** (`sampler2d name`) register texture samplers that will be available in the generated fragment shader.
+**Sampler declarations** (`sampler2d name` or `samplerCube name`) register texture samplers that will be available in the generated fragment shader. Both 2D and cube map samplers are supported.
 
 **Members** define material properties. The key member is `brdf`, which specifies the BRDF evaluation to use:
 
@@ -1300,6 +1352,80 @@ The generated fragment shader provides `n` (normalized surface normal), `v` (vie
 - `uniform Light { light_dir: vec3, view_pos: vec3 }` block
 - Sampler declarations
 - A `fn main()` that normalizes the surface normal, computes view and light directions, evaluates the BRDF, applies ambient and exposure, and writes the final color
+
+#### 12.2.2 Layered Syntax
+
+The layered syntax provides a composable way to build complex materials from individual lighting layers:
+
+```
+surface Name {
+    sampler2d texture_2d_name,
+    samplerCube cubemap_name,
+    member_name: expression,
+    ...
+    layers [
+        layer_name(arg_name: expression, ...),
+        layer_name(arg_name: expression, ...),
+    ]
+}
+```
+
+**Layer ordering**: Layers are listed bottom-to-top (base layer first). The compiler evaluates them top-to-bottom with albedo-scaling for energy conservation. Each layer consumes a fraction of the remaining light energy before passing the rest to the layer below it.
+
+**Built-in layer types**:
+
+| Layer | Arguments | Description |
+|---|---|---|
+| `base(albedo, roughness, metallic)` | `albedo: vec3`, `roughness: scalar`, `metallic: scalar` | PBR direct lighting via `gltf_pbr`. This is the foundation layer that computes Cook-Torrance specular + Lambertian diffuse. |
+| `normal_map(map)` | `map: sampler2d` | TBN normal perturbation. Samples the normal map, transforms from tangent space to world space using the TBN matrix, and perturbs the surface normal used by subsequent layers. |
+| `ibl(specular_map, irradiance_map, brdf_lut)` | `specular_map: samplerCube`, `irradiance_map: samplerCube`, `brdf_lut: sampler2d` | Image-based lighting with multi-scattering energy compensation. Samples the irradiance map for diffuse IBL and the pre-filtered specular map at a roughness-dependent mip level for specular IBL. Applies the split-sum approximation using the BRDF LUT and adds multi-scattering energy compensation. |
+| `emission(color)` | `color: vec3` | Additive emissive contribution. Adds the given color directly to the final output, unaffected by lighting. |
+
+**Example**:
+
+```
+surface PBRMaterial {
+    sampler2d albedo_tex,
+    sampler2d normal_tex,
+    sampler2d metalrough_tex,
+    sampler2d brdf_lut,
+    samplerCube specular_map,
+    samplerCube irradiance_map,
+    layers [
+        base(
+            albedo: sample(albedo_tex, frag_uv).rgb,
+            roughness: sample(metalrough_tex, frag_uv).g,
+            metallic: sample(metalrough_tex, frag_uv).b,
+        ),
+        normal_map(map: normal_tex),
+        ibl(
+            specular_map: specular_map,
+            irradiance_map: irradiance_map,
+            brdf_lut: brdf_lut,
+        ),
+    ]
+}
+```
+
+**Energy conservation**: The layer system ensures energy conservation automatically. The `ibl` layer adds indirect illumination that is scaled by the surface's albedo and Fresnel response, while the `base` layer provides direct illumination. The compiler evaluates layers from top to bottom, with each layer modifying the surface appearance in a physically-consistent manner.
+
+#### 12.2.3 RT Unification
+
+The same surface declaration (whether using member or layered syntax) compiles to both raster fragment shaders and RT closest-hit shaders. When compiling for a ray tracing pipeline:
+
+- All `sample()` calls are automatically rewritten to `sample_lod()` with LOD 0, since implicit derivatives are not available in RT stages.
+- The fragment shader `main()` logic is adapted into a `closest_hit` stage that reads hit attributes and writes to the incoming ray payload.
+- No changes to the surface declaration are required to switch between raster and RT modes.
+
+#### 12.2.4 AST Representation
+
+The layered surface syntax introduces three new AST node types:
+
+| AST Node | Fields | Description |
+|---|---|---|
+| `SurfaceSampler` | `sampler_type: str`, `name: str` | A sampler declaration within a surface block. The `sampler_type` field is `"sampler2d"` or `"samplerCube"`. |
+| `LayerCall` | `name: str`, `args: list[LayerArg]` | A single layer invocation within a `layers` block. |
+| `LayerArg` | `name: str`, `value: Expr` | A named argument to a layer call. |
 
 ### 12.3 Schedule Block
 
@@ -1631,6 +1757,63 @@ The SPIR-V assembly text is processed by external tools:
 | `intersection` | `.rint.spv` |
 | `callable` | `.rcall.spv` |
 
+### CLI Flags
+
+| Flag | Description |
+|---|---|
+| `--no-validate` | Skip SPIR-V validation after assembly. |
+| `--pipeline <name>` | Compile only the named pipeline from a multi-pipeline file. When a `.lux` file contains multiple `pipeline` declarations, this flag selects a single pipeline by name for compilation. Only the stage blocks generated by the selected pipeline (and its referenced geometry, surface, environment, and procedural declarations) are emitted. If omitted, all pipelines in the file are compiled. |
+| `--features <list>` | Comma-separated list of feature flags to enable (e.g., `--features has_normal_map,has_clearcoat`). |
+| `--all-permutations` | Compile all 2^N feature combinations and emit a permutation manifest. |
+
+### Compile-Time Feature Stripping
+
+When a module declares `features { ... }`, the compiler:
+
+1. Collects all feature flag names from `features_decl` blocks
+2. Receives the active feature set from `--features` CLI flag (or programmatic API)
+3. Evaluates all `if` guard conditions against the active set
+4. Strips (removes) items whose conditions evaluate to false
+5. Inlines `conditional_block` contents whose conditions are true
+6. Clears all condition fields — downstream passes see a clean AST
+
+This is a preprocessing step, not runtime branching. The generated SPIR-V contains only code for enabled features.
+
+#### Output Naming
+
+Feature-enabled outputs include a sorted suffix:
+- Base (no features): `shader.frag.spv`
+- With features: `shader+emission+normal_map.frag.spv`
+
+#### Reflection Metadata
+
+When features are active, the reflection JSON includes:
+
+```json
+{
+    "features": {
+        "has_normal_map": true,
+        "has_clearcoat": false
+    },
+    "feature_suffix": "+normal_map"
+}
+```
+
+#### Permutation Generation
+
+`--all-permutations` compiles all 2^N combinations and emits a manifest:
+
+```json
+{
+    "pipeline": "GltfForward",
+    "features": ["has_normal_map", "has_clearcoat"],
+    "permutations": [
+        { "suffix": "", "features": {"has_normal_map": false, "has_clearcoat": false} },
+        { "suffix": "+normal_map", "features": {"has_normal_map": true, "has_clearcoat": false} }
+    ]
+}
+```
+
 ---
 
 ## 15. SPIR-V Output
@@ -1933,6 +2116,91 @@ This produces three SPIR-V modules:
 
 The same `surface CopperMetal` declaration can be used with both a rasterization pipeline and an RT pipeline without modification.
 
+### 17.5 Layered PBR with IBL (Surface Layers)
+
+A fully declarative PBR material using the layered surface syntax with image-based lighting, normal mapping, and multi-pipeline compilation.
+
+```
+// glTF PBR with IBL using layered surface syntax
+// Compiles to both raster and RT pipelines from the same surface declaration
+
+import brdf;
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    uv: vec2,
+    tangent: vec4,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        frag_uv: uv,
+        frag_tangent: tangent,
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+// Layered surface: base PBR + normal map + IBL
+surface GltfPBR {
+    sampler2d albedo_tex,
+    sampler2d normal_tex,
+    sampler2d metalrough_tex,
+    sampler2d brdf_lut,
+    samplerCube specular_map,
+    samplerCube irradiance_map,
+    layers [
+        base(
+            albedo: sample(albedo_tex, frag_uv).rgb,
+            roughness: sample(metalrough_tex, frag_uv).g,
+            metallic: sample(metalrough_tex, frag_uv).b,
+        ),
+        normal_map(map: normal_tex),
+        ibl(
+            specular_map: specular_map,
+            irradiance_map: irradiance_map,
+            brdf_lut: brdf_lut,
+        ),
+    ]
+}
+
+environment GradientSky {
+    color: mix(vec3(1.0), vec3(0.5, 0.7, 1.0), 0.5),
+}
+
+// Raster pipeline
+pipeline RasterForward {
+    geometry: StandardMesh,
+    surface: GltfPBR,
+}
+
+// RT pipeline -- same surface, different mode
+pipeline RTPathTracer {
+    mode: raytrace,
+    surface: GltfPBR,
+    environment: GradientSky,
+    max_bounces: 1,
+}
+```
+
+Compile only the raster pipeline:
+
+```
+luxc gltf_pbr.lux --pipeline RasterForward
+```
+
+Compile only the RT pipeline:
+
+```
+luxc gltf_pbr.lux --pipeline RTPathTracer
+```
+
+The same `surface GltfPBR` declaration works for both pipelines. For the RT pipeline, the compiler automatically rewrites `sample()` calls to `sample_lod()` with LOD 0.
+
 ---
 
 ## Grammar Reference (EBNF)
@@ -1948,6 +2216,8 @@ module_item     = const_decl
                 | struct_def
                 | type_alias
                 | import_decl
+                | features_decl
+                | conditional_block
                 | surface_decl
                 | geometry_decl
                 | pipeline_decl
@@ -1962,11 +2232,25 @@ struct_field    = IDENT ":" type ;
 type_alias      = "type" IDENT "=" type ";" ;
 import_decl     = "import" IDENT ";" ;
 
+(* -- Features -- *)
+features_decl   = "features" "{" feature_field ("," feature_field)* ","? "}" ;
+feature_field   = IDENT ":" "bool" ;
+conditional_block = "if" feature_expr "{" module_item* "}" ;
+feature_expr    = feature_or ;
+feature_or      = feature_and ("||" feature_and)* ;
+feature_and     = feature_not ("&&" feature_not)* ;
+feature_not     = "!" feature_not | feature_primary ;
+feature_primary = IDENT | "(" feature_expr ")" ;
+
 (* -- Surface -- *)
 surface_decl    = "surface" IDENT "{" surface_item ("," surface_item)* ","? "}" ;
-surface_item    = surface_sampler | surface_member ;
-surface_sampler = "sampler2d" IDENT ;
+surface_item    = surface_sampler | surface_member | surface_layers ;
+surface_sampler = SAMPLER_KW IDENT ;
+SAMPLER_KW      = "sampler2d" | "samplerCube" ;
 surface_member  = IDENT ":" expr ;
+surface_layers  = "layers" "[" layer_call ("," layer_call)* ","? "]" ;
+layer_call      = IDENT "(" layer_arg ("," layer_arg)* ","? ")" ;
+layer_arg       = IDENT ":" expr ;
 
 (* -- Geometry -- *)
 geometry_decl   = "geometry" IDENT "{" geometry_item* "}" ;
@@ -2006,7 +2290,7 @@ out_decl        = "out" IDENT ":" type ";" ;
 uniform_block   = "uniform" IDENT "{" block_field ("," block_field)* ","? "}" ;
 push_block      = "push" IDENT "{" block_field ("," block_field)* ","? "}" ;
 block_field     = IDENT ":" type ;
-sampler_decl    = "sampler2d" IDENT ";" ;
+sampler_decl    = SAMPLER_KW IDENT ";" ;
 
 ray_payload_decl     = "ray_payload" IDENT ":" type ";" ;
 hit_attribute_decl   = "hit_attribute" IDENT ":" type ";" ;
@@ -2036,7 +2320,7 @@ TYPE_NAME       = "scalar" | "int" | "uint" | "bool" | "void"
                 | "ivec2" | "ivec3" | "ivec4"
                 | "uvec2" | "uvec3" | "uvec4"
                 | "mat2" | "mat3" | "mat4"
-                | "sampler2d" | "acceleration_structure"
+                | "sampler2d" | "samplerCube" | "acceleration_structure"
                 | IDENT (* user-defined type alias *) ;
 
 (* -- Expressions (precedence climbing) -- *)

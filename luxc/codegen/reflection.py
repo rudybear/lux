@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from luxc.parser.ast_nodes import (
     Module, StageBlock, VarDecl, UniformBlock, PushBlock, BlockField,
-    SamplerDecl, AccelDecl, StorageImageDecl,
+    SamplerDecl, AccelDecl, StorageImageDecl, StorageBufferDecl,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl,
 )
 from luxc.analysis.layout_assigner import compute_std140_offsets, _std140_size_align
@@ -59,7 +59,13 @@ _TYPE_BYTE_SIZE = {
 }
 
 
-def generate_reflection(module: Module, stage: StageBlock, source_name: str = "") -> dict:
+def generate_reflection(
+    module: Module,
+    stage: StageBlock,
+    source_name: str = "",
+    features: dict[str, bool] | None = None,
+    feature_suffix: str = "",
+) -> dict:
     """Generate reflection metadata dict for a single stage.
 
     Args:
@@ -76,6 +82,10 @@ def generate_reflection(module: Module, stage: StageBlock, source_name: str = ""
         "stage": stage.stage_type,
         "execution_model": _EXEC_MODELS.get(stage.stage_type, "Unknown"),
     }
+
+    if features is not None:
+        result["features"] = features
+        result["feature_suffix"] = feature_suffix
 
     # --- Inputs ---
     result["inputs"] = [
@@ -160,6 +170,20 @@ def generate_reflection(module: Module, stage: StageBlock, source_name: str = ""
             "binding": si.binding,
             "type": "storage_image",
             "name": si.name,
+            "stage_flags": [stage.stage_type],
+        })
+
+    # Storage buffers
+    for sb in getattr(stage, 'storage_buffers', []):
+        set_key = str(sb.set_number)
+        if set_key not in descriptor_sets:
+            descriptor_sets[set_key] = []
+
+        descriptor_sets[set_key].append({
+            "binding": sb.binding,
+            "type": "storage_buffer",
+            "name": sb.name,
+            "element_type": sb.element_type,
             "stage_flags": [stage.stage_type],
         })
 

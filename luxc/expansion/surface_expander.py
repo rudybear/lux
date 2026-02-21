@@ -18,9 +18,12 @@ from luxc.parser.ast_nodes import (
     FunctionDef, Param, LetStmt, AssignStmt, ReturnStmt, ExprStmt,
     NumberLit, VarRef, BinaryOp, CallExpr, ConstructorExpr,
     SwizzleAccess, UnaryOp,
-    AssignTarget, SurfaceDecl, GeometryDecl, PipelineDecl,
+    AssignTarget, SurfaceDecl, SurfaceSampler, LayerCall, LayerArg,
+    GeometryDecl, PipelineDecl,
     ScheduleDecl, EnvironmentDecl, ProceduralDecl,
     RayPayloadDecl, HitAttributeDecl, AccelDecl,
+    StorageBufferDecl, IndexAccess, FieldAccess,
+    IfStmt,
 )
 
 
@@ -64,7 +67,7 @@ def _resolve_schedule(module: Module, name: str) -> dict[str, str]:
     raise ValueError(f"Schedule '{name}' not found")
 
 
-def expand_surfaces(module: Module) -> None:
+def expand_surfaces(module: Module, pipeline_filter: str | None = None) -> None:
     """Expand pipeline/surface/geometry declarations into stage blocks.
 
     If a pipeline declaration references a surface and geometry by name,
@@ -73,6 +76,8 @@ def expand_surfaces(module: Module) -> None:
 
     For RT pipelines (mode: raytrace), generates raygen, closest_hit,
     miss, and optionally any_hit/intersection stages.
+
+    If pipeline_filter is set, only expand the named pipeline.
     """
     # Index declarations by name
     surfaces = {s.name: s for s in module.surfaces}
@@ -81,6 +86,9 @@ def expand_surfaces(module: Module) -> None:
     procedurals = {p.name: p for p in module.procedurals}
 
     for pipeline in module.pipelines:
+        # Filter: skip pipelines that don't match the filter
+        if pipeline_filter and pipeline.name != pipeline_filter:
+            continue
         geo_name = None
         surf_name = None
         schedule_name = None
@@ -270,11 +278,14 @@ def _expand_surface_to_fragment(
     ]))
 
     # Add sampler declarations from the surface
-    for sam_name in surface.samplers:
-        stage.samplers.append(SamplerDecl(sam_name))
+    for sam in surface.samplers:
+        stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
 
-    # Generate main function body
-    body = _generate_surface_main(surface, frag_inputs, schedule)
+    # Generate main function body - use layered path if surface has layers
+    if surface.layers is not None:
+        body = _generate_layered_main(surface, frag_inputs, schedule)
+    else:
+        body = _generate_surface_main(surface, frag_inputs, schedule)
     stage.functions.append(FunctionDef("main", [], None, body))
 
     return stage
@@ -371,6 +382,265 @@ def _generate_surface_main(
     return body
 
 
+def _get_layer_args(layer: LayerCall) -> dict:
+    """Extract layer arguments as a name→expr dict."""
+    return {arg.name: arg.value for arg in layer.args}
+
+
+def _generate_layered_main(
+    surface: SurfaceDecl,
+    frag_inputs: list[tuple[str, str]],
+    schedule: dict[str, str] | None = None,
+) -> list:
+    """Generate main() body for a layered surface-expanded fragment shader.
+
+    Processes layer declarations to generate PBR lighting code equivalent to
+    hand-written gltf_pbr.lux. Supports base, normal_map, ibl, and emission layers.
+    """
+    body = []
+
+    # Index layers by name
+    layers_by_name = {}
+    for layer in surface.layers:
+        layers_by_name[layer.name] = layer
+
+    # Determine which inputs we have
+    has_pos = any(n in ("world_pos", "frag_pos") for n, _ in frag_inputs)
+    pos_var = next(
+        (n for n, _ in frag_inputs if n in ("world_pos", "frag_pos")),
+        "world_pos",
+    )
+    has_tangent = any(n == "world_tangent" for n, _ in frag_inputs)
+
+    # Create UV alias so layer expressions using `uv` resolve correctly
+    body.append(LetStmt("uv", "vec2", VarRef("frag_uv")))
+
+    # --- Normal setup ---
+    if "normal_map" in layers_by_name and has_tangent:
+        nmap_args = _get_layer_args(layers_by_name["normal_map"])
+        map_expr = nmap_args.get("map")
+        body.append(LetStmt("normal_map_raw", "vec3", map_expr))
+        body.append(LetStmt("n", "vec3", CallExpr(VarRef("tbn_perturb_normal"), [
+            VarRef("normal_map_raw"),
+            CallExpr(VarRef("normalize"), [VarRef("world_normal")]),
+            CallExpr(VarRef("normalize"), [VarRef("world_tangent")]),
+            CallExpr(VarRef("normalize"), [VarRef("world_bitangent")]),
+        ])))
+    else:
+        normal_var = next(
+            (n for n, _ in frag_inputs if n in ("world_normal", "frag_normal")),
+            "world_normal",
+        )
+        body.append(LetStmt("n", "vec3",
+            CallExpr(VarRef("normalize"), [VarRef(normal_var)])))
+
+    # --- View and light directions ---
+    if has_pos:
+        body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
+            BinaryOp("-", VarRef("view_pos"), VarRef(pos_var)),
+        ])))
+    else:
+        body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
+            ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("0.0"), NumberLit("1.0")]),
+        ])))
+    body.append(LetStmt("l", "vec3",
+        CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+    body.append(LetStmt("n_dot_v", "scalar", CallExpr(VarRef("max"), [
+        CallExpr(VarRef("dot"), [VarRef("n"), VarRef("v")]),
+        NumberLit("0.001"),
+    ])))
+
+    # --- Base layer: direct lighting ---
+    result_var = "result_zero"
+    body.append(LetStmt(result_var, "vec3",
+        ConstructorExpr("vec3", [NumberLit("0.0")])))
+
+    if "base" in layers_by_name:
+        base_args = _get_layer_args(layers_by_name["base"])
+        albedo_expr = base_args.get("albedo",
+            ConstructorExpr("vec3", [NumberLit("0.5")]))
+        roughness_expr = base_args.get("roughness", NumberLit("0.5"))
+        metallic_expr = base_args.get("metallic", NumberLit("0.0"))
+
+        body.append(LetStmt("layer_albedo", "vec3", albedo_expr))
+        body.append(LetStmt("layer_roughness", "scalar", roughness_expr))
+        body.append(LetStmt("layer_metallic", "scalar", metallic_expr))
+
+        # Direct lighting via gltf_pbr (includes N·L)
+        body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
+            VarRef("n"), VarRef("v"), VarRef("l"),
+            VarRef("layer_albedo"), VarRef("layer_roughness"),
+            VarRef("layer_metallic"),
+        ])))
+        # Light color tint
+        body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
+            VarRef("direct"),
+            ConstructorExpr("vec3", [
+                NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95"),
+            ]),
+        )))
+        result_var = "direct_lit"
+
+    # --- IBL layer: image-based lighting ---
+    if "ibl" in layers_by_name:
+        ibl_args = _get_layer_args(layers_by_name["ibl"])
+        specular_map = ibl_args.get("specular_map")
+        irradiance_map = ibl_args.get("irradiance_map")
+        brdf_lut_ref = ibl_args.get("brdf_lut")
+
+        # F0 = mix(0.04, albedo, metallic)
+        body.append(LetStmt("f0", "vec3", CallExpr(VarRef("mix"), [
+            ConstructorExpr("vec3", [NumberLit("0.04")]),
+            VarRef("layer_albedo"),
+            VarRef("layer_metallic"),
+        ])))
+
+        # Reflection vector
+        body.append(LetStmt("r", "vec3", CallExpr(VarRef("reflect"), [
+            BinaryOp("*", VarRef("v"), UnaryOp("-", NumberLit("1.0"))),
+            VarRef("n"),
+        ])))
+
+        # Sample IBL textures
+        body.append(LetStmt("prefiltered", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                specular_map, VarRef("r"),
+                BinaryOp("*", VarRef("layer_roughness"), NumberLit("8.0")),
+            ]),
+            "xyz",
+        )))
+        body.append(LetStmt("irradiance", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample"), [irradiance_map, VarRef("n")]),
+            "xyz",
+        )))
+        body.append(LetStmt("brdf_sample", "vec2", SwizzleAccess(
+            CallExpr(VarRef("sample"), [
+                brdf_lut_ref,
+                ConstructorExpr("vec2", [
+                    VarRef("n_dot_v"), VarRef("layer_roughness"),
+                ]),
+            ]),
+            "xy",
+        )))
+
+        # Roughness-dependent Fresnel (Fdez-Aguera 2019)
+        body.append(LetStmt("fr", "vec3", BinaryOp("-",
+            CallExpr(VarRef("max"), [
+                ConstructorExpr("vec3", [
+                    BinaryOp("-", NumberLit("1.0"), VarRef("layer_roughness")),
+                ]),
+                VarRef("f0"),
+            ]),
+            VarRef("f0"),
+        )))
+        body.append(LetStmt("k_s", "vec3", BinaryOp("+",
+            VarRef("f0"),
+            BinaryOp("*",
+                VarRef("fr"),
+                CallExpr(VarRef("pow"), [
+                    CallExpr(VarRef("clamp"), [
+                        BinaryOp("-", NumberLit("1.0"), VarRef("n_dot_v")),
+                        NumberLit("0.0"),
+                        NumberLit("1.0"),
+                    ]),
+                    NumberLit("5.0"),
+                ]),
+            ),
+        )))
+
+        # Multi-scattering energy compensation (Fdez-Aguera 2019)
+        body.append(LetStmt("e_ss", "scalar", BinaryOp("+",
+            SwizzleAccess(VarRef("brdf_sample"), "x"),
+            SwizzleAccess(VarRef("brdf_sample"), "y"),
+        )))
+        body.append(LetStmt("f_single", "vec3", BinaryOp("+",
+            BinaryOp("*", VarRef("k_s"),
+                SwizzleAccess(VarRef("brdf_sample"), "x")),
+            ConstructorExpr("vec3", [
+                SwizzleAccess(VarRef("brdf_sample"), "y"),
+            ]),
+        )))
+        body.append(LetStmt("f_avg", "vec3", BinaryOp("+",
+            VarRef("f0"),
+            BinaryOp("*",
+                BinaryOp("-",
+                    ConstructorExpr("vec3", [NumberLit("1.0")]),
+                    VarRef("f0")),
+                BinaryOp("/", NumberLit("1.0"), NumberLit("21.0")),
+            ),
+        )))
+        body.append(LetStmt("f_ms", "vec3", BinaryOp("/",
+            BinaryOp("*", VarRef("f_single"), VarRef("f_avg")),
+            BinaryOp("-",
+                ConstructorExpr("vec3", [NumberLit("1.0")]),
+                BinaryOp("*", VarRef("f_avg"),
+                    BinaryOp("-", NumberLit("1.0"), VarRef("e_ss"))),
+            ),
+        )))
+        body.append(LetStmt("f_total", "vec3", BinaryOp("+",
+            VarRef("f_single"),
+            BinaryOp("*", VarRef("f_ms"),
+                BinaryOp("-", NumberLit("1.0"), VarRef("e_ss"))),
+        )))
+        body.append(LetStmt("ibl_spec", "vec3",
+            BinaryOp("*", VarRef("f_total"), VarRef("prefiltered"))))
+
+        # Energy-conserving diffuse
+        body.append(LetStmt("kd", "vec3", BinaryOp("*",
+            BinaryOp("-",
+                ConstructorExpr("vec3", [NumberLit("1.0")]),
+                VarRef("f_total")),
+            BinaryOp("-", NumberLit("1.0"), VarRef("layer_metallic")),
+        )))
+        body.append(LetStmt("ibl_diff", "vec3", BinaryOp("*",
+            BinaryOp("*", VarRef("kd"), VarRef("layer_albedo")),
+            VarRef("irradiance"),
+        )))
+
+        body.append(LetStmt("ambient", "vec3",
+            BinaryOp("+", VarRef("ibl_diff"), VarRef("ibl_spec"))))
+
+        # Combine direct + ambient
+        body.append(LetStmt("hdr_partial", "vec3",
+            BinaryOp("+", VarRef(result_var), VarRef("ambient"))))
+        result_var = "hdr_partial"
+
+    # --- Emission layer (additive) ---
+    if "emission" in layers_by_name:
+        em_args = _get_layer_args(layers_by_name["emission"])
+        em_expr = em_args.get("color",
+            ConstructorExpr("vec3", [NumberLit("0.0")]))
+        body.append(LetStmt("emission_color", "vec3", em_expr))
+        body.append(LetStmt("hdr", "vec3",
+            BinaryOp("+", VarRef(result_var), VarRef("emission_color"))))
+        result_var = "hdr"
+
+    # --- Tonemap + gamma ---
+    tonemap_strategy = schedule.get("tonemap", "none") if schedule else "none"
+    if tonemap_strategy == "aces":
+        body.append(LetStmt("tonemapped", "vec3",
+            CallExpr(VarRef("tonemap_aces"), [VarRef(result_var)])))
+        body.append(LetStmt("final_color", "vec3",
+            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
+        output_var = "final_color"
+    elif tonemap_strategy == "reinhard":
+        body.append(LetStmt("tonemapped", "vec3",
+            CallExpr(VarRef("tonemap_reinhard"), [VarRef(result_var)])))
+        body.append(LetStmt("final_color", "vec3",
+            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
+        output_var = "final_color"
+    else:
+        output_var = result_var
+
+    # Output final color
+    body.append(AssignStmt(
+        AssignTarget(VarRef("color")),
+        ConstructorExpr("vec4", [VarRef(output_var), NumberLit("1.0")]),
+    ))
+
+    return body
+
+
 def _expand_brdf_call(expr, schedule: dict[str, str] | None = None) -> any:
     """Expand a BRDF expression from surface declaration into concrete calls.
 
@@ -441,6 +711,8 @@ def _infer_output_type(name: str) -> str:
     type_hints = {
         "world_pos": "vec3",
         "world_normal": "vec3",
+        "world_tangent": "vec3",
+        "world_bitangent": "vec3",
         "frag_pos": "vec3",
         "frag_normal": "vec3",
         "frag_uv": "vec2",
@@ -611,11 +883,15 @@ def _expand_surface_to_closest_hit(
 ) -> StageBlock:
     """Generate a closest-hit shader from a surface declaration.
 
-    The closest-hit shader:
-    - Receives incoming ray payload
-    - Evaluates BRDF using hit point data (builtins: world_ray_origin, hit_t, etc.)
-    - Writes color to the payload
+    For surfaces with `layers`, generates full barycentric interpolation,
+    storage buffer reads, texture sampling (sample_lod), and layered
+    PBR evaluation matching the hand-written gltf_pbr_rt.lux output.
+
+    For surfaces with `brdf:`, generates the simpler existing path.
     """
+    if surface.layers is not None:
+        return _expand_layered_closest_hit(surface, module, schedule)
+
     stage = StageBlock(stage_type="closest_hit")
 
     # Incoming ray payload
@@ -679,6 +955,337 @@ def _expand_surface_to_closest_hit(
     return stage
 
 
+def _rewrite_sample_to_lod(expr):
+    """Rewrite sample(tex, uv) → sample_lod(tex, uv, 0.0) in an AST expression.
+
+    In RT shaders there are no implicit derivatives, so all texture sampling
+    must use explicit LOD. This recursively walks the expression tree.
+    """
+    import copy
+
+    if isinstance(expr, CallExpr):
+        # Rewrite sample() calls (but not sample_lod which is already explicit)
+        if isinstance(expr.func, VarRef) and expr.func.name == "sample":
+            new_args = [_rewrite_sample_to_lod(a) for a in expr.args]
+            new_args.append(NumberLit("0.0"))
+            return CallExpr(VarRef("sample_lod"), new_args, loc=expr.loc)
+        else:
+            return CallExpr(
+                _rewrite_sample_to_lod(expr.func),
+                [_rewrite_sample_to_lod(a) for a in expr.args],
+                loc=expr.loc,
+            )
+    elif isinstance(expr, BinaryOp):
+        return BinaryOp(
+            expr.op,
+            _rewrite_sample_to_lod(expr.left),
+            _rewrite_sample_to_lod(expr.right),
+            loc=expr.loc,
+        )
+    elif isinstance(expr, UnaryOp):
+        return UnaryOp(expr.op, _rewrite_sample_to_lod(expr.operand), loc=expr.loc)
+    elif isinstance(expr, ConstructorExpr):
+        return ConstructorExpr(
+            expr.type_name,
+            [_rewrite_sample_to_lod(a) for a in expr.args],
+            loc=expr.loc,
+        )
+    elif isinstance(expr, SwizzleAccess):
+        return SwizzleAccess(
+            _rewrite_sample_to_lod(expr.object), expr.components, loc=expr.loc,
+        )
+    elif isinstance(expr, FieldAccess):
+        return FieldAccess(
+            _rewrite_sample_to_lod(expr.object), expr.field, loc=expr.loc,
+        )
+    elif isinstance(expr, IndexAccess):
+        return IndexAccess(
+            _rewrite_sample_to_lod(expr.object),
+            _rewrite_sample_to_lod(expr.index),
+            loc=expr.loc,
+        )
+    # Leaf nodes: VarRef, NumberLit, etc. — no rewriting needed
+    return expr
+
+
+def _expand_layered_closest_hit(
+    surface: SurfaceDecl,
+    module: Module,
+    schedule: dict[str, str] | None = None,
+) -> StageBlock:
+    """Generate a closest-hit shader from a layered surface declaration.
+
+    Produces output matching the hand-written gltf_pbr_rt.lux:
+    - Storage buffers for vertex data (positions, normals, tex_coords, indices)
+    - Barycentric interpolation to reconstruct hit-point attributes
+    - sample_lod() for all texture sampling (no derivatives in RT)
+    - Layered PBR evaluation with IBL and energy conservation
+    """
+    stage = StageBlock(stage_type="closest_hit")
+
+    # Incoming ray payload
+    stage.ray_payloads.append(RayPayloadDecl("payload", "vec4"))
+
+    # Hit attributes (barycentrics)
+    stage.hit_attributes.append(HitAttributeDecl("bary", "vec2"))
+
+    # Storage buffers for vertex data (SoA layout)
+    stage.storage_buffers.append(StorageBufferDecl("positions", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("normals", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("tex_coords", "vec2"))
+    stage.storage_buffers.append(StorageBufferDecl("indices", "uint"))
+
+    # Light uniform
+    stage.uniforms.append(UniformBlock("Light", [
+        BlockField("light_dir", "vec3"),
+        BlockField("view_pos", "vec3"),
+    ]))
+
+    # Sampler declarations from the surface
+    for sam in surface.samplers:
+        stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
+
+    # --- Generate main body ---
+    body = []
+
+    # Barycentric interpolation preamble (matches gltf_pbr_rt.lux)
+    # let base: scalar = primitive_id * 3.0;
+    body.append(LetStmt("base", "scalar",
+        BinaryOp("*", VarRef("primitive_id"), NumberLit("3.0"))))
+
+    # Index lookups
+    body.append(LetStmt("i0", "uint", IndexAccess(VarRef("indices"), VarRef("base"))))
+    body.append(LetStmt("i1", "uint", IndexAccess(VarRef("indices"),
+        BinaryOp("+", VarRef("base"), NumberLit("1.0")))))
+    body.append(LetStmt("i2", "uint", IndexAccess(VarRef("indices"),
+        BinaryOp("+", VarRef("base"), NumberLit("2.0")))))
+
+    # Barycentric weights
+    body.append(LetStmt("b", "vec2", VarRef("bary")))
+    body.append(LetStmt("bw", "scalar", BinaryOp("-",
+        BinaryOp("-", NumberLit("1.0"), SwizzleAccess(VarRef("b"), "x")),
+        SwizzleAccess(VarRef("b"), "y"))))
+
+    # Interpolate position
+    body.append(LetStmt("p0", "vec4", IndexAccess(VarRef("positions"), VarRef("i0"))))
+    body.append(LetStmt("p1", "vec4", IndexAccess(VarRef("positions"), VarRef("i1"))))
+    body.append(LetStmt("p2", "vec4", IndexAccess(VarRef("positions"), VarRef("i2"))))
+    body.append(LetStmt("hit_pos", "vec3", BinaryOp("+",
+        BinaryOp("+",
+            BinaryOp("*", SwizzleAccess(VarRef("p0"), "xyz"), VarRef("bw")),
+            BinaryOp("*", SwizzleAccess(VarRef("p1"), "xyz"),
+                SwizzleAccess(VarRef("b"), "x"))),
+        BinaryOp("*", SwizzleAccess(VarRef("p2"), "xyz"),
+            SwizzleAccess(VarRef("b"), "y")))))
+
+    # Interpolate normal
+    body.append(LetStmt("n0", "vec4", IndexAccess(VarRef("normals"), VarRef("i0"))))
+    body.append(LetStmt("n1", "vec4", IndexAccess(VarRef("normals"), VarRef("i1"))))
+    body.append(LetStmt("n2", "vec4", IndexAccess(VarRef("normals"), VarRef("i2"))))
+    body.append(LetStmt("n", "vec3", CallExpr(VarRef("normalize"), [
+        BinaryOp("+",
+            BinaryOp("+",
+                BinaryOp("*", SwizzleAccess(VarRef("n0"), "xyz"), VarRef("bw")),
+                BinaryOp("*", SwizzleAccess(VarRef("n1"), "xyz"),
+                    SwizzleAccess(VarRef("b"), "x"))),
+            BinaryOp("*", SwizzleAccess(VarRef("n2"), "xyz"),
+                SwizzleAccess(VarRef("b"), "y")))])))
+
+    # Interpolate UV
+    body.append(LetStmt("uv0", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i0"))))
+    body.append(LetStmt("uv1", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i1"))))
+    body.append(LetStmt("uv2", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i2"))))
+    body.append(LetStmt("uv", "vec2", BinaryOp("+",
+        BinaryOp("+",
+            BinaryOp("*", VarRef("uv0"), VarRef("bw")),
+            BinaryOp("*", VarRef("uv1"), SwizzleAccess(VarRef("b"), "x"))),
+        BinaryOp("*", VarRef("uv2"), SwizzleAccess(VarRef("b"), "y")))))
+
+    # Index layers
+    layers_by_name = {}
+    for layer in surface.layers:
+        layers_by_name[layer.name] = layer
+
+    # --- View and light directions (RT-specific) ---
+    body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
+        UnaryOp("-", VarRef("world_ray_direction"))])))
+    body.append(LetStmt("l", "vec3",
+        CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+    body.append(LetStmt("n_dot_v", "scalar", CallExpr(VarRef("max"), [
+        CallExpr(VarRef("dot"), [VarRef("n"), VarRef("v")]),
+        NumberLit("0.001"),
+    ])))
+
+    # --- Base layer: direct lighting ---
+    # Rewrite sample→sample_lod for all layer expressions in RT
+    result_var = "result_zero"
+    body.append(LetStmt(result_var, "vec3",
+        ConstructorExpr("vec3", [NumberLit("0.0")])))
+
+    if "base" in layers_by_name:
+        base_args = _get_layer_args(layers_by_name["base"])
+        albedo_expr = _rewrite_sample_to_lod(
+            base_args.get("albedo", ConstructorExpr("vec3", [NumberLit("0.5")])))
+        roughness_expr = _rewrite_sample_to_lod(
+            base_args.get("roughness", NumberLit("0.5")))
+        metallic_expr = _rewrite_sample_to_lod(
+            base_args.get("metallic", NumberLit("0.0")))
+
+        body.append(LetStmt("layer_albedo", "vec3", albedo_expr))
+        body.append(LetStmt("layer_roughness", "scalar", roughness_expr))
+        body.append(LetStmt("layer_metallic", "scalar", metallic_expr))
+
+        body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
+            VarRef("n"), VarRef("v"), VarRef("l"),
+            VarRef("layer_albedo"), VarRef("layer_roughness"),
+            VarRef("layer_metallic"),
+        ])))
+        body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
+            VarRef("direct"),
+            ConstructorExpr("vec3", [
+                NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95"),
+            ]),
+        )))
+        result_var = "direct_lit"
+
+    # --- IBL layer ---
+    if "ibl" in layers_by_name:
+        ibl_args = _get_layer_args(layers_by_name["ibl"])
+        specular_map = ibl_args.get("specular_map")
+        irradiance_map = ibl_args.get("irradiance_map")
+        brdf_lut_ref = ibl_args.get("brdf_lut")
+
+        body.append(LetStmt("f0", "vec3", CallExpr(VarRef("mix"), [
+            ConstructorExpr("vec3", [NumberLit("0.04")]),
+            VarRef("layer_albedo"), VarRef("layer_metallic"),
+        ])))
+        body.append(LetStmt("r", "vec3", CallExpr(VarRef("reflect"), [
+            BinaryOp("*", VarRef("v"), UnaryOp("-", NumberLit("1.0"))),
+            VarRef("n"),
+        ])))
+
+        # RT: all sampling uses sample_lod
+        body.append(LetStmt("prefiltered", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                specular_map, VarRef("r"),
+                BinaryOp("*", VarRef("layer_roughness"), NumberLit("8.0")),
+            ]), "xyz")))
+        body.append(LetStmt("irradiance", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                irradiance_map, VarRef("n"), NumberLit("0.0"),
+            ]), "xyz")))
+        body.append(LetStmt("brdf_sample", "vec2", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                brdf_lut_ref,
+                ConstructorExpr("vec2", [
+                    VarRef("n_dot_v"), VarRef("layer_roughness"),
+                ]),
+                NumberLit("0.0"),
+            ]), "xy")))
+
+        # Roughness-dependent Fresnel
+        body.append(LetStmt("fr", "vec3", BinaryOp("-",
+            CallExpr(VarRef("max"), [
+                ConstructorExpr("vec3", [
+                    BinaryOp("-", NumberLit("1.0"), VarRef("layer_roughness")),
+                ]),
+                VarRef("f0"),
+            ]),
+            VarRef("f0"),
+        )))
+        body.append(LetStmt("k_s", "vec3", BinaryOp("+",
+            VarRef("f0"),
+            BinaryOp("*", VarRef("fr"),
+                CallExpr(VarRef("pow"), [
+                    CallExpr(VarRef("clamp"), [
+                        BinaryOp("-", NumberLit("1.0"), VarRef("n_dot_v")),
+                        NumberLit("0.0"), NumberLit("1.0"),
+                    ]),
+                    NumberLit("5.0"),
+                ])),
+        )))
+
+        # Multi-scattering energy compensation
+        body.append(LetStmt("e_ss", "scalar", BinaryOp("+",
+            SwizzleAccess(VarRef("brdf_sample"), "x"),
+            SwizzleAccess(VarRef("brdf_sample"), "y"))))
+        body.append(LetStmt("f_single", "vec3", BinaryOp("+",
+            BinaryOp("*", VarRef("k_s"),
+                SwizzleAccess(VarRef("brdf_sample"), "x")),
+            ConstructorExpr("vec3", [
+                SwizzleAccess(VarRef("brdf_sample"), "y")]))))
+        body.append(LetStmt("f_avg", "vec3", BinaryOp("+",
+            VarRef("f0"),
+            BinaryOp("*",
+                BinaryOp("-",
+                    ConstructorExpr("vec3", [NumberLit("1.0")]),
+                    VarRef("f0")),
+                BinaryOp("/", NumberLit("1.0"), NumberLit("21.0"))))))
+        body.append(LetStmt("f_ms", "vec3", BinaryOp("/",
+            BinaryOp("*", VarRef("f_single"), VarRef("f_avg")),
+            BinaryOp("-",
+                ConstructorExpr("vec3", [NumberLit("1.0")]),
+                BinaryOp("*", VarRef("f_avg"),
+                    BinaryOp("-", NumberLit("1.0"), VarRef("e_ss")))))))
+        body.append(LetStmt("f_total", "vec3", BinaryOp("+",
+            VarRef("f_single"),
+            BinaryOp("*", VarRef("f_ms"),
+                BinaryOp("-", NumberLit("1.0"), VarRef("e_ss"))))))
+        body.append(LetStmt("ibl_spec", "vec3",
+            BinaryOp("*", VarRef("f_total"), VarRef("prefiltered"))))
+
+        # Energy-conserving diffuse
+        body.append(LetStmt("kd", "vec3", BinaryOp("*",
+            BinaryOp("-",
+                ConstructorExpr("vec3", [NumberLit("1.0")]),
+                VarRef("f_total")),
+            BinaryOp("-", NumberLit("1.0"), VarRef("layer_metallic")))))
+        body.append(LetStmt("ibl_diff", "vec3", BinaryOp("*",
+            BinaryOp("*", VarRef("kd"), VarRef("layer_albedo")),
+            VarRef("irradiance"))))
+        body.append(LetStmt("ambient", "vec3",
+            BinaryOp("+", VarRef("ibl_diff"), VarRef("ibl_spec"))))
+        body.append(LetStmt("hdr_partial", "vec3",
+            BinaryOp("+", VarRef(result_var), VarRef("ambient"))))
+        result_var = "hdr_partial"
+
+    # --- Emission layer ---
+    if "emission" in layers_by_name:
+        em_args = _get_layer_args(layers_by_name["emission"])
+        em_expr = _rewrite_sample_to_lod(
+            em_args.get("color", ConstructorExpr("vec3", [NumberLit("0.0")])))
+        body.append(LetStmt("emission_color", "vec3", em_expr))
+        body.append(LetStmt("hdr", "vec3",
+            BinaryOp("+", VarRef(result_var), VarRef("emission_color"))))
+        result_var = "hdr"
+
+    # --- Tonemap + gamma ---
+    tonemap_strategy = schedule.get("tonemap", "none") if schedule else "none"
+    if tonemap_strategy == "aces":
+        body.append(LetStmt("tonemapped", "vec3",
+            CallExpr(VarRef("tonemap_aces"), [VarRef(result_var)])))
+        body.append(LetStmt("final_color", "vec3",
+            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
+        output_var = "final_color"
+    elif tonemap_strategy == "reinhard":
+        body.append(LetStmt("tonemapped", "vec3",
+            CallExpr(VarRef("tonemap_reinhard"), [VarRef(result_var)])))
+        body.append(LetStmt("final_color", "vec3",
+            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
+        output_var = "final_color"
+    else:
+        output_var = result_var
+
+    # Write to payload
+    body.append(AssignStmt(
+        AssignTarget(VarRef("payload")),
+        ConstructorExpr("vec4", [VarRef(output_var), NumberLit("1.0")]),
+    ))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
 def _expand_surface_to_any_hit(surface: SurfaceDecl) -> StageBlock:
     """Generate an any-hit shader from a surface with opacity.
 
@@ -726,8 +1333,8 @@ def _expand_environment_to_miss(environment: EnvironmentDecl) -> StageBlock:
     stage.ray_payloads.append(RayPayloadDecl("payload", "vec4"))
 
     # Add samplers from environment
-    for sam_name in environment.samplers:
-        stage.samplers.append(SamplerDecl(sam_name))
+    for sam in environment.samplers:
+        stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
 
     body = []
 

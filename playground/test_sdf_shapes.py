@@ -1,9 +1,9 @@
 """End-to-end screenshot test: compile sdf_shapes.lux and render to PNG.
 
 This script:
-  1. Compiles examples/sdf_shapes.lux -> playground/*.spv
+  1. Compiles examples/sdf_shapes.lux -> shadercache/*.spv
   2. Loads the fragment SPIR-V via the fullscreen render harness
-  3. Renders a 512x512 frame and saves playground/sdf_shapes.png
+  3. Renders a 512x512 frame and saves screenshots/sdf_shapes.png
   4. Validates the output (coverage, color regions, distance field edges)
 
 Usage:
@@ -21,9 +21,11 @@ import numpy as np
 
 PLAYGROUND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PLAYGROUND_DIR.parent
+SHADERCACHE = PROJECT_ROOT / "shadercache"
+SCREENSHOTS = PROJECT_ROOT / "screenshots"
 LUX_SOURCE = PROJECT_ROOT / "examples" / "sdf_shapes.lux"
-FRAG_SPV = PLAYGROUND_DIR / "sdf_shapes.frag.spv"
-OUTPUT_PNG = PLAYGROUND_DIR / "sdf_shapes.png"
+FRAG_SPV = SHADERCACHE / "sdf_shapes.frag.spv"
+OUTPUT_PNG = SCREENSHOTS / "sdf_shapes.png"
 
 
 def step(msg: str) -> None:
@@ -43,7 +45,7 @@ def compile_shader() -> bool:
     cmd = [
         sys.executable, "-m", "luxc",
         str(LUX_SOURCE),
-        "-o", str(PLAYGROUND_DIR),
+        "-o", str(SHADERCACHE),
     ]
     print(f"  Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))

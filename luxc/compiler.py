@@ -9,6 +9,7 @@ from luxc.codegen.spirv_builder import generate_spirv
 from luxc.codegen.spv_assembler import assemble_and_validate
 from luxc.codegen.reflection import generate_reflection, emit_reflection_json
 from luxc.builtins.types import clear_type_aliases
+from luxc.features.evaluator import collect_feature_names, strip_features
 
 # Standard library search path
 _STDLIB_DIR = Path(__file__).parent / "stdlib"
@@ -72,11 +73,18 @@ def compile_source(
     emit_reflection: bool = True,
     debug: bool = False,
     source_name: str = "",
+    pipeline: str | None = None,
+    features: set[str] | None = None,
 ) -> None:
     # Clear type aliases from previous compilations
     clear_type_aliases()
 
     module = parse_lux(source)
+
+    # Strip compile-time features (before import resolution)
+    if module.features_decls or hasattr(module, '_conditional_blocks'):
+        active = features if features is not None else set()
+        strip_features(module, active)
 
     # Resolve imports before type checking
     _resolve_imports(module, source_dir)
@@ -84,7 +92,7 @@ def compile_source(
     # Expand surface/geometry/pipeline declarations into stage blocks
     if module.surfaces or module.pipelines or module.environments or module.procedurals:
         from luxc.expansion.surface_expander import expand_surfaces
-        expand_surfaces(module)
+        expand_surfaces(module, pipeline_filter=pipeline)
 
     # Expand @differentiable functions into gradient functions
     from luxc.autodiff.forward_diff import autodiff_expand
@@ -111,24 +119,41 @@ def compile_source(
         "callable": "rcall",
     }
 
+    # Compute feature suffix for output filenames
+    feature_suffix = ""
+    all_features = {}
+    if module.features_decls:
+        all_feature_names = collect_feature_names(module)
+        active = features if features is not None else set()
+        feature_suffix = "+" + "+".join(
+            n.removeprefix("has_") for n in sorted(active)
+        ) if active else ""
+        all_features = {name: name in active for name in all_feature_names}
+
     for stage in module.stages:
         stage_name = stage.stage_type
         suffix = _SUFFIX_MAP[stage_name]
+        out_stem = f"{stem}{feature_suffix}"
 
         asm_text = generate_spirv(module, stage, debug=debug, source_name=source_name or f"{stem}.lux")
 
         if emit_asm:
-            asm_path = output_dir / f"{stem}.{suffix}.spvasm"
+            asm_path = output_dir / f"{out_stem}.{suffix}.spvasm"
             asm_path.write_text(asm_text, encoding="utf-8")
             print(f"Wrote {asm_path}")
 
-        spv_path = output_dir / f"{stem}.{suffix}.spv"
+        spv_path = output_dir / f"{out_stem}.{suffix}.spv"
         assemble_and_validate(asm_text, spv_path, validate=validate)
         print(f"Wrote {spv_path}")
 
         if emit_reflection:
-            reflection = generate_reflection(module, stage, source_name=source_name or f"{stem}.lux")
-            json_path = output_dir / f"{stem}.{suffix}.json"
+            reflection = generate_reflection(
+                module, stage,
+                source_name=source_name or f"{stem}.lux",
+                features=all_features,
+                feature_suffix=feature_suffix,
+            )
+            json_path = output_dir / f"{out_stem}.{suffix}.json"
             json_path.write_text(emit_reflection_json(reflection), encoding="utf-8")
             print(f"Wrote {json_path}")
 

@@ -12,13 +12,14 @@ from luxc.parser.ast_nodes import (
     ConstructorExpr, FieldAccess, SwizzleAccess, IndexAccess, TernaryExpr,
     AssignTarget, SourceLocation,
     TypeAlias, ImportDecl,
-    SurfaceDecl, SurfaceMember,
+    SurfaceDecl, SurfaceMember, SurfaceSampler, LayerCall, LayerArg,
     GeometryDecl, GeometryField, GeometryTransform, GeometryOutputs, OutputBinding,
     PipelineDecl, PipelineMember,
     ScheduleDecl, ScheduleMember,
     EnvironmentDecl, ProceduralDecl, ProceduralMember,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
-    StorageImageDecl,
+    StorageImageDecl, StorageBufferDecl,
+    FeaturesDecl, ConditionalBlock, FeatureRef, FeatureAnd, FeatureOr, FeatureNot,
 )
 
 _CONSTRUCTOR_TYPES = frozenset({
@@ -60,6 +61,7 @@ class LuxTransformer(Transformer):
 
     def start(self, items):
         mod = Module()
+        mod._conditional_blocks = []
         for item in items:
             if isinstance(item, ConstDecl):
                 mod.constants.append(item)
@@ -85,6 +87,10 @@ class LuxTransformer(Transformer):
                 mod.environments.append(item)
             elif isinstance(item, ProceduralDecl):
                 mod.procedurals.append(item)
+            elif isinstance(item, FeaturesDecl):
+                mod.features_decls.append(item)
+            elif isinstance(item, ConditionalBlock):
+                mod._conditional_blocks.append(item)
         return mod
 
     # --- Top-level declarations ---
@@ -110,21 +116,80 @@ class LuxTransformer(Transformer):
         name = args[0]
         return ImportDecl(str(name), _tok_loc(name))
 
+    # --- Features declarations ---
+
+    def features_decl(self, args):
+        features = [str(a) for a in args if isinstance(a, Token) and a.type == 'IDENT']
+        # feature_field returns strings
+        features = [a for a in args if isinstance(a, str)]
+        return FeaturesDecl(features)
+
+    def feature_field(self, args):
+        return str(args[0])
+
+    # --- Module-level conditional block ---
+
+    def conditional_block(self, args):
+        condition = args[0]
+        items = list(args[1:])
+        return ConditionalBlock(condition, items)
+
+    # --- Feature expressions ---
+
+    def feature_ref(self, args):
+        return FeatureRef(str(args[0]))
+
+    def feature_or(self, args):
+        result = args[0]
+        for i in range(1, len(args)):
+            result = FeatureOr(result, args[i])
+        return result
+
+    def feature_and(self, args):
+        result = args[0]
+        for i in range(1, len(args)):
+            result = FeatureAnd(result, args[i])
+        return result
+
+    def feature_negate(self, args):
+        return FeatureNot(args[0])
+
     # --- Surface declarations ---
 
     def surface_decl(self, args):
         name = args[0]
         members = [a for a in args[1:] if isinstance(a, SurfaceMember)]
-        samplers = [str(a) for a in args[1:] if isinstance(a, Token) and a.type == "IDENT" and a not in [name]]
-        # Collect sampler names from surface_sampler rules (returned as strings)
-        sampler_names = [a for a in args[1:] if isinstance(a, str) and a not in [str(name)]]
-        return SurfaceDecl(str(name), members, samplers=sampler_names, loc=_tok_loc(name))
+        sampler_objs = [a for a in args[1:] if isinstance(a, SurfaceSampler)]
+        layers = None
+        for a in args[1:]:
+            if isinstance(a, list) and a and isinstance(a[0], LayerCall):
+                layers = a
+        return SurfaceDecl(str(name), members, samplers=sampler_objs, layers=layers, loc=_tok_loc(name))
 
     def surface_sampler(self, args):
-        return str(args[0])  # Return sampler name as string
+        sampler_type = str(args[0])
+        sampler_name = str(args[1])
+        condition = args[2] if len(args) > 2 else None
+        return SurfaceSampler(sampler_name, sampler_type, condition=condition)
 
     def surface_member(self, args):
         return SurfaceMember(str(args[0]), args[1])
+
+    def surface_layers(self, args):
+        return [a for a in args if isinstance(a, LayerCall)]
+
+    def layer_call(self, args):
+        name = str(args[0])
+        layer_args = [a for a in args[1:] if isinstance(a, LayerArg)]
+        # Condition is the last arg if it's a feature expr (not a LayerArg)
+        condition = None
+        for a in args[1:]:
+            if not isinstance(a, LayerArg) and not isinstance(a, Token):
+                condition = a
+        return LayerCall(name, layer_args, condition=condition)
+
+    def layer_arg(self, args):
+        return LayerArg(str(args[0]), args[1])
 
     # --- Geometry declarations ---
 
@@ -143,7 +208,12 @@ class LuxTransformer(Transformer):
         return GeometryDecl(str(name), fields, transform, outputs, _tok_loc(name))
 
     def geometry_field(self, args):
-        return GeometryField(str(args[0]), _extract_type(args[1]))
+        name = str(args[0])
+        type_name = _extract_type(args[1])
+        condition = None
+        if len(args) > 2:
+            condition = args[2]
+        return GeometryField(name, type_name, condition=condition)
 
     def geometry_transform(self, args):
         name = args[0]
@@ -155,7 +225,8 @@ class LuxTransformer(Transformer):
         return GeometryOutputs(bindings)
 
     def output_binding(self, args):
-        return OutputBinding(str(args[0]), args[1])
+        condition = args[2] if len(args) > 2 else None
+        return OutputBinding(str(args[0]), args[1], condition=condition)
 
     # --- Pipeline declarations ---
 
@@ -165,7 +236,8 @@ class LuxTransformer(Transformer):
         return PipelineDecl(str(name), members, _tok_loc(name))
 
     def pipeline_member(self, args):
-        return PipelineMember(str(args[0]), args[1])
+        condition = args[2] if len(args) > 2 else None
+        return PipelineMember(str(args[0]), args[1], condition=condition)
 
     # --- Schedule declarations ---
 
@@ -175,15 +247,16 @@ class LuxTransformer(Transformer):
         return ScheduleDecl(str(name), members, _tok_loc(name))
 
     def schedule_member(self, args):
-        return ScheduleMember(str(args[0]), str(args[1]))
+        condition = args[2] if len(args) > 2 else None
+        return ScheduleMember(str(args[0]), str(args[1]), condition=condition)
 
     # --- Environment declarations ---
 
     def environment_decl(self, args):
         name = args[0]
         members = [a for a in args[1:] if isinstance(a, SurfaceMember)]
-        sampler_names = [a for a in args[1:] if isinstance(a, str) and a != str(name)]
-        return EnvironmentDecl(str(name), members, samplers=sampler_names, loc=_tok_loc(name))
+        sampler_objs = [a for a in args[1:] if isinstance(a, SurfaceSampler)]
+        return EnvironmentDecl(str(name), members, samplers=sampler_objs, loc=_tok_loc(name))
 
     # --- Procedural declarations ---
 
@@ -224,6 +297,8 @@ class LuxTransformer(Transformer):
                 block.accel_structs.append(item)
             elif isinstance(item, StorageImageDecl):
                 block.storage_images.append(item)
+            elif isinstance(item, StorageBufferDecl):
+                block.storage_buffers.append(item)
         return block
 
     def in_decl(self, args):
@@ -276,6 +351,11 @@ class LuxTransformer(Transformer):
 
     def storage_image_decl(self, args):
         return StorageImageDecl(str(args[0]), loc=_tok_loc(args[0]))
+
+    def storage_buffer_decl(self, args):
+        name = args[0]
+        element_type = _extract_type(args[1])
+        return StorageBufferDecl(str(name), element_type, loc=_tok_loc(name))
 
     # --- Functions ---
 

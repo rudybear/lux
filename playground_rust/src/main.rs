@@ -73,19 +73,19 @@ fn main() {
 /// Resolve a default pipeline shader base path from the scene source.
 fn resolve_default_pipeline(scene: &str) -> Result<String, String> {
     if scene.ends_with(".glb") || scene.ends_with(".gltf") {
-        // Try playground/gltf_pbr first (where compiled .spv files live),
+        // Try shadercache/gltf_pbr first (where compiled .spv files live),
         // fall back to examples/gltf_pbr
-        if Path::new("playground/gltf_pbr.vert.spv").exists() {
-            Ok("playground/gltf_pbr".to_string())
+        if Path::new("shadercache/gltf_pbr.vert.spv").exists() {
+            Ok("shadercache/gltf_pbr".to_string())
         } else {
             Ok("examples/gltf_pbr".to_string())
         }
     } else if scene == "fullscreen" {
         Err("--pipeline required for fullscreen scenes".to_string())
     } else if scene == "triangle" {
-        Ok("examples/hello_triangle".to_string())
+        Ok("shadercache/hello_triangle".to_string())
     } else {
-        Ok("examples/pbr_basic".to_string())
+        Ok("shadercache/pbr_basic".to_string())
     }
 }
 

@@ -21,6 +21,7 @@ from pathlib import Path
 
 PLAYGROUND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PLAYGROUND_DIR.parent
+SHADERCACHE = PROJECT_ROOT / "shadercache"
 
 
 def step(msg: str) -> None:
@@ -38,7 +39,7 @@ def compile_shader(lux_source: Path) -> bool:
     cmd = [
         sys.executable, "-m", "luxc",
         str(lux_source),
-        "-o", str(PLAYGROUND_DIR),
+        "-o", str(SHADERCACHE),
         "--emit-asm",
         "--no-validate",
     ]
@@ -57,7 +58,7 @@ def compile_shader(lux_source: Path) -> bool:
 
 def check_spv_exists(name: str, stage_ext: str) -> Path | None:
     """Check that a .spv file exists and report its size."""
-    spv = PLAYGROUND_DIR / f"{name}.{stage_ext}.spv"
+    spv = SHADERCACHE / f"{name}.{stage_ext}.spv"
     if spv.exists():
         print(f"  OK: {spv.name} ({spv.stat().st_size} bytes)")
         return spv
@@ -68,7 +69,7 @@ def check_spv_exists(name: str, stage_ext: str) -> Path | None:
 
 def read_asm(name: str, stage_ext: str) -> str | None:
     """Read a .spvasm file if it exists."""
-    asm = PLAYGROUND_DIR / f"{name}.{stage_ext}.spvasm"
+    asm = SHADERCACHE / f"{name}.{stage_ext}.spvasm"
     if asm.exists():
         return asm.read_text()
     return None

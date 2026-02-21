@@ -1,0 +1,85 @@
+// glTF PBR Layered — unified surface declaration for raster and RT
+// Demonstrates the layered material system with automatic energy conservation.
+// One surface declaration → both forward and RT pipelines.
+//
+// Uses compile-time features for optional material extensions:
+//   --features has_normal_map,has_emission     (common)
+//   --features has_normal_map,has_clearcoat    (clearcoat)
+//   --all-permutations                          (all 2^4 variants)
+
+import brdf;
+import color;
+import ibl;
+import texture;
+
+features {
+    has_normal_map: bool,
+    has_clearcoat: bool,
+    has_sheen: bool,
+    has_emission: bool,
+}
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    uv: vec2,
+    tangent: vec4 if has_normal_map,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        world_tangent: normalize((model * vec4(tangent.xyz, 0.0)).xyz) if has_normal_map,
+        world_bitangent: cross(world_normal, world_tangent) * tangent.w if has_normal_map,
+        frag_uv: uv,
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+surface GltfPBR {
+    sampler2d base_color_tex,
+    sampler2d normal_tex if has_normal_map,
+    sampler2d metallic_roughness_tex,
+    sampler2d occlusion_tex,
+    sampler2d emissive_tex if has_emission,
+    sampler2d clearcoat_tex if has_clearcoat,
+    sampler2d sheen_tex if has_sheen,
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    layers [
+        base(albedo: srgb_to_linear(sample(base_color_tex, uv).xyz),
+             roughness: sample(metallic_roughness_tex, uv).y,
+             metallic: sample(metallic_roughness_tex, uv).z),
+        normal_map(map: sample(normal_tex, uv).xyz) if has_normal_map,
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
+        emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)) if has_emission,
+    ]
+}
+
+environment HDRSky {
+    color: mix(vec3(0.8, 0.85, 0.9), vec3(0.3, 0.5, 0.8),
+              world_ray_direction.y * 0.5 + 0.5),
+}
+
+schedule HighQuality {
+    tonemap: aces,
+}
+
+pipeline GltfForward {
+    geometry: StandardMesh,
+    surface: GltfPBR,
+    schedule: HighQuality,
+}
+
+pipeline GltfRT {
+    mode: raytrace,
+    surface: GltfPBR,
+    environment: HDRSky,
+    schedule: HighQuality,
+}

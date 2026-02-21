@@ -2022,7 +2022,7 @@ fn load_rt_ibl_assets(
     texture_map: &mut HashMap<String, (vk::ImageView, vk::Sampler)>,
     texture_images: &mut Vec<(vk::Image, Option<Allocation>, vk::ImageView, vk::Sampler)>,
 ) {
-    let ibl_base = std::path::Path::new("playground/assets/ibl");
+    let ibl_base = std::path::Path::new("assets/ibl");
     if !ibl_base.exists() {
         info!("No IBL assets directory, skipping RT IBL");
         return;

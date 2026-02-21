@@ -1,9 +1,9 @@
 """End-to-end screenshot test: compile pbr_surface.lux and render to PNG.
 
 This script:
-  1. Compiles examples/pbr_surface.lux -> playground/*.spv
+  1. Compiles examples/pbr_surface.lux -> shadercache/*.spv
   2. Loads the SPIR-V via the PBR render harness (sphere + texture + lighting)
-  3. Renders a 512x512 frame and saves playground/pbr_surface.png
+  3. Renders a 512x512 frame and saves screenshots/pbr_surface.png
   4. Validates the output (sphere visible, specular highlight, diffuse shading)
 
 Usage:
@@ -21,10 +21,12 @@ import numpy as np
 
 PLAYGROUND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PLAYGROUND_DIR.parent
+SHADERCACHE = PROJECT_ROOT / "shadercache"
+SCREENSHOTS = PROJECT_ROOT / "screenshots"
 LUX_SOURCE = PROJECT_ROOT / "examples" / "pbr_surface.lux"
-VERT_SPV = PLAYGROUND_DIR / "pbr_surface.vert.spv"
-FRAG_SPV = PLAYGROUND_DIR / "pbr_surface.frag.spv"
-OUTPUT_PNG = PLAYGROUND_DIR / "pbr_surface.png"
+VERT_SPV = SHADERCACHE / "pbr_surface.vert.spv"
+FRAG_SPV = SHADERCACHE / "pbr_surface.frag.spv"
+OUTPUT_PNG = SCREENSHOTS / "pbr_surface.png"
 
 
 def step(msg: str) -> None:
@@ -44,7 +46,7 @@ def compile_shader() -> bool:
     cmd = [
         sys.executable, "-m", "luxc",
         str(LUX_SOURCE),
-        "-o", str(PLAYGROUND_DIR),
+        "-o", str(SHADERCACHE),
     ]
     print(f"  Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))

@@ -31,30 +31,49 @@ The compiler expands this into fully typed vertex + fragment SPIR-V — no manua
 
 ## Gallery
 
-### glTF PBR with IBL
+### glTF PBR with IBL — Ray Traced
 
-Full glTF 2.0 PBR rendering — tangent-space normal mapping, metallic-roughness workflow, image-based lighting with pre-filtered specular cubemap + irradiance + BRDF LUT, and multi-scattering energy compensation.
+Full glTF 2.0 PBR rendering with ray tracing — tangent-space normal mapping, metallic-roughness workflow, IBL with pre-filtered specular cubemap, compile-time feature permutations, and a single `surface` declaration that compiles to both raster and RT pipelines.
 
-<p align="center"><img src="playground/test_gltf_pbr.png" width="400"></p>
+<p align="center"><img src="screenshots/test_gltf_rt_cpp.png" width="400"></p>
 
-```
+```lux
 import brdf;
 import color;
 import ibl;
 import texture;
 
-fragment {
-    samplerCube env_specular;
-    samplerCube env_irradiance;
-    sampler2d brdf_lut;
+features {
+    has_normal_map: bool,
+    has_emission: bool,
+}
 
-    fn main() {
-        let n: vec3 = tbn_perturb_normal(normal_sample.xyz, world_normal, world_tangent, world_bitangent);
-        let prefiltered: vec3 = sample_lod(env_specular, reflect(v * -1.0, n), roughness * 4.0).xyz;
-        let irradiance: vec3 = sample(env_irradiance, n).xyz;
-        let brdf: vec2 = sample(brdf_lut, vec2(n_dot_v, roughness)).xy;
-        // ... multi-scattering energy compensation + ACES tonemapping
-    }
+surface GltfPBR {
+    sampler2d base_color_tex,
+    sampler2d normal_tex if has_normal_map,
+    sampler2d metallic_roughness_tex,
+    sampler2d occlusion_tex,
+    sampler2d emissive_tex if has_emission,
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    layers [
+        base(albedo: srgb_to_linear(sample(base_color_tex, uv).xyz),
+             roughness: sample(metallic_roughness_tex, uv).y,
+             metallic: sample(metallic_roughness_tex, uv).z),
+        normal_map(map: sample(normal_tex, uv).xyz) if has_normal_map,
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
+        emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)) if has_emission,
+    ]
+}
+
+pipeline GltfRT {
+    mode: raytrace,
+    surface: GltfPBR,
+    environment: HDRSky,
+    schedule: HighQuality,
 }
 ```
 
@@ -62,7 +81,7 @@ fragment {
 
 Real-time ray traced sphere with barycentric shading and sky gradient — compiled from a single `.lux` file to three SPIR-V stages (raygen, closest-hit, miss).
 
-<p align="center"><img src="playground/rt_manual_cpp.png" width="400"></p>
+<p align="center"><img src="screenshots/rt_manual_cpp.png" width="400"></p>
 
 ```
 raygen {
@@ -84,7 +103,7 @@ raygen {
 
 Declarative material pipeline — just declare geometry, surface BRDF, and pipeline. The compiler generates vertex + fragment stages automatically.
 
-<p align="center"><img src="playground/pbr_surface_cpp.png" width="400"></p>
+<p align="center"><img src="screenshots/pbr_surface_cpp.png" width="400"></p>
 
 ```
 import brdf;
@@ -104,7 +123,7 @@ pipeline PBRForward {
 
 Signed distance field primitives with smooth boolean operations — sphere, box, and torus combined with smooth union.
 
-<p align="center"><img src="playground/sdf_shapes_cpp.png" width="400"></p>
+<p align="center"><img src="screenshots/sdf_shapes_cpp.png" width="400"></p>
 
 ```
 import sdf;
@@ -119,7 +138,7 @@ let d_final: scalar = sdf_smooth_union(sdf_smooth_union(d_sphere, d_box, 0.3), d
 
 Domain-warped FBM noise with Voronoi cell overlay — organic, natural-looking textures from pure math.
 
-<p align="center"><img src="playground/procedural_noise_cpp.png" width="400"></p>
+<p align="center"><img src="screenshots/procedural_noise_cpp.png" width="400"></p>
 
 ```
 import noise;
@@ -134,7 +153,7 @@ let vor: vec2 = voronoi2d(uv * 6.0);
 
 Mark any function with `@differentiable` and the compiler generates its derivative. Top: wave function, bottom: auto-generated gradient.
 
-<p align="center"><img src="playground/autodiff_demo_cpp.png" width="400"></p>
+<p align="center"><img src="screenshots/autodiff_demo_cpp.png" width="400"></p>
 
 ```
 @differentiable
@@ -150,7 +169,7 @@ let f_grad: scalar = wave_d_x(x);  // auto-generated derivative
 
 HSV rainbow with artistic controls — contrast, saturation, hue shift, and gamma correction from the colorspace stdlib.
 
-<p align="center"><img src="playground/colorspace_demo_cpp.png" width="400"></p>
+<p align="center"><img src="screenshots/colorspace_demo_cpp.png" width="400"></p>
 
 ```
 import colorspace;
@@ -164,7 +183,7 @@ let corrected: vec3 = gamma_correct(rainbow, 2.2);
 
 The simplest Lux program — per-vertex colors, zero boilerplate. The entire shader is 15 lines.
 
-<p align="center"><img src="playground/hello_triangle_cpp.png" width="400"></p>
+<p align="center"><img src="screenshots/hello_triangle_cpp.png" width="400"></p>
 
 ```
 vertex {
@@ -185,18 +204,18 @@ Three rendering backends — Python/wgpu, C++/Vulkan, Rust/ash — all driven by
 
 ```bash
 # Python (wgpu)
-python -m playground.engine --scene sphere --pipeline playground/pbr_surface
+python -m playground.engine --scene sphere --pipeline shadercache/pbr_surface
 
 # C++
 cd playground_cpp && cmake -B build && cmake --build build --config Release
-./build/Release/lux-playground --pipeline playground/gltf_pbr --scene path/to/model.glb
+./build/Release/lux-playground --pipeline shadercache/gltf_pbr --scene path/to/model.glb
 
 # Rust
 cd playground_rust && cargo build --release
-./target/release/lux-playground --pipeline playground/gltf_pbr --scene path/to/model.glb
+./target/release/lux-playground --pipeline shadercache/gltf_pbr --scene path/to/model.glb
 
 # Ray tracing (C++ and Rust)
-./build/Release/lux-playground --mode rt playground/rt_manual
+./build/Release/lux-playground --mode rt shadercache/rt_manual
 ```
 
 All three engines support reflection-driven descriptor binding, glTF loading, cubemap textures, and IBL.
@@ -204,6 +223,8 @@ All three engines support reflection-driven descriptor binding, glTF loading, cu
 ## Features
 
 - **Declarative materials** — `surface`, `geometry`, `pipeline` blocks expand to full shader stages
+- **Layered surfaces** — `layers [base, normal_map, ibl, emission]` with automatic energy conservation, compiles to both raster and RT from one declaration
+- **Compile-time features** — `features { has_normal_map: bool }` with `if` guards on any declaration; `--features` and `--all-permutations` for shader permutation generation
 - **Algorithm/schedule separation** — swap BRDF variants and tonemapping without touching material code
 - **Math-first syntax** — `scalar` not `float`, `builtin_position` not `gl_Position`
 - **Auto-layout** — locations, descriptor sets, and bindings assigned by declaration order
@@ -269,6 +290,48 @@ python -m luxc examples/rt_pathtracer.lux
 # Wrote examples/rt_pathtracer.rmiss.spv
 ```
 
+### Compile a specific pipeline
+
+```bash
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfForward
+# Wrote examples/gltf_pbr_layered.vert.spv
+# Wrote examples/gltf_pbr_layered.frag.spv
+
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfRT
+# Wrote examples/gltf_pbr_layered.rgen.spv
+# Wrote examples/gltf_pbr_layered.rchit.spv
+# Wrote examples/gltf_pbr_layered.rmiss.spv
+```
+
+### Compile with features
+
+```bash
+# List available features
+python -m luxc examples/gltf_pbr_layered.lux --list-features
+# Available features:
+#   has_normal_map
+#   has_clearcoat
+#   has_sheen
+#   has_emission
+
+# Compile with specific features enabled
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfForward \
+    --features has_normal_map,has_emission
+# Wrote gltf_pbr_layered+emission+normal_map.vert.spv
+# Wrote gltf_pbr_layered+emission+normal_map.frag.spv
+
+# Compile base variant (no features)
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfForward
+# Wrote gltf_pbr_layered.vert.spv
+# Wrote gltf_pbr_layered.frag.spv
+
+# Compile all 2^N permutations
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfForward \
+    --all-permutations
+# Compiling 16 permutations...
+# Wrote gltf_pbr_layered.manifest.json
+```
+
 ### Transpile GLSL to Lux
 
 ```bash
@@ -293,6 +356,12 @@ Options:
   --dump-ast          Dump the AST as JSON and exit
   --no-validate       Skip spirv-val validation
   -o OUTPUT_DIR       Output directory (default: same as input)
+  --pipeline NAME     Compile only the named pipeline
+  --features FEAT,...   Enable compile-time features (comma-separated)
+  --all-permutations    Compile all 2^N feature permutations
+  --list-features       List available features and exit
+  --no-reflection     Skip .lux.json reflection metadata
+  -g, --debug         Emit OpLine/OpSource debug info
   --transpile         Transpile GLSL input to Lux
   --ai DESCRIPTION    Generate shader from natural language
   --ai-model MODEL    Model for AI generation (default: claude-sonnet-4-20250514)
@@ -380,6 +449,104 @@ pipeline PBRForward {
     surface: TexturedPBR,
 }
 ```
+
+### Layered Surfaces
+
+For complex PBR pipelines, use `layers [...]` instead of `brdf:` — one surface generates both forward and RT shaders:
+
+```
+import brdf;
+import color;
+import ibl;
+
+surface GltfPBR {
+    sampler2d base_color_tex,
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    layers [
+        base(albedo: srgb_to_linear(sample(base_color_tex, uv).xyz),
+             roughness: sample(mr_tex, uv).y, metallic: sample(mr_tex, uv).z),
+        normal_map(map: sample(normal_tex, uv).xyz),
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
+        emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)),
+    ]
+}
+
+pipeline GltfForward {
+    geometry: StandardMesh,
+    surface: GltfPBR,
+    schedule: HighQuality,
+}
+
+pipeline GltfRT {
+    mode: raytrace,
+    surface: GltfPBR,
+    environment: HDRSky,
+    schedule: HighQuality,
+}
+```
+
+Layers are listed bottom-to-top (base first, outermost last). The compiler generates energy-conserving evaluation with `sample()` auto-rewritten to `sample_lod()` for RT.
+
+Built-in layer types:
+
+| Layer | Purpose | Parameters |
+|-------|---------|------------|
+| `base` | PBR direct lighting | albedo, roughness, metallic |
+| `normal_map` | TBN normal perturbation | map |
+| `ibl` | Image-based lighting | specular_map, irradiance_map, brdf_lut |
+| `emission` | Additive emission | color |
+| `coat` | Clearcoat (Phase 2) | factor, roughness |
+| `sheen` | Sheen/fuzz (Phase 2) | color, roughness |
+
+### Compile-Time Features
+
+Declare boolean feature flags and use `if` guards to conditionally include declarations:
+
+```
+features {
+    has_normal_map: bool,
+    has_clearcoat: bool,
+}
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    tangent: vec4 if has_normal_map,
+    // ...
+}
+
+surface GltfPBR {
+    sampler2d normal_tex if has_normal_map,
+    sampler2d clearcoat_tex if has_clearcoat,
+
+    layers [
+        base(albedo: ..., roughness: ..., metallic: ...),
+        normal_map(map: sample(normal_tex, uv).xyz) if has_normal_map,
+    ]
+}
+```
+
+Guards work on any comma-separated declaration item: surface samplers, layers, geometry fields, output bindings, schedule members, and pipeline members.
+
+Module-level `if` blocks group multiple declarations:
+
+```
+if has_clearcoat {
+    import clearcoat;
+}
+```
+
+Feature expressions support `&&`, `||`, `!`, and parentheses:
+
+```
+sheen(color: ...) if (has_sheen && !has_clearcoat),
+```
+
+Features are resolved at compile time — disabled items are stripped before expansion. The generated SPIR-V contains no dead code.
 
 ### Algorithm/Schedule Separation
 
@@ -545,6 +712,7 @@ The compiler searches `luxc/stdlib/` first, then the source file's directory.
 input.lux
   -> Lark Parser         (lux.lark grammar)
   -> Tree Builder         (Transformer -> AST dataclasses)
+  -> Feature Stripping    (compile-time conditional removal)
   -> Import Resolver      (stdlib + local .lux modules)
   -> Surface Expander     (surface/geometry/pipeline -> stage blocks)
   -> Autodiff Expander    (@differentiable -> gradient functions)
@@ -584,6 +752,9 @@ luxc/
         spv_assembler.py     # spirv-as / spirv-val invocation
     expansion/
         surface_expander.py  # surface/geometry/pipeline expansion
+    features/
+        __init__.py
+        evaluator.py             # compile-time feature stripping
     grammar/
         lux.lark             # Lux EBNF grammar
         glsl_subset.lark     # GLSL transpiler grammar
@@ -622,6 +793,7 @@ examples/
     advanced_materials_demo.lux  # transmission, iridescence, dispersion, volume
     gltf_pbr.lux             # glTF 2.0 PBR with IBL + normal mapping
     gltf_pbr_rt.lux          # ray traced glTF PBR
+    gltf_pbr_layered.lux     # layered surface — unified raster + RT pipeline
     lighting_demo.lux        # multi-light PBR (directional, point, spot)
     ibl_demo.lux             # image-based lighting demo
     math_builtins_demo.lux   # built-in function visualizer
@@ -632,10 +804,13 @@ playground/
     scene_utils.py           # procedural scene generators
     preprocess_ibl.py        # HDR/EXR -> cubemap + irradiance + BRDF LUT
     test_*.py                # screenshot tests (15 tests)
+assets/                      # glTF models, IBL maps (downloaded separately, gitignored)
 playground_cpp/
     src/                     # native Vulkan C++ renderer (raster + RT)
 playground_rust/
     src/                     # native Vulkan Rust renderer (ash, raster + RT)
+screenshots/                 # rendered gallery screenshots (gitignored)
+shadercache/                 # compiled SPV + reflection JSON (generated, gitignored)
 tests/
     test_parser.py
     test_type_checker.py
@@ -672,6 +847,7 @@ tools/
 | `advanced_materials_demo.lux` | Transmission, iridescence, dispersion, volume attenuation |
 | `gltf_pbr.lux` | glTF 2.0 PBR: tangent normal mapping, metallic-roughness, IBL cubemaps, multi-scattering |
 | `gltf_pbr_rt.lux` | Ray traced glTF PBR: same material model with RT stages |
+| `gltf_pbr_layered.lux` | Layered surface: unified raster + RT from one surface declaration |
 | `lighting_demo.lux` | Multi-light: directional, point, spot lights with PBR |
 | `ibl_demo.lux` | Image-based lighting showcase: specular + diffuse IBL |
 | `math_builtins_demo.lux` | Built-in function visualizer: sin, smoothstep, fract, etc. |
@@ -704,13 +880,13 @@ The `playground/engine.py` provides a unified rendering engine with scene/pipeli
 
 ```bash
 # Render a glTF model with PBR shading
-python -m playground.engine --scene path/to/model.glb --pipeline playground/gltf_pbr --output render.png
+python -m playground.engine --scene path/to/model.glb --pipeline shadercache/gltf_pbr --output render.png
 
 # Render a procedural sphere
-python -m playground.engine --scene sphere --pipeline playground/pbr_surface --output sphere.png
+python -m playground.engine --scene sphere --pipeline shadercache/pbr_surface --output sphere.png
 
 # Render with IBL environment lighting
-python -m playground.engine --scene path/to/model.glb --pipeline playground/gltf_pbr --ibl neutral --output render_ibl.png
+python -m playground.engine --scene path/to/model.glb --pipeline shadercache/gltf_pbr --ibl neutral --output render_ibl.png
 ```
 
 ### IBL Preprocessing

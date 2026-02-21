@@ -3,7 +3,7 @@
 Converts .exr or .hdr equirectangular panorama images into pre-filtered IBL
 assets suitable for real-time PBR rendering with the split-sum approximation.
 
-Output structure (playground/assets/ibl/<name>/):
+Output structure (assets/ibl/<name>/):
     specular.bin    -- float16 RGBA, 6 faces x 9 mip levels (256..1)
     irradiance.bin  -- float16 RGBA, 6 faces x 1 mip level (32x32)
     brdf_lut.bin    -- float16 RG, 512x512
@@ -34,7 +34,8 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 PLAYGROUND_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = PLAYGROUND_DIR / "assets"
+PROJECT_ROOT = PLAYGROUND_DIR.parent
+ASSETS_DIR = PROJECT_ROOT / "assets"
 
 SPECULAR_FACE_SIZE = 256
 SPECULAR_MIP_COUNT = 9  # 256, 128, 64, 32, 16, 8, 4, 2, 1
@@ -883,7 +884,7 @@ def process_panorama(input_path: Path) -> None:
     """Full IBL preprocessing pipeline for a panorama file."""
     input_path = Path(input_path).resolve()
     name = input_path.stem
-    output_dir = PLAYGROUND_DIR / "assets" / "ibl" / name
+    output_dir = PROJECT_ROOT / "assets" / "ibl" / name
 
     print("=" * 60)
     print(f"  IBL Preprocessing: {input_path.name}")

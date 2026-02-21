@@ -522,9 +522,9 @@ void SceneManager::loadIBLAssets(VulkanContext& ctx, VkPipelineStageFlags dstSta
     std::string iblNames[] = {"pisa", "neutral"};
     std::string iblDir;
     for (auto& name : iblNames) {
-        std::string testPath = "playground/assets/ibl/" + name + "/manifest.json";
+        std::string testPath = "assets/ibl/" + name + "/manifest.json";
         if (fs::exists(testPath)) {
-            iblDir = "playground/assets/ibl/" + name;
+            iblDir = "assets/ibl/" + name;
             break;
         }
     }

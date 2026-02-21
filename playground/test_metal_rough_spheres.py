@@ -4,8 +4,8 @@ MetalRoughSpheres.glb is the standard PBR correctness test — a grid of spheres
 varying metallic (0->1) on one axis and roughness (0->1) on the other.
 
 This script:
-  1. Downloads MetalRoughSpheres.glb from Khronos (cached in playground/assets/)
-  2. Compiles examples/gltf_pbr.lux -> playground/*.spv
+  1. Downloads MetalRoughSpheres.glb from Khronos (cached in assets/)
+  2. Compiles examples/gltf_pbr.lux -> shadercache/*.spv
   3. Renders using the engine with --scene and --pipeline (with IBL if available)
   4. Validates the output (grid visible, metallic/roughness gradient, PBR shading)
 
@@ -25,14 +25,16 @@ import numpy as np
 
 PLAYGROUND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PLAYGROUND_DIR.parent
-ASSETS_DIR = PLAYGROUND_DIR / "assets"
+SHADERCACHE = PROJECT_ROOT / "shadercache"
+SCREENSHOTS = PROJECT_ROOT / "screenshots"
+ASSETS_DIR = PROJECT_ROOT / "assets"
 MODEL_GLB = ASSETS_DIR / "MetalRoughSpheres.glb"
 MODEL_URL = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/MetalRoughSpheres/glTF-Binary/MetalRoughSpheres.glb"
 
 LUX_SOURCE = PROJECT_ROOT / "examples" / "gltf_pbr.lux"
-VERT_SPV = PLAYGROUND_DIR / "gltf_pbr.vert.spv"
-FRAG_SPV = PLAYGROUND_DIR / "gltf_pbr.frag.spv"
-OUTPUT_PNG = PLAYGROUND_DIR / "test_metal_rough_spheres.png"
+VERT_SPV = SHADERCACHE / "gltf_pbr.vert.spv"
+FRAG_SPV = SHADERCACHE / "gltf_pbr.frag.spv"
+OUTPUT_PNG = SCREENSHOTS / "test_metal_rough_spheres.png"
 
 
 def step(msg: str) -> None:
@@ -74,7 +76,7 @@ def compile_shader() -> bool:
     cmd = [
         sys.executable, "-m", "luxc",
         str(LUX_SOURCE),
-        "-o", str(PLAYGROUND_DIR),
+        "-o", str(SHADERCACHE),
     ]
     print(f"  Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
@@ -97,7 +99,7 @@ def compile_shader() -> bool:
 
 def detect_ibl() -> str:
     """Auto-detect available IBL environment name, preferring pisa then neutral."""
-    ibl_dir = PLAYGROUND_DIR / "assets" / "ibl"
+    ibl_dir = PROJECT_ROOT / "assets" / "ibl"
     if ibl_dir.exists():
         preferred = ["pisa", "neutral"]
         candidates = [d.name for d in ibl_dir.iterdir()
@@ -122,7 +124,7 @@ def render_frame() -> np.ndarray | None:
         from engine import render
         pixels = render(
             scene_source=str(MODEL_GLB),
-            pipeline_base=str(PLAYGROUND_DIR / "gltf_pbr"),
+            pipeline_base=str(SHADERCACHE / "gltf_pbr"),
             output=str(OUTPUT_PNG),
             width=512,
             height=512,
@@ -133,7 +135,7 @@ def render_frame() -> np.ndarray | None:
         cmd = [
             sys.executable, "-m", "playground.engine",
             "--scene", str(MODEL_GLB),
-            "--pipeline", str(PLAYGROUND_DIR / "gltf_pbr"),
+            "--pipeline", str(SHADERCACHE / "gltf_pbr"),
             "--output", str(OUTPUT_PNG),
             "--width", "512",
             "--height", "512",

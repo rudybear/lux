@@ -53,6 +53,22 @@ def main(argv: list[str] | None = None) -> None:
         help="Emit OpLine/OpSource debug info in SPIR-V",
     )
     parser.add_argument(
+        "--pipeline", type=str, metavar="NAME",
+        help="Compile only the named pipeline (e.g., --pipeline GltfForward)",
+    )
+    parser.add_argument(
+        "--features", type=str, metavar="FEAT,FEAT,...",
+        help="Enable compile-time features (comma-separated)",
+    )
+    parser.add_argument(
+        "--all-permutations", action="store_true",
+        help="Compile all 2^N feature permutations",
+    )
+    parser.add_argument(
+        "--list-features", action="store_true",
+        help="List available features and exit",
+    )
+    parser.add_argument(
         "--version", action="version", version="luxc 0.1.0"
     )
 
@@ -99,6 +115,20 @@ def main(argv: list[str] | None = None) -> None:
     stem = input_path.stem
     output_dir = args.output_dir or input_path.parent
 
+    # --- List features mode ---
+    if args.list_features:
+        from luxc.parser.tree_builder import parse_lux
+        from luxc.features.evaluator import collect_feature_names
+        module = parse_lux(source)
+        names = collect_feature_names(module)
+        if names:
+            print("Available features:")
+            for name in names:
+                print(f"  {name}")
+        else:
+            print("No features declared in this file.")
+        return
+
     # --- Transpile mode ---
     if args.transpile:
         from luxc.transpiler.glsl_to_lux import transpile_glsl_to_lux
@@ -118,6 +148,72 @@ def main(argv: list[str] | None = None) -> None:
     # --- Normal compilation ---
     from luxc.compiler import compile_source
 
+    # Parse feature flags
+    feature_set = None
+    if args.features:
+        feature_set = set(f.strip() for f in args.features.split(",") if f.strip())
+
+    if args.all_permutations:
+        # Compile all 2^N feature permutations
+        from luxc.parser.tree_builder import parse_lux
+        from luxc.features.evaluator import collect_feature_names
+        import itertools, json
+
+        module = parse_lux(source)
+        all_names = collect_feature_names(module)
+        if not all_names:
+            print("No features declared — compiling normally.", file=sys.stderr)
+            try:
+                compile_source(
+                    source=source, stem=stem, output_dir=output_dir,
+                    source_dir=input_path.parent, dump_ast=args.dump_ast,
+                    emit_asm=args.emit_asm, validate=not args.no_validate,
+                    emit_reflection=not args.no_reflection, debug=args.debug,
+                    source_name=input_path.name, pipeline=args.pipeline,
+                )
+            except Exception as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            return
+
+        permutations = []
+        for r in range(len(all_names) + 1):
+            for combo in itertools.combinations(all_names, r):
+                permutations.append(set(combo))
+
+        print(f"Compiling {len(permutations)} permutations for features: {', '.join(all_names)}")
+        manifest_perms = []
+        for perm in permutations:
+            suffix = "+" + "+".join(
+                n.removeprefix("has_") for n in sorted(perm)
+            ) if perm else ""
+            manifest_perms.append({
+                "suffix": suffix,
+                "features": {n: n in perm for n in all_names},
+            })
+            try:
+                compile_source(
+                    source=source, stem=stem, output_dir=output_dir,
+                    source_dir=input_path.parent, dump_ast=args.dump_ast,
+                    emit_asm=args.emit_asm, validate=not args.no_validate,
+                    emit_reflection=not args.no_reflection, debug=args.debug,
+                    source_name=input_path.name, pipeline=args.pipeline,
+                    features=perm,
+                )
+            except Exception as e:
+                print(f"Error (features={sorted(perm)}): {e}", file=sys.stderr)
+
+        # Write manifest
+        manifest = {
+            "pipeline": args.pipeline or "*",
+            "features": all_names,
+            "permutations": manifest_perms,
+        }
+        manifest_path = output_dir / f"{stem}.manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        print(f"Wrote {manifest_path}")
+        return
+
     try:
         compile_source(
             source=source,
@@ -130,6 +226,8 @@ def main(argv: list[str] | None = None) -> None:
             emit_reflection=not args.no_reflection,
             debug=args.debug,
             source_name=input_path.name,
+            pipeline=args.pipeline,
+            features=feature_set,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

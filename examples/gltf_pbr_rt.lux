@@ -1,12 +1,11 @@
 // glTF PBR Ray Tracing — RT pipeline for glTF scenes
-// Same PBR math and resource naming as gltf_pbr.lux (forward version)
-// so the engine's name-based binding works identically.
+// Vertex data is passed via storage buffers for per-triangle interpolation.
+// Uses barycentrics + primitive_id to reconstruct hit-point attributes.
 //
 // Stages: raygen + closest_hit + miss
 
 import brdf;
 import color;
-import ibl;
 
 raygen {
     acceleration_structure tlas;
@@ -44,39 +43,114 @@ raygen {
 
 closest_hit {
     ray_payload payload: vec4;
+    hit_attribute bary: vec2;
+
+    // Vertex data as SoA storage buffers (uploaded by the engine)
+    storage_buffer positions: vec4;
+    storage_buffer normals: vec4;
+    storage_buffer tex_coords: vec2;
+    storage_buffer indices: uint;
 
     uniform Light {
         light_dir: vec3,
         view_pos: vec3,
     }
 
+    // PBR texture samplers (same names as forward renderer)
+    sampler2d base_color_tex;
+    sampler2d metallic_roughness_tex;
+    sampler2d occlusion_tex;
+    sampler2d emissive_tex;
+
+    // IBL environment maps (same names as forward renderer)
+    samplerCube env_specular;
+    samplerCube env_irradiance;
+    sampler2d brdf_lut;
+
     fn main() {
-        // Evaluate PBR at hit point
-        // For now, use a simple directional light evaluation
-        let n: vec3 = vec3(0.0, 1.0, 0.0);
+        // Look up triangle vertex indices
+        // primitive_id is int; mixed int * scalar -> scalar (codegen converts)
+        let base: scalar = primitive_id * 3.0;
+        let i0: uint = indices[base];
+        let i1: uint = indices[base + 1.0];
+        let i2: uint = indices[base + 2.0];
+
+        // Barycentric interpolation weights
+        let b: vec2 = bary;
+        let bw: scalar = 1.0 - b.x - b.y;
+
+        // Interpolate position
+        let p0: vec4 = positions[i0];
+        let p1: vec4 = positions[i1];
+        let p2: vec4 = positions[i2];
+        let hit_pos: vec3 = p0.xyz * bw + p1.xyz * b.x + p2.xyz * b.y;
+
+        // Interpolate normal
+        let n0: vec4 = normals[i0];
+        let n1: vec4 = normals[i1];
+        let n2: vec4 = normals[i2];
+        let n: vec3 = normalize(n0.xyz * bw + n1.xyz * b.x + n2.xyz * b.y);
+
+        // Interpolate UV coordinates
+        let uv0: vec2 = tex_coords[i0];
+        let uv1: vec2 = tex_coords[i1];
+        let uv2: vec2 = tex_coords[i2];
+        let uv: vec2 = uv0 * bw + uv1 * b.x + uv2 * b.y;
+
+        // Sample textures (sample_lod required in RT — no implicit derivatives)
+        let base_color_sample: vec4 = sample_lod(base_color_tex, uv, 0.0);
+        let base_color_linear: vec3 = srgb_to_linear(base_color_sample.xyz);
+
+        let mr_sample: vec4 = sample_lod(metallic_roughness_tex, uv, 0.0);
+        let roughness: scalar = mr_sample.y;
+        let metallic: scalar = mr_sample.z;
+
+        let ao_sample: vec4 = sample_lod(occlusion_tex, uv, 0.0);
+        let ao: scalar = ao_sample.x;
+
+        let emissive_sample: vec4 = sample_lod(emissive_tex, uv, 0.0);
+        let emissive: vec3 = srgb_to_linear(emissive_sample.xyz);
+
+        // View and light directions
         let v: vec3 = normalize(-world_ray_direction);
         let l: vec3 = normalize(light_dir);
-        let albedo: vec3 = vec3(0.8, 0.3, 0.2);
-        let roughness: scalar = 0.4;
-        let metallic: scalar = 0.0;
-
-        // Direct lighting
-        let direct: vec3 = gltf_pbr(n, v, l, albedo, roughness, metallic);
-        let n_dot_l: scalar = max(dot(n, l), 0.0);
-        let lit: vec3 = direct * n_dot_l;
-
-        // IBL ambient approximation
-        let f0: vec3 = mix(vec3(0.04), albedo, metallic);
         let n_dot_v: scalar = max(dot(n, v), 0.001);
-        let brdf_lut: vec2 = importance_sample_ggx_approx(n_dot_v, roughness);
-        let ibl_spec: vec3 = ibl_specular_contribution(n_dot_v, roughness, f0, brdf_lut);
-        let ambient: vec3 = ibl_spec + vec3(0.03) * albedo;
 
-        let hdr: vec3 = lit + ambient;
+        // Direct lighting — glTF PBR (GGX + Smith + Schlick)
+        let direct: vec3 = gltf_pbr(n, v, l, base_color_linear, roughness, metallic);
+        let direct_lit: vec3 = direct * vec3(1.0, 0.98, 0.95);
+
+        // IBL — real environment maps + BRDF LUT (sample_lod required in RT)
+        let f0: vec3 = mix(vec3(0.04), base_color_linear, metallic);
+        let r: vec3 = reflect(v * -1.0, n);
+        let prefiltered: vec3 = sample_lod(env_specular, r, roughness * 8.0).xyz;
+        let irradiance: vec3 = sample_lod(env_irradiance, n, 0.0).xyz;
+        let brdf_sample: vec2 = sample_lod(brdf_lut, vec2(n_dot_v, roughness), 0.0).xy;
+
+        // Roughness-dependent Fresnel (Fdez-Aguera 2019)
+        let fr: vec3 = max(vec3(1.0 - roughness), f0) - f0;
+        let k_s: vec3 = f0 + fr * pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 5.0);
+
+        // Multi-scattering energy compensation (Fdez-Aguera 2019)
+        let e_ss: scalar = brdf_sample.x + brdf_sample.y;
+        let f_single: vec3 = k_s * brdf_sample.x + vec3(brdf_sample.y);
+        let f_avg: vec3 = f0 + (vec3(1.0) - f0) * (1.0 / 21.0);
+        let f_ms: vec3 = f_single * f_avg / (vec3(1.0) - f_avg * (1.0 - e_ss));
+        let f_total: vec3 = f_single + f_ms * (1.0 - e_ss);
+        let ibl_spec: vec3 = f_total * prefiltered;
+
+        // Energy-conserving diffuse
+        let kd: vec3 = (vec3(1.0) - f_total) * (1.0 - metallic);
+        let ibl_diff: vec3 = kd * base_color_linear * irradiance;
+
+        let ambient: vec3 = (ibl_diff + ibl_spec) * ao;
+
+        // Combine: direct + ambient + emissive
+        let hdr: vec3 = direct_lit + ambient + emissive;
         let tonemapped: vec3 = tonemap_aces(hdr);
         let final_color: vec3 = linear_to_srgb(tonemapped);
 
-        payload = vec4(final_color, 1.0);
+        payload = vec4(final_color, base_color_sample.w);
     }
 }
 

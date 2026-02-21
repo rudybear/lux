@@ -6,8 +6,21 @@ dist/
 build/
 *.egg
 .pytest_cache/
-*.spv
-*.spvasm
 .venv/
 venv/
-playground/assets/
+
+# Generated shader output (compile with luxc to regenerate)
+shadercache/
+*.spv
+*.spvasm
+
+# Rendered screenshots (run tests to regenerate)
+screenshots/
+
+# Assets (glTF models, IBL maps — downloaded separately)
+assets/
+
+# C++/Rust build artifacts
+playground_cpp/build/
+playground_cpp/deps/
+playground_rust/target/
