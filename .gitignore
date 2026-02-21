@@ -15,10 +15,10 @@ shadercache/
 *.spvasm
 
 # Rendered screenshots (run tests to regenerate)
+# Note: README gallery images are force-tracked with git add -f
 screenshots/
 
-# Assets (glTF models, IBL maps — downloaded separately)
-assets/
+# Assets tracked via Git LFS (glTF models, IBL maps)
 
 # C++/Rust build artifacts
 playground_cpp/build/

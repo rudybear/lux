@@ -1,0 +1,99 @@
+// BRDF Polar Lobe Visualization — 2x2 grid of polar plots
+// Each cell shows a 2D polar slice through the BRDF hemisphere
+// Fixed incident direction at 45 degrees from normal
+
+import brdf;
+
+fragment {
+    in uv: vec2;
+    out color: vec4;
+
+    fn main() {
+        // 2x2 grid
+        let cols: scalar = 2.0;
+        let rows: scalar = 2.0;
+        let cell_uv: vec2 = fract(vec2(uv.x * cols, uv.y * rows));
+        let cell_x: scalar = floor(uv.x * cols);
+        let cell_y: scalar = floor(uv.y * rows);
+
+        // Map cell UV to centered coordinates [-1, 1]
+        let cx: scalar = cell_uv.x * 2.0 - 1.0;
+        let cy: scalar = cell_uv.y * 2.0 - 1.0;
+
+        // Polar coordinates from center
+        let radius: scalar = sqrt(cx * cx + cy * cy);
+        let angle: scalar = atan(cx, cy);
+
+        // Fixed surface normal (up) and incident direction at 45 degrees
+        let n: vec3 = vec3(0.0, 0.0, 1.0);
+        let v_inc: vec3 = normalize(vec3(0.707, 0.0, 0.707));
+
+        // Outgoing direction from polar angle (sweep upper hemisphere)
+        let out_x: scalar = sin(angle);
+        let out_z: scalar = cos(angle);
+        let l_out: vec3 = normalize(vec3(out_x, 0.0, max(out_z, 0.001)));
+
+        // Background
+        let bg: vec3 = vec3(0.05, 0.05, 0.07);
+
+        // --- Cell (0,0): GGX specular, roughness=0.2, F0=0.04 ---
+        let f0_ggx: vec3 = vec3(0.04);
+        let brdf_ggx: vec3 = microfacet_brdf(n, v_inc, l_out, 0.2, f0_ggx);
+        let val0: scalar = clamp(length(brdf_ggx) * 2.0, 0.0, 0.95);
+        let fill0: scalar = (radius < val0 && out_z > 0.0) ? 0.4 : 0.0;
+        let edge0: scalar = smoothstep(0.02, 0.005, abs(radius - val0)) * ((out_z > 0.0) ? 1.0 : 0.0);
+        let col0: vec3 = bg + vec3(0.2, 0.7, 1.0) * fill0 + vec3(0.4, 0.9, 1.0) * edge0;
+
+        // --- Cell (1,0): Lambert diffuse, albedo=white ---
+        let brdf_lamb: vec3 = lambert_brdf(vec3(1.0), max(dot(n, l_out), 0.0));
+        let val1: scalar = clamp(length(brdf_lamb) * 3.0, 0.0, 0.95);
+        let fill1: scalar = (radius < val1 && out_z > 0.0) ? 0.4 : 0.0;
+        let edge1: scalar = smoothstep(0.02, 0.005, abs(radius - val1)) * ((out_z > 0.0) ? 1.0 : 0.0);
+        let col1: vec3 = bg + vec3(0.2, 0.9, 0.3) * fill1 + vec3(0.4, 1.0, 0.5) * edge1;
+
+        // --- Cell (0,1): Charlie/sheen, roughness=0.5 ---
+        let n_dot_h_sheen: scalar = max(dot(n, normalize(v_inc + l_out)), 0.0);
+        let n_dot_l_sheen: scalar = max(dot(n, l_out), 0.0);
+        let n_dot_v_sheen: scalar = max(dot(n, v_inc), 0.0);
+        let brdf_sheen: vec3 = sheen_brdf(vec3(1.0), 0.5, n_dot_h_sheen, n_dot_l_sheen, n_dot_v_sheen);
+        let val2: scalar = clamp(length(brdf_sheen) * 4.0, 0.0, 0.95);
+        let fill2: scalar = (radius < val2 && out_z > 0.0) ? 0.4 : 0.0;
+        let edge2: scalar = smoothstep(0.02, 0.005, abs(radius - val2)) * ((out_z > 0.0) ? 1.0 : 0.0);
+        let col2: vec3 = bg + vec3(0.9, 0.3, 0.8) * fill2 + vec3(1.0, 0.5, 0.9) * edge2;
+
+        // --- Cell (1,1): PBR composite, roughness=0.3, metallic=0.0 ---
+        let brdf_pbr: vec3 = pbr_brdf(n, v_inc, l_out, vec3(0.8, 0.4, 0.2), 0.3, 0.0);
+        let val3: scalar = clamp(length(brdf_pbr) * 3.0, 0.0, 0.95);
+        let fill3: scalar = (radius < val3 && out_z > 0.0) ? 0.4 : 0.0;
+        let edge3: scalar = smoothstep(0.02, 0.005, abs(radius - val3)) * ((out_z > 0.0) ? 1.0 : 0.0);
+        let col3: vec3 = bg + vec3(0.9, 0.6, 0.2) * fill3 + vec3(1.0, 0.8, 0.4) * edge3;
+
+        // Reference lines: hemisphere arc, normal (vertical), tangent (horizontal)
+        let arc_dist: scalar = abs(radius - 0.95);
+        let arc_line: scalar = smoothstep(0.01, 0.003, arc_dist) * ((out_z > 0.0) ? 0.3 : 0.0);
+        let normal_line: scalar = smoothstep(0.008, 0.002, abs(cx)) * ((cy > 0.0) ? 0.25 : 0.0);
+        let tangent_line: scalar = smoothstep(0.008, 0.002, abs(cy)) * 0.15;
+
+        // Incident ray indicator
+        let inc_angle_x: scalar = 0.707 * 0.5;
+        let inc_angle_y: scalar = 0.707 * 0.5;
+        let inc_dist: scalar = abs(cx * 0.707 - cy * 0.707);
+        let inc_line: scalar = smoothstep(0.01, 0.003, inc_dist) * ((cx > 0.0 && cy > 0.0 && radius < 0.6) ? 0.4 : 0.0);
+
+        let ref_col: vec3 = vec3(arc_line + normal_line + tangent_line + inc_line);
+
+        // Select cell
+        let is_c0: scalar = (cell_x < 0.5 && cell_y < 0.5) ? 1.0 : 0.0;
+        let is_c1: scalar = (cell_x > 0.5 && cell_y < 0.5) ? 1.0 : 0.0;
+        let is_c2: scalar = (cell_x < 0.5 && cell_y > 0.5) ? 1.0 : 0.0;
+        let is_c3: scalar = (cell_x > 0.5 && cell_y > 0.5) ? 1.0 : 0.0;
+
+        let result: vec3 = col0 * is_c0 + col1 * is_c1 + col2 * is_c2 + col3 * is_c3 + ref_col;
+
+        // Grid border
+        let gx: scalar = smoothstep(0.0, 0.015, cell_uv.x) * smoothstep(0.0, 0.015, 1.0 - cell_uv.x);
+        let gy: scalar = smoothstep(0.0, 0.015, cell_uv.y) * smoothstep(0.0, 0.015, 1.0 - cell_uv.y);
+
+        color = vec4(result * gx * gy, 1.0);
+    }
+}

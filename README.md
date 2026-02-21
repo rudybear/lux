@@ -216,6 +216,30 @@ vertex {
 }
 ```
 
+### BRDF & Layer Visualization
+
+GPU-rendered visualization of BRDF functions — Fresnel curves, NDF distributions, polar lobe plots, parameter sweeps, energy conservation furnace tests, and per-layer energy breakdowns. All visualizations are self-contained `.lux` fragment shaders rendered as fullscreen quads.
+
+```bash
+# Compile and render all 5 visualization shaders
+python -m tools.visualize_brdf --composite
+
+# Render individual panels
+python -m tools.visualize_brdf --shader transfer
+python -m tools.visualize_brdf --shader polar
+python -m tools.visualize_brdf --shader sweep
+python -m tools.visualize_brdf --shader furnace
+python -m tools.visualize_brdf --shader layers
+```
+
+| Shader | Content |
+|--------|---------|
+| `viz_transfer_functions.lux` | 2x3 grid: Fresnel, GGX NDF, Smith G, Charlie NDF, Lambert vs Burley, conductor Fresnel |
+| `viz_brdf_polar.lux` | 2x2 polar lobe plots: GGX specular, Lambert diffuse, sheen, PBR composite |
+| `viz_param_sweep.lux` | Viridis heatmaps: roughness x metallic, roughness x NdotV |
+| `viz_furnace_test.lux` | White furnace test: hemisphere integration with 16 unrolled samples |
+| `viz_layer_energy.lux` | Stacked area chart: per-layer energy (diffuse, specular, coat, sheen) vs viewing angle |
+
 ### Native GPU Playgrounds
 
 Three rendering backends — Python/wgpu, C++/Vulkan, Rust/ash — all driven by the same reflection JSON from the Lux compiler:
@@ -261,6 +285,7 @@ All three engines support reflection-driven descriptor binding, glTF loading, cu
 - **Swizzle & constructors** — `v.xyz`, `vec4(pos, 1.0)`, `vec3(0.5)` (splat)
 - **Import system** — `import brdf;` pulls in stdlib or local modules
 - **User-defined functions** with inlining, structs, type aliases, constants
+- **BRDF visualization** — GPU-rendered transfer function graphs, polar lobe plots, parameter sweep heatmaps, white furnace tests, and per-layer energy breakdowns
 
 ## Prerequisites
 
@@ -851,6 +876,11 @@ examples/
     lighting_demo.lux        # multi-light PBR (directional, point, spot)
     ibl_demo.lux             # image-based lighting demo
     math_builtins_demo.lux   # built-in function visualizer
+    viz_transfer_functions.lux  # BRDF transfer function graphs (2x3 grid)
+    viz_brdf_polar.lux       # polar lobe visualization (2x2 grid)
+    viz_param_sweep.lux      # parameter sweep heatmaps (viridis)
+    viz_furnace_test.lux     # white furnace test (energy conservation)
+    viz_layer_energy.lux     # per-layer energy breakdown (stacked area)
 playground/
     engine.py                # unified rendering engine (scene/pipeline separation)
     reflected_pipeline.py    # reflection-driven descriptor binding
@@ -869,7 +899,7 @@ run_interactive_cpp_rt.bat   # launch interactive C++ RT viewer
 run_interactive_rust_rt.bat  # launch interactive Rust RT viewer
 run_interactive_cartoon_*.bat  # cartoon shader viewers (raster + RT, C++ + Rust)
 compile_gltf_*.bat           # compile + render glTF pipelines (forward, RT, layered)
-screenshots/                 # rendered gallery screenshots (gitignored)
+screenshots/                 # rendered gallery screenshots
 shadercache/                 # compiled SPV + reflection JSON (generated, gitignored)
 tests/
     test_parser.py
@@ -885,8 +915,10 @@ tests/
     test_p6_raytracing.py
     test_custom_layers.py
     test_gltf_extensions.py
+    test_brdf_visualization.py  # P15 BRDF visualization tests (10 tests)
 tools/
     generate_training_data.py
+    visualize_brdf.py        # BRDF visualization CLI (compile + render + composite)
 ```
 
 ## Examples
@@ -914,6 +946,11 @@ tools/
 | `lighting_demo.lux` | Multi-light: directional, point, spot lights with PBR |
 | `ibl_demo.lux` | Image-based lighting showcase: specular + diffuse IBL |
 | `math_builtins_demo.lux` | Built-in function visualizer: sin, smoothstep, fract, etc. |
+| `viz_transfer_functions.lux` | BRDF transfer function graphs: Fresnel, NDF, geometry, diffuse curves |
+| `viz_brdf_polar.lux` | Polar lobe visualization: GGX, Lambert, sheen, PBR composite |
+| `viz_param_sweep.lux` | Parameter sweep heatmaps: roughness x metallic, roughness x NdotV |
+| `viz_furnace_test.lux` | White furnace test: energy conservation with hemisphere integration |
+| `viz_layer_energy.lux` | Per-layer energy breakdown: stacked area chart of BRDF contributions |
 
 ## Screenshot Tests
 
@@ -1007,10 +1044,34 @@ Output: specular cubemap (6 faces x 5 mips), irradiance cubemap, and BRDF integr
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 379 tests
+# 389 tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.
+
+## Assets
+
+The `assets/` directory contains glTF 2.0 sample models and HDR environment maps used for rendering tests and demos. These are tracked via Git LFS.
+
+**glTF models** — official [Khronos glTF Sample Assets](https://github.com/KhronosGroup/glTF-Sample-Assets):
+
+| Asset | Source | Purpose |
+|-------|--------|---------|
+| `DamagedHelmet.glb` | Khronos glTF Sample Assets | Primary PBR test model (normal maps, metallic-roughness, emission) |
+| `MetalRoughSpheres.glb` | Khronos glTF Sample Assets | Metallic-roughness parameter sweep grid |
+| `MetalRoughSpheresNoTextures.glb` | Khronos glTF Sample Assets | Parameter-only variant (no textures) |
+| `ClearCoatTest.glb` | Khronos glTF Sample Assets | `KHR_materials_clearcoat` extension test |
+| `SheenChair.glb` | Khronos glTF Sample Assets | `KHR_materials_sheen` extension test |
+| `TransmissionTest.glb` | Khronos glTF Sample Assets | `KHR_materials_transmission` extension test |
+
+**HDR environment maps:**
+
+| Asset | Purpose |
+|-------|---------|
+| `pisa.hdr` | Pisa courtyard IBL environment (diffuse + specular) |
+| `neutral.hdr` | Neutral studio IBL environment |
+
+**Preprocessed IBL data** (`assets/ibl/`): pre-filtered specular cubemaps, irradiance cubemaps, and BRDF integration LUTs generated by `python -m playground.preprocess_ibl`.
 
 ## Design Decisions
 

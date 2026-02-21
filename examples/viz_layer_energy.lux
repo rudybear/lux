@@ -1,0 +1,94 @@
+// Per-Layer Energy Breakdown — stacked area chart
+// X-axis: NdotV (viewing angle) 0.01 to 1.0
+// Y-axis: stacked energy contributions (cumulative luminance)
+// Layers: base diffuse (orange), base specular (cyan), clearcoat (white), sheen (magenta)
+
+import brdf;
+
+fn lum(c: vec3) -> scalar {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+fragment {
+    in uv: vec2;
+    out color: vec4;
+
+    fn main() {
+        // Single panel: x = NdotV, y = stacked energy
+        let ndotv: scalar = uv.x * 0.99 + 0.01;
+
+        // Construct view and light directions
+        let n: vec3 = vec3(0.0, 0.0, 1.0);
+        let sin_v: scalar = sqrt(max(1.0 - ndotv * ndotv, 0.0));
+        let v: vec3 = normalize(vec3(sin_v, 0.0, ndotv));
+        let l: vec3 = normalize(vec3(0.707, 0.0, 0.707));
+
+        // Dot products
+        let h: vec3 = normalize(v + l);
+        let n_dot_l: scalar = max(dot(n, l), 0.0);
+        let n_dot_v: scalar = max(dot(n, v), 0.0);
+        let n_dot_h: scalar = max(dot(n, h), 0.0);
+        let v_dot_h: scalar = max(dot(v, h), 0.0);
+
+        // Material parameters
+        let albedo: vec3 = vec3(0.8, 0.3, 0.2);
+        let roughness: scalar = 0.3;
+        let metallic: scalar = 0.0;
+        let f0_dielectric: vec3 = vec3(0.04);
+        let f0: vec3 = mix(f0_dielectric, albedo, vec3(metallic));
+        let f: vec3 = fresnel_schlick(v_dot_h, f0);
+
+        // Layer 1: Base diffuse
+        let kd: vec3 = (vec3(1.0) - f) * (1.0 - metallic);
+        let diffuse: vec3 = kd * albedo * INV_PI * n_dot_l;
+        let e_diffuse: scalar = lum(diffuse) * 2.5;
+
+        // Layer 2: Base specular
+        let specular: vec3 = microfacet_brdf(n, v, l, roughness, f0) * n_dot_l;
+        let e_specular: scalar = lum(specular) * 2.5;
+
+        // Layer 3: Clearcoat
+        let coat_val: scalar = clearcoat_brdf(n, v, l, 0.5, 0.1);
+        let e_coat: scalar = coat_val * 2.5;
+
+        // Layer 4: Sheen
+        let sheen_val: vec3 = sheen_brdf(vec3(0.5, 0.3, 0.8), 0.5, n_dot_h, n_dot_l, n_dot_v);
+        let e_sheen: scalar = lum(sheen_val) * 2.5;
+
+        // Stacked cumulative values (clamped to [0,1])
+        let stack0: scalar = clamp(e_diffuse, 0.0, 1.0);
+        let stack1: scalar = clamp(e_diffuse + e_specular, 0.0, 1.0);
+        let stack2: scalar = clamp(e_diffuse + e_specular + e_coat, 0.0, 1.0);
+        let stack3: scalar = clamp(e_diffuse + e_specular + e_coat + e_sheen, 0.0, 1.0);
+
+        // Determine which band the current y falls in
+        let y: scalar = uv.y;
+        let bg: vec3 = vec3(0.04, 0.04, 0.06);
+
+        // Layer colors
+        let c_diffuse: vec3 = vec3(0.9, 0.5, 0.15);
+        let c_specular: vec3 = vec3(0.1, 0.8, 0.9);
+        let c_coat: vec3 = vec3(0.85, 0.85, 0.9);
+        let c_sheen: vec3 = vec3(0.8, 0.3, 0.9);
+
+        // Stacked area fill
+        let result: vec3 = (y < stack0) ? c_diffuse * 0.6
+            : (y < stack1) ? c_specular * 0.6
+            : (y < stack2) ? c_coat * 0.6
+            : (y < stack3) ? c_sheen * 0.6
+            : bg;
+
+        // Layer boundary lines (thin white)
+        let line0: scalar = smoothstep(0.012, 0.004, abs(y - stack0));
+        let line1: scalar = smoothstep(0.012, 0.004, abs(y - stack1));
+        let line2: scalar = smoothstep(0.012, 0.004, abs(y - stack2));
+        let line3: scalar = smoothstep(0.012, 0.004, abs(y - stack3));
+
+        let line_col: vec3 = vec3(0.9) * max(max(line0, line1), max(line2, line3));
+
+        // Reference line at y=1.0 (if visible)
+        let ref_line: scalar = smoothstep(0.008, 0.002, abs(y - 1.0)) * 0.3;
+
+        color = vec4(result + line_col + vec3(ref_line), 1.0);
+    }
+}

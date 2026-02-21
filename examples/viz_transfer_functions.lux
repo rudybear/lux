@@ -1,0 +1,152 @@
+// BRDF Transfer Function Graphs — 2x3 grid of curve plots
+// Visualizes Fresnel, NDF, geometry, diffuse, and conductor functions
+// Each cell plots 2-3 curves with distinct colors
+
+import brdf;
+
+fragment {
+    in uv: vec2;
+    out color: vec4;
+
+    fn main() {
+        // 2x3 grid (2 columns, 3 rows = 6 cells)
+        let cols: scalar = 2.0;
+        let rows: scalar = 3.0;
+        let cell_uv: vec2 = fract(vec2(uv.x * cols, uv.y * rows));
+        let cell_x: scalar = floor(uv.x * cols);
+        let cell_y: scalar = floor(uv.y * rows);
+
+        // Input: x maps cell_uv.x to [0, 1] for all functions
+        let x: scalar = cell_uv.x;
+
+        // Background color (dark gray)
+        let bg: vec3 = vec3(0.06, 0.06, 0.08);
+
+        // --- Cell (0,0): fresnel_schlick ---
+        // 3 curves: F0=0.04 (cyan), F0=0.5 (green), F0=0.96 (gold)
+        let fs_a: scalar = fresnel_schlick(x, vec3(0.04)).x;
+        let fs_b: scalar = fresnel_schlick(x, vec3(0.5)).x;
+        let fs_c: scalar = fresnel_schlick(x, vec3(0.96)).x;
+
+        let da0: scalar = abs(cell_uv.y - fs_a);
+        let db0: scalar = abs(cell_uv.y - fs_b);
+        let dc0: scalar = abs(cell_uv.y - fs_c);
+
+        let la0: scalar = smoothstep(0.015, 0.005, da0);
+        let lb0: scalar = smoothstep(0.015, 0.005, db0);
+        let lc0: scalar = smoothstep(0.015, 0.005, dc0);
+
+        let col0: vec3 = bg + vec3(0.0, 0.8, 0.9) * la0
+                            + vec3(0.2, 0.8, 0.2) * lb0
+                            + vec3(0.9, 0.8, 0.2) * lc0;
+
+        // --- Cell (1,0): ggx_ndf ---
+        // 3 curves: roughness=0.1, 0.3, 0.7 (reds, scaled to fit)
+        let ndf_a: scalar = clamp(ggx_ndf(x, 0.1) * 0.05, 0.0, 1.0);
+        let ndf_b: scalar = clamp(ggx_ndf(x, 0.3) * 0.15, 0.0, 1.0);
+        let ndf_c: scalar = clamp(ggx_ndf(x, 0.7) * 0.5, 0.0, 1.0);
+
+        let da1: scalar = abs(cell_uv.y - ndf_a);
+        let db1: scalar = abs(cell_uv.y - ndf_b);
+        let dc1: scalar = abs(cell_uv.y - ndf_c);
+
+        let la1: scalar = smoothstep(0.015, 0.005, da1);
+        let lb1: scalar = smoothstep(0.015, 0.005, db1);
+        let lc1: scalar = smoothstep(0.015, 0.005, dc1);
+
+        let col1: vec3 = bg + vec3(1.0, 0.2, 0.1) * la1
+                            + vec3(0.9, 0.4, 0.2) * lb1
+                            + vec3(0.8, 0.5, 0.3) * lc1;
+
+        // --- Cell (0,1): v_ggx_correlated ---
+        // 3 curves: roughness=0.1, 0.3, 0.7 (blues), NdotV fixed at 0.5
+        let vg_a: scalar = clamp(v_ggx_correlated(x, 0.5, 0.1) * 2.0, 0.0, 1.0);
+        let vg_b: scalar = clamp(v_ggx_correlated(x, 0.5, 0.3) * 2.0, 0.0, 1.0);
+        let vg_c: scalar = clamp(v_ggx_correlated(x, 0.5, 0.7) * 2.0, 0.0, 1.0);
+
+        let da2: scalar = abs(cell_uv.y - vg_a);
+        let db2: scalar = abs(cell_uv.y - vg_b);
+        let dc2: scalar = abs(cell_uv.y - vg_c);
+
+        let la2: scalar = smoothstep(0.015, 0.005, da2);
+        let lb2: scalar = smoothstep(0.015, 0.005, db2);
+        let lc2: scalar = smoothstep(0.015, 0.005, dc2);
+
+        let col2: vec3 = bg + vec3(0.2, 0.4, 1.0) * la2
+                            + vec3(0.3, 0.5, 0.9) * lb2
+                            + vec3(0.4, 0.6, 0.8) * lc2;
+
+        // --- Cell (1,1): charlie_ndf (sheen) ---
+        // 3 curves: roughness=0.3, 0.5, 0.8 (magentas)
+        let ch_a: scalar = clamp(charlie_ndf(0.3, x) * 0.3, 0.0, 1.0);
+        let ch_b: scalar = clamp(charlie_ndf(0.5, x) * 0.3, 0.0, 1.0);
+        let ch_c: scalar = clamp(charlie_ndf(0.8, x) * 0.3, 0.0, 1.0);
+
+        let da3: scalar = abs(cell_uv.y - ch_a);
+        let db3: scalar = abs(cell_uv.y - ch_b);
+        let dc3: scalar = abs(cell_uv.y - ch_c);
+
+        let la3: scalar = smoothstep(0.015, 0.005, da3);
+        let lb3: scalar = smoothstep(0.015, 0.005, db3);
+        let lc3: scalar = smoothstep(0.015, 0.005, dc3);
+
+        let col3: vec3 = bg + vec3(0.9, 0.2, 0.8) * la3
+                            + vec3(0.8, 0.3, 0.7) * lb3
+                            + vec3(0.7, 0.4, 0.6) * lc3;
+
+        // --- Cell (0,2): Lambert vs Burley ---
+        // Lambert (green), Burley r=0.5 (yellow)
+        let lamb_val: scalar = clamp(x * INV_PI, 0.0, 1.0);
+        let burl_val: scalar = clamp(burley_diffuse(vec3(1.0), 0.5, x, 0.5, 0.7).x * PI, 0.0, 1.0);
+
+        let da4: scalar = abs(cell_uv.y - lamb_val);
+        let db4: scalar = abs(cell_uv.y - burl_val);
+
+        let la4: scalar = smoothstep(0.015, 0.005, da4);
+        let lb4: scalar = smoothstep(0.015, 0.005, db4);
+
+        let col4: vec3 = bg + vec3(0.2, 0.9, 0.3) * la4
+                            + vec3(0.9, 0.9, 0.2) * lb4;
+
+        // --- Cell (1,2): conductor_fresnel ---
+        // Gold F0/F82 (gold), Copper F0/F82 (orange)
+        let gold_f0: vec3 = vec3(1.0, 0.71, 0.29);
+        let gold_f82: vec3 = vec3(1.0, 0.87, 0.61);
+        let copper_f0: vec3 = vec3(0.95, 0.64, 0.54);
+        let copper_f82: vec3 = vec3(1.0, 0.78, 0.70);
+
+        let cf_gold: scalar = conductor_fresnel(gold_f0, gold_f82, x).x;
+        let cf_copper: scalar = conductor_fresnel(copper_f0, copper_f82, x).x;
+
+        let da5: scalar = abs(cell_uv.y - cf_gold);
+        let db5: scalar = abs(cell_uv.y - cf_copper);
+
+        let la5: scalar = smoothstep(0.015, 0.005, da5);
+        let lb5: scalar = smoothstep(0.015, 0.005, db5);
+
+        let col5: vec3 = bg + vec3(1.0, 0.85, 0.3) * la5
+                            + vec3(1.0, 0.6, 0.3) * lb5;
+
+        // --- Select cell ---
+        let is_c0: scalar = (cell_x < 0.5 && cell_y < 0.5) ? 1.0 : 0.0;
+        let is_c1: scalar = (cell_x > 0.5 && cell_y < 0.5) ? 1.0 : 0.0;
+        let is_c2: scalar = (cell_x < 0.5 && cell_y > 0.5 && cell_y < 1.5) ? 1.0 : 0.0;
+        let is_c3: scalar = (cell_x > 0.5 && cell_y > 0.5 && cell_y < 1.5) ? 1.0 : 0.0;
+        let is_c4: scalar = (cell_x < 0.5 && cell_y > 1.5) ? 1.0 : 0.0;
+        let is_c5: scalar = (cell_x > 0.5 && cell_y > 1.5) ? 1.0 : 0.0;
+
+        let result: vec3 = col0 * is_c0 + col1 * is_c1
+                         + col2 * is_c2 + col3 * is_c3
+                         + col4 * is_c4 + col5 * is_c5;
+
+        // Midline reference at y=0.5
+        let mid_line: scalar = smoothstep(0.008, 0.003, abs(cell_uv.y - 0.5));
+        let ref_add: vec3 = vec3(0.15, 0.15, 0.1) * mid_line;
+
+        // Grid border lines
+        let gx: scalar = smoothstep(0.0, 0.015, cell_uv.x) * smoothstep(0.0, 0.015, 1.0 - cell_uv.x);
+        let gy: scalar = smoothstep(0.0, 0.015, cell_uv.y) * smoothstep(0.0, 0.015, 1.0 - cell_uv.y);
+
+        color = vec4((result + ref_add) * gx * gy, 1.0);
+    }
+}

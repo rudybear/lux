@@ -484,17 +484,33 @@ Discuss and design how Gaussian splats should be represented in Lux, then implem
 - Implementation: splat sorting compute shader, tile-based rasterizer, SH evaluation
 - Target: real-time rendering of pre-trained Gaussian splat scenes (.ply format)
 
-### Phase 15: BRDF & Layer Visualization
+### Phase 15: BRDF & Layer Visualization ✅ COMPLETE
 
-Build an interactive visualization system for BRDFs, lobes, and transfer functions so authors can see and debug the behavior of their material layers.
+GPU-rendered visualization of BRDF functions as fullscreen Lux fragment shaders. Each shader plots BRDF functions using grid cells, `smoothstep` anti-aliased curves, and `fract`/`floor` cell selection. A Python tool compiles and renders them into a composite report.
 
-- **BRDF lobe visualization**: Render polar/spherical plots of BRDF response for given incident angles. Show GGX, Lambert, sheen (Charlie NDF), clearcoat lobes as 3D hemisphere plots or 2D polar slices
-- **Transfer function graphs**: Plot Fresnel curves (Schlick, conductor, dielectric), NDF distributions, geometry/visibility terms, and energy conservation budgets as interactive 2D graphs
-- **Per-layer contribution view**: For a given `surface` with `layers [...]`, show a stacked breakdown of each layer's energy contribution (base diffuse, base specular, IBL diffuse, IBL specular, emission, coat, sheen) as a function of viewing angle or roughness
-- **Parameter sweep heatmaps**: Visualize BRDF response across a 2D parameter grid (e.g., roughness × metallic, or NdotV × roughness) as false-color heatmaps
-- **Furnace test integration**: Automated white furnace test rendering per layer to verify energy conservation (output should be <= 1.0 everywhere)
-- **Implementation approach**: Python/matplotlib or wgpu-based interactive viewer that imports Lux stdlib functions, evaluates them on CPU, and renders the plots. Optionally generate the visualization data by compiling a special Lux compute shader
-- **CLI integration**: `luxc --visualize brdf.lux --surface MyMaterial` to open the visualization tool for a given surface declaration
+**New visualization shaders (`examples/`):**
+
+| Shader | Content |
+|--------|---------|
+| `viz_transfer_functions.lux` | 2x3 grid: Fresnel (Schlick), GGX NDF, Smith G, Charlie NDF, Lambert vs Burley, conductor Fresnel |
+| `viz_brdf_polar.lux` | 2x2 polar lobe plots: GGX specular, Lambert diffuse, sheen, PBR composite |
+| `viz_param_sweep.lux` | Viridis heatmaps: roughness × metallic, roughness × NdotV |
+| `viz_furnace_test.lux` | White furnace test: hemisphere integration with 16 Fibonacci samples (energy ≤ 1.0 = green, > 1.0 = red) |
+| `viz_layer_energy.lux` | Stacked area chart: per-layer energy (diffuse, specular, coat, sheen) vs viewing angle |
+
+**New tools:**
+
+| File | Purpose |
+|------|---------|
+| `tools/visualize_brdf.py` | CLI: compile all viz shaders, render to PNG, composite into report |
+| `tests/test_brdf_visualization.py` | 10 tests: compilation + pixel validation for all 5 shaders |
+
+**CLI usage:**
+```bash
+python -m tools.visualize_brdf --composite          # Full report
+python -m tools.visualize_brdf --shader transfer     # Single shader
+python -m tools.visualize_brdf --skip-compile         # Use cached SPIR-V
+```
 
 ### Phase 16: AI Features for Lux
 
@@ -822,7 +838,7 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P12** | Official glTF PBR extensions in engine materials (auto-detect, permutation selection) | ✅ Complete |
 | **P13** | Mesh shader support (`task`/`mesh` stages, meshlet-based geometry) | Planned |
 | **P14** | Gaussian splatting representation (splat sorting, tile-based rasterizer, SH evaluation) | Planned |
-| **P15** | BRDF & layer visualization (lobe plots, transfer function graphs, energy conservation tests) | Planned |
+| **P15** | BRDF & layer visualization (lobe plots, transfer function graphs, energy conservation tests) | ✅ Complete |
 | **P16** | AI features for Lux (image-to-shader, prompt-based generation, AI skills, training pipeline) | Planned |
 | **P17** | Light & shadow management (declarative lights, CSM/cubemap/perspective shadows, PCF/PCSS/VSM/MSM filtering, tiled/clustered culling, volumetric lighting, light probes, LPV) | Planned |
 
