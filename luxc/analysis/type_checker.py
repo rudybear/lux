@@ -148,6 +148,40 @@ class TypeChecker:
                     if t is not None:
                         scope.define(Symbol(bname, t, "rt_builtin"))
 
+        # Register mesh/task built-in variables
+        _MESH_STAGE_TYPES = {"mesh", "task"}
+        if stage.stage_type in _MESH_STAGE_TYPES:
+            from luxc.codegen.spirv_builder import _MESH_BUILTINS
+            for bname, (btype, _, valid_stages) in _MESH_BUILTINS.items():
+                if stage.stage_type in valid_stages:
+                    t = resolve_type(btype)
+                    if t is not None:
+                        scope.define(Symbol(bname, t, "mesh_builtin"))
+
+        # Register mesh output built-in variables as arrays
+        # (IndexAccess on RuntimeArrayType returns the element type correctly)
+        if stage.stage_type == "mesh":
+            scope.define(Symbol("gl_MeshVerticesEXT",
+                                RuntimeArrayType("gl_MeshVerticesEXT_arr", "vec4"),
+                                "mesh_builtin"))
+            scope.define(Symbol("gl_PrimitiveTriangleIndicesEXT",
+                                RuntimeArrayType("gl_PrimitiveTriangleIndicesEXT_arr", "uvec3"),
+                                "mesh_builtin"))
+
+            # Also register per-vertex output arrays (stage.outputs in mesh stage)
+            for out in stage.outputs:
+                t = resolve_type(out.type_name)
+                if t is not None:
+                    scope.define(Symbol(out.name,
+                                        RuntimeArrayType(f"{out.name}_arr", out.type_name),
+                                        "mesh_output"))
+
+        # Register task payload variables
+        for tp in getattr(stage, 'task_payloads', []):
+            t = resolve_type(tp.type_name)
+            if t is not None:
+                scope.define(Symbol(tp.name, t, "task_payload"))
+
         for fn in stage.functions:
             self._check_function(fn, scope)
 

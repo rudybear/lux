@@ -23,7 +23,7 @@ from luxc.parser.ast_nodes import (
     ScheduleDecl, EnvironmentDecl, ProceduralDecl,
     RayPayloadDecl, HitAttributeDecl, AccelDecl, StorageImageDecl,
     StorageBufferDecl, IndexAccess, FieldAccess,
-    IfStmt,
+    IfStmt, TaskPayloadDecl,
 )
 
 
@@ -96,6 +96,7 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None) -> None:
         mode = "rasterize"
         max_bounces = 1
         procedural_name = None
+        use_task_shader = False
         for member in pipeline.members:
             if member.name == "geometry":
                 if isinstance(member.value, VarRef):
@@ -118,6 +119,9 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None) -> None:
             elif member.name == "procedural":
                 if isinstance(member.value, VarRef):
                     procedural_name = member.value.name
+            elif member.name == "use_task_shader":
+                if isinstance(member.value, VarRef) and member.value.name == "true":
+                    use_task_shader = True
 
         # Resolve schedule if specified
         schedule = None
@@ -131,6 +135,14 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None) -> None:
             procedural = procedurals.get(procedural_name) if procedural_name else None
             stages = _expand_rt_pipeline(
                 surface, environment, procedural, module, schedule, max_bounces
+            )
+            module.stages.extend(stages)
+        elif mode == "mesh_shader":
+            # Mesh shader pipeline expansion
+            surface = surfaces.get(surf_name) if surf_name else None
+            geometry = geometries.get(geo_name) if geo_name else None
+            stages = _expand_mesh_pipeline(
+                surface, geometry, module, schedule, pipeline, use_task_shader
             )
             module.stages.extend(stages)
         elif surf_name and surf_name in surfaces:
@@ -1584,6 +1596,293 @@ def _expand_procedural_to_intersection(procedural: ProceduralDecl) -> StageBlock
         ],
         [],
     ))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
+# =========================================================================
+# Mesh Shader Pipeline Expansion
+# =========================================================================
+
+def _expand_mesh_pipeline(
+    surface: SurfaceDecl | None,
+    geometry: GeometryDecl | None,
+    module: Module,
+    schedule: dict[str, str] | None = None,
+    pipeline: PipelineDecl | None = None,
+    use_task_shader: bool = False,
+) -> list[StageBlock]:
+    """Generate mesh + fragment stages (and optionally task) from pipeline declarations.
+
+    The mesh shader replaces the traditional vertex stage with a compute-like shader
+    that reads from storage buffers and outputs vertices + triangle indices per workgroup.
+    The fragment stage is identical to rasterization (reuses _expand_surface_to_fragment).
+    """
+    stages = []
+    defines = getattr(module, '_defines', {})
+
+    # 1. Optional task shader (amplification)
+    if use_task_shader:
+        task = _expand_task_shader(defines)
+        task._descriptor_set_offset = 0
+        stages.append(task)
+
+    # 2. Mesh shader
+    mesh = _expand_geometry_to_mesh(geometry, module, defines)
+    mesh._descriptor_set_offset = 1 if use_task_shader else 0
+    stages.append(mesh)
+
+    # 3. Fragment shader (identical to raster path)
+    if surface:
+        frag = _expand_surface_to_fragment(surface, module, geometry, schedule)
+        frag._descriptor_set_offset = (2 if use_task_shader else 1)
+        stages.append(frag)
+
+    return stages
+
+
+def _expand_geometry_to_mesh(
+    geometry: GeometryDecl | None,
+    module: Module,
+    defines: dict[str, int],
+) -> StageBlock:
+    """Generate a mesh stage from a geometry declaration.
+
+    The mesh shader reads meshlet data from storage buffers and outputs
+    vertices + triangle indices. Each workgroup processes one meshlet.
+    """
+    stage = StageBlock(stage_type="mesh")
+
+    max_verts = defines.get('max_vertices', 64)
+    max_prims = defines.get('max_primitives', 124)
+
+    # Storage buffers for meshlet data
+    stage.storage_buffers.append(StorageBufferDecl("meshlet_descriptors", "uvec4"))
+    stage.storage_buffers.append(StorageBufferDecl("meshlet_vertices", "uint"))
+    stage.storage_buffers.append(StorageBufferDecl("meshlet_triangles", "uint"))
+
+    # Storage buffers for vertex data (SoA, same as RT)
+    stage.storage_buffers.append(StorageBufferDecl("positions", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("normals", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("tex_coords", "vec2"))
+
+    # Optional tangent buffer (present when geometry has a tangent field)
+    if geometry and any(f.name == "tangent" for f in geometry.fields):
+        stage.storage_buffers.append(StorageBufferDecl("tangents", "vec4"))
+
+    # Transform uniform (from geometry declaration)
+    if geometry and geometry.transform:
+        ub = UniformBlock(
+            geometry.transform.name,
+            [BlockField(f.name, f.type_name) for f in geometry.transform.fields],
+        )
+        stage.uniforms.append(ub)
+
+    # Per-vertex outputs (excluding clip_pos which maps to gl_Position)
+    if geometry and geometry.outputs:
+        for binding in geometry.outputs.bindings:
+            if binding.name != "clip_pos":
+                out_type = _infer_output_type(binding.name)
+                v = VarDecl(binding.name, out_type)
+                v._is_input = False
+                stage.outputs.append(v)
+
+    # Generate main function body
+    body = _generate_mesh_main(geometry, defines)
+    stage.functions.append(FunctionDef("main", [], None, body))
+
+    return stage
+
+
+def _generate_mesh_main(
+    geometry: GeometryDecl | None,
+    defines: dict[str, int],
+) -> list:
+    """Generate mesh shader main() body with unrolled iterations.
+
+    Each workgroup has `workgroup_size` threads but may need to process up to
+    `max_vertices` vertices and `max_primitives` triangles.  When these limits
+    exceed workgroup_size, we unroll: each thread handles multiple vertices /
+    triangles at stride = workgroup_size.
+
+    Pattern per iteration i (offset = i * workgroup_size):
+      let vid = tid + offset;
+      if (vid < vert_count) { process vertex vid }
+
+      let trid = tid + offset;
+      if (trid < tri_count) { write triangle trid }
+    """
+    body = []
+
+    workgroup_size = defines.get('workgroup_size', 32)
+    max_verts = defines.get('max_vertices', 64)
+    max_prims = defines.get('max_primitives', 124)
+
+    vert_iters = (max_verts + workgroup_size - 1) // workgroup_size
+    tri_iters = (max_prims + workgroup_size - 1) // workgroup_size
+
+    # --- Common setup ---
+    body.append(LetStmt("meshlet_id", "scalar",
+        SwizzleAccess(VarRef("workgroup_id"), "x")))
+    body.append(LetStmt("tid", "uint", VarRef("local_invocation_index")))
+
+    body.append(LetStmt("desc", "uvec4",
+        IndexAccess(VarRef("meshlet_descriptors"), VarRef("meshlet_id"))))
+
+    body.append(LetStmt("vert_offset", "scalar", SwizzleAccess(VarRef("desc"), "x")))
+    body.append(LetStmt("vert_count", "scalar", SwizzleAccess(VarRef("desc"), "y")))
+    body.append(LetStmt("tri_offset", "scalar", SwizzleAccess(VarRef("desc"), "z")))
+    body.append(LetStmt("tri_count", "scalar", SwizzleAccess(VarRef("desc"), "w")))
+
+    body.append(ExprStmt(CallExpr(VarRef("set_mesh_outputs"), [
+        VarRef("vert_count"),
+        VarRef("tri_count"),
+    ])))
+
+    # --- Vertex processing (unrolled) ---
+    for i in range(vert_iters):
+        if i == 0:
+            vid = "tid"
+        else:
+            vid = f"vid_{i}"
+            body.append(LetStmt(vid, "scalar",
+                BinaryOp("+", VarRef("tid"), NumberLit(str(i * workgroup_size)))))
+
+        vbody = _make_vertex_iteration(geometry, vid)
+        body.append(IfStmt(
+            BinaryOp("<", VarRef(vid), VarRef("vert_count")),
+            vbody,
+            [],
+        ))
+
+    # --- Triangle index writing (unrolled) ---
+    for i in range(tri_iters):
+        if i == 0:
+            trid = "tid"
+        else:
+            trid = f"trid_{i}"
+            body.append(LetStmt(trid, "scalar",
+                BinaryOp("+", VarRef("tid"), NumberLit(str(i * workgroup_size)))))
+
+        tbody = _make_tri_iteration(trid)
+        body.append(IfStmt(
+            BinaryOp("<", VarRef(trid), VarRef("tri_count")),
+            tbody,
+            [],
+        ))
+
+    return body
+
+
+def _make_vertex_iteration(
+    geometry: GeometryDecl | None,
+    vid: str,
+) -> list:
+    """Generate one iteration of vertex processing for invocation variable *vid*."""
+    vbody = []
+
+    # Read vertex index and position from storage buffers
+    vbody.append(LetStmt("global_idx", "uint",
+        IndexAccess(VarRef("meshlet_vertices"),
+            BinaryOp("+", VarRef("vert_offset"), VarRef(vid)))))
+    vbody.append(LetStmt("pos", "vec4",
+        IndexAccess(VarRef("positions"), VarRef("global_idx"))))
+
+    # Bind geometry fields from storage buffers (position, normal, uv)
+    if geometry and geometry.fields:
+        for field in geometry.fields:
+            if field.name == "position":
+                vbody.append(LetStmt("position", "vec3",
+                    SwizzleAccess(VarRef("pos"), "xyz")))
+            elif field.name == "normal":
+                vbody.append(LetStmt("normal_raw", "vec4",
+                    IndexAccess(VarRef("normals"), VarRef("global_idx"))))
+                vbody.append(LetStmt("normal", "vec3",
+                    SwizzleAccess(VarRef("normal_raw"), "xyz")))
+            elif field.name == "uv":
+                vbody.append(LetStmt("uv", "vec2",
+                    IndexAccess(VarRef("tex_coords"), VarRef("global_idx"))))
+            elif field.name == "tangent":
+                vbody.append(LetStmt("tangent", "vec4",
+                    IndexAccess(VarRef("tangents"), VarRef("global_idx"))))
+
+    # Write geometry outputs
+    if geometry and geometry.outputs:
+        for binding in geometry.outputs.bindings:
+            if binding.name == "clip_pos":
+                vbody.append(AssignStmt(
+                    AssignTarget(IndexAccess(VarRef("gl_MeshVerticesEXT"), VarRef(vid))),
+                    binding.value,
+                ))
+            else:
+                vbody.append(AssignStmt(
+                    AssignTarget(IndexAccess(VarRef(binding.name), VarRef(vid))),
+                    binding.value,
+                ))
+    else:
+        vbody.append(AssignStmt(
+            AssignTarget(IndexAccess(VarRef("gl_MeshVerticesEXT"), VarRef(vid))),
+            ConstructorExpr("vec4", [
+                SwizzleAccess(VarRef("pos"), "xyz"),
+                NumberLit("1.0"),
+            ]),
+        ))
+
+    return vbody
+
+
+def _make_tri_iteration(trid: str) -> list:
+    """Generate one iteration of triangle index writing for invocation variable *trid*."""
+    tbody = []
+
+    tbody.append(LetStmt("idx_base", "scalar",
+        BinaryOp("*", VarRef(trid), NumberLit("3"))))
+
+    tbody.append(LetStmt("t0", "uint",
+        IndexAccess(VarRef("meshlet_triangles"),
+            BinaryOp("+", VarRef("tri_offset"), VarRef("idx_base")))))
+    tbody.append(LetStmt("t1", "uint",
+        IndexAccess(VarRef("meshlet_triangles"),
+            BinaryOp("+", VarRef("tri_offset"),
+                BinaryOp("+", VarRef("idx_base"), NumberLit("1"))))))
+    tbody.append(LetStmt("t2", "uint",
+        IndexAccess(VarRef("meshlet_triangles"),
+            BinaryOp("+", VarRef("tri_offset"),
+                BinaryOp("+", VarRef("idx_base"), NumberLit("2"))))))
+
+    tbody.append(AssignStmt(
+        AssignTarget(IndexAccess(VarRef("gl_PrimitiveTriangleIndicesEXT"), VarRef(trid))),
+        ConstructorExpr("uvec3", [VarRef("t0"), VarRef("t1"), VarRef("t2")]),
+    ))
+
+    return tbody
+
+
+def _expand_task_shader(defines: dict[str, int]) -> StageBlock:
+    """Generate a basic task (amplification) shader.
+
+    This is a passthrough task shader that dispatches mesh shader workgroups 1:1.
+    Future versions can add frustum/occlusion culling here.
+    """
+    stage = StageBlock(stage_type="task")
+
+    # Task payload to pass meshlet ID to mesh shader
+    stage.task_payloads.append(TaskPayloadDecl("task_data", "uint"))
+
+    # Simple passthrough: each task workgroup dispatches one mesh workgroup
+    body = []
+
+    # task_data = workgroup_id.x;
+    body.append(AssignStmt(
+        AssignTarget(VarRef("task_data")),
+        SwizzleAccess(VarRef("workgroup_id"), "x"),
+    ))
+
+    # emit_mesh_tasks(1, 1, 1);
+    body.append(ExprStmt(CallExpr(VarRef("emit_mesh_tasks"), [
+        NumberLit("1"), NumberLit("1"), NumberLit("1"),
+    ])))
 
     stage.functions.append(FunctionDef("main", [], None, body))
     return stage

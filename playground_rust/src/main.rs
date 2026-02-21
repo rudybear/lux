@@ -5,6 +5,8 @@
 
 mod camera;
 pub mod gltf_loader;
+mod mesh_renderer;
+mod meshlet;
 mod raster_renderer;
 pub mod reflected_pipeline;
 mod rt_renderer;
@@ -97,6 +99,10 @@ fn resolve_default_pipeline(scene: &str) -> Result<String, String> {
 fn detect_render_path(pipeline_base: &str) -> &'static str {
     if Path::new(&format!("{}.rgen.spv", pipeline_base)).exists() {
         "rt"
+    } else if Path::new(&format!("{}.mesh.spv", pipeline_base)).exists()
+        && Path::new(&format!("{}.frag.spv", pipeline_base)).exists()
+    {
+        "mesh"
     } else if Path::new(&format!("{}.vert.spv", pipeline_base)).exists()
         && Path::new(&format!("{}.frag.spv", pipeline_base)).exists()
     {
@@ -213,6 +219,17 @@ fn run_headless(
             info!("Rendering ray traced image...");
             rt_renderer::render_rt(&mut ctx, pipeline_base, scene_source, width, height, output_path, ibl_name)
         }
+        "mesh" => {
+            if !ctx.mesh_shader_supported {
+                return Err(
+                    "Mesh shader pipeline requires VK_EXT_mesh_shader support. \
+                     Please use a different mode or a GPU with mesh shader support."
+                        .to_string(),
+                );
+            }
+            info!("Rendering mesh shader scene '{}' with pipeline '{}'...", scene_source, pipeline_base);
+            render_mesh_headless(&mut ctx, pipeline_base, scene_source, width, height, output_path, ibl_name)
+        }
         _ => Err(format!("Unknown render path: {}", render_path)),
     };
 
@@ -229,6 +246,91 @@ fn run_headless(
     }
 
     result
+}
+
+/// Render a mesh shader scene headless and save to PNG.
+fn render_mesh_headless(
+    ctx: &mut vulkan_context::VulkanContext,
+    pipeline_base: &str,
+    scene_source: &str,
+    width: u32,
+    height: u32,
+    output_path: &Path,
+    ibl_name: &str,
+) -> Result<(), String> {
+    use scene_manager::Renderer;
+
+    let mut renderer = mesh_renderer::MeshShaderRenderer::new(
+        ctx,
+        scene_source,
+        pipeline_base,
+        width,
+        height,
+        ibl_name,
+    )?;
+
+    // Render frame
+    let cmd = renderer.render(ctx)?;
+
+    // End command buffer and submit
+    unsafe {
+        ctx.device
+            .end_command_buffer(cmd)
+            .map_err(|e| format!("Failed to end mesh command buffer: {:?}", e))?;
+    }
+
+    let cmd_bufs = [cmd];
+    let submit_info = ash::vk::SubmitInfo::default().command_buffers(&cmd_bufs);
+
+    let fence_info = ash::vk::FenceCreateInfo::default();
+    let fence = unsafe {
+        ctx.device
+            .create_fence(&fence_info, None)
+            .map_err(|e| format!("Failed to create fence: {:?}", e))?
+    };
+
+    unsafe {
+        ctx.device
+            .queue_submit(ctx.graphics_queue, &[submit_info], fence)
+            .map_err(|e| format!("Failed to submit mesh command buffer: {:?}", e))?;
+        ctx.device
+            .wait_for_fences(&[fence], true, u64::MAX)
+            .map_err(|e| format!("Failed to wait for fence: {:?}", e))?;
+        ctx.device.destroy_fence(fence, None);
+        ctx.device.free_command_buffers(ctx.command_pool, &cmd_bufs);
+    }
+
+    // Read back pixels from offscreen image
+    let device_clone = ctx.device.clone();
+    let cmd2 = ctx.begin_single_commands()?;
+
+    let mut staging = screenshot::StagingBuffer::new(
+        &device_clone,
+        ctx.allocator_mut(),
+        width,
+        height,
+    )?;
+
+    screenshot::cmd_copy_image_to_buffer(
+        &device_clone,
+        cmd2,
+        renderer.output_image(),
+        staging.buffer,
+        width,
+        height,
+    );
+
+    ctx.end_single_commands(cmd2)?;
+
+    let pixels = staging.read_pixels(width, height)?;
+    screenshot::save_png(&pixels, width, height, output_path)?;
+
+    info!("Saved mesh shader render to {:?}", output_path);
+
+    staging.destroy(&device_clone, ctx.allocator_mut());
+    renderer.destroy(ctx);
+
+    Ok(())
 }
 
 /// Orbit camera state for interactive viewing.
@@ -309,6 +411,7 @@ fn run_interactive(
     use winit::window::{Window, WindowId};
 
     let use_rt = render_path == "rt";
+    let use_mesh = render_path == "mesh";
 
     struct App {
         window: Option<Window>,
@@ -317,6 +420,7 @@ fn run_interactive(
         width: u32,
         height: u32,
         use_rt: bool,
+        use_mesh: bool,
         ibl_name: String,
         // Vulkan state (initialized after window creation)
         ctx: Option<vulkan_context::VulkanContext>,
@@ -371,6 +475,20 @@ fn run_interactive(
                     self.height,
                     &self.ibl_name,
                 ).map(|r| Box::new(r) as Box<dyn Renderer>)
+            } else if self.use_mesh {
+                if !ctx.mesh_shader_supported {
+                    Err("Mesh shader pipeline requires VK_EXT_mesh_shader".to_string())
+                } else {
+                    info!("Initializing mesh shader renderer...");
+                    mesh_renderer::MeshShaderRenderer::new(
+                        &mut ctx,
+                        &self.scene_source,
+                        &self.pipeline_base,
+                        self.width,
+                        self.height,
+                        &self.ibl_name,
+                    ).map(|r| Box::new(r) as Box<dyn Renderer>)
+                }
             } else {
                 info!("Initializing persistent renderer...");
                 raster_renderer::PersistentRenderer::init(
@@ -639,6 +757,7 @@ fn run_interactive(
         width,
         height,
         use_rt,
+        use_mesh,
         ibl_name: ibl_name.to_string(),
         ctx: None,
         renderer: None,

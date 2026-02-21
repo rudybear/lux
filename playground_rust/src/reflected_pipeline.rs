@@ -38,6 +38,8 @@ pub struct ReflectionData {
     pub hit_attributes: Vec<HitAttributeInfo>,
     #[serde(default)]
     pub callable_data: Vec<CallableDataInfo>,
+    #[serde(default)]
+    pub mesh_output: Option<MeshOutputInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +122,46 @@ pub struct CallableDataInfo {
     pub location: i32,
 }
 
+/// Mesh shader output configuration (deserialized from mesh_output in .lux.json).
+#[derive(Debug, Default, Deserialize)]
+pub struct MeshOutputInfo {
+    #[serde(default)]
+    pub max_vertices: u32,
+    #[serde(default)]
+    pub max_primitives: u32,
+    #[serde(default, deserialize_with = "deserialize_workgroup_size")]
+    pub workgroup_size: u32,
+}
+
+fn deserialize_workgroup_size<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct WorkgroupSizeVisitor;
+
+    impl<'de> de::Visitor<'de> for WorkgroupSizeVisitor {
+        type Value = u32;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a u32 or an array of u32")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u32, E> {
+            Ok(v as u32)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<u32, A::Error> {
+            let first: u32 = seq.next_element()?.unwrap_or(32);
+            while seq.next_element::<serde_json::Value>()?.is_some() {}
+            Ok(first)
+        }
+    }
+
+    deserializer.deserialize_any(WorkgroupSizeVisitor)
+}
+
 // ===========================================================================
 // Loading
 // ===========================================================================
@@ -189,6 +231,8 @@ fn stage_flags_from_strings(flags: &[String]) -> vk::ShaderStageFlags {
             "any_hit" => result |= vk::ShaderStageFlags::ANY_HIT_KHR,
             "intersection" => result |= vk::ShaderStageFlags::INTERSECTION_KHR,
             "callable" => result |= vk::ShaderStageFlags::CALLABLE_KHR,
+            "mesh" => result |= vk::ShaderStageFlags::MESH_EXT,
+            "task" => result |= vk::ShaderStageFlags::TASK_EXT,
             _ => {}
         }
     }

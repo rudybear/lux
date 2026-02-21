@@ -353,3 +353,18 @@ procedural MetaBalls {
 | RT surface expansion | Medium | Closest-hit from `surface` | ✅ |
 | SDF → intersection shader | Medium | Procedural RT geometry | ✅ |
 | Callable shader dispatch | Medium | Multi-material RT | ✅ |
+
+### ✅ COMPLETE — P13: Mesh Shader Support
+
+| Item | Effort | Impact | Status |
+|---|---|---|---|
+| `mesh`/`task` stage types in grammar/AST | Medium | Foundation for mesh shaders | ✅ |
+| Mesh SPIR-V codegen (MeshEXT/TaskEXT execution models, SPV_EXT_mesh_shader) | Large | Mesh shader output | ✅ |
+| `--define key=value` compile-time parameters | Medium | Hardware-adaptive meshlet limits | ✅ |
+| Mesh built-in variables (invocation IDs, workgroup IDs) | Medium | Mesh stage inputs | ✅ |
+| `set_mesh_outputs()` / `emit_mesh_tasks()` built-ins | Medium | Mesh stage control flow | ✅ |
+| `mesh_output` / `task_payload` declarations | Medium | Mesh output configuration | ✅ |
+| Surface expansion to mesh pipeline (`mode: mesh_shader`) | Large | Declarative mesh shaders | ✅ |
+| C++ MeshRenderer (IRenderer, meshlet builder, VK_EXT_mesh_shader) | Large | Native C++ mesh rendering | ✅ |
+| Rust MeshShaderRenderer (Renderer trait, meshlet builder) | Large | Native Rust mesh rendering | ✅ |
+| Reflection metadata (workgroup_size, max_vertices, max_primitives) | Small | Engine validation | ✅ |

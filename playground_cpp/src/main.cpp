@@ -2,6 +2,7 @@
 #include "spv_loader.h"
 #include "raster_renderer.h"
 #include "rt_renderer.h"
+#include "mesh_renderer.h"
 #include "scene_manager.h"
 #include "renderer_interface.h"
 #include "reflected_pipeline.h"
@@ -217,6 +218,7 @@ static std::string resolveDefaultPipeline(const std::string& scene) {
 
 static std::string detectRenderPath(const std::string& base) {
     if (fs::exists(base + ".rgen.spv")) return "rt";
+    if (fs::exists(base + ".mesh.spv") && fs::exists(base + ".frag.spv")) return "mesh";
     if (fs::exists(base + ".vert.spv") && fs::exists(base + ".frag.spv")) return "raster";
     if (fs::exists(base + ".frag.spv")) return "fullscreen";
     throw std::runtime_error("No shader files found for: " + base);
@@ -229,6 +231,7 @@ static std::string detectRenderPath(const std::string& base) {
 static int runHeadless(const CLIOptions& opts) {
     std::string renderPath = detectRenderPath(opts.shaderBase);
     bool needRT = (renderPath == "rt");
+    bool needMesh = (renderPath == "mesh");
     VkPipelineStageFlags dstStage = needRT
         ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
         : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -253,6 +256,12 @@ static int runHeadless(const CLIOptions& opts) {
         return 1;
     }
 
+    if (needMesh && !ctx.supportsMeshShader()) {
+        std::cerr << "[error] Mesh shader pipeline requested but VK_EXT_mesh_shader is not supported." << std::endl;
+        ctx.cleanup();
+        return 1;
+    }
+
     try {
         // Shared scene setup
         SceneManager scene;
@@ -260,7 +269,7 @@ static int runHeadless(const CLIOptions& opts) {
 
         // Determine vertex stride: for raster path, check if reflection wants 48-byte stride
         int vertexStride = 32;
-        if (!needRT && renderPath == "raster") {
+        if (!needRT && !needMesh && renderPath == "raster") {
             // Check if vertex reflection requires 48-byte stride
             std::string vertJsonPath = opts.shaderBase + ".vert.json";
             if (fs::exists(vertJsonPath)) {
@@ -281,6 +290,10 @@ static int runHeadless(const CLIOptions& opts) {
             rt->init(ctx, opts.shaderBase + ".rgen.spv", opts.shaderBase + ".rmiss.spv",
                      opts.shaderBase + ".rchit.spv", opts.width, opts.height, scene);
             renderer = std::move(rt);
+        } else if (needMesh) {
+            auto meshR = std::make_unique<MeshRenderer>();
+            meshR->init(ctx, scene, opts.shaderBase, opts.width, opts.height);
+            renderer = std::move(meshR);
         } else {
             auto raster = std::make_unique<RasterRenderer>();
             raster->init(ctx, scene, opts.shaderBase, renderPath, opts.width, opts.height);
@@ -318,6 +331,7 @@ static int runInteractive(CLIOptions opts) {
     }
     std::string renderPath = detectRenderPath(opts.shaderBase);
     bool needRT = (renderPath == "rt");
+    bool needMesh = (renderPath == "mesh");
     VkPipelineStageFlags dstStage = needRT
         ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
         : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -364,6 +378,14 @@ static int runInteractive(CLIOptions opts) {
         return 1;
     }
 
+    if (needMesh && !ctx.supportsMeshShader()) {
+        std::cerr << "[error] Mesh shader pipeline requested but VK_EXT_mesh_shader is not supported." << std::endl;
+        ctx.cleanup();
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return 1;
+    }
+
     // Create swapchain
     try {
         ctx.createSwapchain(opts.width, opts.height);
@@ -394,13 +416,14 @@ static int runInteractive(CLIOptions opts) {
     SceneManager scene;
     std::unique_ptr<IRenderer> renderer;
     bool useRT = needRT;
+    bool useMesh = needMesh;
 
     try {
         scene.loadScene(ctx, opts.sceneSource);
 
         // Determine vertex stride for raster
         int vertexStride = 32;
-        if (!useRT && renderPath == "raster") {
+        if (!useRT && !useMesh && renderPath == "raster") {
             std::string vertJsonPath = opts.shaderBase + ".vert.json";
             if (fs::exists(vertJsonPath)) {
                 auto vertRefl = parseReflectionJson(vertJsonPath);
@@ -422,6 +445,11 @@ static int runInteractive(CLIOptions opts) {
             rt->init(ctx, rgenPath, rmissPath, rchitPath,
                      opts.width, opts.height, scene);
             renderer = std::move(rt);
+        } else if (useMesh) {
+            auto meshR = std::make_unique<MeshRenderer>();
+            meshR->init(ctx, scene, opts.shaderBase,
+                        opts.width, opts.height);
+            renderer = std::move(meshR);
         } else {
             auto raster = std::make_unique<RasterRenderer>();
             raster->init(ctx, scene, opts.shaderBase, renderPath,
@@ -544,6 +572,14 @@ static int runInteractive(CLIOptions opts) {
             submitInfo.pSignalSemaphores = &renderFinishedSem;
 
             vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, inFlightFence);
+        } else if (useMesh) {
+            // Mesh shader rendering to swapchain
+            auto* meshPtr = static_cast<MeshRenderer*>(renderer.get());
+            meshPtr->renderToSwapchain(ctx,
+                ctx.swapchainImages[imageIndex],
+                ctx.swapchainImageViews[imageIndex],
+                ctx.swapchainFormat, ctx.swapchainExtent,
+                imageAvailableSem, renderFinishedSem, inFlightFence);
         } else {
             // Raster rendering to swapchain
             // Cast to RasterRenderer for renderToSwapchain (uses internal command buffer)

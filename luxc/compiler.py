@@ -75,11 +75,14 @@ def compile_source(
     source_name: str = "",
     pipeline: str | None = None,
     features: set[str] | None = None,
+    defines: dict[str, int] | None = None,
 ) -> None:
     # Clear type aliases from previous compilations
     clear_type_aliases()
 
     module = parse_lux(source)
+
+    module._defines = defines or {}
 
     # Strip compile-time features (before import resolution)
     if module.features_decls or hasattr(module, '_conditional_blocks'):
@@ -117,6 +120,8 @@ def compile_source(
         "miss": "rmiss",
         "intersection": "rint",
         "callable": "rcall",
+        "mesh": "mesh",
+        "task": "task",
     }
 
     # Compute feature suffix for output filenames

@@ -303,6 +303,24 @@ ReflectionData jsonToReflection(const JsonValue& root) {
     it = obj.find("vertex_stride");
     if (it != obj.end()) data.vertex_stride = it->second.asInt();
 
+    // Parse mesh_output metadata if present
+    it = obj.find("mesh_output");
+    if (it != obj.end() && it->second.type == JsonValue::Object) {
+        ReflectionData::MeshOutputInfo info;
+        auto& mo = it->second.object;
+        auto moIt = mo.find("max_vertices");
+        if (moIt != mo.end()) info.maxVertices = static_cast<uint32_t>(moIt->second.asInt());
+        moIt = mo.find("max_primitives");
+        if (moIt != mo.end()) info.maxPrimitives = static_cast<uint32_t>(moIt->second.asInt());
+        moIt = mo.find("workgroup_size");
+        if (moIt != mo.end() && moIt->second.type == JsonValue::Array && !moIt->second.array.empty()) {
+            info.workgroupSize = static_cast<uint32_t>(moIt->second.array[0].asInt());
+        }
+        moIt = mo.find("output_topology");
+        if (moIt != mo.end()) info.outputTopology = moIt->second.asString();
+        data.meshOutput = info;
+    }
+
     return data;
 }
 
@@ -364,6 +382,8 @@ static VkShaderStageFlags stageFlagsFromStrings(const std::vector<std::string>& 
         else if (f == "any_hit") result |= VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
         else if (f == "intersection") result |= VK_SHADER_STAGE_INTERSECTION_BIT_KHR;
         else if (f == "callable") result |= VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+        else if (f == "mesh") result |= VK_SHADER_STAGE_MESH_BIT_EXT;
+        else if (f == "task") result |= VK_SHADER_STAGE_TASK_BIT_EXT;
     }
     if (result == 0) {
         // Safe fallback: make binding visible to all shader stages

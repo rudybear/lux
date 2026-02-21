@@ -77,6 +77,26 @@ pipeline GltfRT {
 }
 ```
 
+### Mesh Shaders — Meshlet-Based GPU-Driven Rendering
+
+Meshlet-based geometry processing via `VK_EXT_mesh_shader` — the same `surface` declaration compiles to raster, ray tracing, *and* mesh shader pipelines. Engine queries hardware limits, builds meshlets, and compiles with matching `--define` parameters. C++ and Rust engines only.
+
+<p align="center"><img src="screenshots/mesh_helmet_rust.png" width="400"></p>
+
+```lux
+pipeline GltfMesh {
+    mode: mesh_shader,
+    geometry: StandardMesh,
+    surface: GltfPBR,
+    schedule: HighQuality,
+}
+```
+
+```bash
+luxc gltf_pbr_layered.lux --pipeline GltfMesh --features has_emission \
+    --define max_vertices=64 --define max_primitives=124 --define workgroup_size=32
+```
+
 ### Cartoon / Toon Shader — Custom `@layer`
 
 User-defined layers via `@layer` annotation — cel-shading with quantized NdotL and rim lighting, applied to glTF PBR models. One `@layer fn cartoon(...)` plugs into the standard layer compositing pipeline.
@@ -274,6 +294,7 @@ All three engines support reflection-driven descriptor binding, glTF loading, cu
 - **Standard library** — 80+ functions across 8 modules: BRDF, SDF, noise, color, colorspace, texture, IBL, lighting
 - **Automatic differentiation** — `@differentiable` generates gradient functions via forward-mode autodiff
 - **Ray tracing** — `mode: raytrace` pipelines, `environment`/`procedural` declarations, RT stage blocks
+- **Mesh shaders** — `mode: mesh_shader` pipelines, `task`/`mesh` stages, meshlet-based geometry, `--define` compile-time parameters (C++ and Rust only)
 - **GLSL transpiler** — `--transpile` converts GLSL fragment shaders to Lux
 - **AI generation** — `--ai "description"` generates shaders from natural language
 - **One file, multi-stage** — vertex, fragment, and RT stages in a single `.lux` file
@@ -332,6 +353,14 @@ python -m luxc examples/rt_pathtracer.lux
 # Wrote examples/rt_pathtracer.rgen.spv
 # Wrote examples/rt_pathtracer.rchit.spv
 # Wrote examples/rt_pathtracer.rmiss.spv
+```
+
+### Compile a mesh shader pipeline
+
+```bash
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfMesh --features has_emission --define max_vertices=64 --define max_primitives=124 --define workgroup_size=32
+# Wrote shadercache/gltf_pbr_layered+emission.mesh.spv
+# Wrote shadercache/gltf_pbr_layered+emission.frag.spv
 ```
 
 ### Compile a specific pipeline
@@ -404,6 +433,7 @@ Options:
   --features FEAT,...   Enable compile-time features (comma-separated)
   --all-permutations    Compile all 2^N feature permutations
   --list-features       List available features and exit
+  --define KEY=VALUE  Set compile-time parameter (e.g., --define max_vertices=64)
   --no-reflection     Skip .lux.json reflection metadata
   -g, --debug         Emit OpLine/OpSource debug info
   --transpile         Transpile GLSL input to Lux
@@ -674,6 +704,35 @@ pipeline PathTracer {
 }
 ```
 
+Or write RT stages manually with full control (see [Ray Tracing Stages](#ray-tracing) below).
+
+### Mesh Shaders
+
+Mesh shaders provide a third rendering pipeline mode alongside rasterization and ray tracing. Instead of the traditional vertex/index pipeline, mesh shaders operate on meshlets -- small clusters of triangles processed by workgroups -- enabling GPU-driven rendering with fine-grained culling.
+
+The surface declaration works unchanged; only the geometry processing stage changes:
+
+```
+pipeline GltfMesh {
+    mode: mesh_shader,
+    geometry: StandardMesh,
+    surface: GltfPBR,
+    schedule: HighQuality,
+}
+```
+
+The `GltfMesh` pipeline lives alongside `GltfForward` and `GltfRT` in the same `gltf_pbr_layered.lux` file. Compile with `--define` to set hardware-matched limits:
+
+```bash
+luxc gltf_pbr_layered.lux --pipeline GltfMesh --features has_emission --define max_vertices=64 --define max_primitives=124 --define workgroup_size=32
+```
+
+The approach is data-driven: at runtime the engine queries hardware capabilities (`maxMeshOutputVertices`, `maxMeshOutputPrimitives`, `maxMeshWorkGroupSize`), builds meshlets that respect those limits, and compiles the shader with matching `--define` parameters. This ensures optimal meshlet sizing across different GPU vendors without source changes.
+
+Mesh shaders require `VK_EXT_mesh_shader` and are supported in the C++ and Rust engines only -- Python/wgpu does not expose mesh shader support.
+
+### Ray Tracing Stages (Manual)
+
 Or write RT stages manually with full control:
 
 ```
@@ -704,6 +763,30 @@ miss {
     fn main() {
         let t: scalar = world_ray_direction.y * 0.5 + 0.5;
         payload = vec4(mix(vec3(1.0), vec3(0.5, 0.7, 1.0), vec3(t)), 1.0);
+    }
+}
+```
+
+Or write mesh/task stages manually:
+
+```
+task {
+    task_payload payload: MeshletPayload;
+
+    fn main() {
+        // Frustum cull meshlets on the task shader side
+        payload.meshlet_id = workgroup_id.x;
+        emit_mesh_tasks(1, 1, 1);
+    }
+}
+
+mesh {
+    mesh_output vertices: 64;
+    mesh_output primitives: 126;
+
+    fn main() {
+        set_mesh_outputs(3, 1);
+        // Emit a single triangle from meshlet data
     }
 }
 ```
@@ -798,7 +881,7 @@ input.lux
   -> SPIR-V Builder       (emit .spvasm text per stage)
   -> spirv-as             (assemble to .spv binary)
   -> spirv-val            (validate)
-  -> output: name.{vert,frag,rgen,rchit,rmiss,...}.spv
+  -> output: name.{vert,frag,rgen,rchit,rmiss,mesh,task,...}.spv
 ```
 
 ## Project Structure
@@ -890,14 +973,17 @@ playground/
     test_*.py                # screenshot tests (15 tests)
 assets/                      # glTF models, IBL maps (downloaded separately, gitignored)
 playground_cpp/
-    src/                     # native Vulkan C++ renderer (raster + RT, GLFW)
+    src/                     # native Vulkan C++ renderer (raster + RT + mesh, GLFW)
 playground_rust/
-    src/                     # native Vulkan Rust renderer (ash, winit, raster + RT)
+    src/                     # native Vulkan Rust renderer (ash, winit, raster + RT + mesh)
 run_interactive_cpp.bat      # launch interactive C++ raster viewer
 run_interactive_rust.bat     # launch interactive Rust raster viewer
 run_interactive_cpp_rt.bat   # launch interactive C++ RT viewer
 run_interactive_rust_rt.bat  # launch interactive Rust RT viewer
 run_interactive_cartoon_*.bat  # cartoon shader viewers (raster + RT, C++ + Rust)
+compile_mesh.bat             # compile mesh shader pipeline
+run_mesh_headless_*.bat      # headless mesh shader rendering (C++ + Rust)
+run_mesh_interactive_*.bat   # interactive mesh shader viewers (C++ + Rust)
 compile_gltf_*.bat           # compile + render glTF pipelines (forward, RT, layered)
 screenshots/                 # rendered gallery screenshots
 shadercache/                 # compiled SPV + reflection JSON (generated, gitignored)
@@ -915,6 +1001,7 @@ tests/
     test_p6_raytracing.py
     test_custom_layers.py
     test_gltf_extensions.py
+    test_mesh_shader.py         # P13 mesh shader tests (compilation, expansion, reflection)
     test_brdf_visualization.py  # P15 BRDF visualization tests (10 tests)
 tools/
     generate_training_data.py
@@ -941,7 +1028,7 @@ tools/
 | `advanced_materials_demo.lux` | Transmission, iridescence, dispersion, volume attenuation |
 | `gltf_pbr.lux` | glTF 2.0 PBR: tangent normal mapping, metallic-roughness, IBL cubemaps, multi-scattering |
 | `gltf_pbr_rt.lux` | Ray traced glTF PBR: same material model with RT stages |
-| `gltf_pbr_layered.lux` | Layered surface: unified raster + RT from one surface declaration |
+| `gltf_pbr_layered.lux` | Layered surface: unified raster + RT + mesh shader from one surface declaration |
 | `cartoon_toon.lux` | Custom `@layer` function: cel-shading + rim lighting (raster + RT) |
 | `lighting_demo.lux` | Multi-light: directional, point, spot lights with PBR |
 | `ibl_demo.lux` | Image-based lighting showcase: specular + diffuse IBL |
@@ -1012,6 +1099,11 @@ run_interactive_rust_rt.bat # Interactive Rust RT viewer
 compile_gltf_rt.bat         # Compile + render glTF RT (headless, both engines)
 compile_gltf_forward.bat    # Compile + render glTF raster (all 3 engines)
 compile_gltf_all.bat        # Compile + render all pipeline variants
+compile_mesh.bat            # Compile mesh shader pipeline
+run_mesh_headless_cpp.bat   # Render mesh shaders headless (C++)
+run_mesh_headless_rust.bat  # Render mesh shaders headless (Rust)
+run_mesh_interactive_cpp.bat  # Interactive mesh shader viewer (C++)
+run_mesh_interactive_rust.bat # Interactive mesh shader viewer (Rust)
 ```
 
 **Common CLI flags** (C++ and Rust engines):
@@ -1044,7 +1136,7 @@ Output: specular cubemap (6 faces x 5 mips), irradiance cubemap, and BRDF integr
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 389 tests
+# 425 tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.

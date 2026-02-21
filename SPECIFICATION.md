@@ -36,7 +36,7 @@ Lux eliminates the boilerplate that dominates conventional shader languages: no 
 
 ### 1.2 Target
 
-Lux compiles to **SPIR-V** for use with the **Vulkan** graphics API. The compiler emits SPIR-V 1.0 for rasterization stages (vertex, fragment) and SPIR-V 1.4 with the `SPV_KHR_ray_tracing` extension for ray tracing stages.
+Lux compiles to **SPIR-V** for use with the **Vulkan** graphics API. The compiler emits SPIR-V 1.0 for rasterization stages (vertex, fragment), SPIR-V 1.4 with the `SPV_KHR_ray_tracing` extension for ray tracing stages, and SPIR-V 1.4 with the `SPV_EXT_mesh_shader` extension for mesh shader stages (task, mesh).
 
 ### 1.3 Design Principles
 
@@ -90,9 +90,10 @@ The following identifiers are reserved as keywords and may not be used as user-d
 |---|---|
 | Declarations | `fn`, `let`, `const`, `type`, `struct`, `import` |
 | Control flow | `return`, `if`, `else` |
-| Stage types | `vertex`, `fragment`, `raygen`, `closest_hit`, `any_hit`, `miss`, `intersection`, `callable` |
+| Stage types | `vertex`, `fragment`, `raygen`, `closest_hit`, `any_hit`, `miss`, `intersection`, `callable`, `mesh`, `task` |
 | Stage items | `in`, `out`, `uniform`, `push`, `sampler2d`, `samplerCube` |
 | RT items | `ray_payload`, `hit_attribute`, `callable_data`, `acceleration_structure` |
+| Mesh items | `mesh_output`, `task_payload` |
 | Declarative | `surface`, `geometry`, `pipeline`, `schedule`, `environment`, `procedural`, `layers` |
 | Boolean | `true`, `false` |
 
@@ -649,7 +650,8 @@ An expression followed by a semicolon is a statement. This is used for function 
 ```
 stage_block = STAGE_TYPE "{" stage_item* "}" ;
 STAGE_TYPE  = "vertex" | "fragment" | "raygen" | "closest_hit"
-            | "any_hit" | "miss" | "intersection" | "callable" ;
+            | "any_hit" | "miss" | "intersection" | "callable"
+            | "mesh" | "task" ;
 ```
 
 A stage block defines a single shader stage. Multiple stage blocks may appear in a single `.lux` file. Each stage block compiles to a separate SPIR-V module.
@@ -750,6 +752,20 @@ acceleration_structure name;     // Acceleration structure binding
 
 **Acceleration structures** use `UniformConstant` storage class and are automatically assigned descriptor set and binding numbers.
 
+#### 7.2.8 Mesh Shader Declarations
+
+The following declarations are valid only in mesh and task shader stages:
+
+```
+mesh_output vertices: N;         // Max vertices the mesh shader emits
+mesh_output primitives: N;       // Max primitives the mesh shader emits
+task_payload name: TypeName;     // Payload passed from task to mesh shader
+```
+
+**Mesh outputs** declare the maximum number of vertices and primitives the mesh shader will emit. These values become `OpExecutionMode OutputVertices N` and `OpExecutionMode OutputPrimitivesEXT N` in SPIR-V. The limits are typically set via `--define` compile-time parameters to match hardware capabilities.
+
+**Task payloads** use the `TaskPayloadWorkgroupEXT` storage class. In `task` stages, the payload is written before calling `emit_mesh_tasks()`. In `mesh` stages, the payload is read to receive data from the parent task shader.
+
 ### 7.3 Rasterization Stages
 
 #### 7.3.1 Vertex Stage
@@ -818,6 +834,34 @@ callable { ... }
 
 Execution model: `CallableKHR`. A general-purpose shader callable from other RT stages via `execute_callable()`.
 
+### 7.5 Mesh Shader Stages
+
+#### 7.5.1 Task Stage
+
+```
+task { ... }
+```
+
+Execution model: `TaskEXT`. The task shader (also known as an amplification shader) runs before mesh shaders and determines how many mesh shader workgroups to dispatch. Task shaders perform coarse-grained culling (frustum, occlusion) on meshlet clusters and pass per-meshlet data to mesh shaders via the task payload.
+
+Task shaders must call `emit_mesh_tasks(x, y, z)` to launch mesh shader workgroups. The task payload must be written before calling `emit_mesh_tasks()`.
+
+#### 7.5.2 Mesh Stage
+
+```
+mesh { ... }
+```
+
+Execution model: `MeshEXT`. The mesh shader replaces the vertex + geometry pipeline stages. Each mesh shader workgroup processes a meshlet (a small cluster of vertices and primitives) and emits vertex and primitive data directly to the rasterizer.
+
+Mesh shaders must call `set_mesh_outputs(vertex_count, primitive_count)` before writing any output data. The `mesh_output vertices: N` and `mesh_output primitives: N` declarations set the maximum output limits for the stage.
+
+Execution modes:
+- `OutputVertices N` -- maximum number of vertices emitted
+- `OutputPrimitivesEXT N` -- maximum number of primitives emitted
+- `OutputTrianglesEXT` -- primitive topology (triangles)
+- `LocalSize X Y Z` -- workgroup size (set via `--define workgroup_size=N`)
+
 ---
 
 ## 8. Built-in Variables
@@ -849,6 +893,20 @@ The following built-in variables are automatically available in their valid stag
 | `incoming_ray_flags` | `uint` | `closest_hit`, `any_hit`, `miss`, `intersection` | `IncomingRayFlagsKHR` | Flags passed to `trace_ray` |
 
 Note: `hit_t` and `ray_tmax` share the same SPIR-V variable (`RayTmaxKHR`). In `closest_hit` and `any_hit` stages, `ray_tmax` holds the parametric distance to the current hit point, which is aliased as `hit_t` for readability.
+
+### 8.3 Mesh Shader Built-ins
+
+The following built-in variables are automatically available in mesh and task shader stages:
+
+| Name | Type | Valid Stages | SPIR-V BuiltIn | Description |
+|---|---|---|---|---|
+| `local_invocation_id` | `uvec3` | `mesh`, `task` | `LocalInvocationId` | Local invocation index within the workgroup (3D) |
+| `local_invocation_index` | `uint` | `mesh`, `task` | `LocalInvocationIndex` | Flattened local invocation index within the workgroup |
+| `workgroup_id` | `uvec3` | `mesh`, `task` | `WorkgroupId` | Workgroup index within the dispatch (3D) |
+| `num_workgroups` | `uvec3` | `mesh`, `task` | `NumWorkgroups` | Total number of workgroups in the dispatch |
+| `global_invocation_id` | `uvec3` | `mesh`, `task` | `GlobalInvocationId` | Global invocation index (`workgroup_id * workgroup_size + local_invocation_id`) |
+
+These built-in variables use the `Input` storage class and are read-only.
 
 ---
 
@@ -937,6 +995,15 @@ The `sample` function internally loads the separate sampler and texture image, c
 | `terminate_ray()` | `-> void` | Accept hit and stop traversal (any-hit only) | `OpTerminateRayKHR` |
 
 For `trace_ray`, the integer parameters (`ray_flags`, `cull_mask`, `sbt_offset`, `sbt_stride`, `miss_index`) are automatically converted from `scalar` to `uint` via `OpConvertFToU`, and `payload_loc` is converted from `scalar` to `int` via `OpConvertFToS`, since Lux treats all numeric literals as `scalar`.
+
+### 9.6 Mesh Shader Functions
+
+| Function | Signature | Description | SPIR-V Mapping |
+|---|---|---|---|
+| `set_mesh_outputs(max_vertices, max_primitives)` | `uint, uint -> void` | Set the actual number of vertices and primitives emitted by the mesh shader. Must be called before writing any mesh output data. | `OpSetMeshOutputsEXT` |
+| `emit_mesh_tasks(x, y, z)` | `uint, uint, uint -> void` | Dispatch mesh shader workgroups from a task shader. The three arguments specify the number of workgroups in each dimension. Must be the last operation in the task shader. | `OpEmitMeshTasksEXT` |
+
+`set_mesh_outputs` is valid only in `mesh` stages. `emit_mesh_tasks` is valid only in `task` stages. Integer arguments are automatically converted from `scalar` to `uint` if needed, consistent with other Lux built-in functions.
 
 ---
 
@@ -1546,7 +1613,7 @@ All members are optional except `surface`. Members reference declarations by nam
 | `schedule` | No | Algorithm variant selection |
 | `environment` | No | Background for RT miss shader |
 | `procedural` | No | SDF for RT intersection shader |
-| `mode` | No | `rasterize` (default) or `raytrace` |
+| `mode` | No | `rasterize` (default), `raytrace`, or `mesh_shader` |
 | `max_bounces` | No | Maximum ray recursion depth (RT only, default 1) |
 
 **Rasterization mode** (`mode: rasterize` or omitted): Generates `vertex` and `fragment` stages from the geometry and surface.
@@ -1557,6 +1624,13 @@ All members are optional except `surface`. Members reference declarations by nam
 - `miss` stage from the environment (if provided)
 - `any_hit` stage if the surface has an `opacity` member
 - `intersection` stage from the procedural (if provided)
+
+**Mesh shader mode** (`mode: mesh_shader`): Generates:
+- `task` stage for meshlet culling and workgroup dispatch
+- `mesh` stage for meshlet vertex/primitive processing from the geometry
+- `fragment` stage from the surface (identical to rasterization fragment output)
+
+The mesh shader mode replaces the traditional vertex pipeline with GPU-driven meshlet processing. The surface declaration is unchanged -- only the geometry processing stage changes. Compile-time parameters (`--define max_vertices=N`, `--define max_primitives=N`, `--define workgroup_size=N`) control the mesh shader output limits and workgroup dimensions to match hardware capabilities.
 
 ---
 
@@ -1797,6 +1871,8 @@ The SPIR-V assembly text is processed by external tools:
 | `miss` | `.rmiss.spv` |
 | `intersection` | `.rint.spv` |
 | `callable` | `.rcall.spv` |
+| `mesh` | `.mesh.spv` |
+| `task` | `.task.spv` |
 
 ### CLI Flags
 
@@ -1806,6 +1882,19 @@ The SPIR-V assembly text is processed by external tools:
 | `--pipeline <name>` | Compile only the named pipeline from a multi-pipeline file. When a `.lux` file contains multiple `pipeline` declarations, this flag selects a single pipeline by name for compilation. Only the stage blocks generated by the selected pipeline (and its referenced geometry, surface, environment, and procedural declarations) are emitted. If omitted, all pipelines in the file are compiled. |
 | `--features <list>` | Comma-separated list of feature flags to enable (e.g., `--features has_normal_map,has_clearcoat`). |
 | `--all-permutations` | Compile all 2^N feature combinations and emit a permutation manifest. |
+| `--define KEY=VALUE` | Set a compile-time parameter. May be specified multiple times. Used to pass hardware-adaptive limits to mesh shaders (e.g., `--define max_vertices=64 --define max_primitives=126 --define workgroup_size=32`). Defined values are substituted as integer constants during compilation. |
+
+### Compile-Time Define Parameters
+
+The `--define` flag introduces named compile-time integer constants that are substituted during compilation. This is distinct from the `features` system (which controls conditional inclusion of declarations) -- `--define` sets numeric values used in execution mode declarations and shader logic.
+
+Primary use case is mesh shader hardware adaptation:
+
+```bash
+luxc shader.lux --define max_vertices=64 --define max_primitives=126 --define workgroup_size=32
+```
+
+Defined parameters are available as integer constants within stage blocks and are used to set execution modes (`OutputVertices`, `OutputPrimitivesEXT`, `LocalSize`) in the generated SPIR-V.
 
 ### Compile-Time Feature Stripping
 
@@ -1863,15 +1952,18 @@ When features are active, the reflection JSON includes:
 
 - **Rasterization stages**: SPIR-V 1.0
 - **Ray tracing stages**: SPIR-V 1.4
+- **Mesh shader stages**: SPIR-V 1.4
 
 ### 15.2 Extensions
 
 - `SPV_KHR_ray_tracing` (for RT stages only)
+- `SPV_EXT_mesh_shader` (for mesh/task stages only)
 
 ### 15.3 Capabilities
 
 - `Shader` (all stages)
 - `RayTracingKHR` (RT stages only)
+- `MeshShadingEXT` (mesh/task stages only)
 
 ### 15.4 Extended Instruction Set
 
@@ -1895,10 +1987,14 @@ OpMemoryModel Logical GLSL450
 | `miss` | `MissKHR` |
 | `intersection` | `IntersectionKHR` |
 | `callable` | `CallableKHR` |
+| `mesh` | `MeshEXT` |
+| `task` | `TaskEXT` |
 
 ### 15.7 Execution Modes
 
 - Fragment shaders: `OriginUpperLeft`
+- Mesh shaders: `OutputVertices N`, `OutputPrimitivesEXT N`, `OutputTrianglesEXT`, `LocalSize X Y Z`
+- Task shaders: `LocalSize X Y Z`
 - All other stages: no additional execution modes
 
 ### 15.8 Layout Rules
@@ -1969,6 +2065,8 @@ No `OpFunctionCall` instructions are emitted for user-defined functions.
 | `execute_callable(...)` | `OpExecuteCallableKHR` |
 | `ignore_intersection()` | `OpIgnoreIntersectionKHR` |
 | `terminate_ray()` | `OpTerminateRayKHR` |
+| `set_mesh_outputs(v, p)` | `OpSetMeshOutputsEXT` |
+| `emit_mesh_tasks(x, y, z)` | `OpEmitMeshTasksEXT` |
 
 ---
 

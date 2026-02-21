@@ -1,6 +1,6 @@
 //! Vulkan initialization: instance, device, queues, allocator, command pool.
 //!
-//! Supports optional ray tracing extensions with graceful fallback.
+//! Supports optional ray tracing and mesh shader extensions with graceful fallback.
 
 use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
@@ -18,6 +18,11 @@ pub struct VulkanContext {
     pub rt_pipeline_loader: Option<ash::khr::ray_tracing_pipeline::Device>,
     pub accel_struct_loader: Option<ash::khr::acceleration_structure::Device>,
     pub rt_properties: Option<vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static>>,
+
+    // Optional mesh shader extension loader and properties
+    pub mesh_shader_supported: bool,
+    pub mesh_shader_loader: Option<ash::ext::mesh_shader::Device>,
+    pub mesh_shader_properties: Option<vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>>,
 
     // Allocator must be dropped before device — wrapped in Option so we can take() in Drop
     allocator_inner: Option<Allocator>,
@@ -168,6 +173,7 @@ impl VulkanContext {
         let mut selected_physical_device = None;
         let mut selected_queue_family = 0u32;
         let mut rt_available = false;
+        let mut mesh_shader_available = false;
 
         for &phys_dev in &physical_devices {
             let props = unsafe { instance.get_physical_device_properties(phys_dev) };
@@ -205,6 +211,8 @@ impl VulkanContext {
                     && ext_names.contains(&"VK_KHR_acceleration_structure".to_string())
                     && ext_names.contains(&"VK_KHR_deferred_host_operations".to_string());
 
+                let has_mesh = ext_names.contains(&"VK_EXT_mesh_shader".to_string());
+
                 let is_discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
 
                 if selected_physical_device.is_none()
@@ -214,14 +222,16 @@ impl VulkanContext {
                     selected_physical_device = Some(phys_dev);
                     selected_queue_family = family_idx as u32;
                     rt_available = has_rt;
+                    mesh_shader_available = has_mesh;
 
                     let dev_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) };
                     info!(
-                        "Selected GPU: {} (Vulkan {}.{}, RT: {})",
+                        "Selected GPU: {} (Vulkan {}.{}, RT: {}, Mesh: {})",
                         dev_name.to_string_lossy(),
                         vk::api_version_major(api_version),
                         vk::api_version_minor(api_version),
-                        if has_rt { "yes" } else { "no" }
+                        if has_rt { "yes" } else { "no" },
+                        if has_mesh { "yes" } else { "no" }
                     );
                 }
             }
@@ -234,6 +244,7 @@ impl VulkanContext {
         if request_rt && !rt_available {
             warn!("Ray tracing requested but GPU does not support VK_KHR_ray_tracing_pipeline");
         }
+        let enable_mesh = mesh_shader_available;
 
         // --- Device creation ---
         let queue_priority = [1.0f32];
@@ -248,6 +259,9 @@ impl VulkanContext {
             device_extensions.push(CString::new("VK_KHR_acceleration_structure").unwrap());
             device_extensions.push(CString::new("VK_KHR_deferred_host_operations").unwrap());
             device_extensions.push(CString::new("VK_KHR_buffer_device_address").unwrap());
+        }
+        if enable_mesh {
+            device_extensions.push(CString::new("VK_EXT_mesh_shader").unwrap());
         }
 
         let device_ext_ptrs: Vec<*const i8> =
@@ -264,6 +278,11 @@ impl VulkanContext {
             vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
                 .ray_tracing_pipeline(true);
 
+        let mut mesh_shader_features =
+            vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+                .mesh_shader(true)
+                .task_shader(true);
+
         let mut features2 =
             vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan_12_features);
 
@@ -271,6 +290,9 @@ impl VulkanContext {
             features2 = features2
                 .push_next(&mut accel_features)
                 .push_next(&mut rt_pipeline_features);
+        }
+        if enable_mesh {
+            features2 = features2.push_next(&mut mesh_shader_features);
         }
 
         let device_create_info = vk::DeviceCreateInfo::default()
@@ -336,12 +358,41 @@ impl VulkanContext {
             (None, None, None)
         };
 
+        // --- Mesh shader extension loader and properties ---
+        let (mesh_shader_loader, mesh_shader_properties) = if enable_mesh {
+            let ms_loader = ash::ext::mesh_shader::Device::new(&instance, &device);
+
+            let mut ms_props = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
+            let mut props2 =
+                vk::PhysicalDeviceProperties2::default().push_next(&mut ms_props);
+            unsafe {
+                instance.get_physical_device_properties2(physical_device, &mut props2);
+            }
+
+            info!(
+                "Mesh shader properties: max_output_vertices={}, max_output_primitives={}, max_work_group_invocations={}",
+                ms_props.max_mesh_output_vertices,
+                ms_props.max_mesh_output_primitives,
+                ms_props.max_mesh_work_group_invocations
+            );
+
+            let ms_props_static: vk::PhysicalDeviceMeshShaderPropertiesEXT<'static> =
+                unsafe { std::mem::transmute(ms_props) };
+
+            (Some(ms_loader), Some(ms_props_static))
+        } else {
+            (None, None)
+        };
+
         info!("Vulkan context initialized successfully");
 
         Ok(VulkanContext {
             rt_pipeline_loader,
             accel_struct_loader,
             rt_properties,
+            mesh_shader_supported: enable_mesh,
+            mesh_shader_loader,
+            mesh_shader_properties,
             allocator_inner: Some(allocator),
             allocator: Mutex::new(Some(())),
             command_pool,
@@ -505,6 +556,7 @@ impl VulkanContext {
         let mut selected_physical_device = None;
         let mut selected_queue_family = 0u32;
         let mut rt_available = false;
+        let mut mesh_shader_available = false;
 
         for &phys_dev in &physical_devices {
             let props = unsafe { instance.get_physical_device_properties(phys_dev) };
@@ -547,6 +599,8 @@ impl VulkanContext {
                     && ext_names.contains(&"VK_KHR_acceleration_structure".to_string())
                     && ext_names.contains(&"VK_KHR_deferred_host_operations".to_string());
 
+                let has_mesh = ext_names.contains(&"VK_EXT_mesh_shader".to_string());
+
                 let is_discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
 
                 if selected_physical_device.is_none()
@@ -556,14 +610,16 @@ impl VulkanContext {
                     selected_physical_device = Some(phys_dev);
                     selected_queue_family = family_idx as u32;
                     rt_available = has_rt;
+                    mesh_shader_available = has_mesh;
 
                     let dev_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) };
                     info!(
-                        "Selected GPU: {} (Vulkan {}.{}, RT: {})",
+                        "Selected GPU: {} (Vulkan {}.{}, RT: {}, Mesh: {})",
                         dev_name.to_string_lossy(),
                         vk::api_version_major(api_version),
                         vk::api_version_minor(api_version),
-                        if has_rt { "yes" } else { "no" }
+                        if has_rt { "yes" } else { "no" },
+                        if has_mesh { "yes" } else { "no" }
                     );
                 }
             }
@@ -573,6 +629,7 @@ impl VulkanContext {
             .ok_or("No suitable GPU found (need Vulkan 1.2+ with graphics+present queue)")?;
 
         let enable_rt = request_rt && rt_available;
+        let enable_mesh = mesh_shader_available;
 
         // --- Device creation (with VK_KHR_swapchain) ---
         let queue_priority = [1.0f32];
@@ -589,6 +646,9 @@ impl VulkanContext {
             device_extensions.push(CString::new("VK_KHR_deferred_host_operations").unwrap());
             device_extensions.push(CString::new("VK_KHR_buffer_device_address").unwrap());
         }
+        if enable_mesh {
+            device_extensions.push(CString::new("VK_EXT_mesh_shader").unwrap());
+        }
 
         let device_ext_ptrs: Vec<*const i8> =
             device_extensions.iter().map(|n| n.as_ptr()).collect();
@@ -601,6 +661,10 @@ impl VulkanContext {
         let mut rt_pipeline_features =
             vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
                 .ray_tracing_pipeline(true);
+        let mut mesh_shader_features =
+            vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+                .mesh_shader(true)
+                .task_shader(true);
 
         let mut features2 =
             vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan_12_features);
@@ -608,6 +672,9 @@ impl VulkanContext {
             features2 = features2
                 .push_next(&mut accel_features)
                 .push_next(&mut rt_pipeline_features);
+        }
+        if enable_mesh {
+            features2 = features2.push_next(&mut mesh_shader_features);
         }
 
         let device_create_info = vk::DeviceCreateInfo::default()
@@ -659,6 +726,25 @@ impl VulkanContext {
             (None, None, None)
         };
 
+        // --- Mesh shader extension loader and properties ---
+        let (mesh_shader_loader, mesh_shader_properties) = if enable_mesh {
+            let ms_loader = ash::ext::mesh_shader::Device::new(&instance, &device);
+            let mut ms_props = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut ms_props);
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut props2); }
+            info!(
+                "Mesh shader properties: max_output_vertices={}, max_output_primitives={}, max_work_group_invocations={}",
+                ms_props.max_mesh_output_vertices,
+                ms_props.max_mesh_output_primitives,
+                ms_props.max_mesh_work_group_invocations
+            );
+            let ms_props_static: vk::PhysicalDeviceMeshShaderPropertiesEXT<'static> =
+                unsafe { std::mem::transmute(ms_props) };
+            (Some(ms_loader), Some(ms_props_static))
+        } else {
+            (None, None)
+        };
+
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
 
         info!("Vulkan context (with window) initialized successfully");
@@ -667,6 +753,9 @@ impl VulkanContext {
             rt_pipeline_loader,
             accel_struct_loader,
             rt_properties,
+            mesh_shader_supported: enable_mesh,
+            mesh_shader_loader,
+            mesh_shader_properties,
             allocator_inner: Some(allocator),
             allocator: Mutex::new(Some(())),
             command_pool,

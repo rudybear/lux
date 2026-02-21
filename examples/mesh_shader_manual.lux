@@ -1,0 +1,46 @@
+// Manual Mesh Shader — hand-written mesh + fragment stages
+// Demonstrates low-level mesh shader stage blocks with mesh-specific builtins
+// Generates a single triangle from storage buffer data using meshlet-style dispatch.
+//
+// Compile with:
+//   luxc mesh_shader_manual.lux --define max_vertices=64 --define max_primitives=124 --define workgroup_size=32
+
+mesh {
+    storage_buffer positions: vec4;
+
+    uniform MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+
+    out frag_color: vec3;
+
+    fn main() {
+        let tid: uint = local_invocation_index;
+
+        // Output 3 vertices, 1 triangle
+        set_mesh_outputs(3, 1);
+
+        // Each invocation handles one vertex (only first 3 threads active)
+        if (tid < 3) {
+            let pos: vec4 = positions[tid];
+            gl_MeshVerticesEXT[tid] = projection * view * model * vec4(pos.xyz, 1.0);
+            frag_color[tid] = pos.xyz * 0.5 + vec3(0.5);
+        }
+
+        // First invocation writes the single triangle's indices
+        if (tid < 1) {
+            gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+        }
+    }
+}
+
+fragment {
+    in frag_color: vec3;
+    out color: vec4;
+
+    fn main() {
+        color = vec4(frag_color, 1.0);
+    }
+}

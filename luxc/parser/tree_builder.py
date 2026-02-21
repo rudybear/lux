@@ -18,7 +18,7 @@ from luxc.parser.ast_nodes import (
     ScheduleDecl, ScheduleMember,
     EnvironmentDecl, ProceduralDecl, ProceduralMember,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
-    StorageImageDecl, StorageBufferDecl,
+    StorageImageDecl, StorageBufferDecl, MeshOutputDecl, TaskPayloadDecl,
     FeaturesDecl, ConditionalBlock, FeatureRef, FeatureAnd, FeatureOr, FeatureNot,
 )
 
@@ -299,6 +299,10 @@ class LuxTransformer(Transformer):
                 block.storage_images.append(item)
             elif isinstance(item, StorageBufferDecl):
                 block.storage_buffers.append(item)
+            elif isinstance(item, MeshOutputDecl):
+                block.mesh_outputs.append(item)
+            elif isinstance(item, TaskPayloadDecl):
+                block.task_payloads.append(item)
         return block
 
     def in_decl(self, args):
@@ -356,6 +360,18 @@ class LuxTransformer(Transformer):
         name = args[0]
         element_type = _extract_type(args[1])
         return StorageBufferDecl(str(name), element_type, loc=_tok_loc(name))
+
+    # --- Mesh shader declarations ---
+
+    def mesh_output_decl(self, args):
+        name = args[0]
+        fields = [a for a in args[1:] if isinstance(a, BlockField)]
+        return MeshOutputDecl(str(name), fields, loc=_tok_loc(name))
+
+    def task_payload_decl(self, args):
+        name = args[0]
+        type_name = _extract_type(args[1])
+        return TaskPayloadDecl(str(name), type_name, loc=_tok_loc(name))
 
     # --- Functions ---
 

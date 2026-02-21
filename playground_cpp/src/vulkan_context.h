@@ -44,6 +44,18 @@ public:
     // RT properties
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtPipelineProperties = {};
 
+    // Mesh shader support
+    bool meshShaderSupported = false;
+
+    // Mesh shader function pointer
+    PFN_vkCmdDrawMeshTasksEXT pfnCmdDrawMeshTasksEXT = nullptr;
+
+    // Mesh shader properties
+    VkPhysicalDeviceMeshShaderPropertiesEXT meshShaderProperties = {};
+
+    // Check mesh shader support
+    bool supportsMeshShader() const { return meshShaderSupported; }
+
     // Initialize Vulkan context
     void init(bool enableRT, bool headless, GLFWwindow* window = nullptr);
 

@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <optional>
 
 // Forward declaration for JSON parsing (uses minimal built-in parser)
 struct ReflectionData {
@@ -61,6 +62,14 @@ struct ReflectionData {
     std::vector<PushConstantInfo> push_constants;
     std::vector<VertexAttribute> vertex_attributes;
     int vertex_stride = 0;
+
+    struct MeshOutputInfo {
+        uint32_t maxVertices = 64;
+        uint32_t maxPrimitives = 124;
+        uint32_t workgroupSize = 32;
+        std::string outputTopology = "triangles";
+    };
+    std::optional<MeshOutputInfo> meshOutput;
 };
 
 /**

@@ -31,6 +31,8 @@ _EXEC_MODELS = {
     "miss": "MissKHR",
     "intersection": "IntersectionKHR",
     "callable": "CallableKHR",
+    "mesh": "MeshEXT",
+    "task": "TaskEXT",
 }
 
 # Vulkan format strings for common Lux types
@@ -250,6 +252,21 @@ def generate_reflection(
             {"name": cd.name, "type": cd.type_name, "location": cd.location}
             for cd in stage.callable_data
         ]
+
+    # --- Mesh shader metadata ---
+    if stage.stage_type == "mesh":
+        defines = getattr(module, '_defines', {})
+        result["mesh_output"] = {
+            "max_vertices": defines.get('max_vertices', 64),
+            "max_primitives": defines.get('max_primitives', 124),
+            "workgroup_size": [defines.get('workgroup_size', 32), 1, 1],
+            "output_topology": "triangles",
+        }
+    elif stage.stage_type == "task":
+        defines = getattr(module, '_defines', {})
+        result["task_shader"] = {
+            "workgroup_size": [defines.get('workgroup_size', 32), 1, 1],
+        }
 
     return result
 

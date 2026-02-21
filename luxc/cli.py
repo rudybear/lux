@@ -69,6 +69,10 @@ def main(argv: list[str] | None = None) -> None:
         help="List available features and exit",
     )
     parser.add_argument(
+        "--define", type=str, action="append", metavar="KEY=VALUE",
+        help="Define compile-time integer constant (e.g., --define max_vertices=64)",
+    )
+    parser.add_argument(
         "--version", action="version", version="luxc 0.1.0"
     )
 
@@ -148,6 +152,20 @@ def main(argv: list[str] | None = None) -> None:
     # --- Normal compilation ---
     from luxc.compiler import compile_source
 
+    # Parse --define arguments
+    defines = {}
+    if args.define:
+        for d in args.define:
+            if '=' not in d:
+                print(f"Error: --define requires KEY=VALUE format, got '{d}'", file=sys.stderr)
+                sys.exit(1)
+            key, val = d.split('=', 1)
+            try:
+                defines[key.strip()] = int(val.strip())
+            except ValueError:
+                print(f"Error: --define value must be integer, got '{val}' for key '{key}'", file=sys.stderr)
+                sys.exit(1)
+
     # Parse feature flags
     feature_set = None
     if args.features:
@@ -170,6 +188,7 @@ def main(argv: list[str] | None = None) -> None:
                     emit_asm=args.emit_asm, validate=not args.no_validate,
                     emit_reflection=not args.no_reflection, debug=args.debug,
                     source_name=input_path.name, pipeline=args.pipeline,
+                    defines=defines,
                 )
             except Exception as e:
                 print(f"Error: {e}", file=sys.stderr)
@@ -198,7 +217,7 @@ def main(argv: list[str] | None = None) -> None:
                     emit_asm=args.emit_asm, validate=not args.no_validate,
                     emit_reflection=not args.no_reflection, debug=args.debug,
                     source_name=input_path.name, pipeline=args.pipeline,
-                    features=perm,
+                    features=perm, defines=defines,
                 )
             except Exception as e:
                 print(f"Error (features={sorted(perm)}): {e}", file=sys.stderr)
@@ -228,6 +247,7 @@ def main(argv: list[str] | None = None) -> None:
             source_name=input_path.name,
             pipeline=args.pipeline,
             features=feature_set,
+            defines=defines,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

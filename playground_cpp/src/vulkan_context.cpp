@@ -72,6 +72,9 @@ void VulkanContext::init(bool enableRT, bool headless, GLFWwindow* window) {
         selector.add_desired_extension(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     }
 
+    // Request mesh shader extension (always desired)
+    selector.add_desired_extension(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+
     auto physResult = selector.select();
     if (!physResult) {
         throw std::runtime_error("Failed to select physical device: " +
@@ -100,6 +103,21 @@ void VulkanContext::init(bool enableRT, bool headless, GLFWwindow* window) {
                   << "RT features will be disabled." << std::endl;
     }
 
+    // Check mesh shader extension availability
+    {
+        bool hasMeshShader = false;
+        auto extensions = vkbPhysDevice.get_extensions();
+        for (const auto& ext : extensions) {
+            if (ext == VK_EXT_MESH_SHADER_EXTENSION_NAME)
+                hasMeshShader = true;
+        }
+        meshShaderSupported = hasMeshShader;
+    }
+
+    if (!meshShaderSupported) {
+        std::cout << "[info] VK_EXT_mesh_shader not available. Mesh shader features disabled." << std::endl;
+    }
+
     // Build device
     vkb::DeviceBuilder deviceBuilder(vkbPhysDevice);
 
@@ -122,6 +140,15 @@ void VulkanContext::init(bool enableRT, bool headless, GLFWwindow* window) {
         rtFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
         rtFeatures.rayTracingPipeline = VK_TRUE;
         deviceBuilder.add_pNext(&rtFeatures);
+    }
+
+    // Enable mesh shader features if supported
+    VkPhysicalDeviceMeshShaderFeaturesEXT meshFeatures = {};
+    if (meshShaderSupported) {
+        meshFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+        meshFeatures.meshShader = VK_TRUE;
+        meshFeatures.taskShader = VK_TRUE;
+        deviceBuilder.add_pNext(&meshFeatures);
     }
 
     auto deviceResult = deviceBuilder.build();
@@ -197,6 +224,24 @@ void VulkanContext::init(bool enableRT, bool headless, GLFWwindow* window) {
             std::cout << "[warn] Some RT function pointers failed to load. "
                       << "Disabling RT support." << std::endl;
             rtSupported = false;
+        }
+    }
+
+    // Load mesh shader function pointers if supported
+    if (meshShaderSupported) {
+        pfnCmdDrawMeshTasksEXT = reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(
+            vkGetDeviceProcAddr(device, "vkCmdDrawMeshTasksEXT"));
+
+        // Query mesh shader properties
+        meshShaderProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT;
+        VkPhysicalDeviceProperties2 msProps2 = {};
+        msProps2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        msProps2.pNext = &meshShaderProperties;
+        vkGetPhysicalDeviceProperties2(physicalDevice, &msProps2);
+
+        if (!pfnCmdDrawMeshTasksEXT) {
+            std::cout << "[warn] vkCmdDrawMeshTasksEXT failed to load. Disabling mesh shader." << std::endl;
+            meshShaderSupported = false;
         }
     }
 }

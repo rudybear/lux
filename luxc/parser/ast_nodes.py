@@ -246,6 +246,8 @@ class StageBlock:
     accel_structs: list[AccelDecl] = field(default_factory=list)
     storage_images: list[StorageImageDecl] = field(default_factory=list)
     storage_buffers: list[StorageBufferDecl] = field(default_factory=list)
+    mesh_outputs: list[MeshOutputDecl] = field(default_factory=list)
+    task_payloads: list[TaskPayloadDecl] = field(default_factory=list)
     loc: Optional[SourceLocation] = None
 
 
@@ -336,6 +338,21 @@ class StorageBufferDecl:
     element_type: str  # type of each element in the runtime array
     set_number: Optional[int] = None
     binding: Optional[int] = None
+    loc: Optional[SourceLocation] = None
+
+
+# --- Mesh shader-specific declarations ---
+
+@dataclass
+class MeshOutputDecl:
+    name: str
+    fields: list[BlockField]
+    loc: Optional[SourceLocation] = None
+
+@dataclass
+class TaskPayloadDecl:
+    name: str
+    type_name: str
     loc: Optional[SourceLocation] = None
 
 

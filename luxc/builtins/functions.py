@@ -144,6 +144,13 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     add([FuncSig("image_store", (STORAGE_IMAGE, VEC2, VEC4), VOID)])
     add([FuncSig("image_store", (STORAGE_IMAGE, UVEC2, VEC4), VOID)])
 
+    # --- Mesh shader instructions ---
+    # set_mesh_outputs(vert_count, prim_count) -> void
+    add([FuncSig("set_mesh_outputs", (UINT, UINT), VOID)])
+
+    # emit_mesh_tasks(gx, gy, gz) -> void
+    add([FuncSig("emit_mesh_tasks", (UINT, UINT, UINT), VOID)])
+
     return table
 
 

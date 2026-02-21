@@ -94,3 +94,10 @@ pipeline GltfRT {
     environment: HDRSky,
     schedule: HighQuality,
 }
+
+pipeline GltfMesh {
+    mode: mesh_shader,
+    geometry: StandardMesh,
+    surface: GltfPBR,
+    schedule: HighQuality,
+}

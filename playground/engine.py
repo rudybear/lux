@@ -418,6 +418,11 @@ def detect_render_path(pipeline_base: str) -> str:
         return "raster"
     elif base.with_suffix(".frag.spv").exists():
         return "fullscreen"
+    elif base.with_suffix(".mesh.spv").exists():
+        raise RuntimeError(
+            "Mesh shaders are not supported by the Python/wgpu engine. "
+            "Use the C++ or Rust engine instead."
+        )
     elif base.with_suffix(".rgen.spv").exists():
         return "rt"
     else:

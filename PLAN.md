@@ -461,16 +461,22 @@ Extend the three engine runtimes (Python/wgpu, C++/Vulkan, Rust/ash) to detect a
 - Automatic pipeline permutation selection: engine reads manifest JSON, matches asset extensions → picks correct compiled shader variant
 - Validation: render Khronos sample models with all extensions enabled
 
-### Phase 13: Mesh Shader Support
+### Phase 13: Mesh Shader Support ✅ COMPLETE
 
-Add mesh shader pipeline mode alongside rasterization and ray tracing:
+Mesh shader pipeline mode alongside rasterization and ray tracing. Meshlet-based geometry processing with GPU-driven culling, task/mesh shader stages, and compile-time `--define` parameters for hardware-adaptive meshlet sizing.
 
 - New execution models: `task` (amplification) and `mesh` shader stages
 - SPIR-V codegen for `OpEmitMeshTasksEXT`, `OpSetMeshOutputsEXT`
 - Geometry declaration expansion to mesh shaders (meshlet-based vertex processing)
-- Surface declaration works unchanged — only the geometry stage changes
+- Surface declaration works unchanged -- only the geometry stage changes
 - Pipeline mode: `mode: mesh_shader` in pipeline declaration
+- `--define key=value` compile-time parameter system for hardware-adaptive limits (`max_vertices`, `max_primitives`, `workgroup_size`)
+- New built-in variables: `local_invocation_id`, `local_invocation_index`, `workgroup_id`, `num_workgroups`, `global_invocation_id`
+- New built-in functions: `set_mesh_outputs(uint, uint)`, `emit_mesh_tasks(uint, uint, uint)`
+- New stage declarations: `mesh_output` (per-vertex/per-primitive outputs), `task_payload` (task-to-mesh data)
 - Requires `SPV_EXT_mesh_shader` capability and `VK_EXT_mesh_shader` in engines
+- Supported in C++ and Rust engines only (Python/wgpu does not support mesh shaders)
+- Data-driven approach: engine queries hardware, builds meshlets, compiles shader with matching limits
 - Meshlet generation utility for glTF assets (offline preprocessing step)
 
 ### Phase 14: Gaussian Splatting Representation
@@ -836,7 +842,7 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P10** | Ray tracing pipeline — full (RT stages, SPIR-V codegen, surface→RT expansion) | ✅ Complete |
 | **P11** | Metal backend via SPIR-V cross-compilation (SPIRV-Cross → MSL) | Planned |
 | **P12** | Official glTF PBR extensions in engine materials (auto-detect, permutation selection) | ✅ Complete |
-| **P13** | Mesh shader support (`task`/`mesh` stages, meshlet-based geometry) | Planned |
+| **P13** | Mesh shader support (`task`/`mesh` stages, meshlet-based geometry, `--define` compile-time parameters) | ✅ Complete |
 | **P14** | Gaussian splatting representation (splat sorting, tile-based rasterizer, SH evaluation) | Planned |
 | **P15** | BRDF & layer visualization (lobe plots, transfer function graphs, energy conservation tests) | ✅ Complete |
 | **P16** | AI features for Lux (image-to-shader, prompt-based generation, AI skills, training pipeline) | Planned |

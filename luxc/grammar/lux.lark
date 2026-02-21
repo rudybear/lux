@@ -98,7 +98,7 @@ procedural_decl: "procedural" IDENT "{" procedural_item ("," procedural_item)* "
 
 stage_block: STAGE_TYPE "{" stage_item* "}"
 
-STAGE_TYPE: "vertex" | "fragment" | "raygen" | "closest_hit" | "any_hit" | "miss" | "intersection" | "callable"
+STAGE_TYPE: "vertex" | "fragment" | "raygen" | "closest_hit" | "any_hit" | "miss" | "intersection" | "callable" | "mesh" | "task"
 
 ?stage_item: in_decl
            | out_decl
@@ -112,6 +112,8 @@ STAGE_TYPE: "vertex" | "fragment" | "raygen" | "closest_hit" | "any_hit" | "miss
            | accel_decl
            | storage_image_decl
            | storage_buffer_decl
+           | mesh_output_decl
+           | task_payload_decl
 
 in_decl: "in" IDENT ":" type ";"
 out_decl: "out" IDENT ":" type ";"
@@ -131,6 +133,10 @@ callable_data_decl: "callable_data" IDENT ":" type ";"
 accel_decl: "acceleration_structure" IDENT ";"
 storage_image_decl: "storage_image" IDENT ";"
 storage_buffer_decl: "storage_buffer" IDENT ":" type ";"
+
+// Mesh shader-specific stage items
+mesh_output_decl: "mesh_output" IDENT "{" block_field ("," block_field)* ","? "}"
+task_payload_decl: "task_payload" IDENT ":" type ";"
 
 // --- Functions ---
 
