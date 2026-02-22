@@ -17,6 +17,7 @@ Pipelines:
 from __future__ import annotations
 
 import argparse
+import json as _json
 import math
 import struct
 import sys
@@ -89,6 +90,14 @@ class LightData:
 
 
 @dataclass
+class DrawRange:
+    """Index range for a single draw call within a merged vertex/index buffer."""
+    index_offset: int
+    index_count: int
+    material_index: int
+
+
+@dataclass
 class SceneData:
     """Complete scene description, independent of rendering pipeline."""
     meshes: list[MeshData] = field(default_factory=list)
@@ -107,6 +116,9 @@ class GPUScene:
     index_buffers: list = field(default_factory=list)    # list of (GPUBuffer, num_indices)
     textures: dict = field(default_factory=dict)         # name -> (sampler, texture_view)
     uniform_buffers: dict = field(default_factory=dict)  # name -> GPUBuffer
+    per_material_textures: list = field(default_factory=list)  # list of dict: name -> (sampler, view)
+    per_material_ubos: list = field(default_factory=list)      # list of GPUBuffer
+    draw_ranges: list = field(default_factory=list)            # list of DrawRange
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +418,146 @@ def detect_scene_features(scene_source: str, scene: SceneData, gltf_scene) -> se
 
 
 # ---------------------------------------------------------------------------
+# Per-material feature detection
+# ---------------------------------------------------------------------------
+
+def detect_material_features(material: MaterialData, material_textures: dict) -> set:
+    """Detect features for a single material.
+
+    Examines both the material's scalar properties and its texture map to
+    determine which shader features (normal mapping, emission, clearcoat,
+    sheen, transmission) are active for this particular material.
+    """
+    features = set()
+    if "normal_tex" in material_textures and material_textures["normal_tex"] is not None:
+        features.add("has_normal_map")
+    if material.emissive != (0, 0, 0) or "emissive_tex" in material_textures:
+        features.add("has_emission")
+    if material.clearcoat_factor > 0:
+        features.add("has_clearcoat")
+    if any(c > 0 for c in material.sheen_color_factor) or material.sheen_roughness_factor > 0:
+        features.add("has_sheen")
+    if material.transmission_factor > 0:
+        features.add("has_transmission")
+    return features
+
+
+def features_to_suffix(features: set) -> str:
+    """Convert feature set to permutation suffix.
+
+    Example: {has_normal_map, has_sheen} -> '+normal_map+sheen'
+    Features are sorted alphabetically for deterministic ordering.
+    """
+    if not features:
+        return ""
+    sorted_names = sorted(f.replace("has_", "") for f in features)
+    return "+" + "+".join(sorted_names)
+
+
+def group_materials_by_features(materials: list, per_material_textures: list) -> dict:
+    """Group materials by their feature suffix.
+
+    Returns a dict mapping suffix string to a list of material indices that
+    share those features, e.g. {'': [0], '+normal_map+sheen': [1, 3]}.
+    """
+    groups = {}
+    for i, mat in enumerate(materials):
+        tex = per_material_textures[i] if i < len(per_material_textures) else {}
+        suffix = features_to_suffix(detect_material_features(mat, tex))
+        groups.setdefault(suffix, []).append(i)
+
+    if len(groups) > 1:
+        print("[info] Material permutation groups:")
+        for suffix, indices in groups.items():
+            label = suffix if suffix else "(base)"
+            print(f"  \"{label}\": materials {indices}")
+
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# Manifest loading
+# ---------------------------------------------------------------------------
+
+def parse_manifest_json(manifest_path: Path) -> dict:
+    """Parse a .manifest.json file.
+
+    Returns a dict with keys:
+        'pipeline': str - pipeline name
+        'features': list[str] - ordered feature names
+        'permutations': list[dict] - each with 'suffix' and 'features' dict
+    """
+    with open(manifest_path, encoding="utf-8") as f:
+        data = _json.load(f)
+
+    result = {
+        "pipeline": data.get("pipeline", ""),
+        "features": data.get("features", []),
+        "permutations": [],
+    }
+    for p in data.get("permutations", []):
+        perm = {
+            "suffix": p.get("suffix", ""),
+            "features": p.get("features", {}),
+        }
+        result["permutations"].append(perm)
+    return result
+
+
+def try_load_manifest(pipeline_base: str) -> Optional[dict]:
+    """Try to load a manifest from pipeline_base + '.manifest.json'.
+
+    Also checks a legacy subdirectory format used by older shader caches.
+    Returns the parsed manifest dict, or None if no manifest exists.
+    """
+    # Try direct: pipelineBase + ".manifest.json"
+    path1 = Path(pipeline_base + ".manifest.json")
+    if path1.exists():
+        print(f"[info] Loading shader manifest: {path1}")
+        return parse_manifest_json(path1)
+
+    # Try legacy subdirectory format
+    base_path = Path(pipeline_base)
+    filename = base_path.name
+    parent = base_path.parent
+    if parent != base_path:
+        path2 = parent / "gltf_pbr" / (filename + ".manifest.json")
+        if path2.exists():
+            print(f"[info] Loading shader manifest: {path2}")
+            return parse_manifest_json(path2)
+
+    return None
+
+
+def find_permutation_suffix(manifest: dict, material_features: set) -> str:
+    """Find the matching permutation suffix for a given set of material features.
+
+    Checks the manifest's permutation list for an exact match of the feature
+    flags. Falls back to the empty suffix (base permutation) if no match.
+    """
+    feature_names = manifest.get("features", [])
+
+    # Build wanted feature map
+    wanted = {}
+    for fname in feature_names:
+        wanted[fname] = (fname in material_features)
+
+    # Find exact match
+    for perm in manifest.get("permutations", []):
+        match = True
+        for fname in feature_names:
+            perm_has = perm["features"].get(fname, False)
+            if perm_has != wanted[fname]:
+                match = False
+                break
+        if match:
+            return perm["suffix"]
+
+    # Fallback: base permutation
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Pipeline resolution
 # ---------------------------------------------------------------------------
 
@@ -599,13 +751,40 @@ def upload_scene(device: wgpu.GPUDevice, scene: SceneData, width: int, height: i
         gpu.vertex_buffers.append((vbo, vstride, mesh.num_vertices))
         gpu.index_buffers.append((ibo, mesh.num_indices))
 
-    # Upload textures from materials
+    # Upload textures from materials (global set, backward-compatible)
     for mat in scene.materials:
         for tex_name, tex_data in mat.textures.items():
             if tex_name in gpu.textures:
                 continue
             sampler, view = _upload_texture(device, tex_data)
             gpu.textures[tex_name] = (sampler, view)
+
+    # Upload per-material textures (each material gets its own texture map)
+    for mat in scene.materials:
+        mat_textures = {}
+        for tex_name, tex_data in mat.textures.items():
+            sampler, view = _upload_texture(device, tex_data)
+            mat_textures[tex_name] = (sampler, view)
+        gpu.per_material_textures.append(mat_textures)
+
+    # Create per-material UBO buffers
+    for mat in scene.materials:
+        ubo_buf = device.create_buffer_with_data(
+            data=_pack_material_ubo(mat),
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+        gpu.per_material_ubos.append(ubo_buf)
+
+    # Build draw ranges: track index offset as meshes are appended
+    index_offset = 0
+    for mesh in scene.meshes:
+        if mesh.num_indices > 0:
+            gpu.draw_ranges.append(DrawRange(
+                index_offset=index_offset,
+                index_count=mesh.num_indices,
+                material_index=mesh.material_index,
+            ))
+            index_offset += mesh.num_indices
 
     # Create MVP uniform buffer
     from scene_utils import perspective, look_at
@@ -631,7 +810,7 @@ def upload_scene(device: wgpu.GPUDevice, scene: SceneData, width: int, height: i
         )
         gpu.uniform_buffers["Lighting"] = gpu.uniform_buffers["Light"]
 
-    # Create Material properties UBO (fixed std140 layout)
+    # Create Material properties UBO (fixed std140 layout) — for single-pipeline compat
     if scene.materials:
         gpu.uniform_buffers["Material"] = device.create_buffer_with_data(
             data=_pack_material_ubo(scene.materials[0]),
@@ -762,7 +941,6 @@ def _upload_cubemap_f16(device: wgpu.GPUDevice, face_size: int, num_faces: int,
 
 def _load_ibl_assets(device: wgpu.GPUDevice, ibl_name: str) -> dict:
     """Load preprocessed IBL assets and upload cubemaps. Returns name -> (sampler, view) dict."""
-    import json
     assets_dir = Path(_PROJECT_ROOT) / "assets" / "ibl" / ibl_name
     manifest_path = assets_dir / "manifest.json"
     if not manifest_path.exists():
@@ -770,7 +948,7 @@ def _load_ibl_assets(device: wgpu.GPUDevice, ibl_name: str) -> dict:
         return {}
 
     with open(manifest_path) as f:
-        manifest = json.load(f)
+        manifest = _json.load(f)
 
     result = {}
 
@@ -1022,6 +1200,195 @@ def bind_scene_to_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# Multi-pipeline setup
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PermutationPipeline:
+    """A single permutation's pipeline and associated resources."""
+    suffix: str = ""
+    base_path: str = ""
+    material_indices: list = field(default_factory=list)
+    pipeline: object = None       # wgpu.GPURenderPipeline
+    reflected: object = None      # ReflectedPipeline
+    per_material_bind_groups: list = field(default_factory=list)  # list of bind group dicts
+
+
+def _build_per_material_resources(
+    device: wgpu.GPUDevice,
+    reflected,
+    gpu_scene: GPUScene,
+    material_index: int,
+    scene: SceneData,
+) -> dict:
+    """Build a resource map for a single material's bind group (fragment set).
+
+    Combines shared scene resources (IBL, global UBOs) with per-material
+    textures and UBO for the given material index.
+    """
+    resources = {}
+
+    # Shared uniform buffers (MVP, Light/Lighting)
+    for name, buf in gpu_scene.uniform_buffers.items():
+        if name != "Material":  # Material is per-material, not shared
+            resources[name] = buf
+
+    # Per-material UBO
+    if material_index < len(gpu_scene.per_material_ubos):
+        resources["Material"] = gpu_scene.per_material_ubos[material_index]
+
+    # IBL and other global textures (cubemaps, brdf_lut)
+    for name, tex_pair in gpu_scene.textures.items():
+        resources[name] = tex_pair
+
+    # Override with per-material textures
+    if material_index < len(gpu_scene.per_material_textures):
+        for name, tex_pair in gpu_scene.per_material_textures[material_index].items():
+            resources[name] = tex_pair
+
+    # Identify which names need cube textures
+    cube_names = set()
+    for set_idx, bindings in reflected._binding_info.items():
+        for b in bindings:
+            if b["type"] == "sampled_cube_image":
+                cube_names.add(b["name"])
+
+    # Fill missing textures with semantically correct defaults
+    default_tex = None
+    default_cube = None
+    default_brdf = None
+    default_normal = None
+    default_black = None
+    _BLACK_TEX_NAMES = {"emissive_tex", "sheen_color_tex", "transmission_tex"}
+    for set_idx, bindings in reflected._binding_info.items():
+        for b in bindings:
+            if b["type"] in ("sampler", "sampled_image", "sampled_cube_image") and b["name"] not in resources:
+                if b["name"] in cube_names:
+                    if default_cube is None:
+                        default_cube = _create_default_cubemap(device)
+                    resources[b["name"]] = default_cube
+                elif b["name"] == "normal_tex":
+                    if default_normal is None:
+                        default_normal = _create_default_normal_texture(device)
+                    resources[b["name"]] = default_normal
+                elif b["name"] in _BLACK_TEX_NAMES:
+                    if default_black is None:
+                        default_black = _create_black_texture(device)
+                    resources[b["name"]] = default_black
+                elif b["name"] == "brdf_lut":
+                    if default_brdf is None:
+                        default_brdf = _create_default_brdf_lut(device)
+                    resources[b["name"]] = default_brdf
+                else:
+                    if default_tex is None:
+                        default_tex = _create_default_texture(device)
+                    resources[b["name"]] = default_tex
+
+    # Fill missing uniform buffers with zero-filled buffers
+    for set_idx, bindings in reflected._binding_info.items():
+        for b in bindings:
+            if b["type"] == "uniform_buffer" and b["name"] not in resources:
+                size = b.get("size", 64)
+                resources[b["name"]] = device.create_buffer_with_data(
+                    data=bytes(size),
+                    usage=wgpu.BufferUsage.UNIFORM,
+                )
+
+    return resources
+
+
+def setup_multi_pipeline(
+    device: wgpu.GPUDevice,
+    pipeline_base: str,
+    manifest: dict,
+    scene: SceneData,
+    gpu_scene: GPUScene,
+    color_format=wgpu.TextureFormat.rgba8unorm,
+) -> list:
+    """Set up multi-pipeline rendering: one pipeline per permutation group.
+
+    Groups materials by their feature sets, creates a ReflectedPipeline for
+    each permutation, and builds per-material bind groups.
+
+    Returns a list of PermutationPipeline objects.
+    """
+    from reflected_pipeline import ReflectedPipeline, load_reflection
+    from render_harness import load_shader_module
+
+    # Build per-material texture name maps (just names, for feature detection)
+    per_mat_tex_names = []
+    for mat in scene.materials:
+        per_mat_tex_names.append(mat.textures)
+
+    # Group materials by features
+    groups = group_materials_by_features(scene.materials, per_mat_tex_names)
+
+    # Build material -> permutation index mapping
+    total_materials = len(scene.materials)
+    material_to_perm = [0] * total_materials
+
+    permutations = []
+    perm_idx = 0
+
+    for suffix, material_indices in groups.items():
+        # Build full path for this permutation
+        perm_base = pipeline_base + suffix
+        vert_path = Path(perm_base + ".vert.spv")
+        frag_path = Path(perm_base + ".frag.spv")
+
+        if not vert_path.exists() or not frag_path.exists():
+            print(f"[warn] Missing shader for permutation '{suffix}', falling back to base")
+            perm_base = pipeline_base
+            vert_path = Path(pipeline_base + ".vert.spv")
+            frag_path = Path(pipeline_base + ".frag.spv")
+            suffix = ""
+
+        vert_json = Path(perm_base + ".vert.json")
+        frag_json = Path(perm_base + ".frag.json")
+
+        vert_module = load_shader_module(device, vert_path)
+        frag_module = load_shader_module(device, frag_path)
+        vert_reflection = load_reflection(vert_json) if vert_json.exists() else {}
+        frag_reflection = load_reflection(frag_json) if frag_json.exists() else {}
+
+        reflected = ReflectedPipeline(
+            device, vert_reflection, frag_reflection,
+            vert_module, frag_module, color_format,
+        )
+
+        perm = PermutationPipeline(
+            suffix=suffix,
+            base_path=perm_base,
+            material_indices=material_indices,
+            pipeline=reflected.pipeline,
+            reflected=reflected,
+        )
+
+        # Create per-material bind groups for each material in this permutation
+        for mi in material_indices:
+            resources = _build_per_material_resources(
+                device, reflected, gpu_scene, mi, scene,
+            )
+            bind_groups = reflected.create_bind_groups(device, resources)
+            perm.per_material_bind_groups.append(bind_groups)
+
+        # Map materials to this permutation
+        for mi in material_indices:
+            material_to_perm[mi] = perm_idx
+
+        permutations.append(perm)
+        perm_idx += 1
+
+        print(f"[info] Loaded permutation '{suffix or '(base)'}' from {perm_base}"
+              f" ({len(material_indices)} material(s))")
+
+    print(f"[info] Multi-pipeline: {len(permutations)} permutation(s)"
+          f" for {total_materials} material(s)")
+
+    return permutations
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -1039,16 +1406,7 @@ def render(
     # Load scene
     scene = load_scene(scene_source, camera_elevation=camera_elevation)
 
-    # Auto-select pipeline variant based on detected features
-    # Only override when the user's pipeline is a gltf_pbr_layered base
-    if scene.scene_features and "gltf_pbr_layered" in pipeline_base:
-        suffix = "+".join(sorted(f.replace("has_", "") for f in scene.scene_features))
-        candidate = f"shadercache/gltf_pbr_layered+{suffix}"
-        if Path(candidate + ".frag.spv").exists():
-            print(f"[info] Auto-selected pipeline variant: {candidate}")
-            pipeline_base = candidate
-
-    # Detect render path
+    # Detect render path (use base pipeline to check for shader files)
     render_path = detect_render_path(pipeline_base)
 
     # Override render path based on scene hint
@@ -1064,12 +1422,11 @@ def render(
     device = adapter.request_device_sync()
 
     # Peek at pipeline vertex stride from reflection for vertex padding
-    import json
     vert_json = Path(pipeline_base).with_suffix(".vert.json")
     pipeline_stride = 0
     if vert_json.exists():
         with open(vert_json) as f:
-            vert_refl = json.load(f)
+            vert_refl = _json.load(f)
         pipeline_stride = vert_refl.get("vertex_stride", 0)
 
     # Phase 1: Upload scene to GPU
@@ -1095,21 +1452,51 @@ def render(
                 for name, tex in ibl_textures.items():
                     gpu_scene.textures[name] = tex
 
-    # Phase 2: Create pipeline from reflection
-    print(f"Creating pipeline from '{pipeline_base}'...")
-    gpu_pipeline, path, frag_refl, pipeline_info = create_pipeline(
-        device, pipeline_base, render_path,
-    )
+    # Check for multi-pipeline mode: manifest exists AND multiple materials
+    manifest = try_load_manifest(pipeline_base) if render_path == "raster" else None
+    has_multiple_materials = len(scene.materials) > 1
+    use_multi_pipeline = (manifest is not None
+                          and len(manifest.get("permutations", [])) > 0
+                          and has_multiple_materials)
 
-    # Phase 3: Bind scene to pipeline
-    bind_groups = bind_scene_to_pipeline(device, gpu_scene, pipeline_info)
+    if use_multi_pipeline:
+        # Multi-pipeline mode: one pipeline per material permutation group
+        print(f"Creating multi-pipeline from '{pipeline_base}'...")
+        permutations = setup_multi_pipeline(
+            device, pipeline_base, manifest, scene, gpu_scene,
+        )
 
-    # Execute render pass
-    print(f"Rendering {width}x{height}...")
-    pixels = _execute_render(
-        device, gpu_pipeline, render_path, bind_groups,
-        gpu_scene, width, height,
-    )
+        # Execute render pass with multi-pipeline
+        print(f"Rendering {width}x{height} (multi-pipeline)...")
+        pixels = _execute_render_multi_pipeline(
+            device, permutations, gpu_scene, scene, width, height,
+        )
+    else:
+        # Single-pipeline mode (original behavior)
+        # Auto-select pipeline variant based on detected scene features
+        effective_base = pipeline_base
+        if scene.scene_features and "gltf_pbr_layered" in pipeline_base:
+            suffix = "+".join(sorted(f.replace("has_", "") for f in scene.scene_features))
+            candidate = f"shadercache/gltf_pbr_layered+{suffix}"
+            if Path(candidate + ".frag.spv").exists():
+                print(f"[info] Auto-selected pipeline variant: {candidate}")
+                effective_base = candidate
+
+        # Phase 2: Create pipeline from reflection
+        print(f"Creating pipeline from '{effective_base}'...")
+        gpu_pipeline, path, frag_refl, pipeline_info = create_pipeline(
+            device, effective_base, render_path,
+        )
+
+        # Phase 3: Bind scene to pipeline
+        bind_groups = bind_scene_to_pipeline(device, gpu_scene, pipeline_info)
+
+        # Execute render pass
+        print(f"Rendering {width}x{height}...")
+        pixels = _execute_render(
+            device, gpu_pipeline, render_path, bind_groups,
+            gpu_scene, width, height,
+        )
 
     # Save output
     from render_harness import save_png
@@ -1192,6 +1579,157 @@ def _execute_render(
                 render_pass.draw(num_verts)
 
         render_pass.end()
+
+    # Readback
+    bytes_per_row = width * 4
+    bytes_per_row_aligned = (bytes_per_row + 255) & ~255
+    readback_buffer = device.create_buffer(
+        size=bytes_per_row_aligned * height,
+        usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
+    )
+    encoder.copy_texture_to_buffer(
+        wgpu.TexelCopyTextureInfo(texture=texture),
+        wgpu.TexelCopyBufferInfo(
+            buffer=readback_buffer, offset=0,
+            bytes_per_row=bytes_per_row_aligned, rows_per_image=height,
+        ),
+        (width, height, 1),
+    )
+    device.queue.submit([encoder.finish()])
+
+    readback_buffer.map_sync(wgpu.MapMode.READ)
+    raw = readback_buffer.read_mapped()
+    arr = np.frombuffer(raw, dtype=np.uint8).reshape(height, bytes_per_row_aligned)
+    arr = arr[:, :width * 4].reshape(height, width, 4).copy()
+    readback_buffer.unmap()
+    return arr
+
+
+def _execute_render_multi_pipeline(
+    device, permutations, gpu_scene, scene, width, height,
+) -> np.ndarray:
+    """Execute a multi-pipeline render pass.
+
+    Each draw range is rendered with the pipeline matching its material's
+    permutation group. Per-material bind groups provide the correct Material
+    UBO and textures for each draw call.
+    """
+    color_format = wgpu.TextureFormat.rgba8unorm
+
+    # Render target
+    texture = device.create_texture(
+        size=(width, height, 1),
+        format=color_format,
+        usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.COPY_SRC,
+    )
+    texture_view = texture.create_view()
+
+    # Depth buffer
+    depth_texture = device.create_texture(
+        size=(width, height, 1),
+        format=wgpu.TextureFormat.depth24plus,
+        usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
+    )
+    depth_view = depth_texture.create_view()
+
+    encoder = device.create_command_encoder()
+
+    render_pass = encoder.begin_render_pass(
+        color_attachments=[wgpu.RenderPassColorAttachment(
+            view=texture_view,
+            load_op=wgpu.LoadOp.clear,
+            store_op=wgpu.StoreOp.store,
+            clear_value=(0.05, 0.05, 0.08, 1.0),
+        )],
+        depth_stencil_attachment=wgpu.RenderPassDepthStencilAttachment(
+            view=depth_view,
+            depth_load_op=wgpu.LoadOp.clear,
+            depth_store_op=wgpu.StoreOp.store,
+            depth_clear_value=1.0,
+        ),
+    )
+
+    # Build material -> permutation index mapping
+    total_materials = len(scene.materials)
+    material_to_perm = [0] * total_materials
+    for perm_idx, perm in enumerate(permutations):
+        for mi in perm.material_indices:
+            if mi < total_materials:
+                material_to_perm[mi] = perm_idx
+
+    # If we have draw ranges, use them for proper multi-material rendering
+    if gpu_scene.draw_ranges:
+        # Each draw range maps 1:1 to a mesh (built in mesh order in upload_scene).
+        # Each mesh has its own VBO/IBO in the Python engine.
+        current_perm_idx = -1
+        current_mat_idx = -1
+
+        for mesh_idx, draw_range in enumerate(gpu_scene.draw_ranges):
+            mat_idx = draw_range.material_index
+            perm_idx = material_to_perm[mat_idx] if mat_idx < total_materials else 0
+            perm = permutations[perm_idx]
+
+            # Switch pipeline if permutation changed
+            if perm_idx != current_perm_idx:
+                current_perm_idx = perm_idx
+                render_pass.set_pipeline(perm.pipeline)
+
+            # Rebind material when material or permutation changes
+            if mat_idx != current_mat_idx:
+                current_mat_idx = mat_idx
+
+                # Find which local index within this permutation's material list
+                local_mat_idx = -1
+                for j, mi in enumerate(perm.material_indices):
+                    if mi == mat_idx:
+                        local_mat_idx = j
+                        break
+
+                if local_mat_idx >= 0 and local_mat_idx < len(perm.per_material_bind_groups):
+                    bind_groups = perm.per_material_bind_groups[local_mat_idx]
+                    for set_idx in sorted(bind_groups.keys()):
+                        render_pass.set_bind_group(set_idx, bind_groups[set_idx])
+
+            # Bind vertex/index buffers for this mesh and draw
+            if mesh_idx < len(gpu_scene.vertex_buffers):
+                vbo, stride, num_verts = gpu_scene.vertex_buffers[mesh_idx]
+                ibo, num_indices = gpu_scene.index_buffers[mesh_idx]
+                if vbo:
+                    render_pass.set_vertex_buffer(0, vbo)
+                if ibo and num_indices > 0:
+                    render_pass.set_index_buffer(ibo, wgpu.IndexFormat.uint32)
+                    render_pass.draw_indexed(num_indices)
+    else:
+        # Fallback: draw meshes individually (no draw ranges)
+        for i, (vbo, stride, num_verts) in enumerate(gpu_scene.vertex_buffers):
+            ibo, num_indices = gpu_scene.index_buffers[i]
+            mat_idx = scene.meshes[i].material_index if i < len(scene.meshes) else 0
+            perm_idx = material_to_perm[mat_idx] if mat_idx < total_materials else 0
+            perm = permutations[perm_idx]
+
+            render_pass.set_pipeline(perm.pipeline)
+
+            # Find local material index
+            local_mat_idx = -1
+            for j, mi in enumerate(perm.material_indices):
+                if mi == mat_idx:
+                    local_mat_idx = j
+                    break
+
+            if local_mat_idx >= 0 and local_mat_idx < len(perm.per_material_bind_groups):
+                bind_groups = perm.per_material_bind_groups[local_mat_idx]
+                for set_idx in sorted(bind_groups.keys()):
+                    render_pass.set_bind_group(set_idx, bind_groups[set_idx])
+
+            if vbo:
+                render_pass.set_vertex_buffer(0, vbo)
+            if ibo and num_indices > 0:
+                render_pass.set_index_buffer(ibo, wgpu.IndexFormat.uint32)
+                render_pass.draw_indexed(num_indices)
+            elif vbo:
+                render_pass.draw(num_verts)
+
+    render_pass.end()
 
     # Readback
     bytes_per_row = width * 4

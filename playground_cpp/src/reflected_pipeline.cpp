@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <iostream>
 #include <map>
+#include <filesystem>
+#include <set>
 
 // ===========================================================================
 // Minimal JSON parser (no external dependency required)
@@ -360,7 +362,7 @@ VkFormat reflectionFormatToVkFormat(const std::string& fmt) {
     return VK_FORMAT_R32G32B32A32_SFLOAT; // fallback
 }
 
-static VkDescriptorType bindingTypeToVkDescriptorType(const std::string& type) {
+VkDescriptorType bindingTypeToVkDescriptorType(const std::string& type) {
     if (type == "uniform_buffer") return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     if (type == "sampler") return VK_DESCRIPTOR_TYPE_SAMPLER;
     if (type == "sampled_image") return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -620,6 +622,101 @@ VkPipelineLayout createReflectedPipelineLayout(
     }
 
     return pipelineLayout;
+}
+
+// ===========================================================================
+// Manifest parsing
+// ===========================================================================
+
+ShaderManifest parseManifestJson(const std::string& manifest_path) {
+    ShaderManifest manifest;
+    std::ifstream file(manifest_path);
+    if (!file.is_open()) return manifest;
+
+    std::stringstream ss;
+    ss << file.rdbuf();
+    std::string content = ss.str();
+
+    JsonParser parser(content);
+    JsonValue root = parser.parse();
+    if (root.type != JsonValue::Object) return manifest;
+
+    auto it = root.object.find("pipeline");
+    if (it != root.object.end()) manifest.pipeline = it->second.asString();
+
+    it = root.object.find("features");
+    if (it != root.object.end() && it->second.type == JsonValue::Array) {
+        for (auto& f : it->second.array) {
+            manifest.featureNames.push_back(f.asString());
+        }
+    }
+
+    it = root.object.find("permutations");
+    if (it != root.object.end() && it->second.type == JsonValue::Array) {
+        for (auto& p : it->second.array) {
+            ManifestPermutation perm;
+            auto si = p.object.find("suffix");
+            if (si != p.object.end()) perm.suffix = si->second.asString();
+
+            auto fi = p.object.find("features");
+            if (fi != p.object.end() && fi->second.type == JsonValue::Object) {
+                for (auto& [key, val] : fi->second.object) {
+                    perm.features[key] = val.boolean;
+                }
+            }
+            manifest.permutations.push_back(perm);
+        }
+    }
+
+    return manifest;
+}
+
+ShaderManifest tryLoadManifest(const std::string& pipelineBase) {
+    namespace fs = std::filesystem;
+
+    // Try direct: pipelineBase + ".manifest.json"
+    std::string path1 = pipelineBase + ".manifest.json";
+    if (fs::exists(path1)) {
+        std::cout << "[info] Loading shader manifest: " << path1 << std::endl;
+        return parseManifestJson(path1);
+    }
+
+    // Try legacy subdirectory format: shadercache/gltf_pbr/gltf_pbr_layered.manifest.json
+    // Extract filename from pipelineBase
+    std::string filename = fs::path(pipelineBase).filename().string();
+    std::string dir = fs::path(pipelineBase).parent_path().string();
+    if (!dir.empty()) {
+        std::string path2 = dir + "/gltf_pbr/" + filename + ".manifest.json";
+        if (fs::exists(path2)) {
+            std::cout << "[info] Loading shader manifest: " << path2 << std::endl;
+            return parseManifestJson(path2);
+        }
+    }
+
+    return ShaderManifest{}; // empty = no manifest
+}
+
+std::string findPermutationSuffix(const ShaderManifest& manifest,
+                                   const std::set<std::string>& materialFeatures) {
+    // Build feature map from the material's features
+    std::unordered_map<std::string, bool> wanted;
+    for (auto& fname : manifest.featureNames) {
+        wanted[fname] = (materialFeatures.count(fname) > 0);
+    }
+
+    // Find exact match in manifest permutations
+    for (auto& perm : manifest.permutations) {
+        bool match = true;
+        for (auto& fname : manifest.featureNames) {
+            auto pi = perm.features.find(fname);
+            bool permHas = (pi != perm.features.end() && pi->second);
+            if (permHas != wanted[fname]) { match = false; break; }
+        }
+        if (match) return perm.suffix;
+    }
+
+    // Fallback: return base (empty suffix)
+    return "";
 }
 
 ReflectedVertexInput createReflectedVertexInput(const ReflectionData& vertReflection, int overrideStride) {

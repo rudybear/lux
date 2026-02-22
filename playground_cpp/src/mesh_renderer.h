@@ -13,6 +13,38 @@
 #include <vector>
 #include <unordered_map>
 
+// Per-permutation pipeline data for mesh shader multi-material rendering.
+// The mesh shader (.mesh.spv) is SHARED across all permutations (it only reads
+// geometry data), while the fragment shader (.frag.spv) differs per permutation
+// (different BRDF features, texture bindings).
+struct MeshPermutationPipeline {
+    std::string suffix;                              // e.g. "+normal_map+sheen"
+    std::string basePath;                            // full path with suffix
+
+    VkShaderModule fragModule = VK_NULL_HANDLE;      // per-permutation frag shader
+    ReflectionData fragRefl;
+
+    VkDescriptorSetLayout materialSetLayout = VK_NULL_HANDLE;  // set 1 layout
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+
+    // Per-material descriptor sets and UBOs for materials using this permutation
+    std::vector<VkDescriptorSet> perMaterialDescSets;
+    std::vector<VkBuffer> perMaterialUBOs;
+    std::vector<VmaAllocation> perMaterialAllocations;
+    std::vector<int> materialIndices;                // which scene materials use this
+};
+
+// A group of meshlets that share a common material.
+// Built by partitioning meshlets per draw range so each group maps to a
+// specific material (and therefore a specific shader permutation).
+struct MeshletGroup {
+    uint32_t firstMeshlet;   // offset into global meshlet descriptor array
+    uint32_t meshletCount;   // how many meshlets in this group
+    int materialIndex;       // scene material index
+    int permutationIndex;    // index into m_meshPermutations (set during multi-pipeline setup)
+};
+
 class MeshRenderer : public IRenderer {
 public:
     void init(VulkanContext& ctx, SceneManager& scene,
@@ -57,14 +89,22 @@ private:
     VkRenderPass m_renderPass = VK_NULL_HANDLE;
     VkFramebuffer m_framebuffer = VK_NULL_HANDLE;
 
-    // Pipeline
+    // --- Single-pipeline mode (original behavior) ---
     VkPipeline m_pipeline = VK_NULL_HANDLE;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
 
-    // Reflection-driven descriptor sets
+    // Reflection-driven descriptor sets (single pipeline)
     std::unordered_map<int, VkDescriptorSetLayout> m_setLayouts;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     std::unordered_map<int, VkDescriptorSet> m_descriptorSets;
+
+    // --- Multi-pipeline mode (per-material permutation selection) ---
+    bool m_multiPipeline = false;
+    std::vector<MeshPermutationPipeline> m_meshPermutations;
+    std::vector<int> m_materialToPermutation;          // materialIndex -> permutation index
+    VkDescriptorSetLayout m_sharedSet0Layout = VK_NULL_HANDLE;  // shared set 0 (meshlet data + MVP + Light)
+    VkDescriptorSet m_sharedSet0 = VK_NULL_HANDLE;
+    std::vector<MeshletGroup> m_meshletGroups;
 
     // Meshlet buffers
     VkBuffer m_meshletDescBuffer = VK_NULL_HANDLE;
@@ -116,4 +156,8 @@ private:
     void setupDescriptors(VulkanContext& ctx);
     void uploadMeshletData(VulkanContext& ctx);
     void uploadVertexData(VulkanContext& ctx);
+
+    // Multi-pipeline setup (mesh shader permutations)
+    void setupMeshMultiPipeline(VulkanContext& ctx, const ShaderManifest& manifest);
+    void cleanupPermutations(VulkanContext& ctx);
 };

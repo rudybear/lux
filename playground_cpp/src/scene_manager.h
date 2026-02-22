@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
 #include <unordered_map>
 
 // Shared scene management: loads scenes, uploads meshes/textures/IBL, computes auto-camera.
@@ -50,6 +51,15 @@ public:
     std::set<std::string> detectSceneFeatures() const;
     static std::string buildPipelinePath(const std::string& basePath,
                                           const std::set<std::string>& features);
+
+    // Per-material feature detection for permutation selection
+    std::set<std::string> detectMaterialFeatures(int materialIndex) const;
+
+    // Group materials by feature set -> {suffix: [material_indices]}
+    std::map<std::string, std::vector<int>> groupMaterialsByFeatures() const;
+
+    // Build permutation suffix from features -> "+normal_map+sheen"
+    static std::string featuresToSuffix(const std::set<std::string>& features);
 
     static bool isGltfFile(const std::string& source);
 

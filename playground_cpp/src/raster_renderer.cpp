@@ -892,34 +892,84 @@ void RasterRenderer::init(VulkanContext& ctx, SceneManager& scene,
         fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
         createPipelineFullscreen(ctx);
     } else if (renderPath == "raster") {
-        std::string vertPath = pipelineBase + ".vert.spv";
-        auto vertCode = SpvLoader::loadSPIRV(vertPath);
-        vertModule = SpvLoader::createShaderModule(ctx.device, vertCode);
-        auto fragCode = SpvLoader::loadSPIRV(fragPath);
-        fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
+        // Check for manifest to enable multi-pipeline mode
+        ShaderManifest manifest = tryLoadManifest(pipelineBase);
+        bool hasMultipleMaterials = m_scene->hasGltfScene() &&
+            m_scene->getGltfScene().materials.size() > 1;
 
-        std::string vertJsonPath = pipelineBase + ".vert.json";
-        std::string fragJsonPath = pipelineBase + ".frag.json";
-
-        if (fs::exists(vertJsonPath) && fs::exists(fragJsonPath)) {
-            std::cout << "[info] Loading reflection JSON: " << vertJsonPath << std::endl;
-            vertReflection = parseReflectionJson(vertJsonPath);
-            std::cout << "[info] Loading reflection JSON: " << fragJsonPath << std::endl;
-            fragReflection = parseReflectionJson(fragJsonPath);
-        }
-
-        if (sceneSource == "triangle") {
-            createPipelineTriangle(ctx);
+        if (!manifest.permutations.empty() && hasMultipleMaterials) {
+            // Multi-pipeline mode: create one pipeline per permutation used
+            setupMultiPipeline(ctx, manifest);
         } else {
-            setupReflectedDescriptors(ctx);
-            createPipelinePBR(ctx);
+            // Single-pipeline mode: resolve permutation from manifest if available
+            std::string resolvedBase = pipelineBase;
+            if (!manifest.permutations.empty() && m_scene->hasGltfScene()) {
+                // Auto-detect features for single-material scene and resolve permutation
+                auto sceneFeatures = m_scene->detectSceneFeatures();
+                std::string suffix = findPermutationSuffix(manifest, sceneFeatures);
+                if (!suffix.empty()) {
+                    std::string candidateBase = pipelineBase + suffix;
+                    if (fs::exists(candidateBase + ".vert.spv") && fs::exists(candidateBase + ".frag.spv")) {
+                        resolvedBase = candidateBase;
+                        std::cout << "[info] Resolved single-material permutation: " << suffix << std::endl;
+                    }
+                }
+            }
+
+            std::string vertPath = resolvedBase + ".vert.spv";
+            fragPath = resolvedBase + ".frag.spv";
+            auto vertCode = SpvLoader::loadSPIRV(vertPath);
+            vertModule = SpvLoader::createShaderModule(ctx.device, vertCode);
+            auto fragCode = SpvLoader::loadSPIRV(fragPath);
+            fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
+
+            std::string vertJsonPath = resolvedBase + ".vert.json";
+            std::string fragJsonPath = resolvedBase + ".frag.json";
+
+            if (fs::exists(vertJsonPath) && fs::exists(fragJsonPath)) {
+                std::cout << "[info] Loading reflection JSON: " << vertJsonPath << std::endl;
+                vertReflection = parseReflectionJson(vertJsonPath);
+                std::cout << "[info] Loading reflection JSON: " << fragJsonPath << std::endl;
+                fragReflection = parseReflectionJson(fragJsonPath);
+            }
+
+            if (sceneSource == "triangle") {
+                createPipelineTriangle(ctx);
+            } else {
+                setupReflectedDescriptors(ctx);
+                createPipelinePBR(ctx);
+            }
         }
     } else {
         throw std::runtime_error("Unsupported render path for raster renderer: " + renderPath);
     }
 
     // Bind scene resources to pipeline (push constants)
-    {
+    if (m_multiPipeline) {
+        // In multi-pipeline mode, gather push constants from the first permutation
+        glm::vec3 lightDir = glm::normalize(glm::vec3(1.0f, 0.8f, 0.6f));
+        if (!m_permutations.empty()) {
+            auto buildPushData = [&](const ReflectionData& refl) {
+                for (auto& pc : refl.push_constants) {
+                    if (pc.size <= 0) continue;
+                    pushConstantSize = std::max(pushConstantSize, static_cast<uint32_t>(pc.size));
+                    pushConstantData.resize(pushConstantSize, 0);
+                    pushConstantStageFlags |= (refl.stage == "vertex")
+                        ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+                    for (auto& f : pc.fields) {
+                        if (f.name == "light_dir" && static_cast<uint32_t>(f.offset) + 12 <= pushConstantSize) {
+                            memcpy(pushConstantData.data() + f.offset, &lightDir, sizeof(glm::vec3));
+                        } else if (f.name == "view_pos" && static_cast<uint32_t>(f.offset) + 12 <= pushConstantSize) {
+                            glm::vec3 eye = m_scene->hasSceneBounds() ? m_scene->getAutoEye() : Camera::DEFAULT_EYE;
+                            memcpy(pushConstantData.data() + f.offset, &eye, sizeof(glm::vec3));
+                        }
+                    }
+                }
+            };
+            buildPushData(m_permutations[0].vertRefl);
+            buildPushData(m_permutations[0].fragRefl);
+        }
+    } else {
         glm::vec3 lightDir = glm::normalize(glm::vec3(1.0f, 0.8f, 0.6f));
         auto buildPushData = [&](const ReflectionData& refl) {
             for (auto& pc : refl.push_constants) {
@@ -943,7 +993,549 @@ void RasterRenderer::init(VulkanContext& ctx, SceneManager& scene,
     }
 
     std::cout << "[info] Raster renderer initialized: " << pipelineBase
-              << " (path=" << renderPath << ")" << std::endl;
+              << " (path=" << renderPath
+              << (m_multiPipeline ? ", multi-pipeline" : "")
+              << ")" << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Multi-pipeline setup: one pipeline per permutation
+// --------------------------------------------------------------------------
+
+void RasterRenderer::setupMultiPipeline(VulkanContext& ctx, const ShaderManifest& manifest) {
+    namespace fs = std::filesystem;
+    m_multiPipeline = true;
+
+    // Group materials by feature set
+    auto groups = m_scene->groupMaterialsByFeatures();
+    size_t totalMaterials = m_scene->getGltfScene().materials.size();
+
+    // Build materialToPermutation mapping
+    m_materialToPermutation.resize(totalMaterials, 0);
+
+    int permIdx = 0;
+    for (auto& [suffix, materialIndices] : groups) {
+        // Resolve suffix to a manifest permutation
+        std::string resolvedSuffix = suffix;
+
+        // Build full path for this permutation
+        std::string permBase = m_pipelineBase + resolvedSuffix;
+        std::string vertPath = permBase + ".vert.spv";
+        std::string fragPath = permBase + ".frag.spv";
+
+        if (!fs::exists(vertPath) || !fs::exists(fragPath)) {
+            std::cerr << "[warn] Missing shader for permutation '" << resolvedSuffix
+                      << "', falling back to base" << std::endl;
+            permBase = m_pipelineBase;
+            vertPath = permBase + ".vert.spv";
+            fragPath = permBase + ".frag.spv";
+            resolvedSuffix = "";
+        }
+
+        PermutationPipeline perm;
+        perm.suffix = resolvedSuffix;
+        perm.basePath = permBase;
+        perm.materialIndices = materialIndices;
+
+        // Load shaders
+        auto vertCode = SpvLoader::loadSPIRV(vertPath);
+        perm.vertModule = SpvLoader::createShaderModule(ctx.device, vertCode);
+        auto fragCode = SpvLoader::loadSPIRV(fragPath);
+        perm.fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
+
+        // Load reflection
+        std::string vertJsonPath = permBase + ".vert.json";
+        std::string fragJsonPath = permBase + ".frag.json";
+        if (fs::exists(vertJsonPath)) perm.vertRefl = parseReflectionJson(vertJsonPath);
+        if (fs::exists(fragJsonPath)) perm.fragRefl = parseReflectionJson(fragJsonPath);
+
+        // Map materials to this permutation
+        for (int mi : materialIndices) {
+            m_materialToPermutation[mi] = permIdx;
+        }
+
+        m_permutations.push_back(std::move(perm));
+        permIdx++;
+
+        std::cout << "[info] Loaded permutation '" << resolvedSuffix << "' from " << permBase
+                  << " (" << materialIndices.size() << " material(s))" << std::endl;
+    }
+
+    // Create shared set 0 layout (MVP + Light) from first permutation's vertex reflection
+    // All permutations share the same set 0 layout
+    {
+        std::vector<ReflectionData> set0Stages = {m_permutations[0].vertRefl};
+        // Only include set 0 bindings from vertex stage
+        auto sharedLayouts = createDescriptorSetLayoutsMultiStage(ctx.device, set0Stages);
+        auto it = sharedLayouts.find(0);
+        if (it != sharedLayouts.end()) {
+            m_sharedSet0Layout = it->second;
+        }
+        // Clean up other layouts (we only want set 0)
+        for (auto& [idx, layout] : sharedLayouts) {
+            if (idx != 0) vkDestroyDescriptorSetLayout(ctx.device, layout, nullptr);
+        }
+    }
+
+    // Count total descriptor pool requirements
+    std::unordered_map<VkDescriptorType, uint32_t> typeCounts;
+    uint32_t maxSets = 1; // set 0
+
+    // Set 0 bindings (shared)
+    for (auto& [setIdx, bindings] : m_permutations[0].vertRefl.descriptor_sets) {
+        if (setIdx != 0) continue;
+        for (auto& b : bindings) {
+            typeCounts[bindingTypeToVkDescriptorType(b.type)]++;
+        }
+    }
+
+    // Per-permutation set 1 bindings
+    for (auto& perm : m_permutations) {
+        std::vector<ReflectionData> stages = {perm.vertRefl, perm.fragRefl};
+        auto mergedBindings = getMergedBindings(stages);
+        int fragSetIdx = 1;
+        for (auto& b : mergedBindings) {
+            if (b.name == "Material") fragSetIdx = b.set;
+        }
+
+        // Create set 1 layout for this permutation
+        auto permLayouts = createDescriptorSetLayoutsMultiStage(ctx.device, stages);
+        auto it = permLayouts.find(fragSetIdx);
+        if (it != permLayouts.end()) {
+            perm.materialSetLayout = it->second;
+        }
+        // Clean up other layouts
+        for (auto& [idx, layout] : permLayouts) {
+            if (idx != fragSetIdx) vkDestroyDescriptorSetLayout(ctx.device, layout, nullptr);
+        }
+
+        for (auto& b : mergedBindings) {
+            if (b.set != fragSetIdx) continue;
+            typeCounts[bindingTypeToVkDescriptorType(b.type)] += static_cast<uint32_t>(perm.materialIndices.size());
+        }
+        maxSets += static_cast<uint32_t>(perm.materialIndices.size());
+    }
+
+    // Create descriptor pool
+    std::vector<VkDescriptorPoolSize> poolSizes;
+    for (auto& [type, count] : typeCounts) {
+        poolSizes.push_back({type, count});
+    }
+
+    VkDescriptorPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = maxSets;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &descriptorPool);
+
+    // Allocate and write shared set 0 (MVP + Light)
+    if (m_sharedSet0Layout != VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo allocSetInfo = {};
+        allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocSetInfo.descriptorPool = descriptorPool;
+        allocSetInfo.descriptorSetCount = 1;
+        allocSetInfo.pSetLayouts = &m_sharedSet0Layout;
+        vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &m_vertexDescSet);
+
+        // Write MVP + Light to set 0
+        auto mergedBindings = getMergedBindings({m_permutations[0].vertRefl});
+        struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
+        std::vector<DescWriteInfo> writeInfos;
+        std::vector<VkWriteDescriptorSet> writes;
+
+        for (auto& b : mergedBindings) {
+            if (b.set != 0) continue;
+            DescWriteInfo info = {};
+            VkWriteDescriptorSet w = {};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = m_vertexDescSet;
+            w.dstBinding = static_cast<uint32_t>(b.binding);
+            w.descriptorCount = 1;
+
+            if (b.type == "uniform_buffer") {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                if (b.name == "MVP") {
+                    info.bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
+                } else if (b.name == "Light") {
+                    info.bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                } else continue;
+                writeInfos.push_back(info);
+                w.pBufferInfo = &writeInfos.back().bufferInfo;
+            } else continue;
+            writes.push_back(w);
+        }
+        if (!writes.empty()) {
+            vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
+    }
+
+    // For each permutation: allocate per-material descriptor sets and create pipeline
+    for (auto& perm : m_permutations) {
+        std::vector<ReflectionData> stages = {perm.vertRefl, perm.fragRefl};
+        auto mergedBindings = getMergedBindings(stages);
+        int fragSetIdx = 1;
+        for (auto& b : mergedBindings) {
+            if (b.name == "Material") fragSetIdx = b.set;
+        }
+
+        perm.perMaterialDescSets.resize(perm.materialIndices.size());
+        perm.perMaterialUBOs.resize(perm.materialIndices.size());
+        perm.perMaterialAllocations.resize(perm.materialIndices.size());
+
+        for (size_t i = 0; i < perm.materialIndices.size(); i++) {
+            int mi = perm.materialIndices[i];
+
+            // Create Material UBO
+            MaterialUBOData materialData{};
+            if (mi < static_cast<int>(m_scene->getGltfScene().materials.size())) {
+                const auto& mat = m_scene->getGltfScene().materials[mi];
+                materialData.baseColorFactor = mat.baseColor;
+                materialData.metallicFactor = mat.metallic;
+                materialData.roughnessFactor = mat.roughness;
+                materialData.emissiveFactor = mat.emissive;
+                materialData.emissiveStrength = mat.emissiveStrength;
+                materialData.ior = mat.ior;
+                materialData.clearcoatFactor = mat.clearcoatFactor;
+                materialData.clearcoatRoughnessFactor = mat.clearcoatRoughnessFactor;
+                materialData.sheenColorFactor = mat.sheenColorFactor;
+                materialData.sheenRoughnessFactor = mat.sheenRoughnessFactor;
+                materialData.transmissionFactor = mat.transmissionFactor;
+                materialData.baseColorUvSt = glm::vec4(mat.base_color_uv_xform.offset, mat.base_color_uv_xform.scale);
+                materialData.normalUvSt = glm::vec4(mat.normal_uv_xform.offset, mat.normal_uv_xform.scale);
+                materialData.mrUvSt = glm::vec4(mat.metallic_roughness_uv_xform.offset, mat.metallic_roughness_uv_xform.scale);
+                materialData.baseColorUvRot = mat.base_color_uv_xform.rotation;
+                materialData.normalUvRot = mat.normal_uv_xform.rotation;
+                materialData.mrUvRot = mat.metallic_roughness_uv_xform.rotation;
+            }
+
+            VkBufferCreateInfo matBufInfo = {};
+            matBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            matBufInfo.size = sizeof(MaterialUBOData);
+            matBufInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+            VmaAllocationCreateInfo matAllocInfo = {};
+            matAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+            vmaCreateBuffer(ctx.allocator, &matBufInfo, &matAllocInfo,
+                            &perm.perMaterialUBOs[i], &perm.perMaterialAllocations[i], nullptr);
+
+            void* mapped;
+            vmaMapMemory(ctx.allocator, perm.perMaterialAllocations[i], &mapped);
+            memcpy(mapped, &materialData, sizeof(MaterialUBOData));
+            vmaUnmapMemory(ctx.allocator, perm.perMaterialAllocations[i]);
+
+            // Allocate descriptor set
+            VkDescriptorSetAllocateInfo allocSetInfo = {};
+            allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocSetInfo.descriptorPool = descriptorPool;
+            allocSetInfo.descriptorSetCount = 1;
+            allocSetInfo.pSetLayouts = &perm.materialSetLayout;
+            vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &perm.perMaterialDescSets[i]);
+
+            // Write descriptors
+            struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
+            std::vector<DescWriteInfo> writeInfos;
+            std::vector<VkWriteDescriptorSet> writes;
+            auto& perMatTextures = m_scene->getPerMaterialTextures();
+
+            for (auto& b : mergedBindings) {
+                if (b.set != fragSetIdx) continue;
+                DescWriteInfo info = {};
+                VkWriteDescriptorSet w = {};
+                w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w.dstSet = perm.perMaterialDescSets[i];
+                w.dstBinding = static_cast<uint32_t>(b.binding);
+                w.descriptorCount = 1;
+
+                if (b.type == "uniform_buffer") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    if (b.name == "Material") {
+                        info.bufferInfo = {perm.perMaterialUBOs[i], 0, sizeof(MaterialUBOData)};
+                    } else if (b.name == "Light" && lightBuffer != VK_NULL_HANDLE) {
+                        info.bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                    } else continue;
+                    writeInfos.push_back(info);
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else if (b.type == "sampler") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                    auto& iblTextures = m_scene->getIBLTextures();
+                    auto iblIt = iblTextures.find(b.name);
+                    if (iblIt != iblTextures.end()) {
+                        info.imageInfo = {}; info.imageInfo.sampler = iblIt->second.sampler;
+                    } else {
+                        auto& tex = m_scene->getTextureForBinding(b.name);
+                        info.imageInfo = {}; info.imageInfo.sampler = tex.sampler;
+                    }
+                    writeInfos.push_back(info);
+                    w.pImageInfo = &writeInfos.back().imageInfo;
+                } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                    auto& iblTextures = m_scene->getIBLTextures();
+                    auto iblIt = iblTextures.find(b.name);
+                    if (iblIt != iblTextures.end()) {
+                        info.imageInfo = {};
+                        info.imageInfo.imageView = iblIt->second.imageView;
+                        info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    } else {
+                        GPUTexture* texPtr = nullptr;
+                        if (mi < static_cast<int>(perMatTextures.size())) {
+                            auto it = perMatTextures[mi].find(b.name);
+                            if (it != perMatTextures[mi].end())
+                                texPtr = const_cast<GPUTexture*>(&it->second);
+                        }
+                        if (texPtr && texPtr->imageView != VK_NULL_HANDLE) {
+                            info.imageInfo = {};
+                            info.imageInfo.imageView = texPtr->imageView;
+                            info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        } else {
+                            auto& tex = m_scene->getTextureForBinding(b.name);
+                            info.imageInfo = {};
+                            info.imageInfo.imageView = tex.imageView;
+                            info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        }
+                    }
+                    writeInfos.push_back(info);
+                    w.pImageInfo = &writeInfos.back().imageInfo;
+                } else continue;
+                writes.push_back(w);
+            }
+
+            if (!writes.empty()) {
+                vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            }
+        }
+
+        // Create pipeline layout: set 0 (shared) + set 1 (per-permutation)
+        std::vector<VkDescriptorSetLayout> layouts;
+        if (m_sharedSet0Layout != VK_NULL_HANDLE) layouts.push_back(m_sharedSet0Layout);
+        if (perm.materialSetLayout != VK_NULL_HANDLE) layouts.push_back(perm.materialSetLayout);
+
+        // Collect push constant ranges
+        std::vector<VkPushConstantRange> pushRanges;
+        for (auto& pc : perm.vertRefl.push_constants) {
+            VkPushConstantRange range = {};
+            range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+            range.offset = 0;
+            range.size = static_cast<uint32_t>(pc.size);
+            pushRanges.push_back(range);
+        }
+        for (auto& pc : perm.fragRefl.push_constants) {
+            VkPushConstantRange range = {};
+            range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            range.offset = 0;
+            range.size = static_cast<uint32_t>(pc.size);
+            pushRanges.push_back(range);
+        }
+
+        VkPipelineLayoutCreateInfo layoutInfo = {};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutInfo.setLayoutCount = static_cast<uint32_t>(layouts.size());
+        layoutInfo.pSetLayouts = layouts.data();
+        layoutInfo.pushConstantRangeCount = static_cast<uint32_t>(pushRanges.size());
+        layoutInfo.pPushConstantRanges = pushRanges.data();
+        vkCreatePipelineLayout(ctx.device, &layoutInfo, nullptr, &perm.pipelineLayout);
+
+        // Create graphics pipeline (same as createPipelinePBR but per-permutation)
+        VkPipelineShaderStageCreateInfo shaderStages[2] = {};
+        shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        shaderStages[0].module = perm.vertModule;
+        shaderStages[0].pName = "main";
+        shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        shaderStages[1].module = perm.fragModule;
+        shaderStages[1].pName = "main";
+
+        int bufferStride = (m_scene && m_scene->hasGltfScene()) ? 48 : 0;
+        auto reflectedInput = createReflectedVertexInput(perm.vertRefl, bufferStride);
+
+        VkPipelineVertexInputStateCreateInfo vertexInput = {};
+        vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertexInput.vertexBindingDescriptionCount = 1;
+        vertexInput.pVertexBindingDescriptions = &reflectedInput.binding;
+        vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(reflectedInput.attributes.size());
+        vertexInput.pVertexAttributeDescriptions = reflectedInput.attributes.data();
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkViewport viewport = {0, 0, (float)renderWidth, (float)renderHeight, 0, 1};
+        VkRect2D scissor = {{0, 0}, {renderWidth, renderHeight}};
+        VkPipelineViewportStateCreateInfo viewportState = {};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1; viewportState.pViewports = &viewport;
+        viewportState.scissorCount = 1; viewportState.pScissors = &scissor;
+
+        VkPipelineRasterizationStateCreateInfo rasterizer = {};
+        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.lineWidth = 1.0f;
+        rasterizer.cullMode = VK_CULL_MODE_NONE;
+        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+        VkPipelineMultisampleStateCreateInfo multisampling = {};
+        multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo depthStencil = {};
+        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencil.depthTestEnable = VK_TRUE;
+        depthStencil.depthWriteEnable = VK_TRUE;
+        depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+        VkPipelineColorBlendAttachmentState colorBlendAtt = {};
+        colorBlendAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo colorBlending = {};
+        colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlending.attachmentCount = 1;
+        colorBlending.pAttachments = &colorBlendAtt;
+
+        VkGraphicsPipelineCreateInfo pipeInfo = {};
+        pipeInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipeInfo.stageCount = 2;
+        pipeInfo.pStages = shaderStages;
+        pipeInfo.pVertexInputState = &vertexInput;
+        pipeInfo.pInputAssemblyState = &inputAssembly;
+        pipeInfo.pViewportState = &viewportState;
+        pipeInfo.pRasterizationState = &rasterizer;
+        pipeInfo.pMultisampleState = &multisampling;
+        pipeInfo.pDepthStencilState = &depthStencil;
+        pipeInfo.pColorBlendState = &colorBlending;
+        pipeInfo.layout = perm.pipelineLayout;
+        pipeInfo.renderPass = renderPass;
+
+        if (vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeInfo,
+                                      nullptr, &perm.pipeline) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create permutation pipeline: " + perm.suffix);
+        }
+    }
+
+    std::cout << "[info] Multi-pipeline setup complete: " << m_permutations.size()
+              << " permutation(s) for " << totalMaterials << " material(s)" << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Record draw commands (shared between render() and renderToSwapchain())
+// --------------------------------------------------------------------------
+
+void RasterRenderer::recordDrawCommands(VkCommandBuffer cmd) {
+    const std::string& sceneSource = m_scene->getSceneSource();
+
+    if (sceneSource == "triangle") {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        if (pushConstantSize > 0 && pushConstantStageFlags != 0) {
+            vkCmdPushConstants(cmd, pipelineLayout, pushConstantStageFlags,
+                               0, pushConstantSize, pushConstantData.data());
+        }
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &triangleVB, &offset);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    } else if (sceneSource == "fullscreen" || m_renderPath == "fullscreen") {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        if (pushConstantSize > 0 && pushConstantStageFlags != 0) {
+            vkCmdPushConstants(cmd, pipelineLayout, pushConstantStageFlags,
+                               0, pushConstantSize, pushConstantData.data());
+        }
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    } else if (m_multiPipeline) {
+        // Multi-pipeline mode: switch pipeline per permutation
+        const auto& mesh = m_scene->getMesh();
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &offset);
+        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+
+        // Bind shared set 0 (MVP + Light)
+        if (m_vertexDescSet != VK_NULL_HANDLE && !m_permutations.empty()) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    m_permutations[0].pipelineLayout, 0, 1,
+                                    &m_vertexDescSet, 0, nullptr);
+        }
+
+        const auto& drawRanges = m_scene->getDrawRanges();
+        int currentPermIdx = -1;
+
+        for (auto& range : drawRanges) {
+            int matIdx = range.materialIndex;
+            int permIdx = (matIdx < static_cast<int>(m_materialToPermutation.size()))
+                ? m_materialToPermutation[matIdx] : 0;
+            auto& perm = m_permutations[permIdx];
+
+            // Switch pipeline if permutation changed
+            if (permIdx != currentPermIdx) {
+                currentPermIdx = permIdx;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, perm.pipeline);
+                if (pushConstantSize > 0 && pushConstantStageFlags != 0) {
+                    vkCmdPushConstants(cmd, perm.pipelineLayout, pushConstantStageFlags,
+                                       0, pushConstantSize, pushConstantData.data());
+                }
+                // Re-bind set 0 after pipeline change
+                if (m_vertexDescSet != VK_NULL_HANDLE) {
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            perm.pipelineLayout, 0, 1,
+                                            &m_vertexDescSet, 0, nullptr);
+                }
+            }
+
+            // Find per-material descriptor set index within this permutation
+            int localMatIdx = -1;
+            for (size_t j = 0; j < perm.materialIndices.size(); j++) {
+                if (perm.materialIndices[j] == matIdx) { localMatIdx = static_cast<int>(j); break; }
+            }
+            if (localMatIdx >= 0) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        perm.pipelineLayout, 1, 1,
+                                        &perm.perMaterialDescSets[localMatIdx], 0, nullptr);
+            }
+
+            vkCmdDrawIndexed(cmd, range.indexCount, 1, range.indexOffset, 0, 0);
+        }
+    } else {
+        // Single-pipeline mode (original behavior)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        if (pushConstantSize > 0 && pushConstantStageFlags != 0) {
+            vkCmdPushConstants(cmd, pipelineLayout, pushConstantStageFlags,
+                               0, pushConstantSize, pushConstantData.data());
+        }
+
+        const auto& mesh = m_scene->getMesh();
+        if (m_vertexDescSet != VK_NULL_HANDLE) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    pipelineLayout, 0, 1, &m_vertexDescSet, 0, nullptr);
+        }
+
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &offset);
+        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+
+        const auto& drawRanges = m_scene->getDrawRanges();
+        if (!drawRanges.empty() && !m_perMaterialDescSets.empty()) {
+            int currentMat = -1;
+            for (auto& range : drawRanges) {
+                if (range.materialIndex != currentMat) {
+                    currentMat = range.materialIndex;
+                    int matIdx = std::min(currentMat, static_cast<int>(m_perMaterialDescSets.size()) - 1);
+                    if (matIdx >= 0) {
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                pipelineLayout, 1, 1, &m_perMaterialDescSets[matIdx], 0, nullptr);
+                    }
+                }
+                vkCmdDrawIndexed(cmd, range.indexCount, 1, range.indexOffset, 0, 0);
+            }
+        } else {
+            int maxSet = -1;
+            for (auto& [idx, _] : reflectedDescSets) { maxSet = std::max(maxSet, idx); }
+            for (int i = 0; i <= maxSet; i++) {
+                auto it = reflectedDescSets.find(i);
+                if (it != reflectedDescSets.end()) {
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            pipelineLayout, static_cast<uint32_t>(i),
+                                            1, &it->second, 0, nullptr);
+                }
+            }
+            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+        }
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -951,11 +1543,8 @@ void RasterRenderer::init(VulkanContext& ctx, SceneManager& scene,
 // --------------------------------------------------------------------------
 
 void RasterRenderer::render(VulkanContext& ctx) {
-    const std::string& sceneSource = m_scene->getSceneSource();
-
     VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
 
-    // Set clear values
     std::vector<VkClearValue> clearValues;
     VkClearValue colorClear = {};
     if (m_needsDepth) {
@@ -981,67 +1570,7 @@ void RasterRenderer::render(VulkanContext& ctx) {
     rpBeginInfo.pClearValues = clearValues.data();
 
     vkCmdBeginRenderPass(cmd, &rpBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-
-    // Push constants (if any)
-    if (pushConstantSize > 0 && pushConstantStageFlags != 0) {
-        vkCmdPushConstants(cmd, pipelineLayout, pushConstantStageFlags,
-                           0, pushConstantSize, pushConstantData.data());
-    }
-
-    if (sceneSource == "triangle") {
-        // Triangle scene: bind triangle vertex buffer and draw
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &triangleVB, &offset);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-    } else if (sceneSource == "fullscreen" || m_renderPath == "fullscreen") {
-        // Fullscreen scene: draw fullscreen triangle (no vertex buffer)
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-    } else {
-        // Sphere, glTF, or default PBR scene: bind reflection-driven descriptors
-        const auto& mesh = m_scene->getMesh();
-
-        // Bind vertex set (set 0) -- shared across all materials
-        if (m_vertexDescSet != VK_NULL_HANDLE) {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    pipelineLayout, 0, 1, &m_vertexDescSet, 0, nullptr);
-        }
-
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &offset);
-        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-
-        const auto& drawRanges = m_scene->getDrawRanges();
-        if (!drawRanges.empty() && !m_perMaterialDescSets.empty()) {
-            int currentMat = -1;
-            for (auto& range : drawRanges) {
-                if (range.materialIndex != currentMat) {
-                    currentMat = range.materialIndex;
-                    int matIdx = std::min(currentMat, static_cast<int>(m_perMaterialDescSets.size()) - 1);
-                    if (matIdx >= 0) {
-                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                                pipelineLayout, 1, 1, &m_perMaterialDescSets[matIdx], 0, nullptr);
-                    }
-                }
-                vkCmdDrawIndexed(cmd, range.indexCount, 1, range.indexOffset, 0, 0);
-            }
-        } else {
-            // Fallback: single draw (non-glTF or single material)
-            // Bind all descriptor sets the old way
-            int maxSet = -1;
-            for (auto& [idx, _] : reflectedDescSets) { maxSet = std::max(maxSet, idx); }
-            for (int i = 0; i <= maxSet; i++) {
-                auto it = reflectedDescSets.find(i);
-                if (it != reflectedDescSets.end()) {
-                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                            pipelineLayout, static_cast<uint32_t>(i),
-                                            1, &it->second, 0, nullptr);
-                }
-            }
-            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
-        }
-    }
-
+    recordDrawCommands(cmd);
     vkCmdEndRenderPass(cmd);
     ctx.endSingleTimeCommands(cmd);
 }
@@ -1109,11 +1638,6 @@ void RasterRenderer::renderToSwapchain(VulkanContext& ctx,
                                        VkFormat swapFormat, VkExtent2D extent,
                                        VkSemaphore waitSem, VkSemaphore signalSem,
                                        VkFence fence) {
-    const std::string& sceneSource = m_scene->getSceneSource();
-
-    // Record all commands (offscreen render + blit to swapchain) into a single
-    // command buffer and submit with proper semaphore/fence synchronization.
-
     VkCommandBufferAllocateInfo allocInfo = {};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.commandPool = ctx.commandPool;
@@ -1128,7 +1652,6 @@ void RasterRenderer::renderToSwapchain(VulkanContext& ctx,
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
-    // --- Offscreen render pass ---
     std::vector<VkClearValue> clearValues;
     VkClearValue colorClear = {};
     if (m_needsDepth) {
@@ -1153,62 +1676,7 @@ void RasterRenderer::renderToSwapchain(VulkanContext& ctx,
     rpBeginInfo.pClearValues = clearValues.data();
 
     vkCmdBeginRenderPass(cmd, &rpBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-
-    if (pushConstantSize > 0 && pushConstantStageFlags != 0) {
-        vkCmdPushConstants(cmd, pipelineLayout, pushConstantStageFlags,
-                           0, pushConstantSize, pushConstantData.data());
-    }
-
-    if (sceneSource == "triangle") {
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &triangleVB, &offset);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-    } else if (sceneSource == "fullscreen" || m_renderPath == "fullscreen") {
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-    } else {
-        const auto& mesh = m_scene->getMesh();
-
-        // Bind vertex set (set 0) -- shared across all materials
-        if (m_vertexDescSet != VK_NULL_HANDLE) {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    pipelineLayout, 0, 1, &m_vertexDescSet, 0, nullptr);
-        }
-
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &offset);
-        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-
-        const auto& drawRanges = m_scene->getDrawRanges();
-        if (!drawRanges.empty() && !m_perMaterialDescSets.empty()) {
-            int currentMat = -1;
-            for (auto& range : drawRanges) {
-                if (range.materialIndex != currentMat) {
-                    currentMat = range.materialIndex;
-                    int matIdx = std::min(currentMat, static_cast<int>(m_perMaterialDescSets.size()) - 1);
-                    if (matIdx >= 0) {
-                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                                pipelineLayout, 1, 1, &m_perMaterialDescSets[matIdx], 0, nullptr);
-                    }
-                }
-                vkCmdDrawIndexed(cmd, range.indexCount, 1, range.indexOffset, 0, 0);
-            }
-        } else {
-            // Fallback: single draw (non-glTF or single material)
-            int maxSet = -1;
-            for (auto& [idx, _] : reflectedDescSets) { maxSet = std::max(maxSet, idx); }
-            for (int i = 0; i <= maxSet; i++) {
-                auto it = reflectedDescSets.find(i);
-                if (it != reflectedDescSets.end()) {
-                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                            pipelineLayout, static_cast<uint32_t>(i),
-                                            1, &it->second, 0, nullptr);
-                }
-            }
-            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
-        }
-    }
-
+    recordDrawCommands(cmd);
     vkCmdEndRenderPass(cmd);
 
     // --- Blit offscreen -> swapchain ---
@@ -1272,6 +1740,26 @@ void RasterRenderer::updateCamera(VulkanContext& ctx, glm::vec3 eye, glm::vec3 t
 void RasterRenderer::cleanup(VulkanContext& ctx) {
     vkDeviceWaitIdle(ctx.device);
 
+    // Cleanup multi-pipeline resources
+    for (auto& perm : m_permutations) {
+        if (perm.pipeline) vkDestroyPipeline(ctx.device, perm.pipeline, nullptr);
+        if (perm.pipelineLayout) vkDestroyPipelineLayout(ctx.device, perm.pipelineLayout, nullptr);
+        if (perm.vertModule) vkDestroyShaderModule(ctx.device, perm.vertModule, nullptr);
+        if (perm.fragModule) vkDestroyShaderModule(ctx.device, perm.fragModule, nullptr);
+        if (perm.materialSetLayout) vkDestroyDescriptorSetLayout(ctx.device, perm.materialSetLayout, nullptr);
+        for (size_t i = 0; i < perm.perMaterialUBOs.size(); i++) {
+            if (perm.perMaterialUBOs[i]) {
+                vmaDestroyBuffer(ctx.allocator, perm.perMaterialUBOs[i], perm.perMaterialAllocations[i]);
+            }
+        }
+    }
+    m_permutations.clear();
+    if (m_sharedSet0Layout) {
+        vkDestroyDescriptorSetLayout(ctx.device, m_sharedSet0Layout, nullptr);
+        m_sharedSet0Layout = VK_NULL_HANDLE;
+    }
+
+    // Cleanup single-pipeline resources
     if (pipeline) vkDestroyPipeline(ctx.device, pipeline, nullptr);
     if (pipelineLayout) vkDestroyPipelineLayout(ctx.device, pipelineLayout, nullptr);
     if (framebuffer) vkDestroyFramebuffer(ctx.device, framebuffer, nullptr);
@@ -1307,6 +1795,4 @@ void RasterRenderer::cleanup(VulkanContext& ctx) {
     }
     reflectedSetLayouts.clear();
     reflectedDescSets.clear();
-
-    // Note: mesh and textures are owned by SceneManager, not cleaned up here
 }

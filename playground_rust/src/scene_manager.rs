@@ -8,6 +8,8 @@ use ash::vk;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 use gpu_allocator::MemoryLocation;
 use log::info;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::camera::DefaultCamera;
@@ -324,6 +326,69 @@ pub fn build_pipeline_path(base_path: &str, features: &std::collections::BTreeSe
         return candidate;
     }
     base_path.to_string()
+}
+
+/// Detect features for a single material (not the whole scene).
+///
+/// Returns a set of feature flags like "has_normal_map", "has_sheen", etc.
+pub fn detect_material_features(scene: &crate::gltf_loader::GltfScene, material_index: usize) -> BTreeSet<String> {
+    let mut features = BTreeSet::new();
+    if material_index >= scene.materials.len() {
+        return features;
+    }
+    let mat = &scene.materials[material_index];
+    if mat.normal_image.is_some() {
+        features.insert("has_normal_map".to_string());
+    }
+    if mat.emissive_image.is_some() || mat.emissive.iter().any(|&e| e > 0.0) {
+        features.insert("has_emission".to_string());
+    }
+    if mat.has_clearcoat {
+        features.insert("has_clearcoat".to_string());
+    }
+    if mat.has_sheen {
+        features.insert("has_sheen".to_string());
+    }
+    if mat.has_transmission {
+        features.insert("has_transmission".to_string());
+    }
+    features
+}
+
+/// Convert a feature set to a permutation suffix string like "+normal_map+sheen".
+///
+/// Features are sorted (BTreeSet is already sorted), "has_" prefix is stripped.
+/// Empty set returns "".
+pub fn features_to_suffix(features: &BTreeSet<String>) -> String {
+    if features.is_empty() {
+        return String::new();
+    }
+    let mut suffix = String::new();
+    for f in features {
+        suffix.push('+');
+        suffix.push_str(f.strip_prefix("has_").unwrap_or(f));
+    }
+    suffix
+}
+
+/// Group materials by feature set, returning a map of suffix -> [material_indices].
+///
+/// Each unique combination of features gets its own permutation suffix.
+pub fn group_materials_by_features(scene: &crate::gltf_loader::GltfScene) -> BTreeMap<String, Vec<usize>> {
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for i in 0..scene.materials.len() {
+        let feats = detect_material_features(scene, i);
+        let suffix = features_to_suffix(&feats);
+        groups.entry(suffix).or_default().push(i);
+    }
+
+    info!("Material permutation groups:");
+    for (suffix, indices) in &groups {
+        let label = if suffix.is_empty() { "(base)" } else { suffix.as_str() };
+        info!("  \"{}\": materials {:?}", label, indices);
+    }
+
+    groups
 }
 
 /// Compute auto-camera from scene bounds using node transforms (for glTF scenes).

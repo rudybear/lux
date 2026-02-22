@@ -13,6 +13,27 @@
 #include <vector>
 #include <unordered_map>
 
+// Per-permutation pipeline data for multi-material rendering
+struct PermutationPipeline {
+    std::string suffix;                              // e.g. "+normal_map+sheen"
+    std::string basePath;                            // full path with suffix
+
+    VkShaderModule vertModule = VK_NULL_HANDLE;
+    VkShaderModule fragModule = VK_NULL_HANDLE;
+    ReflectionData vertRefl;
+    ReflectionData fragRefl;
+
+    VkDescriptorSetLayout materialSetLayout = VK_NULL_HANDLE;  // set 1 layout
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+
+    // Per-material descriptor sets and UBOs for materials using this permutation
+    std::vector<VkDescriptorSet> perMaterialDescSets;
+    std::vector<VkBuffer> perMaterialUBOs;
+    std::vector<VmaAllocation> perMaterialAllocations;
+    std::vector<int> materialIndices;                // which scene materials use this
+};
+
 class RasterRenderer : public IRenderer {
 public:
     // Initialize with SceneManager
@@ -66,7 +87,7 @@ private:
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
 
-    // Pipeline
+    // --- Single-pipeline mode (triangle, fullscreen, single-material PBR) ---
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
 
@@ -83,21 +104,27 @@ private:
     VkBuffer m_materialBuffer = VK_NULL_HANDLE;
     VmaAllocation m_materialAllocation = VK_NULL_HANDLE;
 
-    // Per-material descriptor sets and buffers for multi-material rendering
+    // Per-material descriptor sets and buffers (single-pipeline fallback)
     std::vector<VkDescriptorSet> m_perMaterialDescSets;
     std::vector<VkBuffer> m_perMaterialBuffers;
     std::vector<VmaAllocation> m_perMaterialAllocations;
     VkDescriptorSet m_vertexDescSet = VK_NULL_HANDLE;
 
+    // --- Multi-pipeline mode (per-material permutation selection) ---
+    bool m_multiPipeline = false;
+    std::vector<PermutationPipeline> m_permutations;
+    std::vector<int> m_materialToPermutation;          // materialIndex -> permutation index
+    VkDescriptorSetLayout m_sharedSet0Layout = VK_NULL_HANDLE;  // shared set 0 (MVP)
+
     // Triangle vertex buffer
     VkBuffer triangleVB = VK_NULL_HANDLE;
     VmaAllocation triangleVBAllocation = VK_NULL_HANDLE;
 
-    // Shader modules
+    // Shader modules (single-pipeline mode)
     VkShaderModule vertModule = VK_NULL_HANDLE;
     VkShaderModule fragModule = VK_NULL_HANDLE;
 
-    // Reflection data cached from JSON parsing
+    // Reflection data cached from JSON parsing (single-pipeline mode)
     ReflectionData vertReflection;
     ReflectionData fragReflection;
 
@@ -114,6 +141,12 @@ private:
     void createPipelinePBR(VulkanContext& ctx);
     void setupPBRResources(VulkanContext& ctx);
 
-    // Reflection-driven descriptor setup
+    // Reflection-driven descriptor setup (single pipeline)
     void setupReflectedDescriptors(VulkanContext& ctx);
+
+    // Multi-pipeline setup
+    void setupMultiPipeline(VulkanContext& ctx, const ShaderManifest& manifest);
+
+    // Record draw commands (shared between render() and renderToSwapchain())
+    void recordDrawCommands(VkCommandBuffer cmd);
 };

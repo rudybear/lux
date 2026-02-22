@@ -921,6 +921,56 @@ std::set<std::string> SceneManager::detectSceneFeatures() const {
     return features;
 }
 
+std::set<std::string> SceneManager::detectMaterialFeatures(int materialIndex) const {
+    std::set<std::string> features;
+    if (!m_hasGltfScene || materialIndex < 0 ||
+        materialIndex >= static_cast<int>(m_gltfScene.materials.size())) return features;
+
+    const auto& mat = m_gltfScene.materials[materialIndex];
+    if (mat.normal_tex.valid()) features.insert("has_normal_map");
+    if (mat.emissive_tex.valid() || glm::length(mat.emissive) > 0.0f)
+        features.insert("has_emission");
+    if (mat.hasClearcoat) features.insert("has_clearcoat");
+    if (mat.hasSheen) features.insert("has_sheen");
+    if (mat.hasTransmission) features.insert("has_transmission");
+
+    return features;
+}
+
+std::string SceneManager::featuresToSuffix(const std::set<std::string>& features) {
+    if (features.empty()) return "";
+    std::string suffix;
+    for (auto& f : features) {
+        suffix += "+";
+        // Strip "has_" prefix
+        suffix += f.substr(4);
+    }
+    return suffix;
+}
+
+std::map<std::string, std::vector<int>> SceneManager::groupMaterialsByFeatures() const {
+    std::map<std::string, std::vector<int>> groups;
+    if (!m_hasGltfScene) return groups;
+
+    for (int i = 0; i < static_cast<int>(m_gltfScene.materials.size()); i++) {
+        auto feats = detectMaterialFeatures(i);
+        std::string suffix = featuresToSuffix(feats);
+        groups[suffix].push_back(i);
+    }
+
+    std::cout << "[info] Material permutation groups:" << std::endl;
+    for (auto& [suffix, indices] : groups) {
+        std::cout << "  \"" << (suffix.empty() ? "(base)" : suffix) << "\": materials [";
+        for (size_t j = 0; j < indices.size(); j++) {
+            if (j > 0) std::cout << ", ";
+            std::cout << indices[j];
+        }
+        std::cout << "]" << std::endl;
+    }
+
+    return groups;
+}
+
 std::string SceneManager::buildPipelinePath(const std::string& basePath,
                                              const std::set<std::string>& features) {
     if (features.empty()) return basePath;

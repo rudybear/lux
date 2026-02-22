@@ -287,15 +287,33 @@ static int runHeadless(const CLIOptions& opts) {
         scene.uploadTextures(ctx);
         scene.loadIBLAssets(ctx, dstStage, opts.iblName);
 
+        // Resolve permutation for RT/mesh paths from manifest + scene features.
+        // (Raster handles this internally in raster_renderer.cpp.)
+        std::string resolvedBase = opts.shaderBase;
+        if ((needRT || needMesh) && scene.hasGltfScene()) {
+            ShaderManifest manifest = tryLoadManifest(opts.shaderBase);
+            if (!manifest.permutations.empty()) {
+                auto features = scene.detectSceneFeatures();
+                std::string suffix = findPermutationSuffix(manifest, features);
+                if (!suffix.empty()) {
+                    std::string ext = needRT ? ".rgen.spv" : ".mesh.spv";
+                    if (fs::exists(opts.shaderBase + suffix + ext)) {
+                        resolvedBase = opts.shaderBase + suffix;
+                        std::cout << "[info] Resolved permutation: " << suffix << std::endl;
+                    }
+                }
+            }
+        }
+
         std::unique_ptr<IRenderer> renderer;
         if (needRT) {
             auto rt = std::make_unique<RTRenderer>();
-            rt->init(ctx, opts.shaderBase + ".rgen.spv", opts.shaderBase + ".rmiss.spv",
-                     opts.shaderBase + ".rchit.spv", opts.width, opts.height, scene);
+            rt->init(ctx, resolvedBase + ".rgen.spv", resolvedBase + ".rmiss.spv",
+                     resolvedBase + ".rchit.spv", opts.width, opts.height, scene);
             renderer = std::move(rt);
         } else if (needMesh) {
             auto meshR = std::make_unique<MeshRenderer>();
-            meshR->init(ctx, scene, opts.shaderBase, opts.width, opts.height);
+            meshR->init(ctx, scene, resolvedBase, opts.width, opts.height);
             renderer = std::move(meshR);
         } else {
             auto raster = std::make_unique<RasterRenderer>();
@@ -435,17 +453,34 @@ static int runInteractive(CLIOptions opts) {
         scene.uploadTextures(ctx);
         scene.loadIBLAssets(ctx, dstStage, opts.iblName);
 
+        // Resolve permutation for RT/mesh paths from manifest + scene features.
+        std::string resolvedBase = opts.shaderBase;
+        if ((useRT || useMesh) && scene.hasGltfScene()) {
+            ShaderManifest manifest = tryLoadManifest(opts.shaderBase);
+            if (!manifest.permutations.empty()) {
+                auto features = scene.detectSceneFeatures();
+                std::string suffix = findPermutationSuffix(manifest, features);
+                if (!suffix.empty()) {
+                    std::string ext = useRT ? ".rgen.spv" : ".mesh.spv";
+                    if (fs::exists(opts.shaderBase + suffix + ext)) {
+                        resolvedBase = opts.shaderBase + suffix;
+                        std::cout << "[info] Resolved permutation: " << suffix << std::endl;
+                    }
+                }
+            }
+        }
+
         if (useRT) {
             auto rt = std::make_unique<RTRenderer>();
-            std::string rgenPath = opts.shaderBase + ".rgen.spv";
-            std::string rmissPath = opts.shaderBase + ".rmiss.spv";
-            std::string rchitPath = opts.shaderBase + ".rchit.spv";
+            std::string rgenPath = resolvedBase + ".rgen.spv";
+            std::string rmissPath = resolvedBase + ".rmiss.spv";
+            std::string rchitPath = resolvedBase + ".rchit.spv";
             rt->init(ctx, rgenPath, rmissPath, rchitPath,
                      opts.width, opts.height, scene);
             renderer = std::move(rt);
         } else if (useMesh) {
             auto meshR = std::make_unique<MeshRenderer>();
-            meshR->init(ctx, scene, opts.shaderBase,
+            meshR->init(ctx, scene, resolvedBase,
                         opts.width, opts.height);
             renderer = std::move(meshR);
         } else {

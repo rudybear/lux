@@ -480,6 +480,47 @@ pub unsafe fn create_pipeline_layout_from_merged(
         .map_err(|e| format!("Failed to create pipeline layout: {:?}", e))
 }
 
+/// Create vertex input binding and attribute descriptions from reflection,
+/// with an optional stride override.
+///
+/// When `override_stride > 0`, the binding stride is set to `override_stride`
+/// instead of `vert_reflection.vertex_stride`. This is needed when the vertex
+/// buffer always has a larger stride (e.g. 48-byte glTF vertices with tangent)
+/// but the shader for a particular permutation only reads fewer attributes
+/// (e.g. position+normal+uv = 32 bytes). Vulkan allows stride > sum of attributes.
+pub fn create_reflected_vertex_input_with_stride(
+    vert_reflection: &ReflectionData,
+    override_stride: u32,
+) -> (
+    Vec<vk::VertexInputBindingDescription>,
+    Vec<vk::VertexInputAttributeDescription>,
+) {
+    let stride = if override_stride > 0 {
+        override_stride
+    } else {
+        vert_reflection.vertex_stride
+    };
+
+    let binding = vec![vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(stride)
+        .input_rate(vk::VertexInputRate::VERTEX)];
+
+    let attributes: Vec<vk::VertexInputAttributeDescription> = vert_reflection
+        .vertex_attributes
+        .iter()
+        .map(|attr| {
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(attr.location)
+                .format(reflection_format_to_vk(&attr.format))
+                .offset(attr.offset)
+        })
+        .collect();
+
+    (binding, attributes)
+}
+
 /// Public accessor: convert binding_type string to VkDescriptorType.
 pub fn binding_type_to_vk_public(btype: &str) -> vk::DescriptorType {
     binding_type_to_vk(btype)

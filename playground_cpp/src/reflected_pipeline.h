@@ -9,6 +9,7 @@
 #include <vulkan/vulkan.h>
 #include <string>
 #include <vector>
+#include <set>
 #include <unordered_map>
 #include <optional>
 
@@ -83,6 +84,11 @@ ReflectionData parseReflectionJson(const std::string& json_path);
 VkFormat reflectionFormatToVkFormat(const std::string& fmt);
 
 /**
+ * Map a binding type string to VkDescriptorType.
+ */
+VkDescriptorType bindingTypeToVkDescriptorType(const std::string& type);
+
+/**
  * Create descriptor set layouts from merged vertex + fragment reflection data.
  * Returns map of set index -> VkDescriptorSetLayout.
  */
@@ -146,3 +152,36 @@ struct ReflectedVertexInput {
 };
 
 ReflectedVertexInput createReflectedVertexInput(const ReflectionData& vertReflection, int overrideStride = 0);
+
+/**
+ * Shader manifest: lists all available permutations for a pipeline.
+ */
+struct ManifestPermutation {
+    std::string suffix;                                // e.g. "+normal_map+sheen"
+    std::unordered_map<std::string, bool> features;    // feature name -> enabled
+};
+
+struct ShaderManifest {
+    std::string pipeline;                              // e.g. "GltfForward"
+    std::vector<std::string> featureNames;             // all declared features
+    std::vector<ManifestPermutation> permutations;     // all permutations
+};
+
+/**
+ * Parse a .manifest.json file into a ShaderManifest struct.
+ * Returns empty manifest if file doesn't exist.
+ */
+ShaderManifest parseManifestJson(const std::string& manifest_path);
+
+/**
+ * Try to load manifest from a pipeline base path.
+ * Checks for basePath + ".manifest.json" and the legacy gltf_pbr/ subdirectory.
+ */
+ShaderManifest tryLoadManifest(const std::string& pipelineBase);
+
+/**
+ * Find the best matching permutation suffix for a set of material features.
+ * Returns "" (base) if no exact match found.
+ */
+std::string findPermutationSuffix(const ShaderManifest& manifest,
+                                   const std::set<std::string>& materialFeatures);

@@ -230,52 +230,145 @@ void MeshRenderer::uploadMeshletData(VulkanContext& ctx) {
         if (hwMaxPrims > 0) maxPrims = std::min(hwMaxPrims, 124u);
     }
 
-    // Build meshlets
-    auto buildResult = buildMeshlets(
-        indices.data(), static_cast<uint32_t>(indices.size()),
-        static_cast<uint32_t>(vertices.size()),
-        maxVerts, maxPrims);
+    const auto& drawRanges = m_scene->getDrawRanges();
+    bool hasMultipleDrawRanges = drawRanges.size() > 1;
 
-    m_totalMeshlets = static_cast<uint32_t>(buildResult.meshlets.size());
-    std::cout << "[mesh] Built " << m_totalMeshlets << " meshlets"
-              << " (max_verts=" << maxVerts << ", max_prims=" << maxPrims << ")" << std::endl;
+    if (hasMultipleDrawRanges) {
+        // Multi-material path: build meshlets per draw range so each group
+        // is associated with a specific material for permutation selection.
+        std::vector<MeshletDescriptor> allMeshlets;
+        std::vector<uint32_t> allMeshletVertices;
+        std::vector<uint32_t> allMeshletTriangles;
+        m_meshletGroups.clear();
 
-    VkBufferUsageFlags ssboUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        for (const auto& range : drawRanges) {
+            // Extract index slice for this draw range
+            uint32_t rangeIndexCount = range.indexCount;
+            if (rangeIndexCount == 0) continue;
 
-    // Upload meshlet descriptors
-    m_meshletDescSize = buildResult.meshlets.size() * sizeof(MeshletDescriptor);
-    Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
-                        buildResult.meshlets.data(), m_meshletDescSize, ssboUsage,
-                        m_meshletDescBuffer, m_meshletDescAlloc);
+            // The indices in the draw range are already global vertex indices.
+            // Build meshlets from this slice.
+            const uint32_t* rangeIndices = indices.data() + range.indexOffset;
 
-    // Upload meshlet vertex indices
-    m_meshletVertSize = buildResult.meshletVertices.size() * sizeof(uint32_t);
-    if (m_meshletVertSize > 0) {
+            auto buildResult = buildMeshlets(
+                rangeIndices, rangeIndexCount,
+                static_cast<uint32_t>(vertices.size()),
+                maxVerts, maxPrims);
+
+            if (buildResult.meshlets.empty()) continue;
+
+            // Record the meshlet group before concatenation
+            MeshletGroup group;
+            group.firstMeshlet = static_cast<uint32_t>(allMeshlets.size());
+            group.meshletCount = static_cast<uint32_t>(buildResult.meshlets.size());
+            group.materialIndex = range.materialIndex;
+            group.permutationIndex = 0;  // set later during multi-pipeline setup
+
+            // Offset meshlet descriptors to account for global vertex/triangle arrays
+            uint32_t vertexBase = static_cast<uint32_t>(allMeshletVertices.size());
+            uint32_t triangleBase = static_cast<uint32_t>(allMeshletTriangles.size());
+            for (auto& meshlet : buildResult.meshlets) {
+                meshlet.vertexOffset += vertexBase;
+                meshlet.triangleOffset += triangleBase;
+            }
+
+            // Concatenate into global arrays
+            allMeshlets.insert(allMeshlets.end(),
+                buildResult.meshlets.begin(), buildResult.meshlets.end());
+            allMeshletVertices.insert(allMeshletVertices.end(),
+                buildResult.meshletVertices.begin(), buildResult.meshletVertices.end());
+            allMeshletTriangles.insert(allMeshletTriangles.end(),
+                buildResult.meshletTriangles.begin(), buildResult.meshletTriangles.end());
+
+            m_meshletGroups.push_back(group);
+        }
+
+        m_totalMeshlets = static_cast<uint32_t>(allMeshlets.size());
+        std::cout << "[mesh] Built " << m_totalMeshlets << " meshlets across "
+                  << m_meshletGroups.size() << " material group(s)"
+                  << " (max_verts=" << maxVerts << ", max_prims=" << maxPrims << ")" << std::endl;
+
+        VkBufferUsageFlags ssboUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+        // Upload meshlet descriptors
+        m_meshletDescSize = allMeshlets.size() * sizeof(MeshletDescriptor);
         Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
-                            buildResult.meshletVertices.data(), m_meshletVertSize, ssboUsage,
-                            m_meshletVertBuffer, m_meshletVertAlloc);
+                            allMeshlets.data(), m_meshletDescSize, ssboUsage,
+                            m_meshletDescBuffer, m_meshletDescAlloc);
+
+        // Upload meshlet vertex indices
+        m_meshletVertSize = allMeshletVertices.size() * sizeof(uint32_t);
+        if (m_meshletVertSize > 0) {
+            Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                                allMeshletVertices.data(), m_meshletVertSize, ssboUsage,
+                                m_meshletVertBuffer, m_meshletVertAlloc);
+        } else {
+            uint32_t dummy = 0;
+            Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                                &dummy, sizeof(uint32_t), ssboUsage,
+                                m_meshletVertBuffer, m_meshletVertAlloc);
+            m_meshletVertSize = sizeof(uint32_t);
+        }
+
+        // Upload meshlet triangle indices
+        m_meshletTriSize = allMeshletTriangles.size() * sizeof(uint32_t);
+        if (m_meshletTriSize > 0) {
+            Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                                allMeshletTriangles.data(), m_meshletTriSize, ssboUsage,
+                                m_meshletTriBuffer, m_meshletTriAlloc);
+        } else {
+            uint32_t dummy = 0;
+            Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                                &dummy, sizeof(uint32_t), ssboUsage,
+                                m_meshletTriBuffer, m_meshletTriAlloc);
+            m_meshletTriSize = sizeof(uint32_t);
+        }
     } else {
-        // Create a minimal buffer for descriptor binding
-        uint32_t dummy = 0;
-        Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
-                            &dummy, sizeof(uint32_t), ssboUsage,
-                            m_meshletVertBuffer, m_meshletVertAlloc);
-        m_meshletVertSize = sizeof(uint32_t);
-    }
+        // Single draw range (original path): build meshlets from the full index buffer
+        auto buildResult = buildMeshlets(
+            indices.data(), static_cast<uint32_t>(indices.size()),
+            static_cast<uint32_t>(vertices.size()),
+            maxVerts, maxPrims);
 
-    // Upload meshlet triangle indices
-    m_meshletTriSize = buildResult.meshletTriangles.size() * sizeof(uint32_t);
-    if (m_meshletTriSize > 0) {
+        m_totalMeshlets = static_cast<uint32_t>(buildResult.meshlets.size());
+        std::cout << "[mesh] Built " << m_totalMeshlets << " meshlets"
+                  << " (max_verts=" << maxVerts << ", max_prims=" << maxPrims << ")" << std::endl;
+
+        VkBufferUsageFlags ssboUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+        // Upload meshlet descriptors
+        m_meshletDescSize = buildResult.meshlets.size() * sizeof(MeshletDescriptor);
         Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
-                            buildResult.meshletTriangles.data(), m_meshletTriSize, ssboUsage,
-                            m_meshletTriBuffer, m_meshletTriAlloc);
-    } else {
-        // Create a minimal buffer for descriptor binding
-        uint32_t dummy = 0;
-        Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
-                            &dummy, sizeof(uint32_t), ssboUsage,
-                            m_meshletTriBuffer, m_meshletTriAlloc);
-        m_meshletTriSize = sizeof(uint32_t);
+                            buildResult.meshlets.data(), m_meshletDescSize, ssboUsage,
+                            m_meshletDescBuffer, m_meshletDescAlloc);
+
+        // Upload meshlet vertex indices
+        m_meshletVertSize = buildResult.meshletVertices.size() * sizeof(uint32_t);
+        if (m_meshletVertSize > 0) {
+            Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                                buildResult.meshletVertices.data(), m_meshletVertSize, ssboUsage,
+                                m_meshletVertBuffer, m_meshletVertAlloc);
+        } else {
+            uint32_t dummy = 0;
+            Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                                &dummy, sizeof(uint32_t), ssboUsage,
+                                m_meshletVertBuffer, m_meshletVertAlloc);
+            m_meshletVertSize = sizeof(uint32_t);
+        }
+
+        // Upload meshlet triangle indices
+        m_meshletTriSize = buildResult.meshletTriangles.size() * sizeof(uint32_t);
+        if (m_meshletTriSize > 0) {
+            Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                                buildResult.meshletTriangles.data(), m_meshletTriSize, ssboUsage,
+                                m_meshletTriBuffer, m_meshletTriAlloc);
+        } else {
+            uint32_t dummy = 0;
+            Scene::uploadBuffer(ctx.allocator, ctx.device, ctx.commandPool, ctx.graphicsQueue,
+                                &dummy, sizeof(uint32_t), ssboUsage,
+                                m_meshletTriBuffer, m_meshletTriAlloc);
+            m_meshletTriSize = sizeof(uint32_t);
+        }
     }
 }
 
@@ -578,12 +671,9 @@ void MeshRenderer::init(VulkanContext& ctx, SceneManager& scene,
         m_fragReflection = parseReflectionJson(fragJsonPath);
     }
 
-    // Load shader modules
+    // Load mesh shader module (shared across all permutations)
     auto meshCode = SpvLoader::loadSPIRV(pipelineBase + ".mesh.spv");
     m_meshModule = SpvLoader::createShaderModule(ctx.device, meshCode);
-
-    auto fragCode = SpvLoader::loadSPIRV(pipelineBase + ".frag.spv");
-    m_fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
 
     // Upload vertex data as SoA storage buffers
     uploadVertexData(ctx);
@@ -591,7 +681,7 @@ void MeshRenderer::init(VulkanContext& ctx, SceneManager& scene,
     // Build meshlets and upload
     uploadMeshletData(ctx);
 
-    // Create uniform buffers
+    // Create uniform buffers (needed before multi-pipeline setup for descriptor writes)
     float aspect = static_cast<float>(m_width) / static_cast<float>(m_height);
 
     // MVP buffer (3 x mat4 = 192 bytes)
@@ -686,16 +776,59 @@ void MeshRenderer::init(VulkanContext& ctx, SceneManager& scene,
     memcpy(mapped, &materialData, sizeof(MaterialUBOData));
     vmaUnmapMemory(ctx.allocator, m_materialAllocation);
 
-    // Create offscreen render target
+    // Create offscreen render target and render pass (needed before pipeline creation)
     createOffscreenTarget(ctx);
     createRenderPass(ctx);
     createFramebuffer(ctx);
 
-    // Create pipeline and descriptors
-    createPipeline(ctx);
-    setupDescriptors(ctx);
+    // Check for manifest to enable multi-pipeline mode
+    ShaderManifest manifest = tryLoadManifest(pipelineBase);
+    bool hasMultipleMaterials = m_scene->hasGltfScene() &&
+        m_scene->getGltfScene().materials.size() > 1;
 
-    std::cout << "[mesh] Mesh shader renderer initialized: " << pipelineBase << std::endl;
+    if (!manifest.permutations.empty() && hasMultipleMaterials) {
+        // Check if the mesh shader declares a meshletOffset push constant,
+        // which is required for per-group dispatch in multi-pipeline mode.
+        bool hasMeshletOffsetPC = false;
+        for (const auto& pc : m_meshReflection.push_constants) {
+            for (const auto& field : pc.fields) {
+                if (field.name == "meshletOffset") {
+                    hasMeshletOffsetPC = true;
+                    break;
+                }
+            }
+            if (hasMeshletOffsetPC) break;
+        }
+
+        if (hasMeshletOffsetPC) {
+            // Full multi-pipeline path: mesh shader supports meshletOffset push constant
+            setupMeshMultiPipeline(ctx, manifest);
+        } else {
+            // Mesh shader does not declare meshletOffset push constant.
+            // Multi-pipeline mode requires the mesh shader to support a
+            // meshletOffset push constant so that per-group dispatch can
+            // index into the correct region of the meshlet descriptor array
+            // (gl_WorkGroupID.x always starts from 0 per dispatch).
+            std::cout << "[mesh] WARNING: Manifest found with "
+                      << manifest.permutations.size() << " permutation(s) and "
+                      << m_scene->getGltfScene().materials.size() << " material(s), "
+                      << "but mesh shader multi-pipeline requires meshletOffset push constant support. "
+                      << "Falling back to single pipeline (material[0] used for all meshlets)."
+                      << std::endl;
+        }
+    }
+
+    if (!m_multiPipeline) {
+        // Single-pipeline mode: load fragment shader and create pipeline + descriptors
+        auto fragCode = SpvLoader::loadSPIRV(pipelineBase + ".frag.spv");
+        m_fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
+
+        createPipeline(ctx);
+        setupDescriptors(ctx);
+    }
+
+    std::cout << "[mesh] Mesh shader renderer initialized: " << pipelineBase
+              << (m_multiPipeline ? ", multi-pipeline" : "") << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -718,24 +851,76 @@ void MeshRenderer::render(VulkanContext& ctx) {
     rpBegin.pClearValues = clearValues;
 
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
 
-    // Bind descriptor sets in order
-    int maxSet = -1;
-    for (auto& [idx, _] : m_descriptorSets) {
-        maxSet = std::max(maxSet, idx);
-    }
-    for (int i = 0; i <= maxSet; i++) {
-        auto it = m_descriptorSets.find(i);
-        if (it != m_descriptorSets.end()) {
+    if (m_multiPipeline) {
+        // Multi-pipeline mode: dispatch meshlet groups with per-material pipeline switching.
+        // Bind shared set 0 once (meshlet data + SoA buffers + MVP + Light)
+        if (m_sharedSet0 != VK_NULL_HANDLE && !m_meshPermutations.empty()) {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    m_pipelineLayout, static_cast<uint32_t>(i),
-                                    1, &it->second, 0, nullptr);
+                                    m_meshPermutations[0].pipelineLayout, 0, 1,
+                                    &m_sharedSet0, 0, nullptr);
         }
-    }
 
-    // Draw mesh tasks - one workgroup per meshlet
-    ctx.pfnCmdDrawMeshTasksEXT(cmd, m_totalMeshlets, 1, 1);
+        int currentPermIdx = -1;
+        for (auto& group : m_meshletGroups) {
+            auto& perm = m_meshPermutations[group.permutationIndex];
+
+            // Switch pipeline if permutation changed
+            if (group.permutationIndex != currentPermIdx) {
+                currentPermIdx = group.permutationIndex;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, perm.pipeline);
+                // Re-bind set 0 after pipeline change
+                if (m_sharedSet0 != VK_NULL_HANDLE) {
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            perm.pipelineLayout, 0, 1,
+                                            &m_sharedSet0, 0, nullptr);
+                }
+            }
+
+            // Find per-material descriptor set index within this permutation
+            int localMatIdx = -1;
+            for (size_t j = 0; j < perm.materialIndices.size(); j++) {
+                if (perm.materialIndices[j] == group.materialIndex) {
+                    localMatIdx = static_cast<int>(j);
+                    break;
+                }
+            }
+            if (localMatIdx >= 0) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        perm.pipelineLayout, 1, 1,
+                                        &perm.perMaterialDescSets[localMatIdx], 0, nullptr);
+            }
+
+            // Push meshletOffset so the mesh shader reads the correct region
+            uint32_t meshletOffset = group.firstMeshlet;
+            vkCmdPushConstants(cmd, perm.pipelineLayout,
+                               VK_SHADER_STAGE_MESH_BIT_EXT, 0,
+                               sizeof(uint32_t), &meshletOffset);
+
+            // Dispatch meshlets for this group
+            ctx.pfnCmdDrawMeshTasksEXT(cmd, group.meshletCount, 1, 1);
+        }
+    } else {
+        // Single-pipeline mode (original behavior)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+
+        // Bind descriptor sets in order
+        int maxSet = -1;
+        for (auto& [idx, _] : m_descriptorSets) {
+            maxSet = std::max(maxSet, idx);
+        }
+        for (int i = 0; i <= maxSet; i++) {
+            auto it = m_descriptorSets.find(i);
+            if (it != m_descriptorSets.end()) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        m_pipelineLayout, static_cast<uint32_t>(i),
+                                        1, &it->second, 0, nullptr);
+            }
+        }
+
+        // Draw mesh tasks - one workgroup per meshlet
+        ctx.pfnCmdDrawMeshTasksEXT(cmd, m_totalMeshlets, 1, 1);
+    }
 
     vkCmdEndRenderPass(cmd);
     ctx.endSingleTimeCommands(cmd);
@@ -871,24 +1056,68 @@ void MeshRenderer::renderToSwapchain(VulkanContext& ctx,
     rpBegin.pClearValues = clearValues;
 
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
 
-    // Bind descriptor sets in order
-    int maxSet = -1;
-    for (auto& [idx, _] : m_descriptorSets) {
-        maxSet = std::max(maxSet, idx);
-    }
-    for (int i = 0; i <= maxSet; i++) {
-        auto it = m_descriptorSets.find(i);
-        if (it != m_descriptorSets.end()) {
+    if (m_multiPipeline) {
+        // Multi-pipeline mode: dispatch meshlet groups with per-material pipeline switching.
+        if (m_sharedSet0 != VK_NULL_HANDLE && !m_meshPermutations.empty()) {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    m_pipelineLayout, static_cast<uint32_t>(i),
-                                    1, &it->second, 0, nullptr);
+                                    m_meshPermutations[0].pipelineLayout, 0, 1,
+                                    &m_sharedSet0, 0, nullptr);
         }
-    }
 
-    // Draw mesh tasks - one workgroup per meshlet
-    ctx.pfnCmdDrawMeshTasksEXT(cmd, m_totalMeshlets, 1, 1);
+        int currentPermIdx = -1;
+        for (auto& group : m_meshletGroups) {
+            auto& perm = m_meshPermutations[group.permutationIndex];
+
+            if (group.permutationIndex != currentPermIdx) {
+                currentPermIdx = group.permutationIndex;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, perm.pipeline);
+                if (m_sharedSet0 != VK_NULL_HANDLE) {
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            perm.pipelineLayout, 0, 1,
+                                            &m_sharedSet0, 0, nullptr);
+                }
+            }
+
+            int localMatIdx = -1;
+            for (size_t j = 0; j < perm.materialIndices.size(); j++) {
+                if (perm.materialIndices[j] == group.materialIndex) {
+                    localMatIdx = static_cast<int>(j);
+                    break;
+                }
+            }
+            if (localMatIdx >= 0) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        perm.pipelineLayout, 1, 1,
+                                        &perm.perMaterialDescSets[localMatIdx], 0, nullptr);
+            }
+
+            uint32_t meshletOffset = group.firstMeshlet;
+            vkCmdPushConstants(cmd, perm.pipelineLayout,
+                               VK_SHADER_STAGE_MESH_BIT_EXT, 0,
+                               sizeof(uint32_t), &meshletOffset);
+
+            ctx.pfnCmdDrawMeshTasksEXT(cmd, group.meshletCount, 1, 1);
+        }
+    } else {
+        // Single-pipeline mode (original behavior)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+
+        int maxSet = -1;
+        for (auto& [idx, _] : m_descriptorSets) {
+            maxSet = std::max(maxSet, idx);
+        }
+        for (int i = 0; i <= maxSet; i++) {
+            auto it = m_descriptorSets.find(i);
+            if (it != m_descriptorSets.end()) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        m_pipelineLayout, static_cast<uint32_t>(i),
+                                        1, &it->second, 0, nullptr);
+            }
+        }
+
+        ctx.pfnCmdDrawMeshTasksEXT(cmd, m_totalMeshlets, 1, 1);
+    }
 
     vkCmdEndRenderPass(cmd);
 
@@ -913,12 +1142,463 @@ void MeshRenderer::renderToSwapchain(VulkanContext& ctx,
 }
 
 // --------------------------------------------------------------------------
+// Multi-pipeline setup (per-material permutation selection)
+// --------------------------------------------------------------------------
+
+void MeshRenderer::setupMeshMultiPipeline(VulkanContext& ctx, const ShaderManifest& manifest) {
+    namespace fs = std::filesystem;
+    m_multiPipeline = true;
+
+    // Group materials by feature set
+    auto groups = m_scene->groupMaterialsByFeatures();
+    size_t totalMaterials = m_scene->getGltfScene().materials.size();
+
+    // Build materialToPermutation mapping
+    m_materialToPermutation.resize(totalMaterials, 0);
+
+    int permIdx = 0;
+    for (auto& [suffix, materialIndices] : groups) {
+        // Build full path for this permutation
+        std::string resolvedSuffix = suffix;
+        std::string permBase = m_pipelineBase + resolvedSuffix;
+        std::string fragPath = permBase + ".frag.spv";
+
+        if (!fs::exists(fragPath)) {
+            std::cerr << "[warn] Missing fragment shader for permutation '" << resolvedSuffix
+                      << "', falling back to base" << std::endl;
+            permBase = m_pipelineBase;
+            fragPath = permBase + ".frag.spv";
+            resolvedSuffix = "";
+        }
+
+        MeshPermutationPipeline perm;
+        perm.suffix = resolvedSuffix;
+        perm.basePath = permBase;
+        perm.materialIndices = materialIndices;
+
+        // Load per-permutation fragment shader (mesh shader is shared via m_meshModule)
+        auto fragCode = SpvLoader::loadSPIRV(fragPath);
+        perm.fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
+
+        // Load fragment reflection
+        std::string fragJsonPath = permBase + ".frag.json";
+        if (fs::exists(fragJsonPath)) perm.fragRefl = parseReflectionJson(fragJsonPath);
+
+        // Map materials to this permutation
+        for (int mi : materialIndices) {
+            m_materialToPermutation[mi] = permIdx;
+        }
+
+        m_meshPermutations.push_back(std::move(perm));
+        permIdx++;
+
+        std::cout << "[info] Loaded mesh permutation '" << resolvedSuffix << "' from " << permBase
+                  << " (" << materialIndices.size() << " material(s))" << std::endl;
+    }
+
+    // Assign permutation indices to meshlet groups
+    for (auto& group : m_meshletGroups) {
+        if (group.materialIndex < static_cast<int>(m_materialToPermutation.size())) {
+            group.permutationIndex = m_materialToPermutation[group.materialIndex];
+        }
+    }
+
+    // Create shared set 0 layout from mesh shader reflection (meshlet buffers + SoA + MVP + Light)
+    // All permutations share the same set 0 layout since the mesh shader is shared.
+    {
+        std::vector<ReflectionData> set0Stages = {m_meshReflection};
+        auto sharedLayouts = createDescriptorSetLayoutsMultiStage(ctx.device, set0Stages);
+        auto it = sharedLayouts.find(0);
+        if (it != sharedLayouts.end()) {
+            m_sharedSet0Layout = it->second;
+        }
+        // Clean up layouts other than set 0
+        for (auto& [idx, layout] : sharedLayouts) {
+            if (idx != 0) vkDestroyDescriptorSetLayout(ctx.device, layout, nullptr);
+        }
+    }
+
+    // Count total descriptor pool requirements
+    std::unordered_map<VkDescriptorType, uint32_t> typeCounts;
+    uint32_t maxSets = 1; // set 0
+
+    // Set 0 bindings (shared) from mesh shader
+    for (auto& [setIdx, bindings] : m_meshReflection.descriptor_sets) {
+        if (setIdx != 0) continue;
+        for (auto& b : bindings) {
+            typeCounts[bindingTypeToVkDescriptorType(b.type)]++;
+        }
+    }
+
+    // Per-permutation set 1 bindings (fragment stage + mesh stage merged)
+    for (auto& perm : m_meshPermutations) {
+        std::vector<ReflectionData> stages = {m_meshReflection, perm.fragRefl};
+        auto mergedBindings = getMergedBindings(stages);
+        int fragSetIdx = 1;
+        for (auto& b : mergedBindings) {
+            if (b.name == "Material") fragSetIdx = b.set;
+        }
+
+        // Create set 1 layout for this permutation
+        auto permLayouts = createDescriptorSetLayoutsMultiStage(ctx.device, stages);
+        auto it = permLayouts.find(fragSetIdx);
+        if (it != permLayouts.end()) {
+            perm.materialSetLayout = it->second;
+        }
+        // Clean up other layouts
+        for (auto& [idx, layout] : permLayouts) {
+            if (idx != fragSetIdx) vkDestroyDescriptorSetLayout(ctx.device, layout, nullptr);
+        }
+
+        for (auto& b : mergedBindings) {
+            if (b.set != fragSetIdx) continue;
+            typeCounts[bindingTypeToVkDescriptorType(b.type)] += static_cast<uint32_t>(perm.materialIndices.size());
+        }
+        maxSets += static_cast<uint32_t>(perm.materialIndices.size());
+    }
+
+    // Create descriptor pool
+    std::vector<VkDescriptorPoolSize> poolSizes;
+    for (auto& [type, count] : typeCounts) {
+        poolSizes.push_back({type, count});
+    }
+
+    VkDescriptorPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = maxSets;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &m_descriptorPool);
+
+    // Allocate and write shared set 0 (meshlet data + SoA buffers + MVP + Light)
+    if (m_sharedSet0Layout != VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo allocSetInfo = {};
+        allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocSetInfo.descriptorPool = m_descriptorPool;
+        allocSetInfo.descriptorSetCount = 1;
+        allocSetInfo.pSetLayouts = &m_sharedSet0Layout;
+        vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &m_sharedSet0);
+
+        // Write set 0 bindings from mesh reflection
+        auto mergedBindings = getMergedBindings({m_meshReflection});
+        struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
+        std::vector<DescWriteInfo> writeInfos;
+        std::vector<VkWriteDescriptorSet> writes;
+
+        for (auto& b : mergedBindings) {
+            if (b.set != 0) continue;
+            DescWriteInfo info = {};
+            VkWriteDescriptorSet w = {};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = m_sharedSet0;
+            w.dstBinding = static_cast<uint32_t>(b.binding);
+            w.descriptorCount = 1;
+
+            if (b.type == "uniform_buffer") {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                if (b.name == "MVP") {
+                    info.bufferInfo = {m_mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
+                } else if (b.name == "Light") {
+                    info.bufferInfo = {m_lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                } else continue;
+                writeInfos.push_back(info);
+                w.pBufferInfo = &writeInfos.back().bufferInfo;
+            } else if (b.type == "storage_buffer") {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                VkBuffer buf = VK_NULL_HANDLE;
+                VkDeviceSize bufSize = 0;
+                if (b.name == "meshlet_descriptors") { buf = m_meshletDescBuffer; bufSize = m_meshletDescSize; }
+                else if (b.name == "meshlet_vertices") { buf = m_meshletVertBuffer; bufSize = m_meshletVertSize; }
+                else if (b.name == "meshlet_triangles") { buf = m_meshletTriBuffer; bufSize = m_meshletTriSize; }
+                else if (b.name == "positions") { buf = m_positionsBuffer; bufSize = m_positionsSize; }
+                else if (b.name == "normals") { buf = m_normalsBuffer; bufSize = m_normalsSize; }
+                else if (b.name == "tex_coords") { buf = m_texCoordsBuffer; bufSize = m_texCoordsSize; }
+                else if (b.name == "tangents") { buf = m_tangentsBuffer; bufSize = m_tangentsSize; }
+                if (buf == VK_NULL_HANDLE) {
+                    std::cout << "[warn] Unknown storage buffer in set 0: " << b.name << std::endl;
+                    continue;
+                }
+                info.bufferInfo = {buf, 0, bufSize};
+                writeInfos.push_back(info);
+                w.pBufferInfo = &writeInfos.back().bufferInfo;
+            } else continue;
+            writes.push_back(w);
+        }
+        if (!writes.empty()) {
+            vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
+    }
+
+    // For each permutation: allocate per-material descriptor sets and create pipeline
+    for (auto& perm : m_meshPermutations) {
+        std::vector<ReflectionData> stages = {m_meshReflection, perm.fragRefl};
+        auto mergedBindings = getMergedBindings(stages);
+        int fragSetIdx = 1;
+        for (auto& b : mergedBindings) {
+            if (b.name == "Material") fragSetIdx = b.set;
+        }
+
+        perm.perMaterialDescSets.resize(perm.materialIndices.size());
+        perm.perMaterialUBOs.resize(perm.materialIndices.size());
+        perm.perMaterialAllocations.resize(perm.materialIndices.size());
+
+        for (size_t i = 0; i < perm.materialIndices.size(); i++) {
+            int mi = perm.materialIndices[i];
+
+            // Create Material UBO for this material
+            MaterialUBOData matData{};
+            if (mi < static_cast<int>(m_scene->getGltfScene().materials.size())) {
+                const auto& mat = m_scene->getGltfScene().materials[mi];
+                matData.baseColorFactor = mat.baseColor;
+                matData.metallicFactor = mat.metallic;
+                matData.roughnessFactor = mat.roughness;
+                matData.emissiveFactor = mat.emissive;
+                matData.emissiveStrength = mat.emissiveStrength;
+                matData.ior = mat.ior;
+                matData.clearcoatFactor = mat.clearcoatFactor;
+                matData.clearcoatRoughnessFactor = mat.clearcoatRoughnessFactor;
+                matData.sheenColorFactor = mat.sheenColorFactor;
+                matData.sheenRoughnessFactor = mat.sheenRoughnessFactor;
+                matData.transmissionFactor = mat.transmissionFactor;
+            }
+
+            VkBufferCreateInfo matBufInfo = {};
+            matBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            matBufInfo.size = sizeof(MaterialUBOData);
+            matBufInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+            VmaAllocationCreateInfo matAllocInfo = {};
+            matAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+            vmaCreateBuffer(ctx.allocator, &matBufInfo, &matAllocInfo,
+                            &perm.perMaterialUBOs[i], &perm.perMaterialAllocations[i], nullptr);
+
+            void* mapped;
+            vmaMapMemory(ctx.allocator, perm.perMaterialAllocations[i], &mapped);
+            memcpy(mapped, &matData, sizeof(MaterialUBOData));
+            vmaUnmapMemory(ctx.allocator, perm.perMaterialAllocations[i]);
+
+            // Allocate descriptor set for this material
+            VkDescriptorSetAllocateInfo allocSetInfo = {};
+            allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocSetInfo.descriptorPool = m_descriptorPool;
+            allocSetInfo.descriptorSetCount = 1;
+            allocSetInfo.pSetLayouts = &perm.materialSetLayout;
+            vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &perm.perMaterialDescSets[i]);
+
+            // Write descriptors for set 1
+            struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
+            std::vector<DescWriteInfo> writeInfos;
+            std::vector<VkWriteDescriptorSet> writes;
+            auto& perMatTextures = m_scene->getPerMaterialTextures();
+
+            for (auto& b : mergedBindings) {
+                if (b.set != fragSetIdx) continue;
+                DescWriteInfo info = {};
+                VkWriteDescriptorSet w = {};
+                w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w.dstSet = perm.perMaterialDescSets[i];
+                w.dstBinding = static_cast<uint32_t>(b.binding);
+                w.descriptorCount = 1;
+
+                if (b.type == "uniform_buffer") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    if (b.name == "Material") {
+                        info.bufferInfo = {perm.perMaterialUBOs[i], 0, sizeof(MaterialUBOData)};
+                    } else if (b.name == "Light" && m_lightBuffer != VK_NULL_HANDLE) {
+                        info.bufferInfo = {m_lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                    } else continue;
+                    writeInfos.push_back(info);
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else if (b.type == "sampler") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                    auto& iblTextures = m_scene->getIBLTextures();
+                    auto iblIt = iblTextures.find(b.name);
+                    if (iblIt != iblTextures.end()) {
+                        info.imageInfo = {}; info.imageInfo.sampler = iblIt->second.sampler;
+                    } else {
+                        auto& tex = m_scene->getTextureForBinding(b.name);
+                        info.imageInfo = {}; info.imageInfo.sampler = tex.sampler;
+                    }
+                    writeInfos.push_back(info);
+                    w.pImageInfo = &writeInfos.back().imageInfo;
+                } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                    auto& iblTextures = m_scene->getIBLTextures();
+                    auto iblIt = iblTextures.find(b.name);
+                    if (iblIt != iblTextures.end()) {
+                        info.imageInfo = {};
+                        info.imageInfo.imageView = iblIt->second.imageView;
+                        info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    } else {
+                        GPUTexture* texPtr = nullptr;
+                        if (mi < static_cast<int>(perMatTextures.size())) {
+                            auto it = perMatTextures[mi].find(b.name);
+                            if (it != perMatTextures[mi].end())
+                                texPtr = const_cast<GPUTexture*>(&it->second);
+                        }
+                        if (texPtr && texPtr->imageView != VK_NULL_HANDLE) {
+                            info.imageInfo = {};
+                            info.imageInfo.imageView = texPtr->imageView;
+                            info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        } else {
+                            auto& tex = m_scene->getTextureForBinding(b.name);
+                            info.imageInfo = {};
+                            info.imageInfo.imageView = tex.imageView;
+                            info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        }
+                    }
+                    writeInfos.push_back(info);
+                    w.pImageInfo = &writeInfos.back().imageInfo;
+                } else continue;
+                writes.push_back(w);
+            }
+
+            if (!writes.empty()) {
+                vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            }
+        }
+
+        // Create pipeline layout: set 0 (shared) + set 1 (per-permutation material)
+        std::vector<VkDescriptorSetLayout> layouts;
+        if (m_sharedSet0Layout != VK_NULL_HANDLE) layouts.push_back(m_sharedSet0Layout);
+        if (perm.materialSetLayout != VK_NULL_HANDLE) layouts.push_back(perm.materialSetLayout);
+
+        // Collect push constant ranges from mesh + fragment stages
+        std::vector<VkPushConstantRange> pushRanges;
+        for (auto& pc : m_meshReflection.push_constants) {
+            VkPushConstantRange range = {};
+            range.stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT;
+            range.offset = 0;
+            range.size = static_cast<uint32_t>(pc.size);
+            pushRanges.push_back(range);
+        }
+        for (auto& pc : perm.fragRefl.push_constants) {
+            VkPushConstantRange range = {};
+            range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            range.offset = 0;
+            range.size = static_cast<uint32_t>(pc.size);
+            pushRanges.push_back(range);
+        }
+
+        VkPipelineLayoutCreateInfo layoutInfo = {};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutInfo.setLayoutCount = static_cast<uint32_t>(layouts.size());
+        layoutInfo.pSetLayouts = layouts.data();
+        layoutInfo.pushConstantRangeCount = static_cast<uint32_t>(pushRanges.size());
+        layoutInfo.pPushConstantRanges = pushRanges.data();
+        vkCreatePipelineLayout(ctx.device, &layoutInfo, nullptr, &perm.pipelineLayout);
+
+        // Create graphics pipeline (mesh shader + permutation fragment shader)
+        VkPipelineShaderStageCreateInfo shaderStages[2] = {};
+        shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shaderStages[0].stage = VK_SHADER_STAGE_MESH_BIT_EXT;
+        shaderStages[0].module = m_meshModule;  // shared mesh shader
+        shaderStages[0].pName = "main";
+        shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        shaderStages[1].module = perm.fragModule;
+        shaderStages[1].pName = "main";
+
+        // Mesh shaders don't use vertex input
+        VkPipelineVertexInputStateCreateInfo vertexInput = {};
+        vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkViewport viewport = {0, 0, (float)m_width, (float)m_height, 0, 1};
+        VkRect2D scissor = {{0, 0}, {m_width, m_height}};
+        VkPipelineViewportStateCreateInfo viewportState = {};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1; viewportState.pViewports = &viewport;
+        viewportState.scissorCount = 1; viewportState.pScissors = &scissor;
+
+        VkPipelineRasterizationStateCreateInfo rasterizer = {};
+        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.lineWidth = 1.0f;
+        rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+        VkPipelineMultisampleStateCreateInfo multisampling = {};
+        multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo depthStencil = {};
+        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencil.depthTestEnable = VK_TRUE;
+        depthStencil.depthWriteEnable = VK_TRUE;
+        depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+        VkPipelineColorBlendAttachmentState colorBlendAtt = {};
+        colorBlendAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo colorBlending = {};
+        colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlending.attachmentCount = 1;
+        colorBlending.pAttachments = &colorBlendAtt;
+
+        VkGraphicsPipelineCreateInfo pipeInfo = {};
+        pipeInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipeInfo.stageCount = 2;
+        pipeInfo.pStages = shaderStages;
+        pipeInfo.pVertexInputState = &vertexInput;
+        pipeInfo.pInputAssemblyState = &inputAssembly;
+        pipeInfo.pViewportState = &viewportState;
+        pipeInfo.pRasterizationState = &rasterizer;
+        pipeInfo.pMultisampleState = &multisampling;
+        pipeInfo.pDepthStencilState = &depthStencil;
+        pipeInfo.pColorBlendState = &colorBlending;
+        pipeInfo.layout = perm.pipelineLayout;
+        pipeInfo.renderPass = m_renderPass;
+
+        if (vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeInfo,
+                                      nullptr, &perm.pipeline) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create mesh permutation pipeline: " + perm.suffix);
+        }
+    }
+
+    std::cout << "[info] Mesh multi-pipeline setup complete: " << m_meshPermutations.size()
+              << " permutation(s) for " << totalMaterials << " material(s)" << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Cleanup permutation resources
+// --------------------------------------------------------------------------
+
+void MeshRenderer::cleanupPermutations(VulkanContext& ctx) {
+    for (auto& perm : m_meshPermutations) {
+        if (perm.pipeline) vkDestroyPipeline(ctx.device, perm.pipeline, nullptr);
+        if (perm.pipelineLayout) vkDestroyPipelineLayout(ctx.device, perm.pipelineLayout, nullptr);
+        if (perm.fragModule) vkDestroyShaderModule(ctx.device, perm.fragModule, nullptr);
+        if (perm.materialSetLayout) vkDestroyDescriptorSetLayout(ctx.device, perm.materialSetLayout, nullptr);
+        for (size_t i = 0; i < perm.perMaterialUBOs.size(); i++) {
+            if (perm.perMaterialUBOs[i]) {
+                vmaDestroyBuffer(ctx.allocator, perm.perMaterialUBOs[i], perm.perMaterialAllocations[i]);
+            }
+        }
+    }
+    m_meshPermutations.clear();
+    if (m_sharedSet0Layout) {
+        vkDestroyDescriptorSetLayout(ctx.device, m_sharedSet0Layout, nullptr);
+        m_sharedSet0Layout = VK_NULL_HANDLE;
+    }
+    m_sharedSet0 = VK_NULL_HANDLE;
+    m_meshletGroups.clear();
+    m_materialToPermutation.clear();
+}
+
+// --------------------------------------------------------------------------
 // Cleanup
 // --------------------------------------------------------------------------
 
 void MeshRenderer::cleanup(VulkanContext& ctx) {
     vkDeviceWaitIdle(ctx.device);
 
+    // Cleanup multi-pipeline resources
+    cleanupPermutations(ctx);
+
+    // Cleanup single-pipeline resources
     if (m_pipeline) vkDestroyPipeline(ctx.device, m_pipeline, nullptr);
     if (m_pipelineLayout) vkDestroyPipelineLayout(ctx.device, m_pipelineLayout, nullptr);
 
