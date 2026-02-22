@@ -368,3 +368,26 @@ procedural MetaBalls {
 | C++ MeshRenderer (IRenderer, meshlet builder, VK_EXT_mesh_shader) | Large | Native C++ mesh rendering | ✅ |
 | Rust MeshShaderRenderer (Renderer trait, meshlet builder) | Large | Native Rust mesh rendering | ✅ |
 | Reflection metadata (workgroup_size, max_vertices, max_primitives) | Small | Engine validation | ✅ |
+
+### ✅ COMPLETE — P18: Material Property Pipeline
+
+**Problem**: Engines loaded glTF material properties (baseColorFactor, metallicFactor, roughnessFactor, etc.) but never passed them to shaders. Layer expressions baked texture samples without multiplying by per-material factors, so all models rendered with identical material parameters regardless of what the glTF file specified.
+
+**Solution**: Added a `properties` block to surface declarations that defines named material properties with types and default values. The compiler generates a UBO (Uniform Buffer Object) from the properties block. Engines wire material data from glTF loaders into the generated UBO at draw time.
+
+**Architecture**: The compiler is fully generic and has no glTF knowledge — it only knows about `properties` as typed fields with defaults. All glTF-specific mapping (e.g., baseColorFactor → albedo_factor, metallicFactor → metallic_factor) lives in the engine loaders, keeping the compiler portable across material formats.
+
+**Implementation**: Changes span the full stack — grammar + AST + tree builder + surface expander + SPIR-V builder (FieldAccess on uniform blocks) + reflection (default values) + all 3 engines (C++ rasterizer, C++ ray tracer, Rust engine).
+
+| Item | Effort | Impact | Status |
+|---|---|---|---|
+| `properties` block in surface grammar/AST | Medium | Declarative material property definitions | ✅ |
+| Tree builder + surface expander integration | Medium | Property references in layer expressions | ✅ |
+| SPIR-V builder FieldAccess on uniform blocks | Medium | Correct UBO access codegen | ✅ |
+| Reflection JSON with default values | Small | Engine-side property discovery | ✅ |
+| C++ rasterization engine material wiring | Medium | glTF properties in raster path | ✅ |
+| C++ ray tracing engine material wiring | Medium | glTF properties in RT path | ✅ |
+| Rust engine material wiring | Medium | glTF properties in Rust path | ✅ |
+| Mesh shader pipeline material wiring | Medium | glTF properties in mesh path | ✅ |
+| 10 new tests (435 total pass, SPIR-V validates) | Small | Regression safety | ✅ |
+| Screenshots verified across RT/raster/mesh for C++ and Rust engines | — | Visual correctness | ✅ |

@@ -288,6 +288,7 @@ All three engines support reflection-driven descriptor binding, glTF loading, cu
 - **Layered surfaces** — `layers [base, normal_map, ibl, emission]` with automatic energy conservation, compiles to both raster and RT from one declaration
 - **Custom `@layer` functions** — user-defined layers via `@layer fn name(base, n, v, l, ...custom_params) -> vec3`, validated at compile time and composited in declaration order
 - **Compile-time features** — `features { has_normal_map: bool }` with `if` guards on any declaration; `--features` and `--all-permutations` for shader permutation generation
+- **Material property pipeline** — `properties` block in surface declarations abstracts runtime material data; compiler generates std140 UBO + reflection JSON with defaults; qualified `Material.field` access in layer expressions; all engines wire glTF material properties automatically
 - **Algorithm/schedule separation** — swap BRDF variants and tonemapping without touching material code
 - **Math-first syntax** — `scalar` not `float`, `builtin_position` not `gl_Position`
 - **Auto-layout** — locations, descriptor sets, and bindings assigned by declaration order
@@ -651,6 +652,52 @@ sheen(color: ...) if (has_sheen && !has_clearcoat),
 ```
 
 Features are resolved at compile time — disabled items are stripped before expansion. The generated SPIR-V contains no dead code.
+
+### Material Property Pipeline
+
+The `properties` block declares an abstract data source for runtime material parameters inside a `surface` declaration. Instead of hardcoding BRDF inputs, you declare typed fields with defaults -- the compiler generates a UBO (std140 layout) and reflection JSON so engines can fill in values at runtime from glTF materials or any other source.
+
+```
+import brdf;
+import color;
+
+surface GltfPBR {
+    sampler2d base_color_tex,
+    sampler2d metallic_roughness_tex,
+
+    properties Material {
+        base_color_factor: vec4 = vec4(1.0, 1.0, 1.0, 1.0),
+        emissive_factor: vec3 = vec3(0.0),
+        metallic_factor: scalar = 1.0,
+        roughness_factor: scalar = 1.0,
+        emissive_strength: scalar = 1.0,
+        ior: scalar = 1.5,
+        clearcoat_factor: scalar = 0.0,
+        clearcoat_roughness_factor: scalar = 0.0,
+        sheen_roughness_factor: scalar = 0.0,
+        transmission_factor: scalar = 0.0,
+        sheen_color_factor: vec3 = vec3(0.0),
+    },
+
+    layers [
+        base(albedo: srgb_to_linear(sample(base_color_tex, uv).xyz)
+                     * Material.base_color_factor.xyz,
+             roughness: sample(metallic_roughness_tex, uv).y
+                        * Material.roughness_factor,
+             metallic: sample(metallic_roughness_tex, uv).z
+                        * Material.metallic_factor),
+    ]
+}
+```
+
+Fields are accessed with qualified syntax (`Material.roughness_factor`) and can appear anywhere in layer expressions -- multiplied with texture samples, used directly, or composed with other fields. Swizzling works as expected (`Material.base_color_factor.xyz`).
+
+The compiler generates:
+
+- A **UBO** with std140 layout placed in the fragment shader (and closest-hit / mesh stages for RT and mesh pipelines)
+- **Reflection JSON** (`*.lux.json`) that lists each field's name, type, byte offset, and default value -- engines read this to build the buffer without hardcoding struct layouts
+
+All three engines (Python/wgpu, C++/Vulkan, Rust/ash) use the reflection JSON to wire glTF material properties into the generated UBO automatically. When loading a glTF model, each engine reads the material's `pbrMetallicRoughness`, clearcoat, sheen, transmission, and emissive parameters and fills the corresponding UBO fields. Fields not present in the glTF material fall back to the defaults declared in the `properties` block.
 
 ### Algorithm/Schedule Separation
 

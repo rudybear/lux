@@ -441,6 +441,38 @@ void RasterRenderer::setupPBRResources(VulkanContext& ctx) {
     vmaMapMemory(ctx.allocator, lightAllocation, &mapped);
     memcpy(mapped, &lightData, sizeof(LightData));
     vmaUnmapMemory(ctx.allocator, lightAllocation);
+
+    // Create Material uniform buffer (80 bytes, std140 layout)
+    MaterialUBOData materialData{};
+    if (m_scene && m_scene->hasGltfScene()) {
+        const auto& mat = m_scene->getGltfScene().materials[0];
+        materialData.baseColorFactor = mat.baseColor;
+        materialData.metallicFactor = mat.metallic;
+        materialData.roughnessFactor = mat.roughness;
+        materialData.emissiveFactor = mat.emissive;
+        materialData.emissiveStrength = mat.emissiveStrength;
+        materialData.ior = mat.ior;
+        materialData.clearcoatFactor = mat.clearcoatFactor;
+        materialData.clearcoatRoughnessFactor = mat.clearcoatRoughnessFactor;
+        materialData.sheenColorFactor = mat.sheenColorFactor;
+        materialData.sheenRoughnessFactor = mat.sheenRoughnessFactor;
+        materialData.transmissionFactor = mat.transmissionFactor;
+    }
+
+    VkBufferCreateInfo matBufInfo = {};
+    matBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    matBufInfo.size = sizeof(MaterialUBOData);
+    matBufInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+
+    VmaAllocationCreateInfo matAllocInfo = {};
+    matAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+    vmaCreateBuffer(ctx.allocator, &matBufInfo, &matAllocInfo,
+                    &m_materialBuffer, &m_materialAllocation, nullptr);
+
+    vmaMapMemory(ctx.allocator, m_materialAllocation, &mapped);
+    memcpy(mapped, &materialData, sizeof(MaterialUBOData));
+    vmaUnmapMemory(ctx.allocator, m_materialAllocation);
 }
 
 // --------------------------------------------------------------------------
@@ -524,6 +556,8 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
                 writeInfos[i].bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
             } else if (b.name == "Light") {
                 writeInfos[i].bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+            } else if (b.name == "Material") {
+                writeInfos[i].bufferInfo = {m_materialBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : sizeof(MaterialUBOData))};
             } else {
                 // Unknown UBO name - use MVP as fallback
                 writeInfos[i].bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
@@ -1100,6 +1134,7 @@ void RasterRenderer::cleanup(VulkanContext& ctx) {
 
     if (mvpBuffer) vmaDestroyBuffer(ctx.allocator, mvpBuffer, mvpAllocation);
     if (lightBuffer) vmaDestroyBuffer(ctx.allocator, lightBuffer, lightAllocation);
+    if (m_materialBuffer) vmaDestroyBuffer(ctx.allocator, m_materialBuffer, m_materialAllocation);
 
     if (descriptorPool) vkDestroyDescriptorPool(ctx.device, descriptorPool, nullptr);
     for (auto& [_, layout] : reflectedSetLayouts) {

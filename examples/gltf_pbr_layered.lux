@@ -56,20 +56,43 @@ surface GltfPBR {
     samplerCube env_irradiance,
     sampler2d brdf_lut,
 
+    properties Material {
+        base_color_factor: vec4 = vec4(1.0, 1.0, 1.0, 1.0),
+        emissive_factor: vec3 = vec3(0.0),
+        metallic_factor: scalar = 1.0,
+        roughness_factor: scalar = 1.0,
+        emissive_strength: scalar = 1.0,
+        ior: scalar = 1.5,
+        clearcoat_factor: scalar = 0.0,
+        clearcoat_roughness_factor: scalar = 0.0,
+        sheen_roughness_factor: scalar = 0.0,
+        transmission_factor: scalar = 0.0,
+        sheen_color_factor: vec3 = vec3(0.0),
+    },
+
     layers [
-        base(albedo: srgb_to_linear(sample(base_color_tex, uv).xyz),
-             roughness: sample(metallic_roughness_tex, uv).y,
-             metallic: sample(metallic_roughness_tex, uv).z),
+        base(albedo: srgb_to_linear(sample(base_color_tex, uv).xyz)
+                     * Material.base_color_factor.xyz,
+             roughness: sample(metallic_roughness_tex, uv).y
+                        * Material.roughness_factor,
+             metallic: sample(metallic_roughness_tex, uv).z
+                        * Material.metallic_factor),
         normal_map(map: sample(normal_tex, uv).xyz) if has_normal_map,
-        transmission(factor: sample(transmission_tex, uv).x,
-                     ior: 1.5) if has_transmission,
+        transmission(factor: sample(transmission_tex, uv).x
+                             * Material.transmission_factor,
+                     ior: Material.ior) if has_transmission,
         ibl(specular_map: env_specular, irradiance_map: env_irradiance,
             brdf_lut: brdf_lut),
-        sheen(color: srgb_to_linear(sample(sheen_color_tex, uv).xyz),
-              roughness: 0.5) if has_sheen,
-        coat(factor: sample(clearcoat_tex, uv).x,
-             roughness: sample(clearcoat_roughness_tex, uv).y) if has_clearcoat,
-        emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)) if has_emission,
+        sheen(color: srgb_to_linear(sample(sheen_color_tex, uv).xyz)
+                     * Material.sheen_color_factor,
+              roughness: Material.sheen_roughness_factor) if has_sheen,
+        coat(factor: sample(clearcoat_tex, uv).x
+                     * Material.clearcoat_factor,
+             roughness: sample(clearcoat_roughness_tex, uv).y
+                        * Material.clearcoat_roughness_factor) if has_clearcoat,
+        emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)
+                        * Material.emissive_factor
+                        * Material.emissive_strength) if has_emission,
     ]
 }
 

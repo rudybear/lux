@@ -8,6 +8,7 @@
 #include "reflected_pipeline.h"
 #include "renderer_interface.h"
 #include "scene_manager.h"
+#include "material_ubo.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -79,6 +80,8 @@ private:
     VmaAllocation mvpAllocation = VK_NULL_HANDLE;
     VkBuffer lightBuffer = VK_NULL_HANDLE;
     VmaAllocation lightAllocation = VK_NULL_HANDLE;
+    VkBuffer m_materialBuffer = VK_NULL_HANDLE;
+    VmaAllocation m_materialAllocation = VK_NULL_HANDLE;
 
     // Triangle vertex buffer
     VkBuffer triangleVB = VK_NULL_HANDLE;

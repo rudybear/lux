@@ -847,6 +847,117 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P15** | BRDF & layer visualization (lobe plots, transfer function graphs, energy conservation tests) | ✅ Complete |
 | **P16** | AI features for Lux (image-to-shader, prompt-based generation, AI skills, training pipeline) | Planned |
 | **P17** | Light & shadow management (declarative lights, CSM/cubemap/perspective shadows, PCF/PCSS/VSM/MSM filtering, tiled/clustered culling, volumetric lighting, light probes, LPV) | Planned |
+| **P18** | Material property pipeline (`properties` block, Material UBO, `Material.field` access, engine wiring) | ✅ Complete (18.1) |
+| **P19** | Linux support (build scripts, path handling, CI) | Planned |
+| **P20** | Validation & debugging (validation layer fixes, shader debugger) | Planned |
+
+---
+
+### Phase 18: Material Property Pipeline ✅ COMPLETE (18.1)
+
+#### 18.1 — Material Uniforms from glTF Properties ✅
+
+Implemented `properties` block syntax in surface declarations with full compiler and engine support:
+
+- **`properties` block syntax**: `properties Material { field: type = default, ... }` inside `surface` declarations
+- **Compiler pipeline**: grammar (`surface_properties`, `properties_field` rules), AST (`PropertiesField`, `PropertiesBlock` nodes), tree builder, surface expander (emits UBO for fragment + closest-hit + mesh stages), SPIR-V builder (`FieldAccess(VarRef(block_name), field)` via `OpAccessChain`), reflection
+- **`Material.field` qualified access**: layer expressions reference properties via qualified names (e.g., `Material.roughness_factor`)
+- **Reflection JSON**: emits default values from properties field initializers
+- **Engine integration**: all three engines (Python/wgpu, C++/Vulkan, Rust/ash) wire glTF material properties to Material UBO
+- **MaterialUBOData struct**: 80 bytes, std140 layout, shared across all three engines
+- **Updated `gltf_pbr_layered.lux`**: properties Material block with 11 PBR fields, layer expressions use `Material.field`
+- **Tests**: 10 new tests (parse, AST, compilation, reflection offsets/defaults, RT, backward compat), all pass; 435 total tests passing
+
+#### 18.2 — Bindless Descriptors for Multi-Material Scenes
+
+Use `VK_EXT_descriptor_indexing` (descriptor binding without update after bind) to support scenes with many materials and textures efficiently:
+
+- Single large descriptor array for all textures in the scene
+- Material index passed via push constant or instance data
+- Material properties stored in an SSBO (structured buffer of material structs)
+- Per-draw-call: bind material index → shader indexes into texture array + material SSBO
+- Eliminates per-material descriptor set switching (major performance win for complex scenes)
+
+This is the foundation for GPU-driven rendering where draw calls are batched and materials are selected per-primitive via indirection.
+
+---
+
+### Phase 19: Linux Support
+
+Add first-class Linux build and run support for the C++ and Rust engines.
+
+| Item | Description |
+|------|-------------|
+| Shell scripts | `compile_mesh.sh`, `run_mesh_headless_cpp.sh`, etc. (Linux equivalents of `.bat` files) |
+| CMake paths | Platform-agnostic path handling in CMakeLists.txt |
+| Vulkan SDK detection | Find Vulkan headers/libs on Linux (`find_package(Vulkan)` already works) |
+| GLFW on Linux | Ensure X11/Wayland support via system GLFW or bundled |
+| CI pipeline | GitHub Actions Linux build + test matrix |
+| Asset paths | Forward-slash path normalization throughout engine code |
+
+---
+
+### Phase 20: Validation & Debugging
+
+#### 20.1 — Fix Vulkan Validation Errors
+
+Run all three rendering paths (raster, RT, mesh) with `VK_LAYER_KHRONOS_validation` enabled and fix all reported errors:
+
+- Descriptor set layout mismatches
+- Missing synchronization (pipeline barriers, memory barriers)
+- Invalid image layouts or transitions
+- Incorrect push constant ranges
+- Extension feature enablement gaps
+
+#### 20.2 — Shader Debugger
+
+Shader debugging capabilities for development and troubleshooting:
+
+| Feature | Description |
+|---------|-------------|
+| `printf`-style debug output | `OpDebugPrintf` support via `VK_EXT_debug_utils` / `VK_EXT_debug_printf` |
+| Debug visualization modes | Render normals, UVs, metallic, roughness, depth as false-color overlays |
+| Per-pixel inspection | Click-to-inspect pixel values in interactive mode |
+| SPIR-V debug info | `OpLine`/`OpSource` mapping back to `.lux` source lines (already have `--debug` flag) |
+| RenderDoc integration | Frame capture markers via `VK_EXT_debug_utils` labels |
+
+---
+
+### Phase 18: Material Property Pipeline + Bindless Descriptors ✅ COMPLETE (18.1)
+
+A `properties` block in `surface` declarations — an abstract data source for runtime material parameters. The compiler generates a UBO for standard mode; the same syntax supports SSBO+push-constant for bindless mode (18.2, future).
+
+**New syntax:**
+```lux
+surface GltfPBR {
+    sampler2d base_color_tex,
+    properties Material {
+        base_color_factor: vec4 = vec4(1.0, 1.0, 1.0, 1.0),
+        roughness_factor: scalar = 1.0,
+        metallic_factor: scalar = 1.0,
+        ior: scalar = 1.5,
+    },
+    layers [
+        base(albedo: sample(base_color_tex, uv).xyz * Material.base_color_factor.xyz,
+             roughness: Material.roughness_factor,
+             metallic: Material.metallic_factor),
+    ]
+}
+```
+
+**18.1 deliverables (standard UBO mode):**
+- Grammar: `surface_properties` and `properties_field` rules in `lux.lark`
+- AST: `PropertiesField`, `PropertiesBlock` nodes; `SurfaceDecl.properties` field
+- Type system: `UniformBlockType` for qualified field access (`Material.field`)
+- Surface expander: emits UBO from properties block (fragment + closest-hit + mesh)
+- SPIR-V builder: handles `FieldAccess(VarRef(block_name), field)` → `OpAccessChain`
+- Reflection: emits default values from properties field initializers
+- `gltf_pbr_layered.lux`: properties Material block with 11 PBR fields, layer expressions use `Material.field`
+- All three engines: MaterialUBOData struct (80 bytes std140), buffer creation, descriptor binding by name
+- 10 new tests (parse, AST, compilation, reflection offsets/defaults, RT, backward compat)
+- 435 total tests passing (zero regressions)
+
+**18.2 (future): Bindless mode** — same `properties` syntax, `bindless: true` in pipeline → SSBO[material_idx] + texture arrays + push constant.
 
 ---
 

@@ -586,6 +586,42 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
     // Update camera data
     updateCameraUBO(ctx);
 
+    // Create Material uniform buffer (80 bytes, std140 layout)
+    MaterialUBOData materialData{};
+    if (m_scene && m_scene->hasGltfScene()) {
+        const auto& mat = m_scene->getGltfScene().materials[0];
+        materialData.baseColorFactor = mat.baseColor;
+        materialData.metallicFactor = mat.metallic;
+        materialData.roughnessFactor = mat.roughness;
+        materialData.emissiveFactor = mat.emissive;
+        materialData.emissiveStrength = mat.emissiveStrength;
+        materialData.ior = mat.ior;
+        materialData.clearcoatFactor = mat.clearcoatFactor;
+        materialData.clearcoatRoughnessFactor = mat.clearcoatRoughnessFactor;
+        materialData.sheenColorFactor = mat.sheenColorFactor;
+        materialData.sheenRoughnessFactor = mat.sheenRoughnessFactor;
+        materialData.transmissionFactor = mat.transmissionFactor;
+    }
+
+    VkBufferCreateInfo matBufInfo = {};
+    matBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    matBufInfo.size = sizeof(MaterialUBOData);
+    matBufInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+
+    VmaAllocationCreateInfo matAllocInfo = {};
+    matAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+    result = vmaCreateBuffer(ctx.allocator, &matBufInfo, &matAllocInfo,
+                             &m_materialBuffer, &m_materialAllocation, nullptr);
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create material UBO");
+    }
+
+    void* matMapped;
+    vmaMapMemory(ctx.allocator, m_materialAllocation, &matMapped);
+    memcpy(matMapped, &materialData, sizeof(MaterialUBOData));
+    vmaUnmapMemory(ctx.allocator, m_materialAllocation);
+
     // Get merged bindings from reflection data for pool sizing
     auto mergedBindings = getMergedBindings(stageReflections);
 
@@ -659,9 +695,14 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
 
         if (b.type == "uniform_buffer") {
             w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            // Match by name: "Camera" or "Light" -> cameraBuffer
-            writeInfos[i].bufferInfo = {cameraBuffer, 0,
-                static_cast<VkDeviceSize>(b.size > 0 ? b.size : 128)};
+            if (b.name == "Material") {
+                writeInfos[i].bufferInfo = {m_materialBuffer, 0,
+                    static_cast<VkDeviceSize>(b.size > 0 ? b.size : sizeof(MaterialUBOData))};
+            } else {
+                // Match by name: "Camera" or "Light" -> cameraBuffer
+                writeInfos[i].bufferInfo = {cameraBuffer, 0,
+                    static_cast<VkDeviceSize>(b.size > 0 ? b.size : 128)};
+            }
             w.pBufferInfo = &writeInfos[i].bufferInfo;
         } else if (b.type == "acceleration_structure") {
             w.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -1001,6 +1042,7 @@ void RTRenderer::cleanup(VulkanContext& ctx) {
     if (instanceBuffer) vmaDestroyBuffer(ctx.allocator, instanceBuffer, instanceAllocation);
     if (sbtBuffer) vmaDestroyBuffer(ctx.allocator, sbtBuffer, sbtAllocation);
     if (cameraBuffer) vmaDestroyBuffer(ctx.allocator, cameraBuffer, cameraAllocation);
+    if (m_materialBuffer) vmaDestroyBuffer(ctx.allocator, m_materialBuffer, m_materialAllocation);
 
     // Storage image
     if (storageImageView) vkDestroyImageView(ctx.device, storageImageView, nullptr);

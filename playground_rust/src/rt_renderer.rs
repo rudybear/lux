@@ -16,6 +16,65 @@ use crate::screenshot;
 use crate::spv_loader;
 use crate::vulkan_context::VulkanContext;
 
+/// Material UBO data matching `properties Material { ... }` in gltf_pbr_layered.lux (std140 layout, 80 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct MaterialUboData {
+    base_color_factor: [f32; 4],          // offset  0, size 16
+    emissive_factor: [f32; 3],            // offset 16, size 12
+    metallic_factor: f32,                 // offset 28, size  4
+    roughness_factor: f32,                // offset 32, size  4
+    emissive_strength: f32,               // offset 36, size  4
+    ior: f32,                             // offset 40, size  4
+    clearcoat_factor: f32,                // offset 44, size  4
+    clearcoat_roughness_factor: f32,      // offset 48, size  4
+    sheen_roughness_factor: f32,          // offset 52, size  4
+    transmission_factor: f32,             // offset 56, size  4
+    _pad_before_sheen: f32,              // offset 60, size  4 (padding for vec3 alignment)
+    sheen_color_factor: [f32; 3],         // offset 64, size 12
+    _pad0: f32,                           // offset 76, size  4
+}
+unsafe impl bytemuck::Pod for MaterialUboData {}
+unsafe impl bytemuck::Zeroable for MaterialUboData {}
+
+impl MaterialUboData {
+    fn default_values() -> Self {
+        Self {
+            base_color_factor: [1.0, 1.0, 1.0, 1.0],
+            emissive_factor: [0.0, 0.0, 0.0],
+            metallic_factor: 0.0,
+            roughness_factor: 1.0,
+            emissive_strength: 1.0,
+            ior: 1.5,
+            clearcoat_factor: 0.0,
+            clearcoat_roughness_factor: 0.0,
+            sheen_roughness_factor: 0.0,
+            transmission_factor: 0.0,
+            _pad_before_sheen: 0.0,
+            sheen_color_factor: [0.0, 0.0, 0.0],
+            _pad0: 0.0,
+        }
+    }
+
+    fn from_gltf_material(mat: &crate::gltf_loader::GltfMaterial) -> Self {
+        Self {
+            base_color_factor: mat.base_color,
+            metallic_factor: mat.metallic,
+            roughness_factor: mat.roughness,
+            emissive_factor: mat.emissive,
+            emissive_strength: mat.emissive_strength,
+            ior: mat.ior,
+            clearcoat_factor: mat.clearcoat_factor,
+            clearcoat_roughness_factor: mat.clearcoat_roughness_factor,
+            sheen_color_factor: mat.sheen_color_factor,
+            sheen_roughness_factor: mat.sheen_roughness_factor,
+            transmission_factor: mat.transmission_factor,
+            _pad_before_sheen: 0.0,
+            _pad0: 0.0,
+        }
+    }
+}
+
 /// Ray tracing renderer state.
 pub struct RTRenderer {
     pipeline: vk::Pipeline,
@@ -44,6 +103,9 @@ pub struct RTRenderer {
 
     camera_buffer: vk::Buffer,
     camera_allocation: Option<Allocation>,
+
+    material_buffer: vk::Buffer,
+    material_allocation: Option<Allocation>,
 
     // SoA storage buffers for closest_hit vertex interpolation
     positions_buffer: GpuBuffer,
@@ -392,6 +454,20 @@ impl RTRenderer {
             }
         }
 
+        // --- 3b. Create material UBO (80 bytes) ---
+        let material_data = if let Some(ref gs) = gltf_scene_opt {
+            if !gs.materials.is_empty() {
+                MaterialUboData::from_gltf_material(&gs.materials[0])
+            } else {
+                MaterialUboData::default_values()
+            }
+        } else {
+            MaterialUboData::default_values()
+        };
+
+        let (material_buffer, material_allocation) =
+            create_material_ubo(&device, ctx.allocator_mut(), &material_data)?;
+
         // --- 4. Build TLAS with single instance ---
         let (tlas, tlas_buffer, tlas_allocation) =
             build_tlas(ctx, blas_device_address)?;
@@ -494,6 +570,7 @@ impl RTRenderer {
             tlas,
             storage_image_view,
             camera_buffer,
+            material_buffer,
             &ssbo_map,
             &texture_map,
         )?;
@@ -522,6 +599,8 @@ impl RTRenderer {
             storage_image_allocation: Some(storage_image_allocation),
             camera_buffer,
             camera_allocation: Some(camera_allocation),
+            material_buffer,
+            material_allocation: Some(material_allocation),
             positions_buffer,
             normals_buffer,
             tex_coords_buffer,
@@ -697,6 +776,14 @@ impl RTRenderer {
         }
         unsafe {
             ctx.device.destroy_buffer(self.camera_buffer, None);
+        }
+
+        // Free material buffer
+        if let Some(alloc) = self.material_allocation.take() {
+            let _ = ctx.allocator_mut().free(alloc);
+        }
+        unsafe {
+            ctx.device.destroy_buffer(self.material_buffer, None);
         }
 
         // Free SoA storage buffers
@@ -1049,6 +1136,53 @@ fn create_camera_ubo(
         mapped[..128].copy_from_slice(&ubo_data);
     } else {
         return Err("Camera UBO is not host-visible".to_string());
+    }
+
+    Ok((buffer, allocation))
+}
+
+/// Create material UBO buffer (80 bytes, host-visible for potential updates).
+fn create_material_ubo(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    data: &MaterialUboData,
+) -> Result<(vk::Buffer, Allocation), String> {
+    let ubo_bytes = bytemuck::bytes_of(data);
+    let size = std::mem::size_of::<MaterialUboData>() as u64;
+
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let buffer = unsafe {
+        device
+            .create_buffer(&buffer_info, None)
+            .map_err(|e| format!("Failed to create material UBO: {:?}", e))?
+    };
+
+    let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+
+    let mut allocation = allocator
+        .allocate(&AllocationCreateDesc {
+            name: "rt_material_ubo",
+            requirements,
+            location: MemoryLocation::CpuToGpu,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("Failed to allocate material UBO memory: {:?}", e))?;
+
+    unsafe {
+        device
+            .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
+            .map_err(|e| format!("Failed to bind material UBO memory: {:?}", e))?;
+    }
+
+    if let Some(mapped) = allocation.mapped_slice_mut() {
+        mapped[..ubo_bytes.len()].copy_from_slice(ubo_bytes);
+    } else {
+        return Err("Material UBO is not host-visible".to_string());
     }
 
     Ok((buffer, allocation))
@@ -1652,6 +1786,7 @@ fn write_rt_descriptors(
     tlas: vk::AccelerationStructureKHR,
     storage_image_view: vk::ImageView,
     camera_buffer: vk::Buffer,
+    material_buffer: vk::Buffer,
     ssbo_map: &HashMap<String, (vk::Buffer, u64)>,
     texture_map: &HashMap<String, (vk::ImageView, vk::Sampler)>,
 ) -> Result<(), String> {
@@ -1683,11 +1818,18 @@ fn write_rt_descriptors(
 
             match vk_type {
                 vk::DescriptorType::UNIFORM_BUFFER => {
-                    let range = if binding.size > 0 { binding.size as u64 } else { 128 };
+                    let (buffer, range) = match binding.name.as_str() {
+                        "Material" => (material_buffer, std::mem::size_of::<MaterialUboData>() as u64),
+                        _ => {
+                            // Camera / Light / other UBOs default to camera_buffer
+                            let r = if binding.size > 0 { binding.size as u64 } else { 128 };
+                            (camera_buffer, r)
+                        }
+                    };
                     let buf_info_idx = buffer_infos.len();
                     buffer_infos.push(
                         vk::DescriptorBufferInfo::default()
-                            .buffer(camera_buffer)
+                            .buffer(buffer)
                             .offset(0)
                             .range(range),
                     );

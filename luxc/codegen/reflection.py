@@ -16,6 +16,7 @@ from luxc.parser.ast_nodes import (
     Module, StageBlock, VarDecl, UniformBlock, PushBlock, BlockField,
     SamplerDecl, AccelDecl, StorageImageDecl, StorageBufferDecl,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl,
+    NumberLit, ConstructorExpr, UnaryOp,
 )
 from luxc.analysis.layout_assigner import compute_std140_offsets, _std140_size_align
 from luxc.builtins.types import resolve_type, resolve_alias_chain, VectorType, MatrixType, ScalarType
@@ -61,6 +62,35 @@ _TYPE_BYTE_SIZE = {
 }
 
 
+def _eval_default_expr(expr):
+    """Evaluate a simple default expression to a JSON-serializable value.
+
+    Handles NumberLit, ConstructorExpr (vec2/3/4), and UnaryOp('-', NumberLit).
+    Returns None if the expression is too complex to evaluate statically.
+    """
+    if isinstance(expr, NumberLit):
+        v = float(expr.value)
+        return int(v) if v == int(v) and '.' not in expr.value and 'e' not in expr.value.lower() else v
+    if isinstance(expr, UnaryOp) and expr.op == "-" and isinstance(expr.operand, NumberLit):
+        v = -float(expr.operand.value)
+        return v
+    if isinstance(expr, ConstructorExpr) and expr.type_name in ("vec2", "vec3", "vec4"):
+        n = int(expr.type_name[-1])
+        vals = []
+        for arg in expr.args:
+            v = _eval_default_expr(arg)
+            if v is None:
+                return None
+            vals.append(v)
+        # Broadcast single value to all components
+        if len(vals) == 1:
+            vals = vals * n
+        if len(vals) != n:
+            return None
+        return vals
+    return None
+
+
 def generate_reflection(
     module: Module,
     stage: StageBlock,
@@ -102,6 +132,9 @@ def generate_reflection(
     # --- Descriptor sets ---
     descriptor_sets: dict[str, list[dict]] = {}
 
+    # Gather properties defaults from surface expander (if present)
+    props_defaults = getattr(stage, '_properties_defaults', {})
+
     # Uniform blocks
     for ub in stage.uniforms:
         set_key = str(ub.set_number)
@@ -111,19 +144,26 @@ def generate_reflection(
         offsets = compute_std140_offsets(ub.fields)
         total_size = _compute_block_size(ub.fields, offsets)
 
+        fields_list = []
+        for i, f in enumerate(ub.fields):
+            field_info = {
+                "name": f.name,
+                "type": f.type_name,
+                "offset": offsets[i],
+                "size": _std140_size_align(f.type_name)[0],
+            }
+            default_key = (ub.name, f.name)
+            if default_key in props_defaults:
+                default_val = _eval_default_expr(props_defaults[default_key])
+                if default_val is not None:
+                    field_info["default"] = default_val
+            fields_list.append(field_info)
+
         descriptor_sets[set_key].append({
             "binding": ub.binding,
             "type": "uniform_buffer",
             "name": ub.name,
-            "fields": [
-                {
-                    "name": f.name,
-                    "type": f.type_name,
-                    "offset": offsets[i],
-                    "size": _std140_size_align(f.type_name)[0],
-                }
-                for i, f in enumerate(ub.fields)
-            ],
+            "fields": fields_list,
             "size": total_size,
             "stage_flags": [stage.stage_type],
         })

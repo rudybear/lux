@@ -18,6 +18,65 @@ use crate::scene_manager::{self, GpuBuffer, GpuImage, IblAssets};
 use crate::spv_loader;
 use crate::vulkan_context::VulkanContext;
 
+/// Material UBO data matching `properties Material { ... }` in gltf_pbr_layered.lux (std140 layout, 80 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct MaterialUboData {
+    base_color_factor: [f32; 4],          // offset  0, size 16
+    emissive_factor: [f32; 3],            // offset 16, size 12
+    metallic_factor: f32,                 // offset 28, size  4
+    roughness_factor: f32,                // offset 32, size  4
+    emissive_strength: f32,               // offset 36, size  4
+    ior: f32,                             // offset 40, size  4
+    clearcoat_factor: f32,                // offset 44, size  4
+    clearcoat_roughness_factor: f32,      // offset 48, size  4
+    sheen_roughness_factor: f32,          // offset 52, size  4
+    transmission_factor: f32,             // offset 56, size  4
+    _pad_before_sheen: f32,              // offset 60, size  4 (padding for vec3 alignment)
+    sheen_color_factor: [f32; 3],         // offset 64, size 12
+    _pad0: f32,                           // offset 76, size  4
+}
+unsafe impl bytemuck::Pod for MaterialUboData {}
+unsafe impl bytemuck::Zeroable for MaterialUboData {}
+
+impl MaterialUboData {
+    fn default_values() -> Self {
+        Self {
+            base_color_factor: [1.0, 1.0, 1.0, 1.0],
+            emissive_factor: [0.0, 0.0, 0.0],
+            metallic_factor: 0.0,
+            roughness_factor: 1.0,
+            emissive_strength: 1.0,
+            ior: 1.5,
+            clearcoat_factor: 0.0,
+            clearcoat_roughness_factor: 0.0,
+            sheen_roughness_factor: 0.0,
+            transmission_factor: 0.0,
+            _pad_before_sheen: 0.0,
+            sheen_color_factor: [0.0, 0.0, 0.0],
+            _pad0: 0.0,
+        }
+    }
+
+    fn from_gltf_material(mat: &crate::gltf_loader::GltfMaterial) -> Self {
+        Self {
+            base_color_factor: mat.base_color,
+            metallic_factor: mat.metallic,
+            roughness_factor: mat.roughness,
+            emissive_factor: mat.emissive,
+            emissive_strength: mat.emissive_strength,
+            ior: mat.ior,
+            clearcoat_factor: mat.clearcoat_factor,
+            clearcoat_roughness_factor: mat.clearcoat_roughness_factor,
+            sheen_color_factor: mat.sheen_color_factor,
+            sheen_roughness_factor: mat.sheen_roughness_factor,
+            transmission_factor: mat.transmission_factor,
+            _pad_before_sheen: 0.0,
+            _pad0: 0.0,
+        }
+    }
+}
+
 /// Mesh shader renderer state (persistent, suitable for interactive multi-frame rendering).
 pub struct MeshShaderRenderer {
     // Pipeline
@@ -54,6 +113,7 @@ pub struct MeshShaderRenderer {
     // Uniforms
     mvp_buffer: GpuBuffer,
     light_buffer: GpuBuffer,
+    material_buffer: GpuBuffer,
 
     // Textures
     sampler: vk::Sampler,
@@ -448,6 +508,25 @@ impl MeshShaderRenderer {
             "mesh_light",
         )?;
 
+        // Material uniform buffer (80 bytes)
+        let material_data = if let Some(ref gs) = gltf_scene {
+            if !gs.materials.is_empty() {
+                MaterialUboData::from_gltf_material(&gs.materials[0])
+            } else {
+                MaterialUboData::default_values()
+            }
+        } else {
+            MaterialUboData::default_values()
+        };
+
+        let material_buffer = create_buffer_with_data(
+            &device,
+            ctx.allocator_mut(),
+            bytemuck::bytes_of(&material_data),
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            "mesh_material",
+        )?;
+
         // --- Phase 5: Textures ---
         let sampler = unsafe {
             device
@@ -588,6 +667,7 @@ impl MeshShaderRenderer {
                         let (buffer, range) = match binding.name.as_str() {
                             "MVP" => (mvp_buffer.buffer, binding.size as u64),
                             "Light" => (light_buffer.buffer, binding.size as u64),
+                            "Material" => (material_buffer.buffer, std::mem::size_of::<MaterialUboData>() as u64),
                             _ => continue,
                         };
                         let idx = buffer_infos.len();
@@ -894,6 +974,7 @@ impl MeshShaderRenderer {
             tangents_buffer,
             mvp_buffer,
             light_buffer,
+            material_buffer,
             sampler,
             default_texture,
             default_black_texture,
@@ -1149,6 +1230,7 @@ impl MeshShaderRenderer {
         self.ibl_assets.destroy(&device, ctx.allocator_mut());
         self.mvp_buffer.destroy(&device, ctx.allocator_mut());
         self.light_buffer.destroy(&device, ctx.allocator_mut());
+        self.material_buffer.destroy(&device, ctx.allocator_mut());
         self.meshlet_desc_buffer
             .destroy(&device, ctx.allocator_mut());
         self.meshlet_verts_buffer

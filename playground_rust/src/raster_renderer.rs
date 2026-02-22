@@ -19,6 +19,65 @@ use crate::screenshot;
 use crate::spv_loader;
 use crate::vulkan_context::VulkanContext;
 
+/// Material UBO data matching `properties Material { ... }` in gltf_pbr_layered.lux (std140 layout, 80 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct MaterialUboData {
+    base_color_factor: [f32; 4],          // offset  0, size 16
+    emissive_factor: [f32; 3],            // offset 16, size 12
+    metallic_factor: f32,                 // offset 28, size  4
+    roughness_factor: f32,                // offset 32, size  4
+    emissive_strength: f32,               // offset 36, size  4
+    ior: f32,                             // offset 40, size  4
+    clearcoat_factor: f32,                // offset 44, size  4
+    clearcoat_roughness_factor: f32,      // offset 48, size  4
+    sheen_roughness_factor: f32,          // offset 52, size  4
+    transmission_factor: f32,             // offset 56, size  4
+    _pad_before_sheen: f32,              // offset 60, size  4 (padding for vec3 alignment)
+    sheen_color_factor: [f32; 3],         // offset 64, size 12
+    _pad0: f32,                           // offset 76, size  4
+}
+unsafe impl bytemuck::Pod for MaterialUboData {}
+unsafe impl bytemuck::Zeroable for MaterialUboData {}
+
+impl MaterialUboData {
+    fn default_values() -> Self {
+        Self {
+            base_color_factor: [1.0, 1.0, 1.0, 1.0],
+            emissive_factor: [0.0, 0.0, 0.0],
+            metallic_factor: 0.0,
+            roughness_factor: 1.0,
+            emissive_strength: 1.0,
+            ior: 1.5,
+            clearcoat_factor: 0.0,
+            clearcoat_roughness_factor: 0.0,
+            sheen_roughness_factor: 0.0,
+            transmission_factor: 0.0,
+            _pad_before_sheen: 0.0,
+            sheen_color_factor: [0.0, 0.0, 0.0],
+            _pad0: 0.0,
+        }
+    }
+
+    fn from_gltf_material(mat: &crate::gltf_loader::GltfMaterial) -> Self {
+        Self {
+            base_color_factor: mat.base_color,
+            metallic_factor: mat.metallic,
+            roughness_factor: mat.roughness,
+            emissive_factor: mat.emissive,
+            emissive_strength: mat.emissive_strength,
+            ior: mat.ior,
+            clearcoat_factor: mat.clearcoat_factor,
+            clearcoat_roughness_factor: mat.clearcoat_roughness_factor,
+            sheen_color_factor: mat.sheen_color_factor,
+            sheen_roughness_factor: mat.sheen_roughness_factor,
+            transmission_factor: mat.transmission_factor,
+            _pad_before_sheen: 0.0,
+            _pad0: 0.0,
+        }
+    }
+}
+
 /// Built-in fullscreen vertex shader as pre-compiled SPIR-V.
 ///
 /// This is the SPIR-V bytecode for:
@@ -1168,6 +1227,25 @@ fn render_pbr_scene(
         "pbr_light",
     )?;
 
+    // Material uniform buffer (80 bytes)
+    let material_data = if let Some(ref gs) = gltf_scene {
+        if !gs.materials.is_empty() {
+            MaterialUboData::from_gltf_material(&gs.materials[0])
+        } else {
+            MaterialUboData::default_values()
+        }
+    } else {
+        MaterialUboData::default_values()
+    };
+
+    let mut material_buffer = create_buffer_with_data(
+        device,
+        ctx.allocator_mut(),
+        bytemuck::bytes_of(&material_data),
+        vk::BufferUsageFlags::UNIFORM_BUFFER,
+        "pbr_material",
+    )?;
+
     // Sampler (shared by all texture bindings)
     let sampler_create = vk::SamplerCreateInfo::default()
         .mag_filter(vk::Filter::LINEAR)
@@ -1284,6 +1362,7 @@ fn render_pbr_scene(
                     let (buffer, range) = match binding.name.as_str() {
                         "MVP" => (mvp_buffer.buffer, binding.size as u64),
                         "Light" => (light_buffer.buffer, binding.size as u64),
+                        "Material" => (material_buffer.buffer, std::mem::size_of::<MaterialUboData>() as u64),
                         _ => {
                             info!(
                                 "Unknown UBO name '{}' at set={} binding={}, skipping",
@@ -1695,6 +1774,7 @@ fn render_pbr_scene(
     ibl_assets.destroy(device, ctx.allocator_mut());
     mvp_buffer.destroy(device, ctx.allocator_mut());
     light_buffer.destroy(device, ctx.allocator_mut());
+    material_buffer.destroy(device, ctx.allocator_mut());
     vbo.destroy(device, ctx.allocator_mut());
     ibo.destroy(device, ctx.allocator_mut());
 
@@ -1737,6 +1817,7 @@ pub struct PersistentRenderer {
     // Uniforms
     mvp_buffer: GpuBuffer,
     light_buffer: GpuBuffer,
+    material_buffer: GpuBuffer,
 
     // Push constants
     push_constant_data: Vec<u8>,
@@ -2027,6 +2108,23 @@ impl PersistentRenderer {
             vk::BufferUsageFlags::UNIFORM_BUFFER, "pbr_light",
         )?;
 
+        // Material uniform buffer (80 bytes)
+        let material_data = if let Some(ref gs) = gltf_scene {
+            if !gs.materials.is_empty() {
+                MaterialUboData::from_gltf_material(&gs.materials[0])
+            } else {
+                MaterialUboData::default_values()
+            }
+        } else {
+            MaterialUboData::default_values()
+        };
+
+        let material_buffer = create_buffer_with_data(
+            &device, ctx.allocator_mut(),
+            bytemuck::bytes_of(&material_data),
+            vk::BufferUsageFlags::UNIFORM_BUFFER, "pbr_material",
+        )?;
+
         let sampler = unsafe {
             device
                 .create_sampler(
@@ -2099,6 +2197,7 @@ impl PersistentRenderer {
                         let (buffer, range) = match binding.name.as_str() {
                             "MVP" => (mvp_buffer.buffer, binding.size as u64),
                             "Light" => (light_buffer.buffer, binding.size as u64),
+                            "Material" => (material_buffer.buffer, std::mem::size_of::<MaterialUboData>() as u64),
                             _ => continue,
                         };
                         let idx = buffer_infos.len();
@@ -2319,6 +2418,7 @@ impl PersistentRenderer {
             num_indices,
             mvp_buffer,
             light_buffer,
+            material_buffer,
             push_constant_data,
             push_constant_stage_flags,
             sampler,
@@ -2555,6 +2655,7 @@ impl PersistentRenderer {
         self.ibl_assets.destroy(&device, ctx.allocator_mut());
         self.mvp_buffer.destroy(&device, ctx.allocator_mut());
         self.light_buffer.destroy(&device, ctx.allocator_mut());
+        self.material_buffer.destroy(&device, ctx.allocator_mut());
         self.vbo.destroy(&device, ctx.allocator_mut());
         self.ibo.destroy(&device, ctx.allocator_mut());
     }

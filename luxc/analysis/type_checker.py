@@ -87,6 +87,10 @@ class TypeChecker:
                 if t is None:
                     raise TypeCheckError(f"Unknown type '{field.type_name}' in uniform block '{ub.name}'")
                 scope.define(Symbol(field.name, t, "uniform_field"))
+            # Also register the block name for qualified access (e.g. Material.field)
+            from luxc.builtins.types import UniformBlockType
+            block_type = UniformBlockType(ub.name, tuple((f.name, f.type_name) for f in ub.fields))
+            scope.define(Symbol(ub.name, block_type, "uniform_block"))
 
         # Register push constant fields
         for pb in stage.push_constants:
@@ -315,8 +319,19 @@ class TypeChecker:
 
         elif isinstance(expr, FieldAccess):
             obj_type = self._check_expr(expr.object, scope)
-            # For uniform block field access, etc.
-            expr.resolved_type = SCALAR.name  # simplified
+            # Qualified uniform/push block field access (e.g. Material.roughness_factor)
+            from luxc.builtins.types import UniformBlockType
+            if isinstance(obj_type, UniformBlockType):
+                field_map = dict(obj_type.fields)
+                if expr.field in field_map:
+                    field_type = resolve_type(field_map[expr.field])
+                    if field_type is None:
+                        field_type = SCALAR
+                    expr.resolved_type = field_type.name
+                    return field_type
+                raise TypeCheckError(f"Unknown field '{expr.field}' in block '{obj_type.name}'")
+            # For other field access (struct fields, etc.) - simplified
+            expr.resolved_type = SCALAR.name
             return SCALAR
 
         elif isinstance(expr, SwizzleAccess):

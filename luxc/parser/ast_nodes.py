@@ -122,11 +122,26 @@ class LayerCall:
 
 
 @dataclass
+class PropertiesField:
+    name: str
+    type_name: str
+    default: Optional[Expr] = None
+
+
+@dataclass
+class PropertiesBlock:
+    name: str           # e.g. "Material"
+    fields: list[PropertiesField]
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
 class SurfaceDecl:
     name: str
     members: list[SurfaceMember]
     samplers: list[SurfaceSampler] = field(default_factory=list)
     layers: Optional[list[LayerCall]] = None
+    properties: Optional[PropertiesBlock] = None
     loc: Optional[SourceLocation] = None
 
 

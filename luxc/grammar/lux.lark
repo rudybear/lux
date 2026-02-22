@@ -52,13 +52,16 @@ conditional_block: "if" feature_expr "{" module_item* "}"
 
 surface_decl: "surface" IDENT "{" surface_item ("," surface_item)* ","? "}"
 
-?surface_item: surface_sampler | surface_member | surface_layers
+?surface_item: surface_sampler | surface_member | surface_layers | surface_properties
 surface_sampler: SAMPLER_KW IDENT ("if" feature_expr)?
 SAMPLER_KW: "sampler2d" | "samplerCube"
 surface_member: IDENT ":" expr
 surface_layers: "layers" "[" layer_call ("," layer_call)* ","? "]"
 layer_call: IDENT "(" layer_arg ("," layer_arg)* ","? ")" ("if" feature_expr)?
 layer_arg: IDENT ":" expr
+
+surface_properties: "properties" IDENT "{" properties_field ("," properties_field)* ","? "}"
+properties_field: IDENT ":" TYPE_NAME ("=" expr)?
 
 // --- Geometry declarations ---
 

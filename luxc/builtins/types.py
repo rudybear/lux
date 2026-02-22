@@ -60,6 +60,12 @@ class RuntimeArrayType(LuxType):
     element_type_name: str  # name of the element type (e.g., "vec4", "uint")
 
 
+@dataclass(frozen=True)
+class UniformBlockType(LuxType):
+    """Type representing a uniform block, allowing qualified field access (Block.field)."""
+    fields: tuple  # tuple of (field_name, type_name) pairs
+
+
 # Singleton type instances
 VOID = VoidType("void")
 BOOL = BoolType("bool")

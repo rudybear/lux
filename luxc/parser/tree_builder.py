@@ -13,6 +13,7 @@ from luxc.parser.ast_nodes import (
     AssignTarget, SourceLocation,
     TypeAlias, ImportDecl,
     SurfaceDecl, SurfaceMember, SurfaceSampler, LayerCall, LayerArg,
+    PropertiesField, PropertiesBlock,
     GeometryDecl, GeometryField, GeometryTransform, GeometryOutputs, OutputBinding,
     PipelineDecl, PipelineMember,
     ScheduleDecl, ScheduleMember,
@@ -160,11 +161,16 @@ class LuxTransformer(Transformer):
         name = args[0]
         members = [a for a in args[1:] if isinstance(a, SurfaceMember)]
         sampler_objs = [a for a in args[1:] if isinstance(a, SurfaceSampler)]
+        properties = None
+        for a in args[1:]:
+            if isinstance(a, PropertiesBlock):
+                properties = a
         layers = None
         for a in args[1:]:
             if isinstance(a, list) and a and isinstance(a[0], LayerCall):
                 layers = a
-        return SurfaceDecl(str(name), members, samplers=sampler_objs, layers=layers, loc=_tok_loc(name))
+        return SurfaceDecl(str(name), members, samplers=sampler_objs,
+                           layers=layers, properties=properties, loc=_tok_loc(name))
 
     def surface_sampler(self, args):
         sampler_type = str(args[0])
@@ -190,6 +196,17 @@ class LuxTransformer(Transformer):
 
     def layer_arg(self, args):
         return LayerArg(str(args[0]), args[1])
+
+    def surface_properties(self, args):
+        name = str(args[0])
+        fields = [a for a in args[1:] if isinstance(a, PropertiesField)]
+        return PropertiesBlock(name, fields)
+
+    def properties_field(self, args):
+        field_name = str(args[0])
+        type_name = str(args[1])
+        default = args[2] if len(args) > 2 else None
+        return PropertiesField(field_name, type_name, default=default)
 
     # --- Geometry declarations ---
 

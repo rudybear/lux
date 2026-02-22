@@ -7,6 +7,7 @@
 #include "reflected_pipeline.h"
 #include "renderer_interface.h"
 #include "scene_manager.h"
+#include "material_ubo.h"
 #include "meshlet.h"
 #include <string>
 #include <vector>
@@ -88,6 +89,8 @@ private:
     VmaAllocation m_mvpAlloc = VK_NULL_HANDLE;
     VkBuffer m_lightBuffer = VK_NULL_HANDLE;
     VmaAllocation m_lightAlloc = VK_NULL_HANDLE;
+    VkBuffer m_materialBuffer = VK_NULL_HANDLE;
+    VmaAllocation m_materialAllocation = VK_NULL_HANDLE;
 
     // Shader modules
     VkShaderModule m_meshModule = VK_NULL_HANDLE;

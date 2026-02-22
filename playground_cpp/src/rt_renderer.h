@@ -8,6 +8,7 @@
 #include "reflected_pipeline.h"
 #include "renderer_interface.h"
 #include "scene_manager.h"
+#include "material_ubo.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -90,6 +91,10 @@ private:
     // Camera UBO
     VkBuffer cameraBuffer = VK_NULL_HANDLE;
     VmaAllocation cameraAllocation = VK_NULL_HANDLE;
+
+    // Material UBO
+    VkBuffer m_materialBuffer = VK_NULL_HANDLE;
+    VmaAllocation m_materialAllocation = VK_NULL_HANDLE;
 
     // Mesh for BLAS (owned by SceneManager, but we keep a local reference for BLAS geometry)
     GPUMesh sphereMesh = {};

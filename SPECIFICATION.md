@@ -94,7 +94,7 @@ The following identifiers are reserved as keywords and may not be used as user-d
 | Stage items | `in`, `out`, `uniform`, `push`, `sampler2d`, `samplerCube` |
 | RT items | `ray_payload`, `hit_attribute`, `callable_data`, `acceleration_structure` |
 | Mesh items | `mesh_output`, `task_payload` |
-| Declarative | `surface`, `geometry`, `pipeline`, `schedule`, `environment`, `procedural`, `layers` |
+| Declarative | `surface`, `geometry`, `pipeline`, `schedule`, `environment`, `procedural`, `layers`, `properties` |
 | Boolean | `true`, `false` |
 
 ### 2.6 Literals
@@ -1534,6 +1534,54 @@ The layered surface syntax introduces three new AST node types:
 | `SurfaceSampler` | `sampler_type: str`, `name: str` | A sampler declaration within a surface block. The `sampler_type` field is `"sampler2d"` or `"samplerCube"`. |
 | `LayerCall` | `name: str`, `args: list[LayerArg]` | A single layer invocation within a `layers` block. |
 | `LayerArg` | `name: str`, `value: Expr` | A named argument to a layer call. |
+
+#### 12.2.5 Properties Block
+
+A `properties` block declares an abstract set of named material parameters with types and default values. It serves as the canonical data source for a surface: engines map their own data model (e.g., glTF `pbrMetallicRoughness`) to the fields declared in the properties block, while the surface references those fields via qualified access.
+
+**Syntax**:
+
+```
+properties Name {
+    field_name: type = default_value,
+    field_name: type = default_value,
+    ...
+}
+```
+
+Each field has a name, a type annotation, and a default value expression. The default value must be a constant expression (literal or constructor call).
+
+**Example**:
+
+```
+properties Material {
+    base_color_factor: vec4 = vec4(1.0, 1.0, 1.0, 1.0),
+    roughness_factor: scalar = 1.0,
+    metallic_factor: scalar = 1.0,
+}
+```
+
+**Qualified field access**: Properties fields are referenced in layer expressions and surface members using dot-qualified syntax: `Name.field_name`. For example, `Material.base_color_factor` resolves to the `base_color_factor` field of the `Material` properties block:
+
+```
+surface PBRSurface {
+    sampler2d albedo_tex,
+    sampler2d metalrough_tex,
+    layers [
+        base(
+            albedo: sample(albedo_tex, frag_uv).rgb * Material.base_color_factor.rgb,
+            roughness: sample(metalrough_tex, frag_uv).g * Material.roughness_factor,
+            metallic: sample(metalrough_tex, frag_uv).b * Material.metallic_factor,
+        ),
+    ]
+}
+```
+
+**UBO generation**: The compiler generates a uniform buffer object (UBO) from the properties block using `std140` layout rules. Fields are packed in declaration order following standard `std140` alignment and padding. The generated UBO is assigned a descriptor set and binding automatically, consistent with the auto-layout rules described in section 4.
+
+**Default values in reflection JSON**: The compiler emits the default value of each properties field in the reflection JSON output. This allows engines to populate the generated UBO with sensible fallback values when the host application does not provide explicit overrides. For example, a properties block with `roughness_factor: scalar = 1.0` produces a reflection entry that records `1.0` as the default, enabling the engine to initialize the buffer without requiring the user to set every field.
+
+**Engine-side mapping**: The properties block is intentionally abstract -- it declares *what* data the shader expects, not *where* that data comes from. The engine is responsible for mapping its own data model to the declared fields. For example, a glTF loader would read `pbrMetallicRoughness.baseColorFactor` from the material and write it into the UBO slot corresponding to `base_color_factor`. This separation keeps shader code portable across different asset formats and engine architectures.
 
 ### 12.3 Schedule Block
 

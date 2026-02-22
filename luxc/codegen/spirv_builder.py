@@ -1551,9 +1551,48 @@ class SpvGenerator:
             return shuffle_id, lines
 
     def _gen_field_access(self, expr: FieldAccess, lines: list[str]) -> tuple[str, list[str]]:
-        # This handles struct.field — for uniform block fields accessed via dot
-        # In Lux, uniform fields are accessed directly by name, not struct.field
-        # This path would be for e.g. push.view_pos
+        # Handle qualified access to uniform block fields: Material.roughness_factor
+        if isinstance(expr.object, VarRef) and expr.object.name in self.uniform_var_ids:
+            block_name = expr.object.name
+            var_id = self.uniform_var_ids[block_name]
+            field_name = expr.field
+            # Find the field index in this block
+            for ub in self.stage.uniforms:
+                if ub.name == block_name:
+                    for i, f in enumerate(ub.fields):
+                        if f.name == field_name:
+                            field_type = f.type_name
+                            type_id = self.reg.lux_type_to_spirv(field_type)
+                            ptr_type = self.reg.pointer("Uniform", type_id)
+                            idx_id = self.reg.const_int(i, signed=True)
+                            ac_id = self.reg.next_id()
+                            lines.append(f"{ac_id} = OpAccessChain {ptr_type} {var_id} {idx_id}")
+                            result = self.reg.next_id()
+                            lines.append(f"{result} = OpLoad {type_id} {ac_id}")
+                            return result, lines
+            raise ValueError(f"Unknown field '{field_name}' in uniform block '{block_name}'")
+
+        # Handle qualified access to push constant fields
+        if isinstance(expr.object, VarRef) and expr.object.name in self.push_var_ids:
+            block_name = expr.object.name
+            var_id = self.push_var_ids[block_name]
+            field_name = expr.field
+            for pb in self.stage.push_constants:
+                if pb.name == block_name:
+                    for i, f in enumerate(pb.fields):
+                        if f.name == field_name:
+                            field_type = f.type_name
+                            type_id = self.reg.lux_type_to_spirv(field_type)
+                            ptr_type = self.reg.pointer("PushConstant", type_id)
+                            idx_id = self.reg.const_int(i, signed=True)
+                            ac_id = self.reg.next_id()
+                            lines.append(f"{ac_id} = OpAccessChain {ptr_type} {var_id} {idx_id}")
+                            result = self.reg.next_id()
+                            lines.append(f"{result} = OpLoad {type_id} {ac_id}")
+                            return result, lines
+            raise ValueError(f"Unknown field '{field_name}' in push constant block '{block_name}'")
+
+        # Default: struct.field via composite extract
         obj_id, obj_lines = self._gen_expr(expr.object)
         lines.extend(obj_lines)
         result_type = self.reg.float32()  # simplified

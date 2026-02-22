@@ -58,6 +58,13 @@ class MaterialData:
     metallic: float = 0.0
     roughness: float = 1.0
     emissive: tuple = (0.0, 0.0, 0.0)
+    emissive_strength: float = 1.0
+    ior: float = 1.5
+    clearcoat_factor: float = 0.0
+    clearcoat_roughness_factor: float = 0.0
+    sheen_color_factor: tuple = (0.0, 0.0, 0.0)
+    sheen_roughness_factor: float = 0.0
+    transmission_factor: float = 0.0
     textures: dict = field(default_factory=dict)  # name -> np.ndarray RGBA uint8
 
 
@@ -234,6 +241,20 @@ def _load_gltf_scene(path: str, camera_elevation: float = 5.0) -> SceneData:
             roughness=mat.roughness,
             emissive=mat.emissive,
         )
+        # Wire extension properties from GltfMaterial
+        ext = getattr(mat, 'extensions', {})
+        if 'emissive_strength' in ext:
+            mdata.emissive_strength = ext['emissive_strength'].get('emissiveStrength', 1.0)
+        if 'ior' in ext:
+            mdata.ior = ext['ior'].get('ior', 1.5)
+        if 'clearcoat' in ext:
+            mdata.clearcoat_factor = ext['clearcoat'].get('factor', 0.0)
+            mdata.clearcoat_roughness_factor = ext['clearcoat'].get('roughnessFactor', 0.0)
+        if 'sheen' in ext:
+            mdata.sheen_color_factor = tuple(ext['sheen'].get('colorFactor', [0, 0, 0]))
+            mdata.sheen_roughness_factor = ext['sheen'].get('roughnessFactor', 0.0)
+        if 'transmission' in ext:
+            mdata.transmission_factor = ext['transmission'].get('factor', 0.0)
         if mat.base_color_texture is not None:
             mdata.textures["base_color_tex"] = mat.base_color_texture
         if mat.normal_texture is not None:
@@ -456,6 +477,93 @@ def _pad_vertices(vertex_data: bytes, src_stride: int, dst_stride: int,
     return bytes(result)
 
 
+# ---------------------------------------------------------------------------
+# Material UBO packing
+# ---------------------------------------------------------------------------
+
+# glTF-specific mapping: reflection field name -> MaterialData attribute
+_GLTF_FIELD_MAP = {
+    "base_color_factor": lambda m: m.base_color,        # vec4
+    "metallic_factor":   lambda m: m.metallic,           # scalar
+    "roughness_factor":  lambda m: m.roughness,          # scalar
+    "emissive_factor":   lambda m: m.emissive,           # vec3
+    "emissive_strength": lambda m: m.emissive_strength,  # scalar
+    "ior":               lambda m: m.ior,                # scalar
+    "clearcoat_factor":  lambda m: m.clearcoat_factor,   # scalar
+    "clearcoat_roughness_factor": lambda m: m.clearcoat_roughness_factor,
+    "sheen_color_factor":    lambda m: m.sheen_color_factor,     # vec3
+    "sheen_roughness_factor": lambda m: m.sheen_roughness_factor,
+    "transmission_factor":    lambda m: m.transmission_factor,
+}
+
+
+def _pack_field(buf: bytearray, offset: int, type_name: str, value):
+    """Pack a single field value into a buffer at the given offset."""
+    if type_name == "scalar":
+        struct.pack_into("f", buf, offset, float(value))
+    elif type_name == "vec2":
+        v = value if hasattr(value, '__len__') else (float(value), 0.0)
+        struct.pack_into("2f", buf, offset, *v[:2])
+    elif type_name == "vec3":
+        v = value if hasattr(value, '__len__') else (float(value), 0.0, 0.0)
+        struct.pack_into("3f", buf, offset, *v[:3])
+    elif type_name == "vec4":
+        v = value if hasattr(value, '__len__') else (float(value), 0.0, 0.0, 0.0)
+        struct.pack_into("4f", buf, offset, *v[:4])
+
+
+def _pack_properties_ubo(mat: MaterialData, ubo_reflection: dict) -> bytes:
+    """Pack material data into buffer matching reflection-declared field offsets."""
+    buf = bytearray(ubo_reflection["size"])
+    for field in ubo_reflection["fields"]:
+        getter = _GLTF_FIELD_MAP.get(field["name"])
+        if getter:
+            value = getter(mat)
+        elif "default" in field:
+            value = field["default"]
+        else:
+            continue
+        _pack_field(buf, field["offset"], field["type"], value)
+    return bytes(buf)
+
+
+def _pack_material_ubo(mat: MaterialData) -> bytes:
+    """Pack material properties into std140 UBO matching properties Material block.
+
+    Fixed layout (80 bytes total):
+        offset  0: base_color_factor  vec4  (16 bytes)
+        offset 16: emissive_factor    vec3  (12 bytes)
+        offset 28: metallic_factor    scalar (4 bytes)
+        offset 32: roughness_factor   scalar (4 bytes)
+        offset 36: emissive_strength  scalar (4 bytes)
+        offset 40: ior                scalar (4 bytes)
+        offset 44: clearcoat_factor   scalar (4 bytes)
+        offset 48: clearcoat_roughness_factor scalar (4 bytes)
+        offset 52: sheen_roughness_factor     scalar (4 bytes)
+        offset 56: transmission_factor        scalar (4 bytes)
+        offset 60: _pad                       (4 bytes, vec3 alignment)
+        offset 64: sheen_color_factor  vec3  (12 bytes)
+        offset 76: _pad                       (4 bytes)
+    """
+    buf = bytearray(80)
+    bc = mat.base_color
+    struct.pack_into("4f", buf, 0, bc[0], bc[1], bc[2], bc[3] if len(bc) > 3 else 1.0)
+    em = mat.emissive
+    struct.pack_into("3f", buf, 16, em[0], em[1], em[2] if len(em) > 2 else 0.0)
+    struct.pack_into("f", buf, 28, mat.metallic)
+    struct.pack_into("f", buf, 32, mat.roughness)
+    struct.pack_into("f", buf, 36, mat.emissive_strength)
+    struct.pack_into("f", buf, 40, mat.ior)
+    struct.pack_into("f", buf, 44, mat.clearcoat_factor)
+    struct.pack_into("f", buf, 48, mat.clearcoat_roughness_factor)
+    struct.pack_into("f", buf, 52, mat.sheen_roughness_factor)
+    struct.pack_into("f", buf, 56, mat.transmission_factor)
+    # pad at offset 60
+    sc = mat.sheen_color_factor
+    struct.pack_into("3f", buf, 64, sc[0], sc[1], sc[2] if len(sc) > 2 else 0.0)
+    return bytes(buf)
+
+
 def upload_scene(device: wgpu.GPUDevice, scene: SceneData, width: int, height: int,
                  pipeline_stride: int = 0) -> GPUScene:
     """Upload scene resources to GPU. Independent of any pipeline."""
@@ -510,6 +618,13 @@ def upload_scene(device: wgpu.GPUDevice, scene: SceneData, width: int, height: i
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
         gpu.uniform_buffers["Lighting"] = gpu.uniform_buffers["Light"]
+
+    # Create Material properties UBO (fixed std140 layout)
+    if scene.materials:
+        gpu.uniform_buffers["Material"] = device.create_buffer_with_data(
+            data=_pack_material_ubo(scene.materials[0]),
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
 
     return gpu
 

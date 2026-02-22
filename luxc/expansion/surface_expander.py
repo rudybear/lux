@@ -23,7 +23,7 @@ from luxc.parser.ast_nodes import (
     ScheduleDecl, EnvironmentDecl, ProceduralDecl,
     RayPayloadDecl, HitAttributeDecl, AccelDecl, StorageImageDecl,
     StorageBufferDecl, IndexAccess, FieldAccess,
-    IfStmt, TaskPayloadDecl,
+    IfStmt, TaskPayloadDecl, PropertiesBlock,
 )
 
 
@@ -288,6 +288,19 @@ def _expand_surface_to_fragment(
         BlockField("light_dir", "vec3"),
         BlockField("view_pos", "vec3"),
     ]))
+
+    # Material properties uniform (from surface properties block)
+    if surface.properties:
+        props = surface.properties
+        stage.uniforms.append(UniformBlock(props.name, [
+            BlockField(f.name, f.type_name) for f in props.fields
+        ]))
+        # Store defaults for reflection emission
+        if not hasattr(stage, '_properties_defaults'):
+            stage._properties_defaults = {}
+        for f in props.fields:
+            if f.default is not None:
+                stage._properties_defaults[(props.name, f.name)] = f.default
 
     # Add sampler declarations from the surface
     for sam in surface.samplers:
@@ -1140,6 +1153,19 @@ def _expand_layered_closest_hit(
         BlockField("light_dir", "vec3"),
         BlockField("view_pos", "vec3"),
     ]))
+
+    # Material properties uniform (from surface properties block)
+    if surface.properties:
+        props = surface.properties
+        stage.uniforms.append(UniformBlock(props.name, [
+            BlockField(f.name, f.type_name) for f in props.fields
+        ]))
+        # Store defaults for reflection emission
+        if not hasattr(stage, '_properties_defaults'):
+            stage._properties_defaults = {}
+        for f in props.fields:
+            if f.default is not None:
+                stage._properties_defaults[(props.name, f.name)] = f.default
 
     # Sampler declarations from the surface
     for sam in surface.samplers:
