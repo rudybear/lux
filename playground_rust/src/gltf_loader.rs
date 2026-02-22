@@ -33,6 +33,23 @@ pub struct GltfMesh {
     pub vertex_stride: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct UvTransform {
+    pub offset: [f32; 2],
+    pub scale: [f32; 2],
+    pub rotation: f32,
+}
+
+impl Default for UvTransform {
+    fn default() -> Self {
+        Self {
+            offset: [0.0, 0.0],
+            scale: [1.0, 1.0],
+            rotation: 0.0,
+        }
+    }
+}
+
 /// Decoded RGBA image data extracted from a GLB texture.
 #[derive(Debug, Clone)]
 pub struct TextureImage {
@@ -84,6 +101,11 @@ pub struct GltfMaterial {
     pub ior: f32,
     pub emissive_strength: f32,
     pub is_unlit: bool,
+
+    // KHR_texture_transform
+    pub base_color_uv_xform: UvTransform,
+    pub normal_uv_xform: UvTransform,
+    pub metallic_roughness_uv_xform: UvTransform,
 }
 
 impl Default for GltfMaterial {
@@ -117,6 +139,9 @@ impl Default for GltfMaterial {
             ior: 1.5,
             emissive_strength: 1.0,
             is_unlit: false,
+            base_color_uv_xform: UvTransform::default(),
+            normal_uv_xform: UvTransform::default(),
+            metallic_roughness_uv_xform: UvTransform::default(),
         }
     }
 }
@@ -170,6 +195,12 @@ pub struct GltfScene {
 pub struct DrawItem {
     pub world_transform: Mat4,
     pub mesh_index: usize,
+    pub material_index: usize,
+}
+
+pub struct DrawRange {
+    pub index_offset: u32,
+    pub index_count: u32,
     pub material_index: usize,
 }
 
@@ -357,8 +388,29 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
         let bc = pbr.base_color_factor();
 
         let base_color_image = extract_texture(&images, pbr.base_color_texture().map(|t| t.texture()));
+        let base_color_uv_xform = pbr.base_color_texture()
+            .and_then(|info| info.texture_transform())
+            .map(|t| UvTransform {
+                offset: t.offset(),
+                scale: t.scale(),
+                rotation: t.rotation(),
+            })
+            .unwrap_or_default();
+
         let normal_image = extract_texture(&images, mat.normal_texture().map(|t| t.texture()));
+        // NormalTexture does not expose texture_transform() directly; use default
+        let normal_uv_xform = UvTransform::default();
+
         let metallic_roughness_image = extract_texture(&images, pbr.metallic_roughness_texture().map(|t| t.texture()));
+        let metallic_roughness_uv_xform = pbr.metallic_roughness_texture()
+            .and_then(|info| info.texture_transform())
+            .map(|t| UvTransform {
+                offset: t.offset(),
+                scale: t.scale(),
+                rotation: t.rotation(),
+            })
+            .unwrap_or_default();
+
         let occlusion_image = extract_texture(&images, mat.occlusion_texture().map(|t| t.texture()));
         let emissive_image = extract_texture(&images, mat.emissive_texture().map(|t| t.texture()));
 
@@ -469,6 +521,9 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
             ior,
             emissive_strength,
             is_unlit,
+            base_color_uv_xform,
+            normal_uv_xform,
+            metallic_roughness_uv_xform,
         });
     }
     if scene.materials.is_empty() {

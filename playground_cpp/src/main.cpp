@@ -97,6 +97,7 @@ struct CLIOptions {
     std::string shaderBase;    // --pipeline value (resolved from scene if not given)
     std::string sceneSource;   // --scene value (required)
     std::string iblName;       // --ibl value (optional, auto-detects if empty)
+    std::string forceMode;     // --mode rt forces RT render path
     uint32_t width = 512;
     uint32_t height = 512;
     std::string output = "output.png";
@@ -175,17 +176,22 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
     }
 
     // Legacy --mode backwards compatibility: map mode to scene source
-    if (!legacyMode.empty() && opts.sceneSource.empty()) {
-        if (legacyMode == "triangle")        opts.sceneSource = "triangle";
-        else if (legacyMode == "fullscreen") opts.sceneSource = "fullscreen";
-        else if (legacyMode == "pbr")        opts.sceneSource = "sphere";
-        else if (legacyMode == "rt")         opts.sceneSource = "sphere";
-        else {
-            std::cerr << "Unknown legacy mode: " << legacyMode << std::endl;
-            std::exit(1);
+    if (!legacyMode.empty()) {
+        if (legacyMode == "rt") {
+            opts.forceMode = "rt";
         }
-        std::cout << "[info] Legacy --mode \"" << legacyMode
-                  << "\" mapped to --scene \"" << opts.sceneSource << "\"" << std::endl;
+        if (opts.sceneSource.empty()) {
+            if (legacyMode == "triangle")        opts.sceneSource = "triangle";
+            else if (legacyMode == "fullscreen") opts.sceneSource = "fullscreen";
+            else if (legacyMode == "pbr")        opts.sceneSource = "sphere";
+            else if (legacyMode == "rt")         opts.sceneSource = "sphere";
+            else {
+                std::cerr << "Unknown legacy mode: " << legacyMode << std::endl;
+                std::exit(1);
+            }
+            std::cout << "[info] Legacy --mode \"" << legacyMode
+                      << "\" mapped to --scene \"" << opts.sceneSource << "\"" << std::endl;
+        }
     }
 
     // Backwards compat: if no --scene, treat positional arg as pipeline base and use "sphere" as scene
@@ -216,10 +222,12 @@ static std::string resolveDefaultPipeline(const std::string& scene) {
     return "examples/pbr_basic";
 }
 
-static std::string detectRenderPath(const std::string& base) {
-    if (fs::exists(base + ".rgen.spv")) return "rt";
-    if (fs::exists(base + ".mesh.spv") && fs::exists(base + ".frag.spv")) return "mesh";
+static std::string detectRenderPath(const std::string& base, const std::string& forceMode = "") {
+    if (forceMode == "rt" && fs::exists(base + ".rgen.spv")) return "rt";
+    // Prefer raster over RT when both exist (raster supports per-material draw calls)
     if (fs::exists(base + ".vert.spv") && fs::exists(base + ".frag.spv")) return "raster";
+    if (fs::exists(base + ".mesh.spv") && fs::exists(base + ".frag.spv")) return "mesh";
+    if (fs::exists(base + ".rgen.spv")) return "rt";
     if (fs::exists(base + ".frag.spv")) return "fullscreen";
     throw std::runtime_error("No shader files found for: " + base);
 }
@@ -229,7 +237,7 @@ static std::string detectRenderPath(const std::string& base) {
 // --------------------------------------------------------------------------
 
 static int runHeadless(const CLIOptions& opts) {
-    std::string renderPath = detectRenderPath(opts.shaderBase);
+    std::string renderPath = detectRenderPath(opts.shaderBase, opts.forceMode);
     bool needRT = (renderPath == "rt");
     bool needMesh = (renderPath == "mesh");
     VkPipelineStageFlags dstStage = needRT
@@ -267,17 +275,12 @@ static int runHeadless(const CLIOptions& opts) {
         SceneManager scene;
         scene.loadScene(ctx, opts.sceneSource);
 
-        // Determine vertex stride: for raster path, check if reflection wants 48-byte stride
+        // Always use 48-byte stride for glTF raster scenes so that flattenScene()
+        // is called (which generates draw ranges and applies world transforms).
+        // Shaders that don't use tangent (stride=32) simply ignore the extra bytes.
         int vertexStride = 32;
-        if (!needRT && !needMesh && renderPath == "raster") {
-            // Check if vertex reflection requires 48-byte stride
-            std::string vertJsonPath = opts.shaderBase + ".vert.json";
-            if (fs::exists(vertJsonPath)) {
-                auto vertRefl = parseReflectionJson(vertJsonPath);
-                if (vertRefl.vertex_stride == 48) {
-                    vertexStride = 48;
-                }
-            }
+        if (!needRT && !needMesh && renderPath == "raster" && scene.hasGltfScene()) {
+            vertexStride = 48;
         }
 
         scene.uploadToGPU(ctx, vertexStride);
@@ -329,7 +332,7 @@ static int runInteractive(CLIOptions opts) {
         opts.width = 1024;
         opts.height = 768;
     }
-    std::string renderPath = detectRenderPath(opts.shaderBase);
+    std::string renderPath = detectRenderPath(opts.shaderBase, opts.forceMode);
     bool needRT = (renderPath == "rt");
     bool needMesh = (renderPath == "mesh");
     VkPipelineStageFlags dstStage = needRT
@@ -421,16 +424,11 @@ static int runInteractive(CLIOptions opts) {
     try {
         scene.loadScene(ctx, opts.sceneSource);
 
-        // Determine vertex stride for raster
+        // Always use 48-byte stride for glTF raster scenes so that flattenScene()
+        // is called (which generates draw ranges and applies world transforms).
         int vertexStride = 32;
-        if (!useRT && !useMesh && renderPath == "raster") {
-            std::string vertJsonPath = opts.shaderBase + ".vert.json";
-            if (fs::exists(vertJsonPath)) {
-                auto vertRefl = parseReflectionJson(vertJsonPath);
-                if (vertRefl.vertex_stride == 48) {
-                    vertexStride = 48;
-                }
-            }
+        if (!useRT && !useMesh && renderPath == "raster" && scene.hasGltfScene()) {
+            vertexStride = 48;
         }
 
         scene.uploadToGPU(ctx, vertexStride);

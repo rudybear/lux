@@ -1121,6 +1121,56 @@ def _rewrite_sample_to_lod(expr):
     return expr
 
 
+def _rewrite_refs(expr, name_map: dict[str, str]):
+    """Deep-copy an AST expression, replacing VarRef names per name_map.
+
+    Used by mesh shader output expansion so that cross-binding references
+    (e.g. world_bitangent = cross(world_normal, world_tangent)) resolve to
+    the local scalar temporaries rather than the per-vertex output arrays.
+    """
+    if isinstance(expr, VarRef):
+        if expr.name in name_map:
+            return VarRef(name_map[expr.name], loc=expr.loc)
+        return expr
+    elif isinstance(expr, CallExpr):
+        return CallExpr(
+            _rewrite_refs(expr.func, name_map),
+            [_rewrite_refs(a, name_map) for a in expr.args],
+            loc=expr.loc,
+        )
+    elif isinstance(expr, BinaryOp):
+        return BinaryOp(
+            expr.op,
+            _rewrite_refs(expr.left, name_map),
+            _rewrite_refs(expr.right, name_map),
+            loc=expr.loc,
+        )
+    elif isinstance(expr, UnaryOp):
+        return UnaryOp(expr.op, _rewrite_refs(expr.operand, name_map), loc=expr.loc)
+    elif isinstance(expr, ConstructorExpr):
+        return ConstructorExpr(
+            expr.type_name,
+            [_rewrite_refs(a, name_map) for a in expr.args],
+            loc=expr.loc,
+        )
+    elif isinstance(expr, SwizzleAccess):
+        return SwizzleAccess(
+            _rewrite_refs(expr.object, name_map), expr.components, loc=expr.loc,
+        )
+    elif isinstance(expr, FieldAccess):
+        return FieldAccess(
+            _rewrite_refs(expr.object, name_map), expr.field, loc=expr.loc,
+        )
+    elif isinstance(expr, IndexAccess):
+        return IndexAccess(
+            _rewrite_refs(expr.object, name_map),
+            _rewrite_refs(expr.index, name_map),
+            loc=expr.loc,
+        )
+    # Leaf nodes: NumberLit, etc. — no rewriting needed
+    return expr
+
+
 def _expand_layered_closest_hit(
     surface: SurfaceDecl,
     module: Module,
@@ -1833,19 +1883,28 @@ def _make_vertex_iteration(
                 vbody.append(LetStmt("tangent", "vec4",
                     IndexAccess(VarRef("tangents"), VarRef("global_idx"))))
 
-    # Write geometry outputs
+    # Write geometry outputs — two-pass to handle cross-binding references.
+    # E.g. world_bitangent = cross(world_normal, world_tangent) needs the
+    # earlier bindings to resolve to scalar locals, not the output arrays.
     if geometry and geometry.outputs:
+        temp_map = {}  # binding.name -> local temp name
         for binding in geometry.outputs.bindings:
             if binding.name == "clip_pos":
+                rewritten = _rewrite_refs(binding.value, temp_map)
                 vbody.append(AssignStmt(
                     AssignTarget(IndexAccess(VarRef("gl_MeshVerticesEXT"), VarRef(vid))),
-                    binding.value,
+                    rewritten,
                 ))
             else:
+                out_type = _infer_output_type(binding.name)
+                local = f"_local_{binding.name}"
+                rewritten = _rewrite_refs(binding.value, temp_map)
+                vbody.append(LetStmt(local, out_type, rewritten))
                 vbody.append(AssignStmt(
                     AssignTarget(IndexAccess(VarRef(binding.name), VarRef(vid))),
-                    binding.value,
+                    VarRef(local),
                 ))
+                temp_map[binding.name] = local
     else:
         vbody.append(AssignStmt(
             AssignTarget(IndexAccess(VarRef("gl_MeshVerticesEXT"), VarRef(vid))),

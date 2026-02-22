@@ -622,12 +622,17 @@ VkPipelineLayout createReflectedPipelineLayout(
     return pipelineLayout;
 }
 
-ReflectedVertexInput createReflectedVertexInput(const ReflectionData& vertReflection) {
+ReflectedVertexInput createReflectedVertexInput(const ReflectionData& vertReflection, int overrideStride) {
     ReflectedVertexInput result;
 
     result.binding = {};
     result.binding.binding = 0;
-    result.binding.stride = static_cast<uint32_t>(vertReflection.vertex_stride);
+    // Use override stride when the actual vertex buffer has a larger stride than the
+    // shader requires (e.g. buffer always has 48-byte stride with tangent, but shader
+    // only reads position+normal+uv = 32 bytes). Vulkan allows stride > attribute sum.
+    result.binding.stride = (overrideStride > 0)
+        ? static_cast<uint32_t>(overrideStride)
+        : static_cast<uint32_t>(vertReflection.vertex_stride);
     result.binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
     for (auto& attr : vertReflection.vertex_attributes) {

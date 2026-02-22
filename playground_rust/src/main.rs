@@ -96,17 +96,23 @@ fn resolve_default_pipeline(scene: &str) -> Result<String, String> {
 }
 
 /// Auto-detect the render path from which .spv files exist for a pipeline base.
-fn detect_render_path(pipeline_base: &str) -> &'static str {
-    if Path::new(&format!("{}.rgen.spv", pipeline_base)).exists() {
-        "rt"
+/// Prefers raster over RT when both exist (raster supports per-material draw calls).
+/// Pass force_mode="rt" to override and use RT path.
+fn detect_render_path(pipeline_base: &str, force_mode: &str) -> &'static str {
+    if force_mode == "rt" && Path::new(&format!("{}.rgen.spv", pipeline_base)).exists() {
+        return "rt";
+    }
+    // Prefer raster over RT when both exist (raster supports per-material draw calls)
+    if Path::new(&format!("{}.vert.spv", pipeline_base)).exists()
+        && Path::new(&format!("{}.frag.spv", pipeline_base)).exists()
+    {
+        "raster"
     } else if Path::new(&format!("{}.mesh.spv", pipeline_base)).exists()
         && Path::new(&format!("{}.frag.spv", pipeline_base)).exists()
     {
         "mesh"
-    } else if Path::new(&format!("{}.vert.spv", pipeline_base)).exists()
-        && Path::new(&format!("{}.frag.spv", pipeline_base)).exists()
-    {
-        "raster"
+    } else if Path::new(&format!("{}.rgen.spv", pipeline_base)).exists() {
+        "rt"
     } else if Path::new(&format!("{}.frag.spv", pipeline_base)).exists() {
         "fullscreen"
     } else {
@@ -141,7 +147,11 @@ fn run(args: Args) -> Result<(), String> {
         resolve_default_pipeline(&scene_source).unwrap_or_else(|e| panic!("{}", e))
     };
 
-    let render_path = detect_render_path(&pipeline_base);
+    let force_mode = match args.mode.as_deref() {
+        Some("rt") => "rt",
+        _ => "",
+    };
+    let render_path = detect_render_path(&pipeline_base, force_mode);
 
     info!("Scene: {}", scene_source);
     info!("Pipeline: {}", pipeline_base);

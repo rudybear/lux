@@ -92,6 +92,8 @@ void SceneManager::uploadToGPU(VulkanContext& ctx, int vertexStride) {
         std::vector<float> vdata;
         std::vector<uint32_t> allIndices;
         uint32_t vertexOffset = 0;
+        uint32_t indexOffset = 0;
+        m_drawRanges.clear();
 
         for (auto& item : drawItems) {
             auto& gmesh = m_gltfScene.meshes[item.meshIndex];
@@ -130,6 +132,8 @@ void SceneManager::uploadToGPU(VulkanContext& ctx, int vertexStride) {
             for (auto idx : gmesh.indices) {
                 allIndices.push_back(idx + vertexOffset);
             }
+            m_drawRanges.push_back({indexOffset, static_cast<uint32_t>(gmesh.indices.size()), item.materialIndex});
+            indexOffset += static_cast<uint32_t>(gmesh.indices.size());
             vertexOffset += static_cast<uint32_t>(gmesh.vertices.size());
         }
 
@@ -358,31 +362,48 @@ void SceneManager::createDefaultTextures(VulkanContext& ctx) {
 void SceneManager::uploadGltfTextures(VulkanContext& ctx) {
     if (!m_hasGltfScene || m_gltfScene.materials.empty()) return;
 
-    auto& mat = m_gltfScene.materials[0];
-
-    auto uploadIfValid = [&](const GltfTextureData& texData, const std::string& name) {
+    auto uploadIfValid = [&](const GltfTextureData& texData, const std::string& name) -> GPUTexture {
         if (texData.valid()) {
             auto gpuTex = Scene::uploadTexture(ctx.allocator, ctx.device, ctx.commandPool,
                                                 ctx.graphicsQueue, texData.pixels,
                                                 static_cast<uint32_t>(texData.width),
                                                 static_cast<uint32_t>(texData.height));
-            m_namedTextures[name] = gpuTex;
             std::cout << "[info] Uploaded GPU texture: " << name
                       << " (" << texData.width << "x" << texData.height << ")" << std::endl;
+            return gpuTex;
         }
+        return {};
     };
 
-    uploadIfValid(mat.base_color_tex, "base_color_tex");
-    uploadIfValid(mat.normal_tex, "normal_tex");
-    uploadIfValid(mat.metallic_roughness_tex, "metallic_roughness_tex");
-    uploadIfValid(mat.occlusion_tex, "occlusion_tex");
-    uploadIfValid(mat.emissive_tex, "emissive_tex");
+    m_perMaterialTextures.resize(m_gltfScene.materials.size());
 
-    // Upload extension textures
-    uploadIfValid(mat.clearcoat_tex, "clearcoat_tex");
-    uploadIfValid(mat.clearcoat_roughness_tex, "clearcoat_roughness_tex");
-    uploadIfValid(mat.sheen_color_tex, "sheen_color_tex");
-    uploadIfValid(mat.transmission_tex, "transmission_tex");
+    for (size_t i = 0; i < m_gltfScene.materials.size(); i++) {
+        auto& mat = m_gltfScene.materials[i];
+        auto& texMap = m_perMaterialTextures[i];
+
+        auto tryUpload = [&](const GltfTextureData& texData, const std::string& name) {
+            if (texData.valid()) {
+                texMap[name] = uploadIfValid(texData, name + "[" + std::to_string(i) + "]");
+            }
+        };
+
+        tryUpload(mat.base_color_tex, "base_color_tex");
+        tryUpload(mat.normal_tex, "normal_tex");
+        tryUpload(mat.metallic_roughness_tex, "metallic_roughness_tex");
+        tryUpload(mat.occlusion_tex, "occlusion_tex");
+        tryUpload(mat.emissive_tex, "emissive_tex");
+        tryUpload(mat.clearcoat_tex, "clearcoat_tex");
+        tryUpload(mat.clearcoat_roughness_tex, "clearcoat_roughness_tex");
+        tryUpload(mat.sheen_color_tex, "sheen_color_tex");
+        tryUpload(mat.transmission_tex, "transmission_tex");
+    }
+
+    // Backward compat: also populate m_namedTextures from material 0 for RT path
+    if (!m_perMaterialTextures.empty()) {
+        for (auto& [name, tex] : m_perMaterialTextures[0]) {
+            m_namedTextures[name] = tex;
+        }
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -940,6 +961,22 @@ void SceneManager::cleanup(VulkanContext& ctx) {
         }
     }
     m_namedTextures.clear();
+
+    for (auto& matTexMap : m_perMaterialTextures) {
+        for (auto& [name, tex] : matTexMap) {
+            if (tex.image != VK_NULL_HANDLE) {
+                bool alreadyDestroyed = false;
+                for (auto img : destroyed) {
+                    if (img == tex.image) { alreadyDestroyed = true; break; }
+                }
+                if (!alreadyDestroyed) {
+                    destroyed.push_back(tex.image);
+                    Scene::destroyTexture(ctx.allocator, ctx.device, tex);
+                }
+            }
+        }
+    }
+    m_perMaterialTextures.clear();
 
     for (auto& [name, tex] : m_iblTextures) {
         if (tex.image != VK_NULL_HANDLE) {

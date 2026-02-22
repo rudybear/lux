@@ -36,6 +36,10 @@ public:
     bool hasGltfScene() const { return m_hasGltfScene; }
     const std::string& getSceneSource() const { return m_sceneSource; }
 
+    // Per-material draw ranges and textures for multi-material rendering
+    const std::vector<DrawRange>& getDrawRanges() const { return m_drawRanges; }
+    const std::vector<std::unordered_map<std::string, GPUTexture>>& getPerMaterialTextures() const { return m_perMaterialTextures; }
+
     // IBL texture access for descriptor binding
     std::unordered_map<std::string, GPUTexture>& getIBLTextures() { return m_iblTextures; }
     std::unordered_map<std::string, GPUTexture>& getNamedTextures() { return m_namedTextures; }
@@ -67,6 +71,12 @@ private:
     GPUTexture m_defaultWhiteTexture = {};
     GPUTexture m_defaultBlackTexture = {};
     GPUTexture m_defaultNormalTexture = {};
+
+    // Per-material draw ranges for multi-draw
+    std::vector<DrawRange> m_drawRanges;
+
+    // Per-material textures (one map per material index)
+    std::vector<std::unordered_map<std::string, GPUTexture>> m_perMaterialTextures;
 
     // Auto-camera
     bool m_hasSceneBounds = false;

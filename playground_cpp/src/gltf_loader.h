@@ -40,6 +40,12 @@ struct GltfTextureData {
     bool valid() const { return !pixels.empty() && width > 0 && height > 0; }
 };
 
+struct UVTransform {
+    glm::vec2 offset{0.0f};
+    glm::vec2 scale{1.0f};
+    float rotation = 0.0f;
+};
+
 struct GltfMaterial {
     std::string name;
     glm::vec4 baseColor{1.0f, 1.0f, 1.0f, 1.0f};
@@ -76,6 +82,11 @@ struct GltfMaterial {
     GltfTextureData metallic_roughness_tex;
     GltfTextureData occlusion_tex;
     GltfTextureData emissive_tex;
+
+    // KHR_texture_transform
+    UVTransform base_color_uv_xform;
+    UVTransform normal_uv_xform;
+    UVTransform metallic_roughness_uv_xform;
 };
 
 struct GltfNode {
@@ -124,6 +135,12 @@ struct GltfScene {
 struct DrawItem {
     glm::mat4 worldTransform;
     int meshIndex;
+    int materialIndex;
+};
+
+struct DrawRange {
+    uint32_t indexOffset;
+    uint32_t indexCount;
     int materialIndex;
 };
 

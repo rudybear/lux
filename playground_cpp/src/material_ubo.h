@@ -23,5 +23,13 @@ struct MaterialUBOData {
     float _pad_before_sheen = 0.0f;                         // offset 60, size  4 (pad to align vec3 to 16)
     glm::vec3 sheenColorFactor{0.0f};                       // offset 64, size 12
     float _pad0 = 0.0f;                                     // offset 76, size  4
+    // KHR_texture_transform (offset 80 -> 144)
+    glm::vec4 baseColorUvSt{0.0f, 0.0f, 1.0f, 1.0f};      // offset 80: offset.xy, scale.xy
+    glm::vec4 normalUvSt{0.0f, 0.0f, 1.0f, 1.0f};          // offset 96
+    glm::vec4 mrUvSt{0.0f, 0.0f, 1.0f, 1.0f};              // offset 112
+    float baseColorUvRot = 0.0f;                              // offset 128
+    float normalUvRot = 0.0f;                                 // offset 132
+    float mrUvRot = 0.0f;                                     // offset 136
+    float _pad1 = 0.0f;                                       // offset 140
 };
-static_assert(sizeof(MaterialUBOData) == 80, "MaterialUBOData must be 80 bytes (std140)");
+static_assert(sizeof(MaterialUBOData) == 144, "MaterialUBOData must be 144 bytes (std140)");

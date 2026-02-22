@@ -530,7 +530,7 @@ def _pack_properties_ubo(mat: MaterialData, ubo_reflection: dict) -> bytes:
 def _pack_material_ubo(mat: MaterialData) -> bytes:
     """Pack material properties into std140 UBO matching properties Material block.
 
-    Fixed layout (80 bytes total):
+    Fixed layout (144 bytes total):
         offset  0: base_color_factor  vec4  (16 bytes)
         offset 16: emissive_factor    vec3  (12 bytes)
         offset 28: metallic_factor    scalar (4 bytes)
@@ -544,8 +544,15 @@ def _pack_material_ubo(mat: MaterialData) -> bytes:
         offset 60: _pad                       (4 bytes, vec3 alignment)
         offset 64: sheen_color_factor  vec3  (12 bytes)
         offset 76: _pad                       (4 bytes)
+        offset 80: baseColorUvSt      vec4  (offset.xy, scale.xy)
+        offset 96: normalUvSt         vec4  (offset.xy, scale.xy)
+        offset112: mrUvSt             vec4  (offset.xy, scale.xy)
+        offset128: baseColorUvRot     scalar (4 bytes)
+        offset132: normalUvRot        scalar (4 bytes)
+        offset136: mrUvRot            scalar (4 bytes)
+        offset140: _pad               (4 bytes)
     """
-    buf = bytearray(80)
+    buf = bytearray(144)
     bc = mat.base_color
     struct.pack_into("4f", buf, 0, bc[0], bc[1], bc[2], bc[3] if len(bc) > 3 else 1.0)
     em = mat.emissive
@@ -561,6 +568,11 @@ def _pack_material_ubo(mat: MaterialData) -> bytes:
     # pad at offset 60
     sc = mat.sheen_color_factor
     struct.pack_into("3f", buf, 64, sc[0], sc[1], sc[2] if len(sc) > 2 else 0.0)
+    # KHR_texture_transform: identity UV transforms (offset 0, scale 1, rotation 0)
+    struct.pack_into("4f", buf, 80, 0.0, 0.0, 1.0, 1.0)   # baseColorUvSt
+    struct.pack_into("4f", buf, 96, 0.0, 0.0, 1.0, 1.0)   # normalUvSt
+    struct.pack_into("4f", buf, 112, 0.0, 0.0, 1.0, 1.0)  # mrUvSt
+    # rotations default to 0.0 (already zero-initialized)
     return bytes(buf)
 
 

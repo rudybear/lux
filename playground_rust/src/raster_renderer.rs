@@ -36,6 +36,14 @@ struct MaterialUboData {
     _pad_before_sheen: f32,              // offset 60, size  4 (padding for vec3 alignment)
     sheen_color_factor: [f32; 3],         // offset 64, size 12
     _pad0: f32,                           // offset 76, size  4
+    // KHR_texture_transform (offset 80 -> 144)
+    base_color_uv_st: [f32; 4],          // offset 80: [offset.x, offset.y, scale.x, scale.y]
+    normal_uv_st: [f32; 4],              // offset 96
+    mr_uv_st: [f32; 4],                  // offset 112
+    base_color_uv_rot: f32,              // offset 128
+    normal_uv_rot: f32,                  // offset 132
+    mr_uv_rot: f32,                      // offset 136
+    _pad1: f32,                          // offset 140
 }
 unsafe impl bytemuck::Pod for MaterialUboData {}
 unsafe impl bytemuck::Zeroable for MaterialUboData {}
@@ -56,6 +64,13 @@ impl MaterialUboData {
             _pad_before_sheen: 0.0,
             sheen_color_factor: [0.0, 0.0, 0.0],
             _pad0: 0.0,
+            base_color_uv_st: [0.0, 0.0, 1.0, 1.0],
+            normal_uv_st: [0.0, 0.0, 1.0, 1.0],
+            mr_uv_st: [0.0, 0.0, 1.0, 1.0],
+            base_color_uv_rot: 0.0,
+            normal_uv_rot: 0.0,
+            mr_uv_rot: 0.0,
+            _pad1: 0.0,
         }
     }
 
@@ -74,6 +89,22 @@ impl MaterialUboData {
             transmission_factor: mat.transmission_factor,
             _pad_before_sheen: 0.0,
             _pad0: 0.0,
+            base_color_uv_st: [
+                mat.base_color_uv_xform.offset[0], mat.base_color_uv_xform.offset[1],
+                mat.base_color_uv_xform.scale[0], mat.base_color_uv_xform.scale[1],
+            ],
+            normal_uv_st: [
+                mat.normal_uv_xform.offset[0], mat.normal_uv_xform.offset[1],
+                mat.normal_uv_xform.scale[0], mat.normal_uv_xform.scale[1],
+            ],
+            mr_uv_st: [
+                mat.metallic_roughness_uv_xform.offset[0], mat.metallic_roughness_uv_xform.offset[1],
+                mat.metallic_roughness_uv_xform.scale[0], mat.metallic_roughness_uv_xform.scale[1],
+            ],
+            base_color_uv_rot: mat.base_color_uv_xform.rotation,
+            normal_uv_rot: mat.normal_uv_xform.rotation,
+            mr_uv_rot: mat.metallic_roughness_uv_xform.rotation,
+            _pad1: 0.0,
         }
     }
 }
@@ -889,13 +920,45 @@ fn render_pbr_scene(
         reflected_pipeline::create_descriptor_set_layouts_from_merged(device, &merged)?
     };
 
-    // Compute pool sizes
-    let (pool_sizes, max_sets) = reflected_pipeline::compute_pool_sizes(&merged);
+    // Load glTF scene early so we know how many materials we need
+    let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
+    let mut gltf_scene = if is_gltf {
+        Some(crate::gltf_loader::load_gltf(Path::new(scene_source))?)
+    } else {
+        None
+    };
+
+    // Identify vertex vs fragment set indices
+    let mut frag_set_idx: Option<u32> = None;
+    let mut vert_set_idx: Option<u32> = None;
+    for (&set_idx, bindings) in &merged {
+        for binding in bindings {
+            if binding.name == "Material" { frag_set_idx = Some(set_idx); }
+            if binding.name == "MVP" { vert_set_idx = Some(set_idx); }
+        }
+    }
+    let frag_set_idx = frag_set_idx.unwrap_or(1);
+    let vert_set_idx = vert_set_idx.unwrap_or(0);
+
+    let num_materials = gltf_scene.as_ref().map(|s| s.materials.len().max(1)).unwrap_or(1);
+
+    // Compute pool sizes with fragment bindings multiplied by num_materials
+    let (mut pool_sizes, _) = reflected_pipeline::compute_pool_sizes(&merged);
+    for ps in &mut pool_sizes {
+        let frag_count: u32 = merged.get(&frag_set_idx).map(|bindings| {
+            bindings.iter().filter(|b| {
+                reflected_pipeline::binding_type_to_vk_public(&b.binding_type) == ps.ty
+            }).count() as u32
+        }).unwrap_or(0);
+        if frag_count > 0 {
+            ps.descriptor_count += frag_count * (num_materials as u32 - 1);
+        }
+    }
+    let max_sets = 1 + num_materials as u32; // 1 vertex set + N fragment sets
 
     info!(
-        "Reflection-driven descriptors: {} sets, {} pool size entries",
-        max_sets,
-        pool_sizes.len()
+        "Reflection-driven descriptors: {} sets ({} materials), {} pool size entries",
+        max_sets, num_materials, pool_sizes.len()
     );
 
     // Create descriptor pool
@@ -909,35 +972,28 @@ fn render_pbr_scene(
             .map_err(|e| format!("Failed to create descriptor pool: {:?}", e))?
     };
 
-    // Allocate descriptor sets (ordered by set index)
-    let max_set_idx = ds_layouts.keys().copied().max().unwrap_or(0);
-    let mut ordered_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
-    for i in 0..=max_set_idx {
-        if let Some(&layout) = ds_layouts.get(&i) {
-            ordered_layouts.push(layout);
-        }
-    }
-
-    let alloc_info = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(descriptor_pool)
-        .set_layouts(&ordered_layouts);
-
-    let descriptor_sets = unsafe {
-        device
-            .allocate_descriptor_sets(&alloc_info)
-            .map_err(|e| format!("Failed to allocate descriptor sets: {:?}", e))?
+    // Allocate vertex set (1 copy)
+    let vert_ds = if let Some(&layout) = ds_layouts.get(&vert_set_idx) {
+        let info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(std::slice::from_ref(&layout));
+        unsafe { device.allocate_descriptor_sets(&info).map_err(|e| format!("Failed: {:?}", e))?[0] }
+    } else {
+        vk::DescriptorSet::null()
     };
 
-    // Build a map: set_index -> vk::DescriptorSet
-    let mut ds_map: HashMap<u32, vk::DescriptorSet> = HashMap::new();
-    {
-        let mut ds_idx = 0;
-        for i in 0..=max_set_idx {
-            if ds_layouts.contains_key(&i) {
-                ds_map.insert(i, descriptor_sets[ds_idx]);
-                ds_idx += 1;
-            }
-        }
+    // Allocate N fragment sets
+    let mut per_material_desc_sets: Vec<vk::DescriptorSet> = Vec::new();
+    let mut per_material_buffers: Vec<GpuBuffer> = Vec::new();
+
+    if let Some(&frag_layout) = ds_layouts.get(&frag_set_idx) {
+        let layouts_vec: Vec<vk::DescriptorSetLayout> = vec![frag_layout; num_materials];
+        let info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&layouts_vec);
+        per_material_desc_sets = unsafe {
+            device.allocate_descriptor_sets(&info).map_err(|e| format!("Failed: {:?}", e))?
+        };
     }
 
     // Build push constant ranges from reflection data
@@ -1010,14 +1066,6 @@ fn render_pbr_scene(
     // =====================================================================
     // Phase 1: Load scene geometry
     // =====================================================================
-    let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
-
-    // Load glTF scene (if applicable) before we start using textures
-    let mut gltf_scene = if is_gltf {
-        Some(crate::gltf_loader::load_gltf(Path::new(scene_source))?)
-    } else {
-        None
-    };
 
     // Determine if we need 48-byte vertices (with tangent) based on reflection stride
     let pipeline_vertex_stride = vert_refl.vertex_stride;
@@ -1029,7 +1077,7 @@ fn render_pbr_scene(
     let mut auto_far = 100.0f32;
     let mut has_scene_bounds = false;
 
-    let (vertex_data_owned, pbr_indices) = if let Some(ref mut gltf_s) = gltf_scene {
+    let (vertex_data_owned, pbr_indices, draw_ranges) = if let Some(ref mut gltf_s) = gltf_scene {
         if gltf_s.meshes.is_empty() {
             return Err(format!("No meshes found in glTF file: {}", scene_source));
         }
@@ -1043,10 +1091,9 @@ fn render_pbr_scene(
         let mut vdata: Vec<f32> = Vec::new();
         let mut all_indices: Vec<u32> = Vec::new();
         let mut vertex_offset: u32 = 0;
-        let mut bbox_min = glam::Vec3::splat(f32::MAX);
-        let mut bbox_max = glam::Vec3::splat(f32::MIN);
-        let mut positive_normals: i32 = 0;
-        let mut negative_normals: i32 = 0;
+        let mut vertex_positions: Vec<[f32; 3]> = Vec::new();
+        let mut draw_ranges: Vec<crate::gltf_loader::DrawRange> = Vec::new();
+        let mut index_offset: u32 = 0;
 
         for item in &draw_items {
             let gmesh = &gltf_s.meshes[item.mesh_index];
@@ -1057,9 +1104,7 @@ fn render_pbr_scene(
             for gv in &gmesh.vertices {
                 let pos = world.transform_point3(glam::Vec3::from(gv.position));
                 let norm = (normal_mat * glam::Vec3::from(gv.normal)).normalize();
-
-                bbox_min = bbox_min.min(pos);
-                bbox_max = bbox_max.max(pos);
+                vertex_positions.push([pos.x, pos.y, pos.z]);
 
                 vdata.push(pos.x); vdata.push(pos.y); vdata.push(pos.z);
                 vdata.push(norm.x); vdata.push(norm.y); vdata.push(norm.z);
@@ -1081,69 +1126,30 @@ fn render_pbr_scene(
                 all_indices.push(idx + vertex_offset);
             }
             vertex_offset += gmesh.vertices.len() as u32;
+
+            draw_ranges.push(crate::gltf_loader::DrawRange {
+                index_offset,
+                index_count: gmesh.indices.len() as u32,
+                material_index: item.material_index,
+            });
+            index_offset += gmesh.indices.len() as u32;
         }
 
-        // Compute auto-camera from scene bounds
+        // Compute auto-camera using shared function (matches all engines)
         has_scene_bounds = true;
         {
-            let center = (bbox_min + bbox_max) * 0.5;
-            let extent = bbox_max - bbox_min;
-            let max_extent = extent.x.max(extent.y).max(extent.z);
-
-            // Find thinnest axis
-            let mut thin_axis = 0usize;
-            let ext = [extent.x, extent.y, extent.z];
-            if ext[1] < ext[thin_axis] { thin_axis = 1; }
-            if ext[2] < ext[thin_axis] { thin_axis = 2; }
-
-            // Count normals to determine front direction
-            // Floats per vertex depends on stride: 12 (48B) or 8 (32B)
-            let floats_per_vert = (pipeline_vertex_stride / 4) as usize;
-            let num_verts = vdata.len() / floats_per_vert;
-            for i in 0..num_verts {
-                let n_comp = vdata[i * floats_per_vert + 3 + thin_axis];
-                if n_comp > 0.0 { positive_normals += 1; }
-                else if n_comp < 0.0 { negative_normals += 1; }
-            }
-            // Camera goes OPPOSITE to where normals face (glTF convention:
-            // model front faces -Z, camera at +Z looking along -Z).
-            let view_sign: f32 = if negative_normals > positive_normals { 1.0 } else { -1.0 };
-
-            let mut view_dir = glam::Vec3::ZERO;
-            match thin_axis {
-                0 => view_dir.x = view_sign,
-                1 => view_dir.y = view_sign,
-                _ => view_dir.z = view_sign,
-            }
-            let fov_y = 45.0f32.to_radians();
-            let distance = max_extent * 1.2 / (2.0 * (fov_y / 2.0).tan());
-            let mut eye = center + view_dir * distance;
-
-            // Add slight elevation (15 degrees)
-            let up_axis: usize = if thin_axis == 1 { 0 } else { 1 };
-            let elev = 5.0f32.to_radians().sin() * distance;
-            match up_axis {
-                0 => eye.x += elev,
-                1 => eye.y += elev,
-                _ => eye.z += elev,
-            }
-            let mut up = glam::Vec3::ZERO;
-            match up_axis {
-                0 => up.x = 1.0,
-                1 => up.y = 1.0,
-                _ => up.z = 1.0,
-            }
-
+            let (eye, target, up, far) = scene_manager::compute_auto_camera_from_draw_items(
+                &vertex_positions,
+                &draw_items,
+            );
             auto_eye = eye;
-            auto_target = center;
+            auto_target = target;
             auto_up = up;
-            auto_far = (distance * 3.0f32).max(100.0);
-            println!("[info] Auto-camera: eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
-                     eye.x, eye.y, eye.z, center.x, center.y, center.z);
+            auto_far = far;
         }
 
         let data: Vec<u8> = bytemuck::cast_slice(&vdata).to_vec();
-        (data, all_indices)
+        (data, all_indices, draw_ranges)
     } else {
         let (sphere_verts, sphere_indices) = scene::generate_sphere(32, 32);
 
@@ -1155,10 +1161,10 @@ fn render_pbr_scene(
                 padded_data.extend_from_slice(bytemuck::cast_slice(&[*v]));
                 padded_data.extend_from_slice(bytemuck::cast_slice(&default_tangent));
             }
-            (padded_data, sphere_indices)
+            (padded_data, sphere_indices, Vec::new())
         } else {
             let data: Vec<u8> = bytemuck::cast_slice(&sphere_verts).to_vec();
-            (data, sphere_indices)
+            (data, sphere_indices, Vec::new())
         }
     };
 
@@ -1260,11 +1266,6 @@ fn render_pbr_scene(
             .map_err(|e| format!("Failed to create sampler: {:?}", e))?
     };
 
-    // Get glTF material (if any) for texture extraction
-    let gltf_material = gltf_scene.as_ref().and_then(|s| {
-        if !s.materials.is_empty() { Some(&s.materials[0]) } else { None }
-    });
-
     // Create default textures for missing texture slots
     let mut default_texture = create_default_white_texture(ctx)?;
     // Black texture for emissive (no emission)
@@ -1274,56 +1275,54 @@ fn render_pbr_scene(
     let normal_pixel = vec![128u8, 128, 255, 255];
     let mut default_normal_texture = create_texture_image(ctx, 1, 1, &normal_pixel, "default_normal")?;
 
-    // Create textures from glTF images. We track them by name for binding.
-    // Name -> GpuImage mapping
-    let mut texture_images: HashMap<String, GpuImage> = HashMap::new();
+    // Build per-material texture maps
+    let mut per_material_textures: Vec<HashMap<String, GpuImage>> = Vec::new();
 
-    // Helper: try to get a glTF texture image by name, or use default
-    let texture_names = [
-        "base_color_tex",
-        "normal_tex",
-        "metallic_roughness_tex",
-        "occlusion_tex",
-        "emissive_tex",
-        "albedo_tex",
-    ];
+    if let Some(ref gs) = gltf_scene {
+        for (mat_idx, mat) in gs.materials.iter().enumerate() {
+            let mut tex_map: HashMap<String, GpuImage> = HashMap::new();
 
-    for tex_name in &texture_names {
-        let tex_image_opt = match *tex_name {
-            "base_color_tex" | "albedo_tex" => {
-                gltf_material.and_then(|m| m.base_color_image.as_ref())
+            let tex_slots: Vec<(&str, Option<&crate::gltf_loader::TextureImage>)> = vec![
+                ("base_color_tex", mat.base_color_image.as_ref()),
+                ("normal_tex", mat.normal_image.as_ref()),
+                ("metallic_roughness_tex", mat.metallic_roughness_image.as_ref()),
+                ("occlusion_tex", mat.occlusion_image.as_ref()),
+                ("emissive_tex", mat.emissive_image.as_ref()),
+                ("clearcoat_tex", mat.clearcoat_image.as_ref()),
+                ("clearcoat_roughness_tex", mat.clearcoat_roughness_image.as_ref()),
+                ("sheen_color_tex", mat.sheen_color_image.as_ref()),
+                ("transmission_tex", mat.transmission_image.as_ref()),
+            ];
+
+            for (name, img_opt) in tex_slots {
+                if let Some(tex_data) = img_opt {
+                    let label = format!("{}[{}]", name, mat_idx);
+                    info!("Uploading texture '{}': {}x{}", label, tex_data.width, tex_data.height);
+                    let gpu_img = create_texture_image(ctx, tex_data.width, tex_data.height, &tex_data.pixels, &label)?;
+                    tex_map.insert(name.to_string(), gpu_img);
+                }
             }
-            "normal_tex" => gltf_material.and_then(|m| m.normal_image.as_ref()),
-            "metallic_roughness_tex" => gltf_material.and_then(|m| m.metallic_roughness_image.as_ref()),
-            "occlusion_tex" => gltf_material.and_then(|m| m.occlusion_image.as_ref()),
-            "emissive_tex" => gltf_material.and_then(|m| m.emissive_image.as_ref()),
-            _ => None,
-        };
 
-        if let Some(tex_data) = tex_image_opt {
-            info!(
-                "Uploading texture '{}': {}x{}",
-                tex_name, tex_data.width, tex_data.height
-            );
-            let gpu_img = create_texture_image(
-                ctx,
-                tex_data.width,
-                tex_data.height,
-                &tex_data.pixels,
-                tex_name,
-            )?;
-            texture_images.insert(tex_name.to_string(), gpu_img);
+            // Also map albedo_tex to base_color_image for backward compat
+            if mat.base_color_image.is_some() && !tex_map.contains_key("albedo_tex") {
+                if let Some(tex_data) = mat.base_color_image.as_ref() {
+                    let gpu_img = create_texture_image(ctx, tex_data.width, tex_data.height, &tex_data.pixels, &format!("albedo_tex[{}]", mat_idx))?;
+                    tex_map.insert("albedo_tex".to_string(), gpu_img);
+                }
+            }
+
+            per_material_textures.push(tex_map);
         }
-        // If no glTF image, we will use the default texture
     }
 
-    // For non-glTF scenes, generate a procedural texture and use it for albedo_tex / base_color_tex
-    if gltf_material.is_none() {
+    // Backward compat: also build texture_images for non-glTF or fallback
+    let mut texture_images: HashMap<String, GpuImage> = HashMap::new();
+    // Keep texture_images for non-glTF or fallback
+    if gltf_scene.is_none() {
         info!("Generating procedural texture for non-glTF scene...");
         let tex_pixels = scene::generate_procedural_texture(512);
         let proc_texture = create_texture_image(ctx, 512, 512, &tex_pixels, "procedural_albedo")?;
         texture_images.insert("albedo_tex".to_string(), proc_texture);
-        // Also map base_color_tex to the same procedural texture
         let proc_texture2 = create_texture_image(ctx, 512, 512, &tex_pixels, "procedural_base_color")?;
         texture_images.insert("base_color_tex".to_string(), proc_texture2);
     }
@@ -1335,187 +1334,142 @@ fn render_pbr_scene(
     // Phase 3: Write descriptor sets from reflection data
     // =====================================================================
 
-    // We need to keep descriptor write infos alive during update_descriptor_sets
-    // Use a Vec to hold them
-    let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
-    let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
-    let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+    // Write vertex set (set 0): MVP + Light only
+    {
+        let mut buf_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
 
-    // Pre-allocate buffer and image infos so pointers remain stable
-    // Count total bindings first
-    let total_bindings: usize = merged.values().map(|v| v.len()).sum();
-    buffer_infos.reserve(total_bindings);
-    image_infos.reserve(total_bindings);
-
-    for (&set_idx, bindings) in &merged {
-        let ds = match ds_map.get(&set_idx) {
-            Some(&ds) => ds,
-            None => continue,
-        };
-
-        for binding in bindings {
-            let vk_type = reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
-
-            match vk_type {
-                vk::DescriptorType::UNIFORM_BUFFER => {
-                    // Match by name
+        if let Some(bindings) = merged.get(&vert_set_idx) {
+            for binding in bindings {
+                let vk_type = reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
+                if vk_type == vk::DescriptorType::UNIFORM_BUFFER {
                     let (buffer, range) = match binding.name.as_str() {
                         "MVP" => (mvp_buffer.buffer, binding.size as u64),
                         "Light" => (light_buffer.buffer, binding.size as u64),
-                        "Material" => (material_buffer.buffer, std::mem::size_of::<MaterialUboData>() as u64),
-                        _ => {
-                            info!(
-                                "Unknown UBO name '{}' at set={} binding={}, skipping",
-                                binding.name, set_idx, binding.binding
-                            );
-                            continue;
-                        }
+                        _ => continue,
                     };
-
-                    let buf_info_idx = buffer_infos.len();
-                    buffer_infos.push(
-                        vk::DescriptorBufferInfo::default()
-                            .buffer(buffer)
-                            .offset(0)
-                            .range(range),
-                    );
-
+                    let idx = buf_infos.len();
+                    buf_infos.push(vk::DescriptorBufferInfo::default().buffer(buffer).offset(0).range(range));
                     writes.push(
                         vk::WriteDescriptorSet::default()
-                            .dst_set(ds)
+                            .dst_set(vert_ds)
                             .dst_binding(binding.binding)
                             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                            .buffer_info(unsafe {
-                                std::slice::from_raw_parts(
-                                    &buffer_infos[buf_info_idx] as *const _,
-                                    1,
-                                )
-                            }),
-                    );
-                }
-                vk::DescriptorType::SAMPLER => {
-                    // Use IBL-specific sampler if the binding name matches an IBL texture,
-                    // otherwise use the default sampler.
-                    let actual_sampler = ibl_assets
-                        .sampler_for_binding(&binding.name)
-                        .unwrap_or(sampler);
-
-                    let img_info_idx = image_infos.len();
-                    image_infos.push(
-                        vk::DescriptorImageInfo::default().sampler(actual_sampler),
-                    );
-
-                    writes.push(
-                        vk::WriteDescriptorSet::default()
-                            .dst_set(ds)
-                            .dst_binding(binding.binding)
-                            .descriptor_type(vk::DescriptorType::SAMPLER)
-                            .image_info(unsafe {
-                                std::slice::from_raw_parts(
-                                    &image_infos[img_info_idx] as *const _,
-                                    1,
-                                )
-                            }),
-                    );
-                }
-                vk::DescriptorType::SAMPLED_IMAGE => {
-                    let is_cube = reflected_pipeline::is_cube_image_binding(&binding.binding_type);
-
-                    if is_cube {
-                        // Cubemap binding: use IBL textures or fall back to default
-                        let view = ibl_assets
-                            .view_for_binding(&binding.name)
-                            .unwrap_or(default_texture.view);
-
-                        let img_info_idx = image_infos.len();
-                        image_infos.push(
-                            vk::DescriptorImageInfo::default()
-                                .image_view(view)
-                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                        );
-
-                        writes.push(
-                            vk::WriteDescriptorSet::default()
-                                .dst_set(ds)
-                                .dst_binding(binding.binding)
-                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                                .image_info(unsafe {
-                                    std::slice::from_raw_parts(
-                                        &image_infos[img_info_idx] as *const _,
-                                        1,
-                                    )
-                                }),
-                        );
-                    } else if binding.name == "brdf_lut" {
-                        // BRDF LUT is a 2D image, not a cubemap
-                        let view = ibl_assets
-                            .view_for_binding(&binding.name)
-                            .unwrap_or(default_texture.view);
-
-                        let img_info_idx = image_infos.len();
-                        image_infos.push(
-                            vk::DescriptorImageInfo::default()
-                                .image_view(view)
-                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                        );
-
-                        writes.push(
-                            vk::WriteDescriptorSet::default()
-                                .dst_set(ds)
-                                .dst_binding(binding.binding)
-                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                                .image_info(unsafe {
-                                    std::slice::from_raw_parts(
-                                        &image_infos[img_info_idx] as *const _,
-                                        1,
-                                    )
-                                }),
-                        );
-                    } else {
-                        // Regular 2D texture: look up by name, fall back to correct default
-                        let fallback_view = match binding.name.as_str() {
-                            "emissive_tex" => default_black_texture.view,
-                            "normal_tex" => default_normal_texture.view,
-                            _ => default_texture.view,
-                        };
-                        let view = texture_images
-                            .get(&binding.name)
-                            .map(|img| img.view)
-                            .unwrap_or(fallback_view);
-
-                        let img_info_idx = image_infos.len();
-                        image_infos.push(
-                            vk::DescriptorImageInfo::default()
-                                .image_view(view)
-                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                        );
-
-                        writes.push(
-                            vk::WriteDescriptorSet::default()
-                                .dst_set(ds)
-                                .dst_binding(binding.binding)
-                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                                .image_info(unsafe {
-                                    std::slice::from_raw_parts(
-                                        &image_infos[img_info_idx] as *const _,
-                                        1,
-                                    )
-                                }),
-                        );
-                    }
-                }
-                _ => {
-                    info!(
-                        "Unhandled descriptor type {:?} at set={} binding={} name='{}'",
-                        vk_type, set_idx, binding.binding, binding.name
+                            .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
                     );
                 }
             }
         }
+        if !writes.is_empty() {
+            unsafe { device.update_descriptor_sets(&writes, &[]); }
+        }
     }
 
-    unsafe {
-        device.update_descriptor_sets(&writes, &[]);
+    // Create per-material UBO buffers and write per-material fragment sets
+    for mi in 0..num_materials {
+        let mat_data = if let Some(ref gs) = gltf_scene {
+            if mi < gs.materials.len() {
+                MaterialUboData::from_gltf_material(&gs.materials[mi])
+            } else {
+                MaterialUboData::default_values()
+            }
+        } else {
+            MaterialUboData::default_values()
+        };
+
+        let mat_buf = create_buffer_with_data(
+            device, ctx.allocator_mut(),
+            bytemuck::bytes_of(&mat_data),
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            &format!("pbr_material_{}", mi),
+        )?;
+        per_material_buffers.push(mat_buf);
+    }
+
+    // Write each per-material descriptor set
+    for mi in 0..num_materials {
+        let ds = per_material_desc_sets[mi];
+        let mut buf_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+        let mut img_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
+        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+
+        if let Some(bindings) = merged.get(&frag_set_idx) {
+            for binding in bindings {
+                let vk_type = reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
+                match vk_type {
+                    vk::DescriptorType::UNIFORM_BUFFER => {
+                        let (buffer, range) = if binding.name == "Material" {
+                            (per_material_buffers[mi].buffer, std::mem::size_of::<MaterialUboData>() as u64)
+                        } else if binding.name == "Light" {
+                            (light_buffer.buffer, binding.size as u64)
+                        } else {
+                            continue;
+                        };
+                        let idx = buf_infos.len();
+                        buf_infos.push(
+                            vk::DescriptorBufferInfo::default()
+                                .buffer(buffer)
+                                .offset(0)
+                                .range(range),
+                        );
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds).dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                        );
+                    }
+                    vk::DescriptorType::SAMPLER => {
+                        let actual_sampler = ibl_assets.sampler_for_binding(&binding.name).unwrap_or(sampler);
+                        let idx = img_infos.len();
+                        img_infos.push(vk::DescriptorImageInfo::default().sampler(actual_sampler));
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds).dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::SAMPLER)
+                                .image_info(unsafe { std::slice::from_raw_parts(&img_infos[idx] as *const _, 1) }),
+                        );
+                    }
+                    vk::DescriptorType::SAMPLED_IMAGE => {
+                        let is_cube = reflected_pipeline::is_cube_image_binding(&binding.binding_type);
+                        let view = if is_cube || binding.name == "brdf_lut" {
+                            ibl_assets.view_for_binding(&binding.name).unwrap_or(default_texture.view)
+                        } else {
+                            // Per-material texture lookup
+                            let per_mat_view = if mi < per_material_textures.len() {
+                                per_material_textures[mi].get(&binding.name).map(|img| img.view)
+                            } else {
+                                None
+                            };
+                            per_mat_view.unwrap_or_else(|| {
+                                let fallback = match binding.name.as_str() {
+                                    "emissive_tex" => default_black_texture.view,
+                                    "normal_tex" => default_normal_texture.view,
+                                    _ => default_texture.view,
+                                };
+                                texture_images.get(&binding.name).map(|img| img.view).unwrap_or(fallback)
+                            })
+                        };
+                        let idx = img_infos.len();
+                        img_infos.push(
+                            vk::DescriptorImageInfo::default()
+                                .image_view(view)
+                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                        );
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds).dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                .image_info(unsafe { std::slice::from_raw_parts(&img_infos[idx] as *const _, 1) }),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !writes.is_empty() {
+            unsafe { device.update_descriptor_sets(&writes, &[]); }
+        }
     }
 
     // =====================================================================
@@ -1709,14 +1663,7 @@ fn render_pbr_scene(
     unsafe {
         device.cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-        device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::GRAPHICS,
-            pipeline_layout,
-            0,
-            &descriptor_sets,
-            &[],
-        );
+
         if !push_constant_data.is_empty() {
             device.cmd_push_constants(
                 cmd,
@@ -1726,9 +1673,31 @@ fn render_pbr_scene(
                 &push_constant_data,
             );
         }
+
+        // Bind vertex set (shared)
+        device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, vert_set_idx, std::slice::from_ref(&vert_ds), &[]);
+
         device.cmd_bind_vertex_buffers(cmd, 0, &[vbo.buffer], &[0]);
         device.cmd_bind_index_buffer(cmd, ibo.buffer, 0, vk::IndexType::UINT32);
-        device.cmd_draw_indexed(cmd, num_indices, 1, 0, 0, 0);
+
+        if !draw_ranges.is_empty() && !per_material_desc_sets.is_empty() {
+            let mut current_mat: i32 = -1;
+            for range in &draw_ranges {
+                if range.material_index as i32 != current_mat {
+                    current_mat = range.material_index as i32;
+                    let mat_idx = (current_mat as usize).min(per_material_desc_sets.len() - 1);
+                    device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, frag_set_idx, std::slice::from_ref(&per_material_desc_sets[mat_idx]), &[]);
+                }
+                device.cmd_draw_indexed(cmd, range.index_count, 1, range.index_offset, 0, 0);
+            }
+        } else {
+            // Fallback: single draw
+            if !per_material_desc_sets.is_empty() {
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, frag_set_idx, std::slice::from_ref(&per_material_desc_sets[0]), &[]);
+            }
+            device.cmd_draw_indexed(cmd, num_indices, 1, 0, 0, 0);
+        }
+
         device.cmd_end_render_pass(cmd);
     }
 
@@ -1775,6 +1744,14 @@ fn render_pbr_scene(
     mvp_buffer.destroy(device, ctx.allocator_mut());
     light_buffer.destroy(device, ctx.allocator_mut());
     material_buffer.destroy(device, ctx.allocator_mut());
+    for mut buf in per_material_buffers {
+        buf.destroy(device, ctx.allocator_mut());
+    }
+    for (_, tex_map) in per_material_textures.into_iter().enumerate() {
+        for (_, mut tex) in tex_map {
+            tex.destroy(device, ctx.allocator_mut());
+        }
+    }
     vbo.destroy(device, ctx.allocator_mut());
     ibo.destroy(device, ctx.allocator_mut());
 
@@ -1813,6 +1790,15 @@ pub struct PersistentRenderer {
     vbo: GpuBuffer,
     ibo: GpuBuffer,
     num_indices: u32,
+
+    // Multi-material draw
+    draw_ranges: Vec<crate::gltf_loader::DrawRange>,
+    per_material_desc_sets: Vec<vk::DescriptorSet>,
+    per_material_buffers: Vec<GpuBuffer>,
+    per_material_textures: Vec<HashMap<String, GpuImage>>,
+    vert_set_idx: u32,
+    frag_set_idx: u32,
+    vert_ds: vk::DescriptorSet,
 
     // Uniforms
     mvp_buffer: GpuBuffer,
@@ -1871,7 +1857,41 @@ impl PersistentRenderer {
             crate::reflected_pipeline::create_descriptor_set_layouts_from_merged(&device, &merged)?
         };
 
-        let (pool_sizes, max_sets) = crate::reflected_pipeline::compute_pool_sizes(&merged);
+        // Load glTF scene early so we know how many materials we need
+        let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
+        let mut gltf_scene = if is_gltf {
+            Some(crate::gltf_loader::load_gltf(std::path::Path::new(scene_source))?)
+        } else {
+            None
+        };
+
+        // Identify vertex vs fragment set indices
+        let mut frag_set_idx_opt: Option<u32> = None;
+        let mut vert_set_idx_opt: Option<u32> = None;
+        for (&set_idx, bindings) in &merged {
+            for binding in bindings {
+                if binding.name == "Material" { frag_set_idx_opt = Some(set_idx); }
+                if binding.name == "MVP" { vert_set_idx_opt = Some(set_idx); }
+            }
+        }
+        let frag_set_idx = frag_set_idx_opt.unwrap_or(1);
+        let vert_set_idx = vert_set_idx_opt.unwrap_or(0);
+
+        let num_materials = gltf_scene.as_ref().map(|s| s.materials.len().max(1)).unwrap_or(1);
+
+        // Compute pool sizes with fragment bindings multiplied by num_materials
+        let (mut pool_sizes, _) = crate::reflected_pipeline::compute_pool_sizes(&merged);
+        for ps in &mut pool_sizes {
+            let frag_count: u32 = merged.get(&frag_set_idx).map(|bindings| {
+                bindings.iter().filter(|b| {
+                    crate::reflected_pipeline::binding_type_to_vk_public(&b.binding_type) == ps.ty
+                }).count() as u32
+            }).unwrap_or(0);
+            if frag_count > 0 {
+                ps.descriptor_count += frag_count * (num_materials as u32 - 1);
+            }
+        }
+        let max_sets = 1 + num_materials as u32;
 
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(max_sets)
@@ -1883,33 +1903,28 @@ impl PersistentRenderer {
                 .map_err(|e| format!("Failed to create descriptor pool: {:?}", e))?
         };
 
-        let max_set_idx = ds_layouts.keys().copied().max().unwrap_or(0);
-        let mut ordered_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
-        for i in 0..=max_set_idx {
-            if let Some(&layout) = ds_layouts.get(&i) {
-                ordered_layouts.push(layout);
-            }
-        }
-
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(&ordered_layouts);
-
-        let descriptor_sets = unsafe {
-            device
-                .allocate_descriptor_sets(&alloc_info)
-                .map_err(|e| format!("Failed to allocate descriptor sets: {:?}", e))?
+        // Allocate vertex set (1 copy)
+        let vert_ds = if let Some(&layout) = ds_layouts.get(&vert_set_idx) {
+            let info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(std::slice::from_ref(&layout));
+            unsafe { device.allocate_descriptor_sets(&info).map_err(|e| format!("Failed: {:?}", e))?[0] }
+        } else {
+            vk::DescriptorSet::null()
         };
 
-        let mut ds_map: HashMap<u32, vk::DescriptorSet> = HashMap::new();
-        {
-            let mut ds_idx = 0;
-            for i in 0..=max_set_idx {
-                if ds_layouts.contains_key(&i) {
-                    ds_map.insert(i, descriptor_sets[ds_idx]);
-                    ds_idx += 1;
-                }
-            }
+        // Allocate N fragment sets
+        let mut per_material_desc_sets: Vec<vk::DescriptorSet> = Vec::new();
+        let mut per_material_buffers: Vec<GpuBuffer> = Vec::new();
+
+        if let Some(&frag_layout) = ds_layouts.get(&frag_set_idx) {
+            let layouts_vec: Vec<vk::DescriptorSetLayout> = vec![frag_layout; num_materials];
+            let info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&layouts_vec);
+            per_material_desc_sets = unsafe {
+                device.allocate_descriptor_sets(&info).map_err(|e| format!("Failed: {:?}", e))?
+            };
         }
 
         // Push constant ranges
@@ -1970,13 +1985,6 @@ impl PersistentRenderer {
         };
 
         // Phase 1: Scene geometry
-        let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
-        let mut gltf_scene = if is_gltf {
-            Some(crate::gltf_loader::load_gltf(std::path::Path::new(scene_source))?)
-        } else {
-            None
-        };
-
         let pipeline_vertex_stride = vert_refl.vertex_stride;
         let mut auto_eye = glam::Vec3::new(0.0, 0.0, 3.0);
         let mut auto_target = glam::Vec3::ZERO;
@@ -1984,7 +1992,7 @@ impl PersistentRenderer {
         let mut auto_far = 100.0f32;
         let mut has_scene_bounds = false;
 
-        let (vertex_data_owned, pbr_indices) = if let Some(ref mut gltf_s) = gltf_scene {
+        let (vertex_data_owned, pbr_indices, draw_ranges) = if let Some(ref mut gltf_s) = gltf_scene {
             if gltf_s.meshes.is_empty() {
                 return Err(format!("No meshes found in glTF file: {}", scene_source));
             }
@@ -1997,6 +2005,8 @@ impl PersistentRenderer {
             let mut all_indices: Vec<u32> = Vec::new();
             let mut vertex_offset: u32 = 0;
             let mut vertex_positions: Vec<[f32; 3]> = Vec::new();
+            let mut draw_ranges: Vec<crate::gltf_loader::DrawRange> = Vec::new();
+            let mut index_offset: u32 = 0;
 
             for item in &draw_items {
                 let gmesh = &gltf_s.meshes[item.mesh_index];
@@ -2029,6 +2039,13 @@ impl PersistentRenderer {
                     all_indices.push(idx + vertex_offset);
                 }
                 vertex_offset += gmesh.vertices.len() as u32;
+
+                draw_ranges.push(crate::gltf_loader::DrawRange {
+                    index_offset,
+                    index_count: gmesh.indices.len() as u32,
+                    material_index: item.material_index,
+                });
+                index_offset += gmesh.indices.len() as u32;
             }
 
             // Compute auto-camera using shared function (matches all engines)
@@ -2045,7 +2062,7 @@ impl PersistentRenderer {
             }
 
             let data: Vec<u8> = bytemuck::cast_slice(&vdata).to_vec();
-            (data, all_indices)
+            (data, all_indices, draw_ranges)
         } else {
             let (sphere_verts, sphere_indices) = scene::generate_sphere(32, 32);
             if pipeline_vertex_stride == 48 {
@@ -2055,10 +2072,10 @@ impl PersistentRenderer {
                     padded_data.extend_from_slice(bytemuck::cast_slice(&[*v]));
                     padded_data.extend_from_slice(bytemuck::cast_slice(&default_tangent));
                 }
-                (padded_data, sphere_indices)
+                (padded_data, sphere_indices, Vec::new())
             } else {
                 let data: Vec<u8> = bytemuck::cast_slice(&sphere_verts).to_vec();
-                (data, sphere_indices)
+                (data, sphere_indices, Vec::new())
             }
         };
 
@@ -2139,35 +2156,53 @@ impl PersistentRenderer {
                 .map_err(|e| format!("Failed to create sampler: {:?}", e))?
         };
 
-        let gltf_material = gltf_scene.as_ref().and_then(|s| {
-            if !s.materials.is_empty() { Some(&s.materials[0]) } else { None }
-        });
-
         let default_texture = create_default_white_texture(ctx)?;
         let default_black_texture = create_texture_image(ctx, 1, 1, &[0u8, 0, 0, 255], "default_black")?;
         let default_normal_texture = create_texture_image(ctx, 1, 1, &[128u8, 128, 255, 255], "default_normal")?;
 
-        let mut texture_images: HashMap<String, GpuImage> = HashMap::new();
-        let texture_names = [
-            "base_color_tex", "normal_tex", "metallic_roughness_tex",
-            "occlusion_tex", "emissive_tex", "albedo_tex",
-        ];
-        for tex_name in &texture_names {
-            let tex_image_opt = match *tex_name {
-                "base_color_tex" | "albedo_tex" => gltf_material.and_then(|m| m.base_color_image.as_ref()),
-                "normal_tex" => gltf_material.and_then(|m| m.normal_image.as_ref()),
-                "metallic_roughness_tex" => gltf_material.and_then(|m| m.metallic_roughness_image.as_ref()),
-                "occlusion_tex" => gltf_material.and_then(|m| m.occlusion_image.as_ref()),
-                "emissive_tex" => gltf_material.and_then(|m| m.emissive_image.as_ref()),
-                _ => None,
-            };
-            if let Some(tex_data) = tex_image_opt {
-                let gpu_img = create_texture_image(ctx, tex_data.width, tex_data.height, &tex_data.pixels, tex_name)?;
-                texture_images.insert(tex_name.to_string(), gpu_img);
+        // Build per-material texture maps
+        let mut per_material_textures: Vec<HashMap<String, GpuImage>> = Vec::new();
+
+        if let Some(ref gs) = gltf_scene {
+            for (mat_idx, mat) in gs.materials.iter().enumerate() {
+                let mut tex_map: HashMap<String, GpuImage> = HashMap::new();
+
+                let tex_slots: Vec<(&str, Option<&crate::gltf_loader::TextureImage>)> = vec![
+                    ("base_color_tex", mat.base_color_image.as_ref()),
+                    ("normal_tex", mat.normal_image.as_ref()),
+                    ("metallic_roughness_tex", mat.metallic_roughness_image.as_ref()),
+                    ("occlusion_tex", mat.occlusion_image.as_ref()),
+                    ("emissive_tex", mat.emissive_image.as_ref()),
+                    ("clearcoat_tex", mat.clearcoat_image.as_ref()),
+                    ("clearcoat_roughness_tex", mat.clearcoat_roughness_image.as_ref()),
+                    ("sheen_color_tex", mat.sheen_color_image.as_ref()),
+                    ("transmission_tex", mat.transmission_image.as_ref()),
+                ];
+
+                for (name, img_opt) in tex_slots {
+                    if let Some(tex_data) = img_opt {
+                        let label = format!("{}[{}]", name, mat_idx);
+                        info!("Uploading texture '{}': {}x{}", label, tex_data.width, tex_data.height);
+                        let gpu_img = create_texture_image(ctx, tex_data.width, tex_data.height, &tex_data.pixels, &label)?;
+                        tex_map.insert(name.to_string(), gpu_img);
+                    }
+                }
+
+                // Also map albedo_tex to base_color_image for backward compat
+                if mat.base_color_image.is_some() && !tex_map.contains_key("albedo_tex") {
+                    if let Some(tex_data) = mat.base_color_image.as_ref() {
+                        let gpu_img = create_texture_image(ctx, tex_data.width, tex_data.height, &tex_data.pixels, &format!("albedo_tex[{}]", mat_idx))?;
+                        tex_map.insert("albedo_tex".to_string(), gpu_img);
+                    }
+                }
+
+                per_material_textures.push(tex_map);
             }
         }
 
-        if gltf_material.is_none() {
+        // Backward compat: also build texture_images for non-glTF or fallback
+        let mut texture_images: HashMap<String, GpuImage> = HashMap::new();
+        if gltf_scene.is_none() {
             let tex_pixels = scene::generate_procedural_texture(512);
             let proc_texture = create_texture_image(ctx, 512, 512, &tex_pixels, "procedural_albedo")?;
             texture_images.insert("albedo_tex".to_string(), proc_texture);
@@ -2178,92 +2213,151 @@ impl PersistentRenderer {
         let ibl_assets = load_ibl_assets(ctx, ibl_name);
 
         // Phase 3: Write descriptor sets
-        let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
-        let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
-        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
-        let total_bindings: usize = merged.values().map(|v| v.len()).sum();
-        buffer_infos.reserve(total_bindings);
-        image_infos.reserve(total_bindings);
 
-        for (&set_idx, bindings) in &merged {
-            let ds = match ds_map.get(&set_idx) {
-                Some(&ds) => ds,
-                None => continue,
-            };
-            for binding in bindings {
-                let vk_type = crate::reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
-                match vk_type {
-                    vk::DescriptorType::UNIFORM_BUFFER => {
+        // Write vertex set: MVP + Light only
+        {
+            let mut buf_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+            let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+
+            if let Some(bindings) = merged.get(&vert_set_idx) {
+                for binding in bindings {
+                    let vk_type = crate::reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
+                    if vk_type == vk::DescriptorType::UNIFORM_BUFFER {
                         let (buffer, range) = match binding.name.as_str() {
                             "MVP" => (mvp_buffer.buffer, binding.size as u64),
                             "Light" => (light_buffer.buffer, binding.size as u64),
-                            "Material" => (material_buffer.buffer, std::mem::size_of::<MaterialUboData>() as u64),
                             _ => continue,
                         };
-                        let idx = buffer_infos.len();
-                        buffer_infos.push(
-                            vk::DescriptorBufferInfo::default()
-                                .buffer(buffer).offset(0).range(range),
-                        );
+                        let idx = buf_infos.len();
+                        buf_infos.push(vk::DescriptorBufferInfo::default().buffer(buffer).offset(0).range(range));
                         writes.push(
                             vk::WriteDescriptorSet::default()
-                                .dst_set(ds).dst_binding(binding.binding)
+                                .dst_set(vert_ds)
+                                .dst_binding(binding.binding)
                                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                                .buffer_info(unsafe {
-                                    std::slice::from_raw_parts(&buffer_infos[idx] as *const _, 1)
-                                }),
+                                .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
                         );
                     }
-                    vk::DescriptorType::SAMPLER => {
-                        let actual_sampler = ibl_assets
-                            .sampler_for_binding(&binding.name)
-                            .unwrap_or(sampler);
-                        let idx = image_infos.len();
-                        image_infos.push(vk::DescriptorImageInfo::default().sampler(actual_sampler));
-                        writes.push(
-                            vk::WriteDescriptorSet::default()
-                                .dst_set(ds).dst_binding(binding.binding)
-                                .descriptor_type(vk::DescriptorType::SAMPLER)
-                                .image_info(unsafe {
-                                    std::slice::from_raw_parts(&image_infos[idx] as *const _, 1)
-                                }),
-                        );
-                    }
-                    vk::DescriptorType::SAMPLED_IMAGE => {
-                        let is_cube = crate::reflected_pipeline::is_cube_image_binding(&binding.binding_type);
-                        let view = if is_cube {
-                            ibl_assets.view_for_binding(&binding.name).unwrap_or(default_texture.view)
-                        } else if binding.name == "brdf_lut" {
-                            ibl_assets.view_for_binding(&binding.name).unwrap_or(default_texture.view)
-                        } else {
-                            let fallback = match binding.name.as_str() {
-                                "emissive_tex" => default_black_texture.view,
-                                "normal_tex" => default_normal_texture.view,
-                                _ => default_texture.view,
-                            };
-                            texture_images.get(&binding.name).map(|img| img.view).unwrap_or(fallback)
-                        };
-                        let idx = image_infos.len();
-                        image_infos.push(
-                            vk::DescriptorImageInfo::default()
-                                .image_view(view)
-                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                        );
-                        writes.push(
-                            vk::WriteDescriptorSet::default()
-                                .dst_set(ds).dst_binding(binding.binding)
-                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                                .image_info(unsafe {
-                                    std::slice::from_raw_parts(&image_infos[idx] as *const _, 1)
-                                }),
-                        );
-                    }
-                    _ => {}
                 }
+            }
+            if !writes.is_empty() {
+                unsafe { device.update_descriptor_sets(&writes, &[]); }
             }
         }
 
-        unsafe { device.update_descriptor_sets(&writes, &[]); }
+        // Create per-material UBO buffers
+        for mi in 0..num_materials {
+            let mat_data = if let Some(ref gs) = gltf_scene {
+                if mi < gs.materials.len() {
+                    MaterialUboData::from_gltf_material(&gs.materials[mi])
+                } else {
+                    MaterialUboData::default_values()
+                }
+            } else {
+                MaterialUboData::default_values()
+            };
+
+            let mat_buf = create_buffer_with_data(
+                &device, ctx.allocator_mut(),
+                bytemuck::bytes_of(&mat_data),
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                &format!("pbr_material_{}", mi),
+            )?;
+            per_material_buffers.push(mat_buf);
+        }
+
+        // Write each per-material descriptor set
+        for mi in 0..num_materials {
+            let ds = per_material_desc_sets[mi];
+            let mut buf_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+            let mut img_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
+            let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+
+            if let Some(bindings) = merged.get(&frag_set_idx) {
+                for binding in bindings {
+                    let vk_type = crate::reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
+                    match vk_type {
+                        vk::DescriptorType::UNIFORM_BUFFER => {
+                            let (buffer, range) = if binding.name == "Material" {
+                                (per_material_buffers[mi].buffer, std::mem::size_of::<MaterialUboData>() as u64)
+                            } else if binding.name == "Light" {
+                                (light_buffer.buffer, binding.size as u64)
+                            } else {
+                                continue;
+                            };
+                            let idx = buf_infos.len();
+                            buf_infos.push(
+                                vk::DescriptorBufferInfo::default()
+                                    .buffer(buffer)
+                                    .offset(0)
+                                    .range(range),
+                            );
+                            writes.push(
+                                vk::WriteDescriptorSet::default()
+                                    .dst_set(ds).dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                    .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                            );
+                        }
+                        vk::DescriptorType::SAMPLER => {
+                            let actual_sampler = ibl_assets.sampler_for_binding(&binding.name).unwrap_or(sampler);
+                            let idx = img_infos.len();
+                            img_infos.push(vk::DescriptorImageInfo::default().sampler(actual_sampler));
+                            writes.push(
+                                vk::WriteDescriptorSet::default()
+                                    .dst_set(ds).dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                                    .image_info(unsafe { std::slice::from_raw_parts(&img_infos[idx] as *const _, 1) }),
+                            );
+                        }
+                        vk::DescriptorType::SAMPLED_IMAGE => {
+                            let is_cube = crate::reflected_pipeline::is_cube_image_binding(&binding.binding_type);
+                            let view = if is_cube || binding.name == "brdf_lut" {
+                                ibl_assets.view_for_binding(&binding.name).unwrap_or(default_texture.view)
+                            } else {
+                                let per_mat_view = if mi < per_material_textures.len() {
+                                    per_material_textures[mi].get(&binding.name).map(|img| img.view)
+                                } else {
+                                    None
+                                };
+                                per_mat_view.unwrap_or_else(|| {
+                                    let fallback = match binding.name.as_str() {
+                                        "emissive_tex" => default_black_texture.view,
+                                        "normal_tex" => default_normal_texture.view,
+                                        _ => default_texture.view,
+                                    };
+                                    texture_images.get(&binding.name).map(|img| img.view).unwrap_or(fallback)
+                                })
+                            };
+                            let idx = img_infos.len();
+                            img_infos.push(
+                                vk::DescriptorImageInfo::default()
+                                    .image_view(view)
+                                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                            );
+                            writes.push(
+                                vk::WriteDescriptorSet::default()
+                                    .dst_set(ds).dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                    .image_info(unsafe { std::slice::from_raw_parts(&img_infos[idx] as *const _, 1) }),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !writes.is_empty() {
+                unsafe { device.update_descriptor_sets(&writes, &[]); }
+            }
+        }
+
+        // Build ordered descriptor sets for pipeline bind
+        let descriptor_sets: Vec<vk::DescriptorSet> = {
+            let max_idx = std::cmp::max(vert_set_idx, frag_set_idx);
+            let mut sets = vec![vk::DescriptorSet::null(); (max_idx + 1) as usize];
+            sets[vert_set_idx as usize] = vert_ds;
+            sets
+        };
 
         // Phase 4: Render pass, framebuffer, pipeline
         let color_image = create_offscreen_image(
@@ -2416,6 +2510,13 @@ impl PersistentRenderer {
             vbo,
             ibo,
             num_indices,
+            draw_ranges,
+            per_material_desc_sets,
+            per_material_buffers,
+            per_material_textures,
+            vert_set_idx,
+            frag_set_idx,
+            vert_ds,
             mvp_buffer,
             light_buffer,
             material_buffer,
@@ -2516,19 +2617,38 @@ impl PersistentRenderer {
         unsafe {
             device.cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-            device.cmd_bind_descriptor_sets(
-                cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout,
-                0, &self.descriptor_sets, &[],
-            );
+
             if !self.push_constant_data.is_empty() {
                 device.cmd_push_constants(
                     cmd, self.pipeline_layout, self.push_constant_stage_flags,
                     0, &self.push_constant_data,
                 );
             }
+
+            // Bind vertex set (shared)
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout, self.vert_set_idx, std::slice::from_ref(&self.vert_ds), &[]);
+
             device.cmd_bind_vertex_buffers(cmd, 0, &[self.vbo.buffer], &[0]);
             device.cmd_bind_index_buffer(cmd, self.ibo.buffer, 0, vk::IndexType::UINT32);
-            device.cmd_draw_indexed(cmd, self.num_indices, 1, 0, 0, 0);
+
+            if !self.draw_ranges.is_empty() && !self.per_material_desc_sets.is_empty() {
+                let mut current_mat: i32 = -1;
+                for range in &self.draw_ranges {
+                    if range.material_index as i32 != current_mat {
+                        current_mat = range.material_index as i32;
+                        let mat_idx = (current_mat as usize).min(self.per_material_desc_sets.len() - 1);
+                        device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout, self.frag_set_idx, std::slice::from_ref(&self.per_material_desc_sets[mat_idx]), &[]);
+                    }
+                    device.cmd_draw_indexed(cmd, range.index_count, 1, range.index_offset, 0, 0);
+                }
+            } else {
+                // Fallback: single draw
+                if !self.per_material_desc_sets.is_empty() {
+                    device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout, self.frag_set_idx, std::slice::from_ref(&self.per_material_desc_sets[0]), &[]);
+                }
+                device.cmd_draw_indexed(cmd, self.num_indices, 1, 0, 0, 0);
+            }
+
             device.cmd_end_render_pass(cmd);
         }
 
@@ -2656,6 +2776,14 @@ impl PersistentRenderer {
         self.mvp_buffer.destroy(&device, ctx.allocator_mut());
         self.light_buffer.destroy(&device, ctx.allocator_mut());
         self.material_buffer.destroy(&device, ctx.allocator_mut());
+        for mut buf in self.per_material_buffers.drain(..) {
+            buf.destroy(&device, ctx.allocator_mut());
+        }
+        for tex_map in self.per_material_textures.drain(..) {
+            for (_, mut tex) in tex_map {
+                tex.destroy(&device, ctx.allocator_mut());
+            }
+        }
         self.vbo.destroy(&device, ctx.allocator_mut());
         self.ibo.destroy(&device, ctx.allocator_mut());
     }

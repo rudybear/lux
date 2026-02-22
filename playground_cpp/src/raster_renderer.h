@@ -83,6 +83,12 @@ private:
     VkBuffer m_materialBuffer = VK_NULL_HANDLE;
     VmaAllocation m_materialAllocation = VK_NULL_HANDLE;
 
+    // Per-material descriptor sets and buffers for multi-material rendering
+    std::vector<VkDescriptorSet> m_perMaterialDescSets;
+    std::vector<VkBuffer> m_perMaterialBuffers;
+    std::vector<VmaAllocation> m_perMaterialAllocations;
+    VkDescriptorSet m_vertexDescSet = VK_NULL_HANDLE;
+
     // Triangle vertex buffer
     VkBuffer triangleVB = VK_NULL_HANDLE;
     VmaAllocation triangleVBAllocation = VK_NULL_HANDLE;

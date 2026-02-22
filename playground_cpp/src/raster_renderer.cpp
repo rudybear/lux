@@ -480,14 +480,26 @@ void RasterRenderer::setupPBRResources(VulkanContext& ctx) {
 // --------------------------------------------------------------------------
 
 void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
-    // Use reflected_pipeline utilities to create descriptor set layouts from reflection JSON
     std::vector<ReflectionData> stages = {vertReflection, fragReflection};
     reflectedSetLayouts = createDescriptorSetLayoutsMultiStage(ctx.device, stages);
-
-    // Get merged binding info for pool sizing and descriptor writes
     auto mergedBindings = getMergedBindings(stages);
 
-    // Count pool sizes from reflection data
+    // Identify which set index contains the "Material" UBO (fragment set)
+    int fragSetIdx = -1;
+    int vertSetIdx = -1;
+    for (auto& b : mergedBindings) {
+        if (b.name == "Material") fragSetIdx = b.set;
+        if (b.name == "MVP") vertSetIdx = b.set;
+    }
+    if (fragSetIdx < 0) fragSetIdx = 1;
+    if (vertSetIdx < 0) vertSetIdx = 0;
+
+    size_t numMaterials = 1;
+    if (m_scene && m_scene->hasGltfScene()) {
+        numMaterials = std::max(size_t(1), m_scene->getGltfScene().materials.size());
+    }
+
+    // Count pool sizes: vertex set bindings x1, fragment set bindings x numMaterials
     std::unordered_map<VkDescriptorType, uint32_t> typeCounts;
     for (auto& b : mergedBindings) {
         VkDescriptorType vkType;
@@ -498,7 +510,9 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
         else if (b.type == "storage_image") vkType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         else if (b.type == "acceleration_structure") vkType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         else vkType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        typeCounts[vkType]++;
+
+        uint32_t multiplier = (b.set == fragSetIdx) ? static_cast<uint32_t>(numMaterials) : 1;
+        typeCounts[vkType] += multiplier;
     }
 
     std::vector<VkDescriptorPoolSize> poolSizes;
@@ -506,109 +520,206 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
         poolSizes.push_back({type, count});
     }
 
-    uint32_t maxSets = static_cast<uint32_t>(reflectedSetLayouts.size());
+    uint32_t maxSets = 1 + static_cast<uint32_t>(numMaterials); // 1 vertex + N fragment
 
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = maxSets;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-
     vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &descriptorPool);
 
-    // Allocate descriptor sets
-    for (auto& [setIdx, layout] : reflectedSetLayouts) {
-        VkDescriptorSetAllocateInfo allocSetInfo = {};
-        allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocSetInfo.descriptorPool = descriptorPool;
-        allocSetInfo.descriptorSetCount = 1;
-        allocSetInfo.pSetLayouts = &layout;
-
-        VkDescriptorSet set;
-        vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &set);
-        reflectedDescSets[setIdx] = set;
-    }
-
-    // Write descriptor sets based on reflection binding names
-    // We need to keep descriptor info structs alive until vkUpdateDescriptorSets returns
-    struct DescWriteInfo {
-        VkDescriptorBufferInfo bufferInfo;
-        VkDescriptorImageInfo imageInfo;
-    };
-    std::vector<DescWriteInfo> writeInfos(mergedBindings.size());
-    std::vector<VkWriteDescriptorSet> writes;
-
-    for (size_t i = 0; i < mergedBindings.size(); i++) {
-        auto& b = mergedBindings[i];
-        auto setIt = reflectedDescSets.find(b.set);
-        if (setIt == reflectedDescSets.end()) continue;
-
-        VkWriteDescriptorSet w = {};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = setIt->second;
-        w.dstBinding = static_cast<uint32_t>(b.binding);
-        w.descriptorCount = 1;
-
-        if (b.type == "uniform_buffer") {
-            w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            // Match by name: "MVP" -> mvpBuffer, "Light" -> lightBuffer
-            if (b.name == "MVP") {
-                writeInfos[i].bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
-            } else if (b.name == "Light") {
-                writeInfos[i].bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
-            } else if (b.name == "Material") {
-                writeInfos[i].bufferInfo = {m_materialBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : sizeof(MaterialUBOData))};
-            } else {
-                // Unknown UBO name - use MVP as fallback
-                writeInfos[i].bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
-            }
-            w.pBufferInfo = &writeInfos[i].bufferInfo;
-        } else if (b.type == "sampler") {
-            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-            // Check IBL textures first, then regular textures
-            auto& iblTextures = m_scene->getIBLTextures();
-            auto iblIt = iblTextures.find(b.name);
-            if (iblIt != iblTextures.end()) {
-                writeInfos[i].imageInfo = {};
-                writeInfos[i].imageInfo.sampler = iblIt->second.sampler;
-            } else {
-                auto& tex = m_scene->getTextureForBinding(b.name);
-                writeInfos[i].imageInfo = {};
-                writeInfos[i].imageInfo.sampler = tex.sampler;
-            }
-            w.pImageInfo = &writeInfos[i].imageInfo;
-        } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
-            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            // Check IBL textures first, then regular textures
-            auto& iblTextures = m_scene->getIBLTextures();
-            auto iblIt = iblTextures.find(b.name);
-            if (iblIt != iblTextures.end()) {
-                writeInfos[i].imageInfo = {};
-                writeInfos[i].imageInfo.imageView = iblIt->second.imageView;
-                writeInfos[i].imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            } else {
-                auto& tex = m_scene->getTextureForBinding(b.name);
-                writeInfos[i].imageInfo = {};
-                writeInfos[i].imageInfo.imageView = tex.imageView;
-                writeInfos[i].imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            }
-            w.pImageInfo = &writeInfos[i].imageInfo;
-        } else {
-            continue; // Skip unsupported types
+    // Allocate vertex descriptor set (set 0) once
+    {
+        auto layoutIt = reflectedSetLayouts.find(vertSetIdx);
+        if (layoutIt != reflectedSetLayouts.end()) {
+            VkDescriptorSetAllocateInfo allocSetInfo = {};
+            allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocSetInfo.descriptorPool = descriptorPool;
+            allocSetInfo.descriptorSetCount = 1;
+            allocSetInfo.pSetLayouts = &layoutIt->second;
+            vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &m_vertexDescSet);
+            reflectedDescSets[vertSetIdx] = m_vertexDescSet;
         }
-
-        writes.push_back(w);
     }
 
+    // Write vertex set (set 0): MVP + Light
+    {
+        struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
+        std::vector<DescWriteInfo> writeInfos;
+        std::vector<VkWriteDescriptorSet> writes;
 
-    if (!writes.empty()) {
-        vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()),
-                               writes.data(), 0, nullptr);
+        for (auto& b : mergedBindings) {
+            if (b.set != vertSetIdx) continue;
+            DescWriteInfo info = {};
+            VkWriteDescriptorSet w = {};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = m_vertexDescSet;
+            w.dstBinding = static_cast<uint32_t>(b.binding);
+            w.descriptorCount = 1;
+
+            if (b.type == "uniform_buffer") {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                if (b.name == "MVP") {
+                    info.bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
+                } else if (b.name == "Light") {
+                    info.bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                } else {
+                    continue;
+                }
+                writeInfos.push_back(info);
+                w.pBufferInfo = &writeInfos.back().bufferInfo;
+            } else {
+                continue;
+            }
+            writes.push_back(w);
+        }
+        if (!writes.empty()) {
+            vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
     }
 
-    std::cout << "[info] Reflection-driven descriptors created: "
-              << reflectedSetLayouts.size() << " set(s), "
-              << mergedBindings.size() << " binding(s)" << std::endl;
+    // Allocate per-material fragment descriptor sets (set 1)
+    auto fragLayoutIt = reflectedSetLayouts.find(fragSetIdx);
+    if (fragLayoutIt != reflectedSetLayouts.end()) {
+        m_perMaterialDescSets.resize(numMaterials);
+        m_perMaterialBuffers.resize(numMaterials);
+        m_perMaterialAllocations.resize(numMaterials);
+
+        for (size_t mi = 0; mi < numMaterials; mi++) {
+            // Create Material UBO for this material
+            MaterialUBOData materialData{};
+            if (m_scene && m_scene->hasGltfScene() && mi < m_scene->getGltfScene().materials.size()) {
+                const auto& mat = m_scene->getGltfScene().materials[mi];
+                materialData.baseColorFactor = mat.baseColor;
+                materialData.metallicFactor = mat.metallic;
+                materialData.roughnessFactor = mat.roughness;
+                materialData.emissiveFactor = mat.emissive;
+                materialData.emissiveStrength = mat.emissiveStrength;
+                materialData.ior = mat.ior;
+                materialData.clearcoatFactor = mat.clearcoatFactor;
+                materialData.clearcoatRoughnessFactor = mat.clearcoatRoughnessFactor;
+                materialData.sheenColorFactor = mat.sheenColorFactor;
+                materialData.sheenRoughnessFactor = mat.sheenRoughnessFactor;
+                materialData.transmissionFactor = mat.transmissionFactor;
+                // UV transform data
+                materialData.baseColorUvSt = glm::vec4(mat.base_color_uv_xform.offset, mat.base_color_uv_xform.scale);
+                materialData.normalUvSt = glm::vec4(mat.normal_uv_xform.offset, mat.normal_uv_xform.scale);
+                materialData.mrUvSt = glm::vec4(mat.metallic_roughness_uv_xform.offset, mat.metallic_roughness_uv_xform.scale);
+                materialData.baseColorUvRot = mat.base_color_uv_xform.rotation;
+                materialData.normalUvRot = mat.normal_uv_xform.rotation;
+                materialData.mrUvRot = mat.metallic_roughness_uv_xform.rotation;
+            }
+
+            VkBufferCreateInfo matBufInfo = {};
+            matBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            matBufInfo.size = sizeof(MaterialUBOData);
+            matBufInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+            VmaAllocationCreateInfo matAllocInfo = {};
+            matAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+            vmaCreateBuffer(ctx.allocator, &matBufInfo, &matAllocInfo,
+                            &m_perMaterialBuffers[mi], &m_perMaterialAllocations[mi], nullptr);
+
+            void* mapped;
+            vmaMapMemory(ctx.allocator, m_perMaterialAllocations[mi], &mapped);
+            memcpy(mapped, &materialData, sizeof(MaterialUBOData));
+            vmaUnmapMemory(ctx.allocator, m_perMaterialAllocations[mi]);
+
+            // Allocate descriptor set for this material
+            VkDescriptorSetAllocateInfo allocSetInfo = {};
+            allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocSetInfo.descriptorPool = descriptorPool;
+            allocSetInfo.descriptorSetCount = 1;
+            allocSetInfo.pSetLayouts = &fragLayoutIt->second;
+            vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &m_perMaterialDescSets[mi]);
+
+            // Write descriptors for this material
+            struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
+            std::vector<DescWriteInfo> writeInfos;
+            std::vector<VkWriteDescriptorSet> writes;
+
+            auto& perMatTextures = m_scene->getPerMaterialTextures();
+
+            for (auto& b : mergedBindings) {
+                if (b.set != fragSetIdx) continue;
+                DescWriteInfo info = {};
+                VkWriteDescriptorSet w = {};
+                w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w.dstSet = m_perMaterialDescSets[mi];
+                w.dstBinding = static_cast<uint32_t>(b.binding);
+                w.descriptorCount = 1;
+
+                if (b.type == "uniform_buffer") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    if (b.name == "Material") {
+                        info.bufferInfo = {m_perMaterialBuffers[mi], 0, sizeof(MaterialUBOData)};
+                    } else if (b.name == "Light" && lightBuffer != VK_NULL_HANDLE) {
+                        info.bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                    } else {
+                        continue;
+                    }
+                    writeInfos.push_back(info);
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else if (b.type == "sampler") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                    auto& iblTextures = m_scene->getIBLTextures();
+                    auto iblIt = iblTextures.find(b.name);
+                    if (iblIt != iblTextures.end()) {
+                        info.imageInfo = {};
+                        info.imageInfo.sampler = iblIt->second.sampler;
+                    } else {
+                        auto& tex = m_scene->getTextureForBinding(b.name);
+                        info.imageInfo = {};
+                        info.imageInfo.sampler = tex.sampler;
+                    }
+                    writeInfos.push_back(info);
+                    w.pImageInfo = &writeInfos.back().imageInfo;
+                } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                    // Check IBL first
+                    auto& iblTextures = m_scene->getIBLTextures();
+                    auto iblIt = iblTextures.find(b.name);
+                    if (iblIt != iblTextures.end()) {
+                        info.imageInfo = {};
+                        info.imageInfo.imageView = iblIt->second.imageView;
+                        info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    } else {
+                        // Check per-material textures
+                        GPUTexture* texPtr = nullptr;
+                        if (mi < perMatTextures.size()) {
+                            auto it = perMatTextures[mi].find(b.name);
+                            if (it != perMatTextures[mi].end()) {
+                                texPtr = const_cast<GPUTexture*>(&it->second);
+                            }
+                        }
+                        if (texPtr && texPtr->imageView != VK_NULL_HANDLE) {
+                            info.imageInfo = {};
+                            info.imageInfo.imageView = texPtr->imageView;
+                            info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        } else {
+                            // Fallback to defaults
+                            auto& tex = m_scene->getTextureForBinding(b.name);
+                            info.imageInfo = {};
+                            info.imageInfo.imageView = tex.imageView;
+                            info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        }
+                    }
+                    writeInfos.push_back(info);
+                    w.pImageInfo = &writeInfos.back().imageInfo;
+                } else {
+                    continue;
+                }
+                writes.push_back(w);
+            }
+
+            if (!writes.empty()) {
+                vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            }
+        }
+    }
+
+    std::cout << "[info] Per-material descriptors created: " << numMaterials
+              << " material(s), " << mergedBindings.size() << " binding(s) each" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -634,7 +745,9 @@ void RasterRenderer::createPipelinePBR(VulkanContext& ctx) {
     stages[1].pName = "main";
 
     // Vertex input from reflection data (supports both 32-byte and 48-byte stride)
-    auto reflectedInput = createReflectedVertexInput(vertReflection);
+    // For glTF scenes, buffer is always 48-byte stride; override pipeline stride to match.
+    int bufferStride = (m_scene && m_scene->hasGltfScene()) ? 48 : 0;
+    auto reflectedInput = createReflectedVertexInput(vertReflection, bufferStride);
 
     VkPipelineVertexInputStateCreateInfo vertexInput = {};
     vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -888,24 +1001,45 @@ void RasterRenderer::render(VulkanContext& ctx) {
         // Sphere, glTF, or default PBR scene: bind reflection-driven descriptors
         const auto& mesh = m_scene->getMesh();
 
-        // Bind descriptor sets in order
-        int maxSet = -1;
-        for (auto& [idx, _] : reflectedDescSets) {
-            maxSet = std::max(maxSet, idx);
-        }
-        for (int i = 0; i <= maxSet; i++) {
-            auto it = reflectedDescSets.find(i);
-            if (it != reflectedDescSets.end()) {
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                        pipelineLayout, static_cast<uint32_t>(i),
-                                        1, &it->second, 0, nullptr);
-            }
+        // Bind vertex set (set 0) -- shared across all materials
+        if (m_vertexDescSet != VK_NULL_HANDLE) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    pipelineLayout, 0, 1, &m_vertexDescSet, 0, nullptr);
         }
 
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &offset);
         vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+
+        const auto& drawRanges = m_scene->getDrawRanges();
+        if (!drawRanges.empty() && !m_perMaterialDescSets.empty()) {
+            int currentMat = -1;
+            for (auto& range : drawRanges) {
+                if (range.materialIndex != currentMat) {
+                    currentMat = range.materialIndex;
+                    int matIdx = std::min(currentMat, static_cast<int>(m_perMaterialDescSets.size()) - 1);
+                    if (matIdx >= 0) {
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                pipelineLayout, 1, 1, &m_perMaterialDescSets[matIdx], 0, nullptr);
+                    }
+                }
+                vkCmdDrawIndexed(cmd, range.indexCount, 1, range.indexOffset, 0, 0);
+            }
+        } else {
+            // Fallback: single draw (non-glTF or single material)
+            // Bind all descriptor sets the old way
+            int maxSet = -1;
+            for (auto& [idx, _] : reflectedDescSets) { maxSet = std::max(maxSet, idx); }
+            for (int i = 0; i <= maxSet; i++) {
+                auto it = reflectedDescSets.find(i);
+                if (it != reflectedDescSets.end()) {
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            pipelineLayout, static_cast<uint32_t>(i),
+                                            1, &it->second, 0, nullptr);
+                }
+            }
+            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+        }
     }
 
     vkCmdEndRenderPass(cmd);
@@ -1035,22 +1169,44 @@ void RasterRenderer::renderToSwapchain(VulkanContext& ctx,
     } else {
         const auto& mesh = m_scene->getMesh();
 
-        int maxSet = -1;
-        for (auto& [idx, _] : reflectedDescSets) {
-            maxSet = std::max(maxSet, idx);
+        // Bind vertex set (set 0) -- shared across all materials
+        if (m_vertexDescSet != VK_NULL_HANDLE) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    pipelineLayout, 0, 1, &m_vertexDescSet, 0, nullptr);
         }
-        for (int i = 0; i <= maxSet; i++) {
-            auto it = reflectedDescSets.find(i);
-            if (it != reflectedDescSets.end()) {
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                        pipelineLayout, static_cast<uint32_t>(i),
-                                        1, &it->second, 0, nullptr);
-            }
-        }
+
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &offset);
         vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+
+        const auto& drawRanges = m_scene->getDrawRanges();
+        if (!drawRanges.empty() && !m_perMaterialDescSets.empty()) {
+            int currentMat = -1;
+            for (auto& range : drawRanges) {
+                if (range.materialIndex != currentMat) {
+                    currentMat = range.materialIndex;
+                    int matIdx = std::min(currentMat, static_cast<int>(m_perMaterialDescSets.size()) - 1);
+                    if (matIdx >= 0) {
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                pipelineLayout, 1, 1, &m_perMaterialDescSets[matIdx], 0, nullptr);
+                    }
+                }
+                vkCmdDrawIndexed(cmd, range.indexCount, 1, range.indexOffset, 0, 0);
+            }
+        } else {
+            // Fallback: single draw (non-glTF or single material)
+            int maxSet = -1;
+            for (auto& [idx, _] : reflectedDescSets) { maxSet = std::max(maxSet, idx); }
+            for (int i = 0; i <= maxSet; i++) {
+                auto it = reflectedDescSets.find(i);
+                if (it != reflectedDescSets.end()) {
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            pipelineLayout, static_cast<uint32_t>(i),
+                                            1, &it->second, 0, nullptr);
+                }
+            }
+            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+        }
     }
 
     vkCmdEndRenderPass(cmd);
@@ -1135,6 +1291,15 @@ void RasterRenderer::cleanup(VulkanContext& ctx) {
     if (mvpBuffer) vmaDestroyBuffer(ctx.allocator, mvpBuffer, mvpAllocation);
     if (lightBuffer) vmaDestroyBuffer(ctx.allocator, lightBuffer, lightAllocation);
     if (m_materialBuffer) vmaDestroyBuffer(ctx.allocator, m_materialBuffer, m_materialAllocation);
+
+    for (size_t i = 0; i < m_perMaterialBuffers.size(); i++) {
+        if (m_perMaterialBuffers[i]) {
+            vmaDestroyBuffer(ctx.allocator, m_perMaterialBuffers[i], m_perMaterialAllocations[i]);
+        }
+    }
+    m_perMaterialBuffers.clear();
+    m_perMaterialAllocations.clear();
+    m_perMaterialDescSets.clear();
 
     if (descriptorPool) vkDestroyDescriptorPool(ctx.device, descriptorPool, nullptr);
     for (auto& [_, layout] : reflectedSetLayouts) {

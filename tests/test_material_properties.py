@@ -142,7 +142,7 @@ class TestPropertiesCompilation:
         assert fields_by_name["emissive_factor"]["offset"] == 16
         assert fields_by_name["metallic_factor"]["offset"] == 28
         assert fields_by_name["roughness_factor"]["offset"] == 32
-        assert mat_ubo["size"] == 80
+        assert mat_ubo["size"] == 144
 
     def test_properties_defaults_in_reflection(self):
         """Reflection JSON includes default values from properties block."""
@@ -153,6 +153,9 @@ class TestPropertiesCompilation:
         assert fields_by_name["roughness_factor"]["default"] == 1.0
         assert fields_by_name["ior"]["default"] == 1.5
         assert fields_by_name["emissive_factor"]["default"] == [0.0, 0.0, 0.0]
+        # KHR_texture_transform defaults
+        assert fields_by_name["base_color_uv_st"]["default"] == [0.0, 0.0, 1.0, 1.0]
+        assert fields_by_name["base_color_uv_rot"]["default"] == 0.0
 
     def test_material_field_access_compiles(self):
         """Material.roughness_factor in layer expressions → valid SPIR-V."""
@@ -167,7 +170,7 @@ class TestPropertiesCompilation:
         assert rchit is not None
         mat_ubo = self._find_material_ubo(rchit)
         assert mat_ubo is not None, "Material UBO not found in rchit reflection"
-        assert mat_ubo["size"] == 80
+        assert mat_ubo["size"] == 144
 
     def test_no_properties_backward_compat(self):
         """Surfaces without properties still compile (existing tests pass).

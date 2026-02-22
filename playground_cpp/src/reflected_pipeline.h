@@ -145,4 +145,4 @@ struct ReflectedVertexInput {
     std::vector<VkVertexInputAttributeDescription> attributes;
 };
 
-ReflectedVertexInput createReflectedVertexInput(const ReflectionData& vertReflection);
+ReflectedVertexInput createReflectedVertexInput(const ReflectionData& vertReflection, int overrideStride = 0);

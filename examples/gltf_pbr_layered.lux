@@ -68,16 +68,22 @@ surface GltfPBR {
         sheen_roughness_factor: scalar = 0.0,
         transmission_factor: scalar = 0.0,
         sheen_color_factor: vec3 = vec3(0.0),
+        base_color_uv_st: vec4 = vec4(0.0, 0.0, 1.0, 1.0),
+        normal_uv_st: vec4 = vec4(0.0, 0.0, 1.0, 1.0),
+        mr_uv_st: vec4 = vec4(0.0, 0.0, 1.0, 1.0),
+        base_color_uv_rot: scalar = 0.0,
+        normal_uv_rot: scalar = 0.0,
+        mr_uv_rot: scalar = 0.0,
     },
 
     layers [
-        base(albedo: srgb_to_linear(sample(base_color_tex, uv).xyz)
+        base(albedo: srgb_to_linear(sample(base_color_tex, transform_uv(uv, Material.base_color_uv_st, Material.base_color_uv_rot)).xyz)
                      * Material.base_color_factor.xyz,
-             roughness: sample(metallic_roughness_tex, uv).y
+             roughness: sample(metallic_roughness_tex, transform_uv(uv, Material.mr_uv_st, Material.mr_uv_rot)).y
                         * Material.roughness_factor,
-             metallic: sample(metallic_roughness_tex, uv).z
+             metallic: sample(metallic_roughness_tex, transform_uv(uv, Material.mr_uv_st, Material.mr_uv_rot)).z
                         * Material.metallic_factor),
-        normal_map(map: sample(normal_tex, uv).xyz) if has_normal_map,
+        normal_map(map: sample(normal_tex, transform_uv(uv, Material.normal_uv_st, Material.normal_uv_rot)).xyz) if has_normal_map,
         transmission(factor: sample(transmission_tex, uv).x
                              * Material.transmission_factor,
                      ior: Material.ior) if has_transmission,

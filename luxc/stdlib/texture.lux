@@ -89,3 +89,12 @@ fn rotate_uv(uv: vec2, angle: scalar, center: vec2) -> vec2 {
 fn tile_uv(uv: vec2, scale: vec2) -> vec2 {
     return vec2(mod(uv.x * scale.x, 1.0), mod(uv.y * scale.y, 1.0));
 }
+
+fn transform_uv(uv: vec2, st: vec4, rot: scalar) -> vec2 {
+    // KHR_texture_transform: apply rotation then scale+offset
+    // st = vec4(offset.x, offset.y, scale.x, scale.y)
+    let c: scalar = cos(rot);
+    let s: scalar = sin(rot);
+    let rotated: vec2 = vec2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
+    return rotated * vec2(st.z, st.w) + vec2(st.x, st.y);
+}

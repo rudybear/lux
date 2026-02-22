@@ -159,10 +159,28 @@ GltfScene loadGltf(const std::string& path) {
             if (pbr.base_color_texture.texture) {
                 std::cout << "[info] Extracting base_color texture for material: " << gmat.name << std::endl;
                 gmat.base_color_tex = extractTextureData(pbr.base_color_texture);
+                if (pbr.base_color_texture.has_transform) {
+                    gmat.base_color_uv_xform.offset = glm::vec2(
+                        pbr.base_color_texture.transform.offset[0],
+                        pbr.base_color_texture.transform.offset[1]);
+                    gmat.base_color_uv_xform.scale = glm::vec2(
+                        pbr.base_color_texture.transform.scale[0],
+                        pbr.base_color_texture.transform.scale[1]);
+                    gmat.base_color_uv_xform.rotation = pbr.base_color_texture.transform.rotation;
+                }
             }
             if (pbr.metallic_roughness_texture.texture) {
                 std::cout << "[info] Extracting metallic_roughness texture for material: " << gmat.name << std::endl;
                 gmat.metallic_roughness_tex = extractTextureData(pbr.metallic_roughness_texture);
+                if (pbr.metallic_roughness_texture.has_transform) {
+                    gmat.metallic_roughness_uv_xform.offset = glm::vec2(
+                        pbr.metallic_roughness_texture.transform.offset[0],
+                        pbr.metallic_roughness_texture.transform.offset[1]);
+                    gmat.metallic_roughness_uv_xform.scale = glm::vec2(
+                        pbr.metallic_roughness_texture.transform.scale[0],
+                        pbr.metallic_roughness_texture.transform.scale[1]);
+                    gmat.metallic_roughness_uv_xform.rotation = pbr.metallic_roughness_texture.transform.rotation;
+                }
             }
         }
 
@@ -170,6 +188,15 @@ GltfScene loadGltf(const std::string& path) {
         if (mat.normal_texture.texture) {
             std::cout << "[info] Extracting normal texture for material: " << gmat.name << std::endl;
             gmat.normal_tex = extractTextureData(mat.normal_texture);
+            if (mat.normal_texture.has_transform) {
+                gmat.normal_uv_xform.offset = glm::vec2(
+                    mat.normal_texture.transform.offset[0],
+                    mat.normal_texture.transform.offset[1]);
+                gmat.normal_uv_xform.scale = glm::vec2(
+                    mat.normal_texture.transform.scale[0],
+                    mat.normal_texture.transform.scale[1]);
+                gmat.normal_uv_xform.rotation = mat.normal_texture.transform.rotation;
+            }
         }
 
         // Occlusion map
