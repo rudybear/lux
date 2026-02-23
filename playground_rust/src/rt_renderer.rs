@@ -657,7 +657,7 @@ impl RTRenderer {
             tex_sampler,
         ));
 
-        // Create 1x1 black default texture (for emissive)
+        // Create 1x1 black default texture (for emissive, sheen, transmission)
         let black_pixel: [u8; 4] = [0, 0, 0, 255];
         let default_black =
             create_rt_texture_image(ctx, 1, 1, &black_pixel, "rt_default_black")?;
@@ -666,6 +666,18 @@ impl RTRenderer {
             default_black.0,
             Some(default_black.2),
             default_black.1,
+            tex_sampler,
+        ));
+
+        // Create 1x1 flat normal default texture (128,128,255 = tangent-space identity)
+        let flat_normal_pixel: [u8; 4] = [128, 128, 255, 255];
+        let default_normal =
+            create_rt_texture_image(ctx, 1, 1, &flat_normal_pixel, "rt_default_normal")?;
+        let default_normal_view = default_normal.1;
+        texture_images.push((
+            default_normal.0,
+            Some(default_normal.2),
+            default_normal.1,
             tex_sampler,
         ));
 
@@ -685,9 +697,14 @@ impl RTRenderer {
 
                 let tex_slots: &[(&str, &Option<crate::gltf_loader::TextureImage>)] = &[
                     ("base_color_tex", &mat.base_color_image),
+                    ("normal_tex", &mat.normal_image),
                     ("metallic_roughness_tex", &mat.metallic_roughness_image),
                     ("occlusion_tex", &mat.occlusion_image),
                     ("emissive_tex", &mat.emissive_image),
+                    ("sheen_color_tex", &mat.sheen_color_image),
+                    ("clearcoat_tex", &mat.clearcoat_image),
+                    ("clearcoat_roughness_tex", &mat.clearcoat_roughness_image),
+                    ("transmission_tex", &mat.transmission_image),
                 ];
 
                 for &(tex_name, tex_opt) in tex_slots {
@@ -719,10 +736,10 @@ impl RTRenderer {
                                 .insert(cache_key, (view, tex_sampler));
                         }
                     } else {
-                        let fallback_view = if tex_name == "emissive_tex" {
-                            default_black_view
-                        } else {
-                            default_white_view
+                        let fallback_view = match tex_name {
+                            "emissive_tex" | "sheen_color_tex" | "transmission_tex" => default_black_view,
+                            "normal_tex" => default_normal_view,
+                            _ => default_white_view,
                         };
                         mat_tex_map.insert(tex_name.to_string(), (fallback_view, tex_sampler));
                     }
@@ -752,6 +769,10 @@ impl RTRenderer {
                     Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.base_color_image),
                 ),
                 (
+                    "normal_tex",
+                    Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.normal_image),
+                ),
+                (
                     "metallic_roughness_tex",
                     Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.metallic_roughness_image),
                 ),
@@ -762,6 +783,22 @@ impl RTRenderer {
                 (
                     "emissive_tex",
                     Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.emissive_image),
+                ),
+                (
+                    "sheen_color_tex",
+                    Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.sheen_color_image),
+                ),
+                (
+                    "clearcoat_tex",
+                    Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.clearcoat_image),
+                ),
+                (
+                    "clearcoat_roughness_tex",
+                    Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.clearcoat_roughness_image),
+                ),
+                (
+                    "transmission_tex",
+                    Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.transmission_image),
                 ),
             ];
 
@@ -784,10 +821,10 @@ impl RTRenderer {
                     texture_images.push((gpu_tex.0, Some(gpu_tex.2), gpu_tex.1, tex_sampler));
                     texture_map.insert(tex_name.to_string(), (view, tex_sampler));
                 } else {
-                    let fallback_view = if *tex_name == "emissive_tex" {
-                        default_black_view
-                    } else {
-                        default_white_view
+                    let fallback_view = match *tex_name {
+                        "emissive_tex" | "sheen_color_tex" | "transmission_tex" => default_black_view,
+                        "normal_tex" => default_normal_view,
+                        _ => default_white_view,
                     };
                     texture_map.insert(tex_name.to_string(), (fallback_view, tex_sampler));
                 }
