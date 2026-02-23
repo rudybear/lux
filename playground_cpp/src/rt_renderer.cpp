@@ -1243,7 +1243,13 @@ void RTRenderer::init(VulkanContext& ctx,
         m_scene->getGltfScene().materials.size() > 1;
     bool hasManifest = !manifest.permutations.empty();
 
-    if (hasManifest && hasMultipleMaterials) {
+    // NOTE: Multi-material RT is disabled because Vulkan RT binds descriptor sets
+    // ONCE before traceRays — all hit shaders share the same textures/UBOs.
+    // Per-geometry material switching would require bindless textures or texture
+    // arrays indexed by gl_GeometryIndexEXT, which needs shader-level changes.
+    // For now, use single-material mode with scene-wide feature detection.
+    // TODO: Add bindless texture support for true per-geometry materials in RT.
+    if (false && hasManifest && hasMultipleMaterials) {
         // Multi-material mode: load per-permutation rchit shaders
         m_multiMaterial = true;
 

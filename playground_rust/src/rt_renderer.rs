@@ -335,7 +335,13 @@ impl RTRenderer {
             .as_ref()
             .map(|s| s.materials.len() > 1)
             .unwrap_or(false);
-        let use_multi_material = manifest.is_some() && has_multiple_materials;
+        // NOTE: Multi-material RT is disabled because Vulkan RT binds descriptor sets
+        // ONCE before traceRays — all hit shaders share the same textures/UBOs.
+        // Per-geometry material switching would require bindless textures or texture
+        // arrays indexed by gl_GeometryIndexEXT, which needs shader-level changes.
+        // For now, use single-material mode with scene-wide feature detection.
+        // TODO: Add bindless texture support for true per-geometry materials in RT.
+        let use_multi_material = false;
 
         if use_multi_material {
             info!(
@@ -476,8 +482,27 @@ impl RTRenderer {
                 }
             }
         } else {
-            // Single-material: just load the base rchit
-            let rchit_json_path = format!("{}.rchit.json", shader_base);
+            // Single-material: resolve best permutation from scene-wide features
+            let mut resolved_base = shader_base.to_string();
+            if let (Some(ref mf), Some(ref gs)) = (&manifest, &gltf_scene_opt) {
+                let scene_features = scene_manager::detect_scene_features(gs);
+                let suffix = find_permutation_suffix(mf, &scene_features);
+                if !suffix.is_empty() {
+                    let candidate = format!("{}{}", shader_base, suffix);
+                    if Path::new(&format!("{}.rchit.spv", candidate)).exists() {
+                        info!("Resolved single-material RT permutation: {}", suffix);
+                        resolved_base = candidate;
+                    }
+                }
+            }
+
+            let rchit_json_path = format!("{}.rchit.json", resolved_base);
+            // Fall back to base if resolved doesn't exist
+            let rchit_json_path = if Path::new(&rchit_json_path).exists() {
+                rchit_json_path
+            } else {
+                format!("{}.rchit.json", shader_base)
+            };
             if Path::new(&rchit_json_path).exists() {
                 let refl = reflected_pipeline::load_reflection(Path::new(&rchit_json_path))?;
                 info!(
@@ -487,7 +512,13 @@ impl RTRenderer {
                 );
                 rchit_reflections.push(refl);
             }
-            rchit_spv_paths.push(format!("{}.rchit.spv", shader_base));
+            let rchit_spv = format!("{}.rchit.spv", resolved_base);
+            let rchit_spv = if Path::new(&rchit_spv).exists() {
+                rchit_spv
+            } else {
+                format!("{}.rchit.spv", shader_base)
+            };
+            rchit_spv_paths.push(rchit_spv);
         }
 
         // Merge all reflections into superset descriptor layout
