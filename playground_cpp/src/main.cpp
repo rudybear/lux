@@ -276,34 +276,42 @@ static int runHeadless(const CLIOptions& opts) {
         SceneManager scene;
         scene.loadScene(ctx, opts.sceneSource);
 
-        // Always use 48-byte stride for glTF raster scenes so that flattenScene()
+        // Always use 48-byte stride for glTF scenes so that flattenScene()
         // is called (which generates draw ranges and applies world transforms).
-        // Shaders that don't use tangent (stride=32) simply ignore the extra bytes.
-        int vertexStride = 32;
-        if (!needRT && !needMesh && renderPath == "raster" && scene.hasGltfScene()) {
-            vertexStride = 48;
-        }
+        // RT/mesh renderers create their own SoA buffers but still need draw
+        // ranges for per-material rendering. Raster shaders that don't use
+        // tangent (stride=32) simply ignore the extra bytes.
+        int vertexStride = scene.hasGltfScene() ? 48 : 32;
 
         scene.uploadToGPU(ctx, vertexStride);
         scene.uploadTextures(ctx);
         scene.loadIBLAssets(ctx, dstStage, opts.iblName);
 
         // Resolve permutation for RT/mesh paths from manifest + scene features.
-        // (Raster handles this internally in raster_renderer.cpp.)
+        // Renderers with multi-material support (raster, mesh, RT) handle
+        // permutation selection internally when a manifest exists.
+        // Only fall back to single-permutation resolution when the renderer
+        // doesn't support multi-material (e.g., legacy code paths).
         std::string resolvedBase = opts.shaderBase;
-        if ((needRT || needMesh) && scene.hasGltfScene()) {
+        bool hasManifest = false;
+        bool hasMultipleMaterials = scene.hasGltfScene() && scene.getGltfScene().materials.size() > 1;
+        if (scene.hasGltfScene()) {
             ShaderManifest manifest = tryLoadManifest(opts.shaderBase);
-            if (!manifest.permutations.empty()) {
+            hasManifest = !manifest.permutations.empty();
+            if (hasManifest && !hasMultipleMaterials) {
+                // Single material: resolve to best permutation for the whole scene
                 auto features = scene.detectSceneFeatures();
                 std::string suffix = findPermutationSuffix(manifest, features);
                 if (!suffix.empty()) {
-                    std::string ext = needRT ? ".rgen.spv" : ".mesh.spv";
+                    std::string ext = needRT ? ".rgen.spv" : (needMesh ? ".mesh.spv" : ".vert.spv");
                     if (fs::exists(opts.shaderBase + suffix + ext)) {
                         resolvedBase = opts.shaderBase + suffix;
                         std::cout << "[info] Resolved permutation: " << suffix << std::endl;
                     }
                 }
             }
+            // Multi-material with manifest: pass unresolved base to renderer
+            // (renderers handle per-material permutation selection internally)
         }
 
         std::unique_ptr<IRenderer> renderer;
@@ -445,24 +453,25 @@ static int runInteractive(CLIOptions opts) {
 
         // Always use 48-byte stride for glTF raster scenes so that flattenScene()
         // is called (which generates draw ranges and applies world transforms).
-        int vertexStride = 32;
-        if (!useRT && !useMesh && renderPath == "raster" && scene.hasGltfScene()) {
-            vertexStride = 48;
-        }
+        int vertexStride = scene.hasGltfScene() ? 48 : 32;
 
         scene.uploadToGPU(ctx, vertexStride);
         scene.uploadTextures(ctx);
         scene.loadIBLAssets(ctx, dstStage, opts.iblName);
 
-        // Resolve permutation for RT/mesh paths from manifest + scene features.
+        // Resolve permutation for RT/mesh paths.
+        // Multi-material scenes: pass unresolved base so renderers handle
+        // per-material permutation selection internally.
+        // Single-material scenes: resolve to best permutation for the whole scene.
         std::string resolvedBase = opts.shaderBase;
-        if ((useRT || useMesh) && scene.hasGltfScene()) {
+        bool hasMultiMat = scene.hasGltfScene() && scene.getGltfScene().materials.size() > 1;
+        if (scene.hasGltfScene()) {
             ShaderManifest manifest = tryLoadManifest(opts.shaderBase);
-            if (!manifest.permutations.empty()) {
+            if (!manifest.permutations.empty() && !hasMultiMat) {
                 auto features = scene.detectSceneFeatures();
                 std::string suffix = findPermutationSuffix(manifest, features);
                 if (!suffix.empty()) {
-                    std::string ext = useRT ? ".rgen.spv" : ".mesh.spv";
+                    std::string ext = useRT ? ".rgen.spv" : (useMesh ? ".mesh.spv" : ".vert.spv");
                     if (fs::exists(opts.shaderBase + suffix + ext)) {
                         resolvedBase = opts.shaderBase + suffix;
                         std::cout << "[info] Resolved permutation: " << suffix << std::endl;

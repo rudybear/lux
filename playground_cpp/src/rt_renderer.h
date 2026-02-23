@@ -11,7 +11,18 @@
 #include "material_ubo.h"
 #include <string>
 #include <vector>
+#include <map>
 #include <unordered_map>
+
+// Per-permutation RT hit group data for multi-material rendering
+struct RTHitPermutation {
+    std::string suffix;             // e.g. "+normal_map+sheen"
+    std::string basePath;           // full path with suffix
+    VkShaderModule rchitModule = VK_NULL_HANDLE;
+    ReflectionData rchitRefl;
+    std::vector<int> materialIndices;  // which scene materials use this permutation
+    uint32_t hitGroupIndex = 0;        // index into shader groups (offset by 2 for rgen+rmiss)
+};
 
 class RTRenderer : public IRenderer {
 public:
@@ -92,7 +103,7 @@ private:
     VkBuffer cameraBuffer = VK_NULL_HANDLE;
     VmaAllocation cameraAllocation = VK_NULL_HANDLE;
 
-    // Material UBO
+    // Material UBO (single-material mode)
     VkBuffer m_materialBuffer = VK_NULL_HANDLE;
     VmaAllocation m_materialAllocation = VK_NULL_HANDLE;
 
@@ -116,10 +127,30 @@ private:
     VmaAllocation indexStorageAllocation = VK_NULL_HANDLE;
     VkDeviceSize indexStorageSize = 0;
 
-    // Shader modules
+    // Shader modules (raygen + miss are always single; rchit varies)
     VkShaderModule rgenModule = VK_NULL_HANDLE;
     VkShaderModule rmissModule = VK_NULL_HANDLE;
-    VkShaderModule rchitModule = VK_NULL_HANDLE;
+    VkShaderModule rchitModule = VK_NULL_HANDLE;  // single-material fallback
+
+    // --- Multi-material RT fields ---
+    bool m_multiMaterial = false;
+    uint32_t m_geometryCount = 1;  // number of BLAS geometries (one per draw range)
+
+    // Per-permutation hit group data
+    std::vector<RTHitPermutation> m_hitPermutations;
+
+    // Mapping: geometry index (BLAS) -> permutation index
+    std::vector<int> m_geometryToPermutation;
+
+    // Mapping: geometry index -> hit group index (for SBT)
+    std::vector<uint32_t> m_geometryToHitGroup;
+
+    // Per-material UBOs (one per material)
+    std::vector<VkBuffer> m_perMaterialBuffers;
+    std::vector<VmaAllocation> m_perMaterialAllocations;
+
+    // Per-material descriptor sets (one per material, for texture + material binding)
+    std::vector<VkDescriptorSet> m_perMaterialDescSets;
 
     void createStorageImage(VulkanContext& ctx);
     void createBLAS(VulkanContext& ctx);

@@ -2,6 +2,9 @@
 //!
 //! Follows the raster_renderer pattern for render pass/framebuffer/depth buffer
 //! and the rt_renderer pattern for SoA storage buffers.
+//!
+//! Supports both single-pipeline mode (original) and multi-pipeline mode
+//! (when a .manifest.json exists AND the scene has multiple materials).
 
 use ash::vk;
 use bytemuck;
@@ -108,9 +111,108 @@ impl MaterialUboData {
     }
 }
 
+// ===========================================================================
+// Manifest loading (same pattern as raster_renderer)
+// ===========================================================================
+
+/// A single manifest permutation entry.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ManifestPermutation {
+    suffix: String,
+    features: HashMap<String, bool>,
+}
+
+/// Parsed shader manifest describing available permutations.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ShaderManifest {
+    #[serde(default)]
+    pipeline: String,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
+    permutations: Vec<ManifestPermutation>,
+}
+
+impl Default for ShaderManifest {
+    fn default() -> Self {
+        Self {
+            pipeline: String::new(),
+            features: Vec::new(),
+            permutations: Vec::new(),
+        }
+    }
+}
+
+/// Parse a .manifest.json file into a ShaderManifest struct.
+fn parse_manifest_json(path: &Path) -> Option<ShaderManifest> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Try to load manifest from a pipeline base path.
+fn try_load_manifest(pipeline_base: &str) -> Option<ShaderManifest> {
+    let path1 = format!("{}.manifest.json", pipeline_base);
+    if Path::new(&path1).exists() {
+        info!("Loading mesh shader manifest: {}", path1);
+        if let Some(manifest) = parse_manifest_json(Path::new(&path1)) {
+            if !manifest.permutations.is_empty() {
+                return Some(manifest);
+            }
+        }
+    }
+
+    // Try legacy subdirectory format
+    let p = std::path::Path::new(pipeline_base);
+    if let (Some(dir), Some(filename)) = (p.parent(), p.file_name()) {
+        let path2 = dir.join("gltf_pbr").join(format!("{}.manifest.json", filename.to_string_lossy()));
+        if path2.exists() {
+            info!("Loading mesh shader manifest: {}", path2.display());
+            if let Some(manifest) = parse_manifest_json(&path2) {
+                if !manifest.permutations.is_empty() {
+                    return Some(manifest);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+// ===========================================================================
+// Multi-pipeline data structures
+// ===========================================================================
+
+/// A group of meshlets that share a common material.
+/// Built by partitioning meshlets per draw range so each group maps to a
+/// specific material (and therefore a specific shader permutation).
+struct MeshletGroup {
+    first_meshlet: u32,     // offset into global meshlet descriptor array
+    meshlet_count: u32,     // how many meshlets in this group
+    material_index: usize,  // scene material index
+    permutation_index: usize, // index into mesh_permutations
+}
+
+/// Per-permutation pipeline data for mesh shader multi-material rendering.
+/// The mesh shader (.mesh.spv) is SHARED across all permutations (it only reads
+/// geometry data), while the fragment shader (.frag.spv) differs per permutation
+/// (different BRDF features, texture bindings).
+struct MeshPermutationPipeline {
+    #[allow(dead_code)]
+    suffix: String,
+    frag_module: vk::ShaderModule,
+    #[allow(dead_code)]
+    frag_refl: reflected_pipeline::ReflectionData,
+    material_set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    per_material_desc_sets: Vec<vk::DescriptorSet>,
+    per_material_ubos: Vec<GpuBuffer>,
+    material_indices: Vec<usize>,
+}
+
 /// Mesh shader renderer state (persistent, suitable for interactive multi-frame rendering).
 pub struct MeshShaderRenderer {
-    // Pipeline
+    // Pipeline (single-pipeline mode)
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -141,6 +243,15 @@ pub struct MeshShaderRenderer {
     tex_coords_buffer: GpuBuffer,
     tangents_buffer: GpuBuffer,
 
+    // Buffer sizes for descriptor writes (needed by multi-pipeline setup)
+    meshlet_desc_size: u64,
+    meshlet_verts_size: u64,
+    meshlet_tris_size: u64,
+    positions_size: u64,
+    normals_size: u64,
+    tex_coords_size: u64,
+    tangents_size: u64,
+
     // Uniforms
     mvp_buffer: GpuBuffer,
     light_buffer: GpuBuffer,
@@ -152,7 +263,19 @@ pub struct MeshShaderRenderer {
     default_black_texture: GpuImage,
     default_normal_texture: GpuImage,
     texture_images: HashMap<String, GpuImage>,
+    per_material_textures: Vec<HashMap<String, GpuImage>>,
     ibl_assets: IblAssets,
+
+    // Multi-pipeline mode
+    multi_pipeline: bool,
+    mesh_permutations: Vec<MeshPermutationPipeline>,
+    material_to_permutation: Vec<usize>,
+    shared_set0_layout: vk::DescriptorSetLayout,
+    shared_set0: vk::DescriptorSet,
+    meshlet_groups: Vec<MeshletGroup>,
+
+    // Cached reflection for multi-pipeline setup
+    mesh_refl: Option<reflected_pipeline::ReflectionData>,
 
     // Auto-camera
     pub auto_eye: glam::Vec3,
@@ -223,6 +346,10 @@ impl MeshShaderRenderer {
     ///
     /// Loads reflection, builds meshlets from scene geometry, uploads storage buffers,
     /// creates render pass/framebuffer/pipeline, and writes descriptors.
+    ///
+    /// Supports both single-pipeline mode (original) and multi-pipeline mode
+    /// (when a .manifest.json exists AND the scene has multiple materials AND
+    /// the mesh shader declares a meshletOffset push constant).
     pub fn new(
         ctx: &mut VulkanContext,
         scene_source: &str,
@@ -257,67 +384,6 @@ impl MeshShaderRenderer {
             max_verts, max_prims
         );
 
-        // Merge descriptor sets from both stages
-        let merged = reflected_pipeline::merge_descriptor_sets(&[&mesh_refl, &frag_refl]);
-
-        // Create descriptor set layouts
-        let ds_layouts = unsafe {
-            reflected_pipeline::create_descriptor_set_layouts_from_merged(&device, &merged)?
-        };
-
-        let (pool_sizes, max_sets) = reflected_pipeline::compute_pool_sizes(&merged);
-
-        info!(
-            "Mesh shader reflection-driven descriptors: {} sets, {} pool size entries",
-            max_sets,
-            pool_sizes.len()
-        );
-
-        // Create descriptor pool
-        let descriptor_pool = unsafe {
-            let pool_info = vk::DescriptorPoolCreateInfo::default()
-                .max_sets(max_sets)
-                .pool_sizes(&pool_sizes);
-            device
-                .create_descriptor_pool(&pool_info, None)
-                .map_err(|e| format!("Failed to create mesh shader descriptor pool: {:?}", e))?
-        };
-
-        // Allocate descriptor sets
-        let max_set_idx = ds_layouts.keys().copied().max().unwrap_or(0);
-        let mut ordered_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
-        for i in 0..=max_set_idx {
-            if let Some(&layout) = ds_layouts.get(&i) {
-                ordered_layouts.push(layout);
-            }
-        }
-
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(&ordered_layouts);
-
-        let descriptor_sets = unsafe {
-            device
-                .allocate_descriptor_sets(&alloc_info)
-                .map_err(|e| format!("Failed to allocate mesh shader descriptor sets: {:?}", e))?
-        };
-
-        let mut ds_map: HashMap<u32, vk::DescriptorSet> = HashMap::new();
-        {
-            let mut ds_idx = 0;
-            for i in 0..=max_set_idx {
-                if ds_layouts.contains_key(&i) {
-                    ds_map.insert(i, descriptor_sets[ds_idx]);
-                    ds_idx += 1;
-                }
-            }
-        }
-
-        // Pipeline layout (no push constants for mesh shader by default)
-        let pipeline_layout = unsafe {
-            reflected_pipeline::create_pipeline_layout_from_merged(&device, &ds_layouts, &[])?
-        };
-
         // --- Phase 1: Load scene geometry ---
         let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
 
@@ -327,6 +393,34 @@ impl MeshShaderRenderer {
             None
         };
 
+        // Check for manifest to decide multi-pipeline mode
+        let manifest = try_load_manifest(pipeline_base);
+        let has_multiple_materials = gltf_scene.as_ref().map(|s| s.materials.len() > 1).unwrap_or(false);
+
+        // Check if the mesh shader declares a meshletOffset push constant
+        let has_meshlet_offset_pc = mesh_refl.push_constants.iter().any(|pc| {
+            pc.fields.iter().any(|f| f.name == "meshletOffset")
+        });
+
+        let use_multi_pipeline = if manifest.is_some() && has_multiple_materials {
+            if has_meshlet_offset_pc {
+                info!(
+                    "Multi-pipeline mode enabled: manifest found, {} materials, meshletOffset push constant present",
+                    gltf_scene.as_ref().map(|s| s.materials.len()).unwrap_or(0)
+                );
+                true
+            } else {
+                info!(
+                    "WARNING: Manifest found with {} material(s), but mesh shader multi-pipeline \
+                     requires meshletOffset push constant support. Falling back to single pipeline.",
+                    gltf_scene.as_ref().map(|s| s.materials.len()).unwrap_or(0)
+                );
+                false
+            }
+        } else {
+            false
+        };
+
         let mut auto_eye = glam::Vec3::new(0.0, 0.0, 3.0);
         let mut auto_target = glam::Vec3::ZERO;
         let mut auto_up = glam::Vec3::new(0.0, 1.0, 0.0);
@@ -334,6 +428,8 @@ impl MeshShaderRenderer {
         let mut has_scene_bounds = false;
 
         let mut tangent_data_raw: Vec<[f32; 4]> = Vec::new();
+        let mut draw_ranges: Vec<crate::gltf_loader::DrawRange> = Vec::new();
+
         let (vertices, indices): (Vec<scene::PbrVertex>, Vec<u32>) =
             if let Some(ref mut gltf_s) = gltf_scene {
                 if gltf_s.meshes.is_empty() {
@@ -348,6 +444,7 @@ impl MeshShaderRenderer {
                 let mut all_indices: Vec<u32> = Vec::new();
                 let mut vertex_offset: u32 = 0;
                 let mut vertex_positions: Vec<[f32; 3]> = Vec::new();
+                let mut index_offset: u32 = 0;
 
                 for item in &draw_items {
                     let mesh = &gltf_s.meshes[item.mesh_index];
@@ -372,6 +469,15 @@ impl MeshShaderRenderer {
                     for &idx in &mesh.indices {
                         all_indices.push(idx + vertex_offset);
                     }
+
+                    // Track draw ranges per draw item (for per-material meshlet building)
+                    draw_ranges.push(crate::gltf_loader::DrawRange {
+                        index_offset,
+                        index_count: mesh.indices.len() as u32,
+                        material_index: item.material_index,
+                    });
+                    index_offset += mesh.indices.len() as u32;
+
                     vertex_offset += mesh.vertices.len() as u32;
                 }
 
@@ -396,45 +502,125 @@ impl MeshShaderRenderer {
         }
 
         // --- Phase 2: Build meshlets ---
-        let meshlet_result = meshlet::build_meshlets(
-            &indices,
-            vertices.len() as u32,
-            max_verts,
-            max_prims,
-        );
+        // Decide whether to build per-draw-range (multi-material) or full-buffer (single)
+        let has_multiple_draw_ranges = draw_ranges.len() > 1;
+        let mut meshlet_groups: Vec<MeshletGroup> = Vec::new();
 
-        let meshlet_count = meshlet_result.meshlets.len() as u32;
-        info!(
-            "Built {} meshlets from {} triangles ({} vertices)",
-            meshlet_count,
-            indices.len() / 3,
-            vertices.len()
-        );
+        let (meshlet_descs, meshlet_vertices_vec, meshlet_triangles_vec) =
+            if has_multiple_draw_ranges && use_multi_pipeline {
+                // Multi-material path: build meshlets per draw range so each group
+                // is associated with a specific material for permutation selection.
+                let mut all_meshlets: Vec<meshlet::MeshletDescriptor> = Vec::new();
+                let mut all_meshlet_vertices: Vec<u32> = Vec::new();
+                let mut all_meshlet_triangles: Vec<u32> = Vec::new();
+
+                for range in &draw_ranges {
+                    let range_index_count = range.index_count;
+                    if range_index_count == 0 {
+                        continue;
+                    }
+
+                    // Build meshlets from this draw range's index slice
+                    let range_start = range.index_offset as usize;
+                    let range_end = range_start + range_index_count as usize;
+                    let range_indices = &indices[range_start..range_end];
+
+                    let build_result = meshlet::build_meshlets(
+                        range_indices,
+                        vertices.len() as u32,
+                        max_verts,
+                        max_prims,
+                    );
+
+                    if build_result.meshlets.is_empty() {
+                        continue;
+                    }
+
+                    // Record the meshlet group before concatenation
+                    let group = MeshletGroup {
+                        first_meshlet: all_meshlets.len() as u32,
+                        meshlet_count: build_result.meshlets.len() as u32,
+                        material_index: range.material_index,
+                        permutation_index: 0, // set later during multi-pipeline setup
+                    };
+
+                    // Offset meshlet descriptors to account for global vertex/triangle arrays
+                    let vertex_base = all_meshlet_vertices.len() as u32;
+                    let triangle_base = all_meshlet_triangles.len() as u32;
+                    let mut offset_meshlets = build_result.meshlets;
+                    for m in &mut offset_meshlets {
+                        m.vertex_offset += vertex_base;
+                        m.triangle_offset += triangle_base;
+                    }
+
+                    // Concatenate into global arrays
+                    all_meshlets.extend_from_slice(&offset_meshlets);
+                    all_meshlet_vertices.extend_from_slice(&build_result.meshlet_vertices);
+                    all_meshlet_triangles.extend_from_slice(&build_result.meshlet_triangles);
+
+                    meshlet_groups.push(group);
+                }
+
+                info!(
+                    "Built {} meshlets across {} material group(s) (max_verts={}, max_prims={})",
+                    all_meshlets.len(),
+                    meshlet_groups.len(),
+                    max_verts,
+                    max_prims
+                );
+
+                (all_meshlets, all_meshlet_vertices, all_meshlet_triangles)
+            } else {
+                // Single draw range (original path): build meshlets from the full index buffer
+                let meshlet_result = meshlet::build_meshlets(
+                    &indices,
+                    vertices.len() as u32,
+                    max_verts,
+                    max_prims,
+                );
+
+                info!(
+                    "Built {} meshlets from {} triangles ({} vertices)",
+                    meshlet_result.meshlets.len(),
+                    indices.len() / 3,
+                    vertices.len()
+                );
+
+                (
+                    meshlet_result.meshlets,
+                    meshlet_result.meshlet_vertices,
+                    meshlet_result.meshlet_triangles,
+                )
+            };
+
+        let meshlet_count = meshlet_descs.len() as u32;
 
         // --- Phase 3: Upload storage buffers ---
-        // Meshlet descriptors (vec4 each)
+        let meshlet_desc_size = meshlet_descs.len() as u64 * 16;
         let meshlet_desc_buffer = create_buffer_with_data(
             &device,
             ctx.allocator_mut(),
-            bytemuck::cast_slice(&meshlet_result.meshlets),
+            bytemuck::cast_slice(&meshlet_descs),
             vk::BufferUsageFlags::STORAGE_BUFFER,
             "mesh_meshlet_descriptors",
         )?;
 
-        // Meshlet vertex indices
+        let meshlet_verts_size = if meshlet_vertices_vec.is_empty() { 4u64 } else { meshlet_vertices_vec.len() as u64 * 4 };
+        let meshlet_verts_data: Vec<u32> = if meshlet_vertices_vec.is_empty() { vec![0u32] } else { meshlet_vertices_vec };
         let meshlet_verts_buffer = create_buffer_with_data(
             &device,
             ctx.allocator_mut(),
-            bytemuck::cast_slice(&meshlet_result.meshlet_vertices),
+            bytemuck::cast_slice(&meshlet_verts_data),
             vk::BufferUsageFlags::STORAGE_BUFFER,
             "mesh_meshlet_vertices",
         )?;
 
-        // Meshlet triangle indices
+        let meshlet_tris_size = if meshlet_triangles_vec.is_empty() { 4u64 } else { meshlet_triangles_vec.len() as u64 * 4 };
+        let meshlet_tris_data: Vec<u32> = if meshlet_triangles_vec.is_empty() { vec![0u32] } else { meshlet_triangles_vec };
         let meshlet_tris_buffer = create_buffer_with_data(
             &device,
             ctx.allocator_mut(),
-            bytemuck::cast_slice(&meshlet_result.meshlet_triangles),
+            bytemuck::cast_slice(&meshlet_tris_data),
             vk::BufferUsageFlags::STORAGE_BUFFER,
             "mesh_meshlet_triangles",
         )?;
@@ -449,6 +635,10 @@ impl MeshShaderRenderer {
             .map(|v| [v.normal[0], v.normal[1], v.normal[2], 0.0])
             .collect();
         let tex_coords_data: Vec<[f32; 2]> = vertices.iter().map(|v| v.uv).collect();
+
+        let positions_size = positions_data.len() as u64 * 16;
+        let normals_size = normals_data.len() as u64 * 16;
+        let tex_coords_size = tex_coords_data.len() as u64 * 8;
 
         let positions_buffer = create_buffer_with_data(
             &device,
@@ -473,6 +663,7 @@ impl MeshShaderRenderer {
         )?;
 
         let tangents_data: Vec<[f32; 4]> = tangent_data_raw;
+        let tangents_size = tangents_data.len() as u64 * 16;
         let tangents_buffer = create_buffer_with_data(
             &device,
             ctx.allocator_mut(),
@@ -483,11 +674,7 @@ impl MeshShaderRenderer {
 
         info!(
             "Created mesh SoA storage buffers: positions={}B, normals={}B, texCoords={}B, tangents={}B, meshlets={}B",
-            positions_data.len() * 16,
-            normals_data.len() * 16,
-            tex_coords_data.len() * 8,
-            tangents_data.len() * 16,
-            meshlet_result.meshlets.len() * 16
+            positions_size, normals_size, tex_coords_size, tangents_size, meshlet_desc_size
         );
 
         // --- Phase 4: Uniform buffers ---
@@ -539,7 +726,7 @@ impl MeshShaderRenderer {
             "mesh_light",
         )?;
 
-        // Material uniform buffer (80 bytes)
+        // Material uniform buffer
         let material_data = if let Some(ref gs) = gltf_scene {
             if !gs.materials.is_empty() {
                 MaterialUboData::from_gltf_material(&gs.materials[0])
@@ -573,6 +760,50 @@ impl MeshShaderRenderer {
                 .map_err(|e| format!("Failed to create sampler: {:?}", e))?
         };
 
+        let default_texture = create_default_white_texture(ctx)?;
+        let default_black_texture =
+            create_texture_image(ctx, 1, 1, &[0u8, 0, 0, 255], "default_black")?;
+        let default_normal_texture =
+            create_texture_image(ctx, 1, 1, &[128u8, 128, 255, 255], "default_normal")?;
+
+        // Build per-material texture maps (for multi-pipeline mode)
+        let mut per_material_textures: Vec<HashMap<String, GpuImage>> = Vec::new();
+        if let Some(ref gs) = gltf_scene {
+            for (mat_idx, mat) in gs.materials.iter().enumerate() {
+                let mut tex_map: HashMap<String, GpuImage> = HashMap::new();
+
+                let tex_slots: Vec<(&str, Option<&crate::gltf_loader::TextureImage>)> = vec![
+                    ("base_color_tex", mat.base_color_image.as_ref()),
+                    ("normal_tex", mat.normal_image.as_ref()),
+                    ("metallic_roughness_tex", mat.metallic_roughness_image.as_ref()),
+                    ("occlusion_tex", mat.occlusion_image.as_ref()),
+                    ("emissive_tex", mat.emissive_image.as_ref()),
+                    ("clearcoat_tex", mat.clearcoat_image.as_ref()),
+                    ("clearcoat_roughness_tex", mat.clearcoat_roughness_image.as_ref()),
+                    ("sheen_color_tex", mat.sheen_color_image.as_ref()),
+                    ("transmission_tex", mat.transmission_image.as_ref()),
+                ];
+
+                for (name, img_opt) in tex_slots {
+                    if let Some(tex_data) = img_opt {
+                        let label = format!("mesh_{}[{}]", name, mat_idx);
+                        let gpu_img = create_texture_image(ctx, tex_data.width, tex_data.height, &tex_data.pixels, &label)?;
+                        tex_map.insert(name.to_string(), gpu_img);
+                    }
+                }
+
+                if mat.base_color_image.is_some() && !tex_map.contains_key("albedo_tex") {
+                    if let Some(tex_data) = mat.base_color_image.as_ref() {
+                        let gpu_img = create_texture_image(ctx, tex_data.width, tex_data.height, &tex_data.pixels, &format!("mesh_albedo_tex[{}]", mat_idx))?;
+                        tex_map.insert("albedo_tex".to_string(), gpu_img);
+                    }
+                }
+
+                per_material_textures.push(tex_map);
+            }
+        }
+
+        // Also build the single-material texture_images map (for single-pipeline fallback)
         let gltf_material = gltf_scene.as_ref().and_then(|s| {
             if !s.materials.is_empty() {
                 Some(&s.materials[0])
@@ -580,12 +811,6 @@ impl MeshShaderRenderer {
                 None
             }
         });
-
-        let default_texture = create_default_white_texture(ctx)?;
-        let default_black_texture =
-            create_texture_image(ctx, 1, 1, &[0u8, 0, 0, 255], "default_black")?;
-        let default_normal_texture =
-            create_texture_image(ctx, 1, 1, &[128u8, 128, 255, 255], "default_normal")?;
 
         let mut texture_images: HashMap<String, GpuImage> = HashMap::new();
         let texture_names = [
@@ -633,201 +858,7 @@ impl MeshShaderRenderer {
 
         let ibl_assets = load_ibl_assets(ctx, ibl_name);
 
-        // --- Phase 6: Write descriptor sets from reflection ---
-        // Build SSBO map by name -> (buffer, size)
-        let ssbo_map: HashMap<String, (vk::Buffer, u64)> = [
-            (
-                "meshlet_descriptors".to_string(),
-                (
-                    meshlet_desc_buffer.buffer,
-                    meshlet_result.meshlets.len() as u64 * 16,
-                ),
-            ),
-            (
-                "meshlet_vertices".to_string(),
-                (
-                    meshlet_verts_buffer.buffer,
-                    meshlet_result.meshlet_vertices.len() as u64 * 4,
-                ),
-            ),
-            (
-                "meshlet_triangles".to_string(),
-                (
-                    meshlet_tris_buffer.buffer,
-                    meshlet_result.meshlet_triangles.len() as u64 * 4,
-                ),
-            ),
-            (
-                "positions".to_string(),
-                (positions_buffer.buffer, positions_data.len() as u64 * 16),
-            ),
-            (
-                "normals".to_string(),
-                (normals_buffer.buffer, normals_data.len() as u64 * 16),
-            ),
-            (
-                "tex_coords".to_string(),
-                (tex_coords_buffer.buffer, tex_coords_data.len() as u64 * 8),
-            ),
-            (
-                "tangents".to_string(),
-                (tangents_buffer.buffer, tangents_data.len() as u64 * 16),
-            ),
-        ]
-        .into_iter()
-        .collect();
-
-        // Write descriptors (same pattern as raster_renderer)
-        let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
-        let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
-        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
-        let total_bindings: usize = merged.values().map(|v| v.len()).sum();
-        buffer_infos.reserve(total_bindings);
-        image_infos.reserve(total_bindings);
-
-        for (&set_idx, bindings) in &merged {
-            let ds = match ds_map.get(&set_idx) {
-                Some(&ds) => ds,
-                None => continue,
-            };
-            for binding in bindings {
-                let vk_type =
-                    reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
-                match vk_type {
-                    vk::DescriptorType::UNIFORM_BUFFER => {
-                        let (buffer, range) = match binding.name.as_str() {
-                            "MVP" => (mvp_buffer.buffer, binding.size as u64),
-                            "Light" => (light_buffer.buffer, binding.size as u64),
-                            "Material" => (material_buffer.buffer, std::mem::size_of::<MaterialUboData>() as u64),
-                            _ => continue,
-                        };
-                        let idx = buffer_infos.len();
-                        buffer_infos.push(
-                            vk::DescriptorBufferInfo::default()
-                                .buffer(buffer)
-                                .offset(0)
-                                .range(range),
-                        );
-                        writes.push(
-                            vk::WriteDescriptorSet::default()
-                                .dst_set(ds)
-                                .dst_binding(binding.binding)
-                                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                                .buffer_info(unsafe {
-                                    std::slice::from_raw_parts(
-                                        &buffer_infos[idx] as *const _,
-                                        1,
-                                    )
-                                }),
-                        );
-                    }
-                    vk::DescriptorType::STORAGE_BUFFER => {
-                        let (buffer, size) = match ssbo_map.get(&binding.name) {
-                            Some(&(buf, sz)) => (buf, sz),
-                            None => {
-                                info!(
-                                    "Unknown SSBO name '{}' at set={} binding={}, skipping",
-                                    binding.name, set_idx, binding.binding
-                                );
-                                continue;
-                            }
-                        };
-                        let idx = buffer_infos.len();
-                        buffer_infos.push(
-                            vk::DescriptorBufferInfo::default()
-                                .buffer(buffer)
-                                .offset(0)
-                                .range(size),
-                        );
-                        writes.push(
-                            vk::WriteDescriptorSet::default()
-                                .dst_set(ds)
-                                .dst_binding(binding.binding)
-                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                                .buffer_info(unsafe {
-                                    std::slice::from_raw_parts(
-                                        &buffer_infos[idx] as *const _,
-                                        1,
-                                    )
-                                }),
-                        );
-                    }
-                    vk::DescriptorType::SAMPLER => {
-                        let actual_sampler = ibl_assets
-                            .sampler_for_binding(&binding.name)
-                            .unwrap_or(sampler);
-                        let idx = image_infos.len();
-                        image_infos
-                            .push(vk::DescriptorImageInfo::default().sampler(actual_sampler));
-                        writes.push(
-                            vk::WriteDescriptorSet::default()
-                                .dst_set(ds)
-                                .dst_binding(binding.binding)
-                                .descriptor_type(vk::DescriptorType::SAMPLER)
-                                .image_info(unsafe {
-                                    std::slice::from_raw_parts(
-                                        &image_infos[idx] as *const _,
-                                        1,
-                                    )
-                                }),
-                        );
-                    }
-                    vk::DescriptorType::SAMPLED_IMAGE => {
-                        let is_cube =
-                            reflected_pipeline::is_cube_image_binding(&binding.binding_type);
-                        let view = if is_cube {
-                            ibl_assets
-                                .view_for_binding(&binding.name)
-                                .unwrap_or(default_texture.view)
-                        } else if binding.name == "brdf_lut" {
-                            ibl_assets
-                                .view_for_binding(&binding.name)
-                                .unwrap_or(default_texture.view)
-                        } else {
-                            let fallback = match binding.name.as_str() {
-                                "emissive_tex" => default_black_texture.view,
-                                "normal_tex" => default_normal_texture.view,
-                                _ => default_texture.view,
-                            };
-                            texture_images
-                                .get(&binding.name)
-                                .map(|img| img.view)
-                                .unwrap_or(fallback)
-                        };
-                        let idx = image_infos.len();
-                        image_infos.push(
-                            vk::DescriptorImageInfo::default()
-                                .image_view(view)
-                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                        );
-                        writes.push(
-                            vk::WriteDescriptorSet::default()
-                                .dst_set(ds)
-                                .dst_binding(binding.binding)
-                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                                .image_info(unsafe {
-                                    std::slice::from_raw_parts(
-                                        &image_infos[idx] as *const _,
-                                        1,
-                                    )
-                                }),
-                        );
-                    }
-                    _ => {
-                        info!(
-                            "Unhandled descriptor type {:?} at set={} binding={} name='{}'",
-                            vk_type, set_idx, binding.binding, binding.name
-                        );
-                    }
-                }
-            }
-        }
-
-        unsafe {
-            device.update_descriptor_sets(&writes, &[]);
-        }
-
-        // --- Phase 7: Render pass, framebuffer, pipeline ---
+        // --- Phase 6: Render pass, framebuffer ---
         let color_image = create_offscreen_image(
             &device,
             ctx.allocator_mut(),
@@ -936,115 +967,867 @@ impl MeshShaderRenderer {
                 .map_err(|e| format!("Failed to create mesh shader framebuffer: {:?}", e))?
         };
 
-        // Load shader modules
+        // Load mesh shader module (shared across all permutations)
         let mesh_path = format!("{}.mesh.spv", pipeline_base);
-        let frag_path = format!("{}.frag.spv", pipeline_base);
         let mesh_code = spv_loader::load_spirv(Path::new(&mesh_path))?;
-        let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
         let mesh_module = spv_loader::create_shader_module(&device, &mesh_code)?;
-        let frag_module = spv_loader::create_shader_module(&device, &frag_code)?;
 
-        // Create graphics pipeline with mesh + fragment stages (no vertex input)
-        let entry_name = c"main";
-        let shader_stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::MESH_EXT)
-                .module(mesh_module)
-                .name(entry_name),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(frag_module)
-                .name(entry_name),
-        ];
+        // ===================================================================
+        // Branch: multi-pipeline vs single-pipeline
+        // ===================================================================
+        if use_multi_pipeline {
+            // ---------------------------------------------------------------
+            // MULTI-PIPELINE MODE
+            // ---------------------------------------------------------------
+            let gltf_s = gltf_scene.as_ref().unwrap();
+            let groups = scene_manager::group_materials_by_features(gltf_s);
+            let total_materials = gltf_s.materials.len();
 
-        let viewport = vk::Viewport::default()
-            .width(width as f32)
-            .height(height as f32)
-            .max_depth(1.0);
-        let scissor = vk::Rect2D::default().extent(vk::Extent2D { width, height });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewports(std::slice::from_ref(&viewport))
-            .scissors(std::slice::from_ref(&scissor));
+            let mut material_to_permutation: Vec<usize> = vec![0; total_materials];
+            let mut mesh_permutations: Vec<MeshPermutationPipeline> = Vec::new();
 
-        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-            .line_width(1.0);
-        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(true)
-            .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::LESS);
-        let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA);
-        let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(std::slice::from_ref(&color_blend_attachment));
+            // Create shared set 0 layout from mesh shader reflection
+            // (meshlet buffers + SoA + MVP + Light)
+            let shared_set0_layout = {
+                let set0_merged = reflected_pipeline::merge_descriptor_sets(&[&mesh_refl]);
+                let set0_layouts = unsafe {
+                    reflected_pipeline::create_descriptor_set_layouts_from_merged(&device, &set0_merged)?
+                };
+                let layout = set0_layouts.get(&0).copied().unwrap_or(vk::DescriptorSetLayout::null());
+                // Destroy non-set-0 layouts
+                for (&idx, &l) in &set0_layouts {
+                    if idx != 0 {
+                        unsafe { device.destroy_descriptor_set_layout(l, None); }
+                    }
+                }
+                layout
+            };
 
-        // Mesh shader pipelines do NOT have vertex_input_state or input_assembly_state.
-        // They only need viewport, rasterization, multisample, depth_stencil, color_blend.
-        let pipeline = unsafe {
-            device
-                .create_graphics_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::GraphicsPipelineCreateInfo::default()
-                        .stages(&shader_stages)
-                        .viewport_state(&viewport_state)
-                        .rasterization_state(&rasterizer)
-                        .multisample_state(&multisampling)
-                        .depth_stencil_state(&depth_stencil)
-                        .color_blend_state(&color_blending)
-                        .layout(pipeline_layout)
-                        .render_pass(render_pass)
-                        .subpass(0)],
-                    None,
-                )
-                .map_err(|e| format!("Failed to create mesh shader pipeline: {:?}", e))?[0]
-        };
+            // Count total descriptor pool requirements
+            let mut type_counts: HashMap<vk::DescriptorType, u32> = HashMap::new();
+            let mut max_sets: u32 = 1; // set 0
 
-        info!(
-            "MeshShaderRenderer initialized: {}x{}, {} meshlets",
-            width, height, meshlet_count
-        );
+            // Set 0 bindings (shared) from mesh shader reflection
+            let mesh_merged = reflected_pipeline::merge_descriptor_sets(&[&mesh_refl]);
+            if let Some(bindings) = mesh_merged.get(&0) {
+                for b in bindings {
+                    let vk_type = reflected_pipeline::binding_type_to_vk_public(&b.binding_type);
+                    *type_counts.entry(vk_type).or_insert(0) += 1;
+                }
+            }
 
-        Ok(MeshShaderRenderer {
-            pipeline,
-            pipeline_layout,
-            descriptor_pool,
-            ds_layouts,
-            descriptor_sets,
-            mesh_module,
-            frag_module,
-            render_pass,
-            framebuffer,
-            color_image,
-            depth_image,
-            width,
-            height,
-            meshlet_count,
-            meshlet_desc_buffer,
-            meshlet_verts_buffer,
-            meshlet_tris_buffer,
-            positions_buffer,
-            normals_buffer,
-            tex_coords_buffer,
-            tangents_buffer,
-            mvp_buffer,
-            light_buffer,
-            material_buffer,
-            sampler,
-            default_texture,
-            default_black_texture,
-            default_normal_texture,
-            texture_images,
-            ibl_assets,
-            auto_eye,
-            auto_target,
-            auto_up,
-            auto_far,
-            has_scene_bounds,
-        })
+            // Pre-pass: load per-permutation reflections and count descriptors
+            struct PermPrep {
+                suffix: String,
+                perm_base: String,
+                material_indices: Vec<usize>,
+                frag_refl: reflected_pipeline::ReflectionData,
+                perm_merged: HashMap<u32, Vec<reflected_pipeline::BindingInfo>>,
+                frag_set_idx: u32,
+            }
+            let mut perm_preps: Vec<PermPrep> = Vec::new();
+
+            for (suffix, material_indices) in &groups {
+                let mut resolved_suffix = suffix.clone();
+                let mut perm_base = format!("{}{}", pipeline_base, resolved_suffix);
+                let perm_frag_path = format!("{}.frag.spv", perm_base);
+
+                if !Path::new(&perm_frag_path).exists() {
+                    info!("Missing fragment shader for mesh permutation '{}', falling back to base", resolved_suffix);
+                    perm_base = pipeline_base.to_string();
+                    resolved_suffix = String::new();
+                }
+
+                let perm_frag_json = format!("{}.frag.json", perm_base);
+                let p_frag_refl = reflected_pipeline::load_reflection(Path::new(&perm_frag_json))?;
+                let p_merged = reflected_pipeline::merge_descriptor_sets(&[&mesh_refl, &p_frag_refl]);
+
+                // Find frag set idx for this permutation
+                let mut p_frag_set_idx: u32 = 1;
+                for (&set_idx, bindings) in &p_merged {
+                    for b in bindings {
+                        if b.name == "Material" { p_frag_set_idx = set_idx; }
+                    }
+                }
+
+                // Count descriptors needed for per-material sets
+                if let Some(bindings) = p_merged.get(&p_frag_set_idx) {
+                    for b in bindings {
+                        let vk_type = reflected_pipeline::binding_type_to_vk_public(&b.binding_type);
+                        *type_counts.entry(vk_type).or_insert(0) += material_indices.len() as u32;
+                    }
+                }
+                max_sets += material_indices.len() as u32;
+
+                perm_preps.push(PermPrep {
+                    suffix: resolved_suffix,
+                    perm_base,
+                    material_indices: material_indices.clone(),
+                    frag_refl: p_frag_refl,
+                    perm_merged: p_merged,
+                    frag_set_idx: p_frag_set_idx,
+                });
+            }
+
+            // Create descriptor pool
+            let pool_sizes: Vec<vk::DescriptorPoolSize> = type_counts.iter()
+                .map(|(&ty, &count)| vk::DescriptorPoolSize::default().ty(ty).descriptor_count(count))
+                .collect();
+
+            let descriptor_pool = unsafe {
+                device
+                    .create_descriptor_pool(
+                        &vk::DescriptorPoolCreateInfo::default()
+                            .max_sets(max_sets)
+                            .pool_sizes(&pool_sizes),
+                        None,
+                    )
+                    .map_err(|e| format!("Failed to create mesh multi-pipeline descriptor pool: {:?}", e))?
+            };
+
+            // Allocate and write shared set 0 (meshlet data + SoA buffers + MVP + Light)
+            let shared_set0 = if shared_set0_layout != vk::DescriptorSetLayout::null() {
+                let info = vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(std::slice::from_ref(&shared_set0_layout));
+                unsafe { device.allocate_descriptor_sets(&info).map_err(|e| format!("Failed to alloc shared set 0: {:?}", e))?[0] }
+            } else {
+                vk::DescriptorSet::null()
+            };
+
+            // Write set 0: meshlet SSBOs + SoA buffers + MVP + Light
+            {
+                let set0_bindings = reflected_pipeline::merge_descriptor_sets(&[&mesh_refl]);
+                let mut buf_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+                let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+
+                let ssbo_map: HashMap<&str, (vk::Buffer, u64)> = [
+                    ("meshlet_descriptors", (meshlet_desc_buffer.buffer, meshlet_desc_size)),
+                    ("meshlet_vertices", (meshlet_verts_buffer.buffer, meshlet_verts_size)),
+                    ("meshlet_triangles", (meshlet_tris_buffer.buffer, meshlet_tris_size)),
+                    ("positions", (positions_buffer.buffer, positions_size)),
+                    ("normals", (normals_buffer.buffer, normals_size)),
+                    ("tex_coords", (tex_coords_buffer.buffer, tex_coords_size)),
+                    ("tangents", (tangents_buffer.buffer, tangents_size)),
+                ].into_iter().collect();
+
+                if let Some(bindings) = set0_bindings.get(&0) {
+                    for binding in bindings {
+                        let vk_type = reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
+                        match vk_type {
+                            vk::DescriptorType::UNIFORM_BUFFER => {
+                                let (buffer, range) = match binding.name.as_str() {
+                                    "MVP" => (mvp_buffer.buffer, binding.size as u64),
+                                    "Light" => (light_buffer.buffer, binding.size as u64),
+                                    _ => continue,
+                                };
+                                let idx = buf_infos.len();
+                                buf_infos.push(vk::DescriptorBufferInfo::default().buffer(buffer).offset(0).range(range));
+                                writes.push(
+                                    vk::WriteDescriptorSet::default()
+                                        .dst_set(shared_set0)
+                                        .dst_binding(binding.binding)
+                                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                        .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                );
+                            }
+                            vk::DescriptorType::STORAGE_BUFFER => {
+                                let (buffer, size) = match ssbo_map.get(binding.name.as_str()) {
+                                    Some(&(buf, sz)) => (buf, sz),
+                                    None => {
+                                        info!("Unknown SSBO '{}' in set 0, skipping", binding.name);
+                                        continue;
+                                    }
+                                };
+                                let idx = buf_infos.len();
+                                buf_infos.push(vk::DescriptorBufferInfo::default().buffer(buffer).offset(0).range(size));
+                                writes.push(
+                                    vk::WriteDescriptorSet::default()
+                                        .dst_set(shared_set0)
+                                        .dst_binding(binding.binding)
+                                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                        .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                );
+                            }
+                            _ => continue,
+                        }
+                    }
+                }
+                if !writes.is_empty() {
+                    unsafe { device.update_descriptor_sets(&writes, &[]); }
+                }
+            }
+
+            // For each permutation: create per-material descriptor sets, UBOs, pipeline
+            let mut perm_idx: usize = 0;
+            for prep in perm_preps {
+                // Load per-permutation fragment shader
+                let perm_frag_path = format!("{}.frag.spv", prep.perm_base);
+                let p_frag_code = spv_loader::load_spirv(Path::new(&perm_frag_path))?;
+                let p_frag_module = spv_loader::create_shader_module(&device, &p_frag_code)?;
+
+                // Create set 1 layout for this permutation
+                let perm_layouts = unsafe {
+                    reflected_pipeline::create_descriptor_set_layouts_from_merged(&device, &prep.perm_merged)?
+                };
+                let material_set_layout = perm_layouts.get(&prep.frag_set_idx).copied()
+                    .unwrap_or(vk::DescriptorSetLayout::null());
+                // Clean up other layouts
+                for (&idx, &l) in &perm_layouts {
+                    if idx != prep.frag_set_idx {
+                        unsafe { device.destroy_descriptor_set_layout(l, None); }
+                    }
+                }
+
+                // Map materials to this permutation
+                for &mi in &prep.material_indices {
+                    if mi < material_to_permutation.len() {
+                        material_to_permutation[mi] = perm_idx;
+                    }
+                }
+
+                // Allocate per-material descriptor sets and UBOs
+                let mut perm_desc_sets: Vec<vk::DescriptorSet> = Vec::new();
+                let mut perm_ubos: Vec<GpuBuffer> = Vec::new();
+
+                for &mi in &prep.material_indices {
+                    // Create Material UBO for this material
+                    let mat_data = if mi < gltf_s.materials.len() {
+                        MaterialUboData::from_gltf_material(&gltf_s.materials[mi])
+                    } else {
+                        MaterialUboData::default_values()
+                    };
+
+                    let mat_buf = create_buffer_with_data(
+                        &device, ctx.allocator_mut(),
+                        bytemuck::bytes_of(&mat_data),
+                        vk::BufferUsageFlags::UNIFORM_BUFFER,
+                        &format!("mesh_perm_{}_material_{}", perm_idx, mi),
+                    )?;
+
+                    // Allocate descriptor set
+                    let ds = if material_set_layout != vk::DescriptorSetLayout::null() {
+                        let info = vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(descriptor_pool)
+                            .set_layouts(std::slice::from_ref(&material_set_layout));
+                        unsafe { device.allocate_descriptor_sets(&info).map_err(|e| format!("Failed to alloc material DS: {:?}", e))?[0] }
+                    } else {
+                        vk::DescriptorSet::null()
+                    };
+
+                    // Write descriptors for set 1
+                    {
+                        let mut buf_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+                        let mut img_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
+                        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+
+                        if let Some(bindings) = prep.perm_merged.get(&prep.frag_set_idx) {
+                            for binding in bindings {
+                                let vk_type = reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
+                                match vk_type {
+                                    vk::DescriptorType::UNIFORM_BUFFER => {
+                                        let (buffer, range) = if binding.name == "Material" {
+                                            (mat_buf.buffer, std::mem::size_of::<MaterialUboData>() as u64)
+                                        } else if binding.name == "Light" {
+                                            (light_buffer.buffer, binding.size as u64)
+                                        } else {
+                                            continue;
+                                        };
+                                        let idx = buf_infos.len();
+                                        buf_infos.push(
+                                            vk::DescriptorBufferInfo::default()
+                                                .buffer(buffer).offset(0).range(range),
+                                        );
+                                        writes.push(
+                                            vk::WriteDescriptorSet::default()
+                                                .dst_set(ds).dst_binding(binding.binding)
+                                                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                                .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                        );
+                                    }
+                                    vk::DescriptorType::SAMPLER => {
+                                        let actual_sampler = ibl_assets.sampler_for_binding(&binding.name).unwrap_or(sampler);
+                                        let idx = img_infos.len();
+                                        img_infos.push(vk::DescriptorImageInfo::default().sampler(actual_sampler));
+                                        writes.push(
+                                            vk::WriteDescriptorSet::default()
+                                                .dst_set(ds).dst_binding(binding.binding)
+                                                .descriptor_type(vk::DescriptorType::SAMPLER)
+                                                .image_info(unsafe { std::slice::from_raw_parts(&img_infos[idx] as *const _, 1) }),
+                                        );
+                                    }
+                                    vk::DescriptorType::SAMPLED_IMAGE => {
+                                        let is_cube = reflected_pipeline::is_cube_image_binding(&binding.binding_type);
+                                        let view = if is_cube || binding.name == "brdf_lut" {
+                                            ibl_assets.view_for_binding(&binding.name).unwrap_or(default_texture.view)
+                                        } else {
+                                            // Per-material texture lookup
+                                            let per_mat_view = if mi < per_material_textures.len() {
+                                                per_material_textures[mi].get(&binding.name).map(|img| img.view)
+                                            } else {
+                                                None
+                                            };
+                                            per_mat_view.unwrap_or_else(|| {
+                                                let fallback = match binding.name.as_str() {
+                                                    "emissive_tex" => default_black_texture.view,
+                                                    "normal_tex" => default_normal_texture.view,
+                                                    _ => default_texture.view,
+                                                };
+                                                texture_images.get(&binding.name).map(|img| img.view).unwrap_or(fallback)
+                                            })
+                                        };
+                                        let idx = img_infos.len();
+                                        img_infos.push(
+                                            vk::DescriptorImageInfo::default()
+                                                .image_view(view)
+                                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                                        );
+                                        writes.push(
+                                            vk::WriteDescriptorSet::default()
+                                                .dst_set(ds).dst_binding(binding.binding)
+                                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                                .image_info(unsafe { std::slice::from_raw_parts(&img_infos[idx] as *const _, 1) }),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if !writes.is_empty() {
+                            unsafe { device.update_descriptor_sets(&writes, &[]); }
+                        }
+                    }
+
+                    perm_desc_sets.push(ds);
+                    perm_ubos.push(mat_buf);
+                }
+
+                // Create pipeline layout: set 0 (shared) + set 1 (per-permutation material)
+                let mut layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
+                if shared_set0_layout != vk::DescriptorSetLayout::null() {
+                    layouts.push(shared_set0_layout);
+                }
+                if material_set_layout != vk::DescriptorSetLayout::null() {
+                    layouts.push(material_set_layout);
+                }
+
+                // Push constant ranges from mesh + fragment stages
+                let mut push_ranges: Vec<vk::PushConstantRange> = Vec::new();
+                for pc in &mesh_refl.push_constants {
+                    push_ranges.push(
+                        vk::PushConstantRange::default()
+                            .stage_flags(vk::ShaderStageFlags::MESH_EXT)
+                            .offset(0)
+                            .size(pc.size),
+                    );
+                }
+                for pc in &prep.frag_refl.push_constants {
+                    push_ranges.push(
+                        vk::PushConstantRange::default()
+                            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                            .offset(0)
+                            .size(pc.size),
+                    );
+                }
+
+                let perm_pipeline_layout = unsafe {
+                    let layout_info = vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&layouts)
+                        .push_constant_ranges(&push_ranges);
+                    device.create_pipeline_layout(&layout_info, None)
+                        .map_err(|e| format!("Failed to create mesh permutation pipeline layout: {:?}", e))?
+                };
+
+                // Create graphics pipeline (shared mesh shader + permutation fragment shader)
+                let entry_name = c"main";
+                let shader_stages = [
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::MESH_EXT)
+                        .module(mesh_module) // shared mesh shader
+                        .name(entry_name),
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::FRAGMENT)
+                        .module(p_frag_module)
+                        .name(entry_name),
+                ];
+
+                let viewport = vk::Viewport::default()
+                    .width(width as f32)
+                    .height(height as f32)
+                    .max_depth(1.0);
+                let scissor = vk::Rect2D::default().extent(vk::Extent2D { width, height });
+                let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+                    .viewports(std::slice::from_ref(&viewport))
+                    .scissors(std::slice::from_ref(&scissor));
+
+                let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+                    .polygon_mode(vk::PolygonMode::FILL)
+                    .cull_mode(vk::CullModeFlags::BACK)
+                    .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                    .line_width(1.0);
+                let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+                    .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+                let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+                    .depth_test_enable(true)
+                    .depth_write_enable(true)
+                    .depth_compare_op(vk::CompareOp::LESS);
+                let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(vk::ColorComponentFlags::RGBA);
+                let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
+                    .attachments(std::slice::from_ref(&color_blend_attachment));
+
+                let perm_pipeline = unsafe {
+                    device
+                        .create_graphics_pipelines(
+                            vk::PipelineCache::null(),
+                            &[vk::GraphicsPipelineCreateInfo::default()
+                                .stages(&shader_stages)
+                                .viewport_state(&viewport_state)
+                                .rasterization_state(&rasterizer)
+                                .multisample_state(&multisampling)
+                                .depth_stencil_state(&depth_stencil)
+                                .color_blend_state(&color_blending)
+                                .layout(perm_pipeline_layout)
+                                .render_pass(render_pass)
+                                .subpass(0)],
+                            None,
+                        )
+                        .map_err(|e| format!("Failed to create mesh permutation pipeline '{}': {:?}", prep.suffix, e))?[0]
+                };
+
+                info!("Loaded mesh permutation '{}' from {} ({} material(s))",
+                      prep.suffix, prep.perm_base, prep.material_indices.len());
+
+                mesh_permutations.push(MeshPermutationPipeline {
+                    suffix: prep.suffix,
+                    frag_module: p_frag_module,
+                    frag_refl: prep.frag_refl,
+                    material_set_layout,
+                    pipeline_layout: perm_pipeline_layout,
+                    pipeline: perm_pipeline,
+                    per_material_desc_sets: perm_desc_sets,
+                    per_material_ubos: perm_ubos,
+                    material_indices: prep.material_indices,
+                });
+
+                perm_idx += 1;
+            }
+
+            // Assign permutation indices to meshlet groups
+            for group in &mut meshlet_groups {
+                if group.material_index < material_to_permutation.len() {
+                    group.permutation_index = material_to_permutation[group.material_index];
+                }
+            }
+
+            info!("Mesh multi-pipeline setup complete: {} permutation(s) for {} material(s)",
+                  mesh_permutations.len(), total_materials);
+
+            // Load base frag module (kept for cleanup symmetry)
+            let frag_path = format!("{}.frag.spv", pipeline_base);
+            let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
+            let frag_module = spv_loader::create_shader_module(&device, &frag_code)?;
+
+            Ok(MeshShaderRenderer {
+                pipeline: vk::Pipeline::null(),
+                pipeline_layout: vk::PipelineLayout::null(),
+                descriptor_pool,
+                ds_layouts: HashMap::new(),
+                descriptor_sets: Vec::new(),
+                mesh_module,
+                frag_module,
+                render_pass,
+                framebuffer,
+                color_image,
+                depth_image,
+                width,
+                height,
+                meshlet_count,
+                meshlet_desc_buffer,
+                meshlet_verts_buffer,
+                meshlet_tris_buffer,
+                positions_buffer,
+                normals_buffer,
+                tex_coords_buffer,
+                tangents_buffer,
+                meshlet_desc_size,
+                meshlet_verts_size,
+                meshlet_tris_size,
+                positions_size,
+                normals_size,
+                tex_coords_size,
+                tangents_size,
+                mvp_buffer,
+                light_buffer,
+                material_buffer,
+                sampler,
+                default_texture,
+                default_black_texture,
+                default_normal_texture,
+                texture_images,
+                per_material_textures,
+                ibl_assets,
+                multi_pipeline: true,
+                mesh_permutations,
+                material_to_permutation,
+                shared_set0_layout,
+                shared_set0,
+                meshlet_groups,
+                mesh_refl: None,
+                auto_eye,
+                auto_target,
+                auto_up,
+                auto_far,
+                has_scene_bounds,
+            })
+        } else {
+            // ---------------------------------------------------------------
+            // SINGLE-PIPELINE MODE (original behavior)
+            // ---------------------------------------------------------------
+
+            // Merge descriptor sets from both stages
+            let merged = reflected_pipeline::merge_descriptor_sets(&[&mesh_refl, &frag_refl]);
+
+            // Create descriptor set layouts
+            let ds_layouts = unsafe {
+                reflected_pipeline::create_descriptor_set_layouts_from_merged(&device, &merged)?
+            };
+
+            let (pool_sizes, max_sets) = reflected_pipeline::compute_pool_sizes(&merged);
+
+            info!(
+                "Mesh shader reflection-driven descriptors: {} sets, {} pool size entries",
+                max_sets,
+                pool_sizes.len()
+            );
+
+            // Create descriptor pool
+            let descriptor_pool = unsafe {
+                let pool_info = vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(max_sets)
+                    .pool_sizes(&pool_sizes);
+                device
+                    .create_descriptor_pool(&pool_info, None)
+                    .map_err(|e| format!("Failed to create mesh shader descriptor pool: {:?}", e))?
+            };
+
+            // Allocate descriptor sets
+            let max_set_idx = ds_layouts.keys().copied().max().unwrap_or(0);
+            let mut ordered_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
+            for i in 0..=max_set_idx {
+                if let Some(&layout) = ds_layouts.get(&i) {
+                    ordered_layouts.push(layout);
+                }
+            }
+
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&ordered_layouts);
+
+            let descriptor_sets = unsafe {
+                device
+                    .allocate_descriptor_sets(&alloc_info)
+                    .map_err(|e| format!("Failed to allocate mesh shader descriptor sets: {:?}", e))?
+            };
+
+            let mut ds_map: HashMap<u32, vk::DescriptorSet> = HashMap::new();
+            {
+                let mut ds_idx = 0;
+                for i in 0..=max_set_idx {
+                    if ds_layouts.contains_key(&i) {
+                        ds_map.insert(i, descriptor_sets[ds_idx]);
+                        ds_idx += 1;
+                    }
+                }
+            }
+
+            // Pipeline layout (no push constants for mesh shader by default)
+            let pipeline_layout = unsafe {
+                reflected_pipeline::create_pipeline_layout_from_merged(&device, &ds_layouts, &[])?
+            };
+
+            // Build SSBO map by name -> (buffer, size)
+            let ssbo_map: HashMap<String, (vk::Buffer, u64)> = [
+                ("meshlet_descriptors".to_string(), (meshlet_desc_buffer.buffer, meshlet_desc_size)),
+                ("meshlet_vertices".to_string(), (meshlet_verts_buffer.buffer, meshlet_verts_size)),
+                ("meshlet_triangles".to_string(), (meshlet_tris_buffer.buffer, meshlet_tris_size)),
+                ("positions".to_string(), (positions_buffer.buffer, positions_size)),
+                ("normals".to_string(), (normals_buffer.buffer, normals_size)),
+                ("tex_coords".to_string(), (tex_coords_buffer.buffer, tex_coords_size)),
+                ("tangents".to_string(), (tangents_buffer.buffer, tangents_size)),
+            ].into_iter().collect();
+
+            // Write descriptors (same pattern as before)
+            let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+            let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
+            let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+            let total_bindings: usize = merged.values().map(|v| v.len()).sum();
+            buffer_infos.reserve(total_bindings);
+            image_infos.reserve(total_bindings);
+
+            for (&set_idx, bindings) in &merged {
+                let ds = match ds_map.get(&set_idx) {
+                    Some(&ds) => ds,
+                    None => continue,
+                };
+                for binding in bindings {
+                    let vk_type =
+                        reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
+                    match vk_type {
+                        vk::DescriptorType::UNIFORM_BUFFER => {
+                            let (buffer, range) = match binding.name.as_str() {
+                                "MVP" => (mvp_buffer.buffer, binding.size as u64),
+                                "Light" => (light_buffer.buffer, binding.size as u64),
+                                "Material" => (material_buffer.buffer, std::mem::size_of::<MaterialUboData>() as u64),
+                                _ => continue,
+                            };
+                            let idx = buffer_infos.len();
+                            buffer_infos.push(
+                                vk::DescriptorBufferInfo::default()
+                                    .buffer(buffer)
+                                    .offset(0)
+                                    .range(range),
+                            );
+                            writes.push(
+                                vk::WriteDescriptorSet::default()
+                                    .dst_set(ds)
+                                    .dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                    .buffer_info(unsafe {
+                                        std::slice::from_raw_parts(
+                                            &buffer_infos[idx] as *const _,
+                                            1,
+                                        )
+                                    }),
+                            );
+                        }
+                        vk::DescriptorType::STORAGE_BUFFER => {
+                            let (buffer, size) = match ssbo_map.get(&binding.name) {
+                                Some(&(buf, sz)) => (buf, sz),
+                                None => {
+                                    info!(
+                                        "Unknown SSBO name '{}' at set={} binding={}, skipping",
+                                        binding.name, set_idx, binding.binding
+                                    );
+                                    continue;
+                                }
+                            };
+                            let idx = buffer_infos.len();
+                            buffer_infos.push(
+                                vk::DescriptorBufferInfo::default()
+                                    .buffer(buffer)
+                                    .offset(0)
+                                    .range(size),
+                            );
+                            writes.push(
+                                vk::WriteDescriptorSet::default()
+                                    .dst_set(ds)
+                                    .dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                    .buffer_info(unsafe {
+                                        std::slice::from_raw_parts(
+                                            &buffer_infos[idx] as *const _,
+                                            1,
+                                        )
+                                    }),
+                            );
+                        }
+                        vk::DescriptorType::SAMPLER => {
+                            let actual_sampler = ibl_assets
+                                .sampler_for_binding(&binding.name)
+                                .unwrap_or(sampler);
+                            let idx = image_infos.len();
+                            image_infos
+                                .push(vk::DescriptorImageInfo::default().sampler(actual_sampler));
+                            writes.push(
+                                vk::WriteDescriptorSet::default()
+                                    .dst_set(ds)
+                                    .dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                                    .image_info(unsafe {
+                                        std::slice::from_raw_parts(
+                                            &image_infos[idx] as *const _,
+                                            1,
+                                        )
+                                    }),
+                            );
+                        }
+                        vk::DescriptorType::SAMPLED_IMAGE => {
+                            let is_cube =
+                                reflected_pipeline::is_cube_image_binding(&binding.binding_type);
+                            let view = if is_cube {
+                                ibl_assets
+                                    .view_for_binding(&binding.name)
+                                    .unwrap_or(default_texture.view)
+                            } else if binding.name == "brdf_lut" {
+                                ibl_assets
+                                    .view_for_binding(&binding.name)
+                                    .unwrap_or(default_texture.view)
+                            } else {
+                                let fallback = match binding.name.as_str() {
+                                    "emissive_tex" => default_black_texture.view,
+                                    "normal_tex" => default_normal_texture.view,
+                                    _ => default_texture.view,
+                                };
+                                texture_images
+                                    .get(&binding.name)
+                                    .map(|img| img.view)
+                                    .unwrap_or(fallback)
+                            };
+                            let idx = image_infos.len();
+                            image_infos.push(
+                                vk::DescriptorImageInfo::default()
+                                    .image_view(view)
+                                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                            );
+                            writes.push(
+                                vk::WriteDescriptorSet::default()
+                                    .dst_set(ds)
+                                    .dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                    .image_info(unsafe {
+                                        std::slice::from_raw_parts(
+                                            &image_infos[idx] as *const _,
+                                            1,
+                                        )
+                                    }),
+                            );
+                        }
+                        _ => {
+                            info!(
+                                "Unhandled descriptor type {:?} at set={} binding={} name='{}'",
+                                vk_type, set_idx, binding.binding, binding.name
+                            );
+                        }
+                    }
+                }
+            }
+
+            unsafe {
+                device.update_descriptor_sets(&writes, &[]);
+            }
+
+            // Load fragment shader module
+            let frag_path = format!("{}.frag.spv", pipeline_base);
+            let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
+            let frag_module = spv_loader::create_shader_module(&device, &frag_code)?;
+
+            // Create graphics pipeline with mesh + fragment stages (no vertex input)
+            let entry_name = c"main";
+            let shader_stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::MESH_EXT)
+                    .module(mesh_module)
+                    .name(entry_name),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(frag_module)
+                    .name(entry_name),
+            ];
+
+            let viewport = vk::Viewport::default()
+                .width(width as f32)
+                .height(height as f32)
+                .max_depth(1.0);
+            let scissor = vk::Rect2D::default().extent(vk::Extent2D { width, height });
+            let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+                .viewports(std::slice::from_ref(&viewport))
+                .scissors(std::slice::from_ref(&scissor));
+
+            let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                .line_width(1.0);
+            let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(true)
+                .depth_write_enable(true)
+                .depth_compare_op(vk::CompareOp::LESS);
+            let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA);
+            let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(std::slice::from_ref(&color_blend_attachment));
+
+            // Mesh shader pipelines do NOT have vertex_input_state or input_assembly_state.
+            let pipeline = unsafe {
+                device
+                    .create_graphics_pipelines(
+                        vk::PipelineCache::null(),
+                        &[vk::GraphicsPipelineCreateInfo::default()
+                            .stages(&shader_stages)
+                            .viewport_state(&viewport_state)
+                            .rasterization_state(&rasterizer)
+                            .multisample_state(&multisampling)
+                            .depth_stencil_state(&depth_stencil)
+                            .color_blend_state(&color_blending)
+                            .layout(pipeline_layout)
+                            .render_pass(render_pass)
+                            .subpass(0)],
+                        None,
+                    )
+                    .map_err(|e| format!("Failed to create mesh shader pipeline: {:?}", e))?[0]
+            };
+
+            info!(
+                "MeshShaderRenderer initialized (single-pipeline): {}x{}, {} meshlets",
+                width, height, meshlet_count
+            );
+
+            Ok(MeshShaderRenderer {
+                pipeline,
+                pipeline_layout,
+                descriptor_pool,
+                ds_layouts,
+                descriptor_sets,
+                mesh_module,
+                frag_module,
+                render_pass,
+                framebuffer,
+                color_image,
+                depth_image,
+                width,
+                height,
+                meshlet_count,
+                meshlet_desc_buffer,
+                meshlet_verts_buffer,
+                meshlet_tris_buffer,
+                positions_buffer,
+                normals_buffer,
+                tex_coords_buffer,
+                tangents_buffer,
+                meshlet_desc_size,
+                meshlet_verts_size,
+                meshlet_tris_size,
+                positions_size,
+                normals_size,
+                tex_coords_size,
+                tangents_size,
+                mvp_buffer,
+                light_buffer,
+                material_buffer,
+                sampler,
+                default_texture,
+                default_black_texture,
+                default_normal_texture,
+                texture_images,
+                per_material_textures,
+                ibl_assets,
+                multi_pipeline: false,
+                mesh_permutations: Vec::new(),
+                material_to_permutation: Vec::new(),
+                shared_set0_layout: vk::DescriptorSetLayout::null(),
+                shared_set0: vk::DescriptorSet::null(),
+                meshlet_groups: Vec::new(),
+                mesh_refl: None,
+                auto_eye,
+                auto_target,
+                auto_up,
+                auto_far,
+                has_scene_bounds,
+            })
+        }
     }
 
     /// Update camera uniforms (MVP + light view_pos).
@@ -1142,18 +1925,86 @@ impl MeshShaderRenderer {
 
         unsafe {
             device.cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-            device.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                0,
-                &self.descriptor_sets,
-                &[],
-            );
 
-            // Dispatch mesh shader workgroups: one workgroup per meshlet
-            ms_loader.cmd_draw_mesh_tasks(cmd, self.meshlet_count, 1, 1);
+            if self.multi_pipeline && !self.mesh_permutations.is_empty() {
+                // ---- Multi-pipeline draw ----
+                // Bind shared set 0 once (meshlet data + SoA buffers + MVP + Light)
+                if self.shared_set0 != vk::DescriptorSet::null() {
+                    device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.mesh_permutations[0].pipeline_layout,
+                        0,
+                        std::slice::from_ref(&self.shared_set0),
+                        &[],
+                    );
+                }
+
+                let mut current_perm_idx: i32 = -1;
+
+                for group in &self.meshlet_groups {
+                    let perm = &self.mesh_permutations[group.permutation_index];
+
+                    // Switch pipeline if permutation changed
+                    if group.permutation_index as i32 != current_perm_idx {
+                        current_perm_idx = group.permutation_index as i32;
+                        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, perm.pipeline);
+                        // Re-bind set 0 after pipeline change
+                        if self.shared_set0 != vk::DescriptorSet::null() {
+                            device.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                perm.pipeline_layout,
+                                0,
+                                std::slice::from_ref(&self.shared_set0),
+                                &[],
+                            );
+                        }
+                    }
+
+                    // Find per-material descriptor set index within this permutation
+                    let local_mat_idx = perm.material_indices.iter().position(|&mi| mi == group.material_index);
+                    if let Some(local_idx) = local_mat_idx {
+                        if local_idx < perm.per_material_desc_sets.len() {
+                            device.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                perm.pipeline_layout,
+                                1,
+                                std::slice::from_ref(&perm.per_material_desc_sets[local_idx]),
+                                &[],
+                            );
+                        }
+                    }
+
+                    // Push meshletOffset so the mesh shader reads the correct region
+                    let meshlet_offset: u32 = group.first_meshlet;
+                    device.cmd_push_constants(
+                        cmd,
+                        perm.pipeline_layout,
+                        vk::ShaderStageFlags::MESH_EXT,
+                        0,
+                        &meshlet_offset.to_le_bytes(),
+                    );
+
+                    // Dispatch meshlets for this group
+                    ms_loader.cmd_draw_mesh_tasks(cmd, group.meshlet_count, 1, 1);
+                }
+            } else {
+                // ---- Single-pipeline draw (original) ----
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    &self.descriptor_sets,
+                    &[],
+                );
+
+                // Dispatch mesh shader workgroups: one workgroup per meshlet
+                ms_loader.cmd_draw_mesh_tasks(cmd, self.meshlet_count, 1, 1);
+            }
 
             device.cmd_end_render_pass(cmd);
         }
@@ -1262,8 +2113,33 @@ impl MeshShaderRenderer {
         let device = ctx.device.clone();
 
         unsafe {
-            device.destroy_pipeline(self.pipeline, None);
-            device.destroy_pipeline_layout(self.pipeline_layout, None);
+            // Clean up multi-pipeline resources
+            for perm in self.mesh_permutations.drain(..) {
+                if perm.pipeline != vk::Pipeline::null() {
+                    device.destroy_pipeline(perm.pipeline, None);
+                }
+                if perm.pipeline_layout != vk::PipelineLayout::null() {
+                    device.destroy_pipeline_layout(perm.pipeline_layout, None);
+                }
+                if perm.material_set_layout != vk::DescriptorSetLayout::null() {
+                    device.destroy_descriptor_set_layout(perm.material_set_layout, None);
+                }
+                device.destroy_shader_module(perm.frag_module, None);
+                for mut ubo in perm.per_material_ubos {
+                    ubo.destroy(&device, ctx.allocator_mut());
+                }
+            }
+            if self.shared_set0_layout != vk::DescriptorSetLayout::null() {
+                device.destroy_descriptor_set_layout(self.shared_set0_layout, None);
+            }
+
+            // Clean up single-pipeline resources
+            if self.pipeline != vk::Pipeline::null() {
+                device.destroy_pipeline(self.pipeline, None);
+            }
+            if self.pipeline_layout != vk::PipelineLayout::null() {
+                device.destroy_pipeline_layout(self.pipeline_layout, None);
+            }
             device.destroy_framebuffer(self.framebuffer, None);
             device.destroy_render_pass(self.render_pass, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
@@ -1284,6 +2160,11 @@ impl MeshShaderRenderer {
             .destroy(&device, ctx.allocator_mut());
         for (_, mut tex) in self.texture_images.drain() {
             tex.destroy(&device, ctx.allocator_mut());
+        }
+        for tex_map in self.per_material_textures.drain(..) {
+            for (_, mut tex) in tex_map {
+                tex.destroy(&device, ctx.allocator_mut());
+            }
         }
         self.ibl_assets.destroy(&device, ctx.allocator_mut());
         self.mvp_buffer.destroy(&device, ctx.allocator_mut());

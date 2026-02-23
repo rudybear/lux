@@ -1747,6 +1747,12 @@ def _expand_geometry_to_mesh(
     if geometry and any(f.name == "tangent" for f in geometry.fields):
         stage.storage_buffers.append(StorageBufferDecl("tangents", "vec4"))
 
+    # Push constant for meshlet offset (multi-pipeline dispatch)
+    stage.push_constants.append(PushBlock(
+        "mesh_params",
+        [BlockField("meshletOffset", "uint")],
+    ))
+
     # Transform uniform (from geometry declaration)
     if geometry and geometry.transform:
         ub = UniformBlock(
@@ -1800,7 +1806,9 @@ def _generate_mesh_main(
 
     # --- Common setup ---
     body.append(LetStmt("meshlet_id", "scalar",
-        SwizzleAccess(VarRef("workgroup_id"), "x")))
+        BinaryOp("+",
+                 SwizzleAccess(VarRef("workgroup_id"), "x"),
+                 VarRef("meshletOffset"))))
     body.append(LetStmt("tid", "uint", VarRef("local_invocation_index")))
 
     body.append(LetStmt("desc", "uvec4",

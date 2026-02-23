@@ -59,6 +59,7 @@ if exist playground_cpp\build\Release\lux-playground.exe (
         echo --- C++ engine: Khronos extension test models ---
         playground_cpp\build\Release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/gltf_pbr_layered --ibl pisa --output screenshots/test_sheen_cpp.png --width 512 --height 512
         playground_cpp\build\Release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/gltf_pbr_layered --mode rt --ibl pisa --output screenshots/test_sheen_rt_cpp.png --width 512 --height 512
+        playground_cpp\build\Release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/gltf_pbr_layered --mode mesh --ibl pisa --output screenshots/test_sheen_mesh_cpp.png --width 512 --height 512
         playground_cpp\build\Release\lux-playground.exe --scene assets/TransmissionTest.glb --pipeline shadercache/gltf_pbr_layered --ibl pisa --output screenshots/test_transmission_cpp.png --width 512 --height 512
         playground_cpp\build\Release\lux-playground.exe --scene assets/ClearCoatTest.glb --pipeline shadercache/gltf_pbr_layered --ibl pisa --output screenshots/test_clearcoat_cpp.png --width 512 --height 512
     )
@@ -75,6 +76,7 @@ if exist playground_rust\target\release\lux-playground.exe (
         echo --- Rust engine: Khronos extension test models ---
         playground_rust\target\release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/gltf_pbr_layered --ibl pisa --output screenshots/test_sheen_rust.png --width 512 --height 512
         playground_rust\target\release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/gltf_pbr_layered --mode rt --ibl pisa --output screenshots/test_sheen_rt_rust.png --width 512 --height 512
+        playground_rust\target\release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/gltf_pbr_layered --mode mesh --ibl pisa --output screenshots/test_sheen_mesh_rust.png --width 512 --height 512
         playground_rust\target\release\lux-playground.exe --scene assets/ClearCoatTest.glb --pipeline shadercache/gltf_pbr_layered --ibl pisa --output screenshots/test_clearcoat_rust.png --width 512 --height 512
         playground_rust\target\release\lux-playground.exe --scene assets/TransmissionTest.glb --pipeline shadercache/gltf_pbr_layered --ibl pisa --output screenshots/test_transmission_rust.png --width 512 --height 512
     )

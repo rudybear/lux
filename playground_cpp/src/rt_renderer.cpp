@@ -11,6 +11,9 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <set>
+#include <map>
+#include <algorithm>
 
 // --------------------------------------------------------------------------
 // Alignment helper
@@ -18,6 +21,32 @@
 
 static VkDeviceSize alignUp(VkDeviceSize size, VkDeviceSize alignment) {
     return (size + alignment - 1) & ~(alignment - 1);
+}
+
+// --------------------------------------------------------------------------
+// Helper: fill MaterialUBOData from a GltfMaterial
+// --------------------------------------------------------------------------
+
+static MaterialUBOData materialDataFromGltf(const GltfMaterial& mat) {
+    MaterialUBOData d{};
+    d.baseColorFactor = mat.baseColor;
+    d.metallicFactor = mat.metallic;
+    d.roughnessFactor = mat.roughness;
+    d.emissiveFactor = mat.emissive;
+    d.emissiveStrength = mat.emissiveStrength;
+    d.ior = mat.ior;
+    d.clearcoatFactor = mat.clearcoatFactor;
+    d.clearcoatRoughnessFactor = mat.clearcoatRoughnessFactor;
+    d.sheenColorFactor = mat.sheenColorFactor;
+    d.sheenRoughnessFactor = mat.sheenRoughnessFactor;
+    d.transmissionFactor = mat.transmissionFactor;
+    d.baseColorUvSt = glm::vec4(mat.base_color_uv_xform.offset, mat.base_color_uv_xform.scale);
+    d.normalUvSt = glm::vec4(mat.normal_uv_xform.offset, mat.normal_uv_xform.scale);
+    d.mrUvSt = glm::vec4(mat.metallic_roughness_uv_xform.offset, mat.metallic_roughness_uv_xform.scale);
+    d.baseColorUvRot = mat.base_color_uv_xform.rotation;
+    d.normalUvRot = mat.normal_uv_xform.rotation;
+    d.mrUvRot = mat.metallic_roughness_uv_xform.rotation;
+    return d;
 }
 
 // --------------------------------------------------------------------------
@@ -88,7 +117,7 @@ void RTRenderer::createStorageImage(VulkanContext& ctx) {
 }
 
 // --------------------------------------------------------------------------
-// BLAS creation from scene mesh (vertices/indices from SceneManager)
+// BLAS creation — multi-geometry when draw ranges are available
 // --------------------------------------------------------------------------
 
 void RTRenderer::createBLAS(VulkanContext& ctx) {
@@ -136,26 +165,85 @@ void RTRenderer::createBLAS(VulkanContext& ctx) {
                   << "B, indices=" << indexStorageSize << "B" << std::endl;
     }
 
-    // Set up geometry description for triangles
     VkDeviceAddress vertexAddress = ctx.getBufferDeviceAddress(sphereMesh.vertexBuffer);
     VkDeviceAddress indexAddress = ctx.getBufferDeviceAddress(sphereMesh.indexBuffer);
 
-    VkAccelerationStructureGeometryTrianglesDataKHR trianglesData = {};
-    trianglesData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-    trianglesData.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-    trianglesData.vertexData.deviceAddress = vertexAddress;
-    trianglesData.vertexStride = sizeof(Vertex);
-    trianglesData.maxVertex = sphereMesh.vertexCount - 1;
-    trianglesData.indexType = VK_INDEX_TYPE_UINT32;
-    trianglesData.indexData.deviceAddress = indexAddress;
+    const auto& drawRanges = m_scene->getDrawRanges();
 
-    VkAccelerationStructureGeometryKHR geometry = {};
-    geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
-    geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-    geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
-    geometry.geometry.triangles = trianglesData;
+    // Decide whether to use multi-geometry BLAS
+    // Multi-geometry: one geometry per draw range, enabling per-geometry hit group selection
+    bool useMultiGeometry = m_multiMaterial && drawRanges.size() > 1;
 
-    uint32_t primitiveCount = sphereMesh.indexCount / 3;
+    std::vector<VkAccelerationStructureGeometryKHR> geometries;
+    std::vector<VkAccelerationStructureBuildRangeInfoKHR> buildRanges;
+    std::vector<uint32_t> primitiveCounts;
+
+    if (useMultiGeometry) {
+        // Multi-geometry BLAS: one geometry per draw range
+        m_geometryCount = static_cast<uint32_t>(drawRanges.size());
+
+        for (auto& range : drawRanges) {
+            VkAccelerationStructureGeometryTrianglesDataKHR trianglesData = {};
+            trianglesData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+            trianglesData.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+            trianglesData.vertexData.deviceAddress = vertexAddress;
+            trianglesData.vertexStride = sizeof(Vertex);
+            trianglesData.maxVertex = sphereMesh.vertexCount - 1;
+            trianglesData.indexType = VK_INDEX_TYPE_UINT32;
+            // Offset the index data to this draw range's start
+            trianglesData.indexData.deviceAddress = indexAddress +
+                static_cast<VkDeviceSize>(range.indexOffset) * sizeof(uint32_t);
+
+            VkAccelerationStructureGeometryKHR geo = {};
+            geo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+            geo.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+            geo.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+            geo.geometry.triangles = trianglesData;
+            geometries.push_back(geo);
+
+            uint32_t primCount = range.indexCount / 3;
+            primitiveCounts.push_back(primCount);
+
+            VkAccelerationStructureBuildRangeInfoKHR rangeInfo = {};
+            rangeInfo.primitiveCount = primCount;
+            rangeInfo.primitiveOffset = 0;  // offset already baked into indexData address
+            rangeInfo.firstVertex = 0;
+            rangeInfo.transformOffset = 0;
+            buildRanges.push_back(rangeInfo);
+        }
+
+        std::cout << "[info] Multi-geometry BLAS: " << m_geometryCount
+                  << " geometries from " << drawRanges.size() << " draw ranges" << std::endl;
+    } else {
+        // Single-geometry BLAS (original path)
+        m_geometryCount = 1;
+
+        VkAccelerationStructureGeometryTrianglesDataKHR trianglesData = {};
+        trianglesData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        trianglesData.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        trianglesData.vertexData.deviceAddress = vertexAddress;
+        trianglesData.vertexStride = sizeof(Vertex);
+        trianglesData.maxVertex = sphereMesh.vertexCount - 1;
+        trianglesData.indexType = VK_INDEX_TYPE_UINT32;
+        trianglesData.indexData.deviceAddress = indexAddress;
+
+        VkAccelerationStructureGeometryKHR geo = {};
+        geo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        geo.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        geo.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        geo.geometry.triangles = trianglesData;
+        geometries.push_back(geo);
+
+        uint32_t primCount = sphereMesh.indexCount / 3;
+        primitiveCounts.push_back(primCount);
+
+        VkAccelerationStructureBuildRangeInfoKHR rangeInfo = {};
+        rangeInfo.primitiveCount = primCount;
+        rangeInfo.primitiveOffset = 0;
+        rangeInfo.firstVertex = 0;
+        rangeInfo.transformOffset = 0;
+        buildRanges.push_back(rangeInfo);
+    }
 
     // Query build sizes
     VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {};
@@ -163,8 +251,8 @@ void RTRenderer::createBLAS(VulkanContext& ctx) {
     buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
     buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
     buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-    buildInfo.geometryCount = 1;
-    buildInfo.pGeometries = &geometry;
+    buildInfo.geometryCount = static_cast<uint32_t>(geometries.size());
+    buildInfo.pGeometries = geometries.data();
 
     VkAccelerationStructureBuildSizesInfoKHR sizeInfo = {};
     sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
@@ -173,7 +261,7 @@ void RTRenderer::createBLAS(VulkanContext& ctx) {
         ctx.device,
         VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
         &buildInfo,
-        &primitiveCount,
+        primitiveCounts.data(),
         &sizeInfo);
 
     // Create AS buffer
@@ -226,18 +314,18 @@ void RTRenderer::createBLAS(VulkanContext& ctx) {
     buildInfo.dstAccelerationStructure = blas;
     buildInfo.scratchData.deviceAddress = ctx.getBufferDeviceAddress(blasScratchBuffer);
 
-    VkAccelerationStructureBuildRangeInfoKHR rangeInfo = {};
-    rangeInfo.primitiveCount = primitiveCount;
-    rangeInfo.primitiveOffset = 0;
-    rangeInfo.firstVertex = 0;
-    rangeInfo.transformOffset = 0;
-    const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfo = &rangeInfo;
+    // Build range info pointer array (one pointer per geometry, but Vulkan expects
+    // a pointer to the whole array, and each element corresponds to one geometry)
+    const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfo = buildRanges.data();
 
     VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
     ctx.pfnCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &pRangeInfo);
     ctx.endSingleTimeCommands(cmd);
 
-    std::cout << "[info] BLAS built (" << primitiveCount << " triangles)" << std::endl;
+    uint32_t totalPrims = 0;
+    for (auto pc : primitiveCounts) totalPrims += pc;
+    std::cout << "[info] BLAS built (" << totalPrims << " triangles, "
+              << geometries.size() << " geometry/geometries)" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -259,6 +347,7 @@ void RTRenderer::createTLAS(VulkanContext& ctx) {
     instance.transform.matrix[2][2] = 1.0f;
     instance.instanceCustomIndex = 0;
     instance.mask = 0xFF;
+    // SBT offset is 0 — geometry index selects hit record within the hit region
     instance.instanceShaderBindingTableRecordOffset = 0;
     instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
     instance.accelerationStructureReference = blasAddress;
@@ -396,59 +485,106 @@ void RTRenderer::createTLAS(VulkanContext& ctx) {
 }
 
 // --------------------------------------------------------------------------
-// RT pipeline creation (reflection-driven descriptor sets)
+// RT pipeline creation — multi-hit-group when multiple permutations exist
 // --------------------------------------------------------------------------
 
 void RTRenderer::createRTPipeline(VulkanContext& ctx) {
-    // Shader stages:
-    //   0 = raygen
-    //   1 = miss
-    //   2 = closest hit
-    VkPipelineShaderStageCreateInfo stages[3] = {};
+    // Build shader stages and groups.
+    // Single-material: stages=[rgen, rmiss, rchit], groups=[rgen, miss, hit]
+    // Multi-material:  stages=[rgen, rmiss, rchit_0, rchit_1, ...],
+    //                  groups=[rgen, miss, hit_0, hit_1, ...]
 
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
-    stages[0].module = rgenModule;
-    stages[0].pName = "main";
+    std::vector<VkPipelineShaderStageCreateInfo> stages;
+    std::vector<VkRayTracingShaderGroupCreateInfoKHR> groups;
 
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
-    stages[1].module = rmissModule;
-    stages[1].pName = "main";
+    // Stage 0: raygen
+    {
+        VkPipelineShaderStageCreateInfo s = {};
+        s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        s.stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        s.module = rgenModule;
+        s.pName = "main";
+        stages.push_back(s);
+    }
+    // Stage 1: miss
+    {
+        VkPipelineShaderStageCreateInfo s = {};
+        s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        s.stage = VK_SHADER_STAGE_MISS_BIT_KHR;
+        s.module = rmissModule;
+        s.pName = "main";
+        stages.push_back(s);
+    }
 
-    stages[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[2].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
-    stages[2].module = rchitModule;
-    stages[2].pName = "main";
+    // Group 0: raygen (GENERAL)
+    {
+        VkRayTracingShaderGroupCreateInfoKHR g = {};
+        g.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        g.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+        g.generalShader = 0;
+        g.closestHitShader = VK_SHADER_UNUSED_KHR;
+        g.anyHitShader = VK_SHADER_UNUSED_KHR;
+        g.intersectionShader = VK_SHADER_UNUSED_KHR;
+        groups.push_back(g);
+    }
+    // Group 1: miss (GENERAL)
+    {
+        VkRayTracingShaderGroupCreateInfoKHR g = {};
+        g.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        g.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+        g.generalShader = 1;
+        g.closestHitShader = VK_SHADER_UNUSED_KHR;
+        g.anyHitShader = VK_SHADER_UNUSED_KHR;
+        g.intersectionShader = VK_SHADER_UNUSED_KHR;
+        groups.push_back(g);
+    }
 
-    // Shader groups:
-    //   Group 0 (raygen): GENERAL, generalShader=0
-    //   Group 1 (miss):   GENERAL, generalShader=1
-    //   Group 2 (hit):    TRIANGLES_HIT_GROUP, closestHitShader=2
-    VkRayTracingShaderGroupCreateInfoKHR groups[3] = {};
+    if (m_multiMaterial && !m_hitPermutations.empty()) {
+        // Multi-material: one rchit stage + hit group per permutation
+        for (size_t pi = 0; pi < m_hitPermutations.size(); pi++) {
+            uint32_t stageIndex = static_cast<uint32_t>(stages.size());
 
-    groups[0].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-    groups[0].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groups[0].generalShader = 0;
-    groups[0].closestHitShader = VK_SHADER_UNUSED_KHR;
-    groups[0].anyHitShader = VK_SHADER_UNUSED_KHR;
-    groups[0].intersectionShader = VK_SHADER_UNUSED_KHR;
+            VkPipelineShaderStageCreateInfo s = {};
+            s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            s.stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+            s.module = m_hitPermutations[pi].rchitModule;
+            s.pName = "main";
+            stages.push_back(s);
 
-    groups[1].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-    groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groups[1].generalShader = 1;
-    groups[1].closestHitShader = VK_SHADER_UNUSED_KHR;
-    groups[1].anyHitShader = VK_SHADER_UNUSED_KHR;
-    groups[1].intersectionShader = VK_SHADER_UNUSED_KHR;
+            VkRayTracingShaderGroupCreateInfoKHR g = {};
+            g.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+            g.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+            g.generalShader = VK_SHADER_UNUSED_KHR;
+            g.closestHitShader = stageIndex;
+            g.anyHitShader = VK_SHADER_UNUSED_KHR;
+            g.intersectionShader = VK_SHADER_UNUSED_KHR;
+            groups.push_back(g);
 
-    groups[2].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
-    groups[2].generalShader = VK_SHADER_UNUSED_KHR;
-    groups[2].closestHitShader = 2;
-    groups[2].anyHitShader = VK_SHADER_UNUSED_KHR;
-    groups[2].intersectionShader = VK_SHADER_UNUSED_KHR;
+            // Record the group index (groups 0,1 are rgen,rmiss; hit groups start at 2)
+            m_hitPermutations[pi].hitGroupIndex = static_cast<uint32_t>(groups.size()) - 1;
+        }
+    } else {
+        // Single-material: one rchit stage + one hit group
+        uint32_t stageIndex = static_cast<uint32_t>(stages.size());
 
-    // Create descriptor set layouts from reflection data (NO hardcoded bindings)
+        VkPipelineShaderStageCreateInfo s = {};
+        s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        s.stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+        s.module = rchitModule;
+        s.pName = "main";
+        stages.push_back(s);
+
+        VkRayTracingShaderGroupCreateInfoKHR g = {};
+        g.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        g.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+        g.generalShader = VK_SHADER_UNUSED_KHR;
+        g.closestHitShader = stageIndex;
+        g.anyHitShader = VK_SHADER_UNUSED_KHR;
+        g.intersectionShader = VK_SHADER_UNUSED_KHR;
+        groups.push_back(g);
+    }
+
+    // Create descriptor set layouts from superset reflection data
     reflectedSetLayouts = createDescriptorSetLayoutsMultiStage(ctx.device, stageReflections);
 
     // Pipeline layout from reflection
@@ -458,10 +594,10 @@ void RTRenderer::createRTPipeline(VulkanContext& ctx) {
     // Create RT pipeline
     VkRayTracingPipelineCreateInfoKHR rtPipeInfo = {};
     rtPipeInfo.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
-    rtPipeInfo.stageCount = 3;
-    rtPipeInfo.pStages = stages;
-    rtPipeInfo.groupCount = 3;
-    rtPipeInfo.pGroups = groups;
+    rtPipeInfo.stageCount = static_cast<uint32_t>(stages.size());
+    rtPipeInfo.pStages = stages.data();
+    rtPipeInfo.groupCount = static_cast<uint32_t>(groups.size());
+    rtPipeInfo.pGroups = groups.data();
     rtPipeInfo.maxPipelineRayRecursionDepth = 1;
     rtPipeInfo.layout = pipelineLayout;
 
@@ -472,11 +608,13 @@ void RTRenderer::createRTPipeline(VulkanContext& ctx) {
         throw std::runtime_error("Failed to create ray tracing pipeline");
     }
 
-    std::cout << "[info] RT pipeline created (reflection-driven)" << std::endl;
+    std::cout << "[info] RT pipeline created (" << stages.size() << " stages, "
+              << groups.size() << " groups"
+              << (m_multiMaterial ? ", multi-material" : "") << ")" << std::endl;
 }
 
 // --------------------------------------------------------------------------
-// SBT creation
+// SBT creation — multi-hit-record when multiple geometries exist
 // --------------------------------------------------------------------------
 
 void RTRenderer::createSBT(VulkanContext& ctx) {
@@ -485,26 +623,33 @@ void RTRenderer::createSBT(VulkanContext& ctx) {
     uint32_t baseAlignment = ctx.rtPipelineProperties.shaderGroupBaseAlignment;
 
     uint32_t handleSizeAligned = static_cast<uint32_t>(alignUp(handleSize, handleAlignment));
-    uint32_t groupCount = 3;
 
-    // Get shader group handles
-    uint32_t sbtSize = groupCount * handleSizeAligned;
-    std::vector<uint8_t> handles(groupCount * handleSize);
+    // Total shader groups in the pipeline
+    uint32_t hitGroupCount = m_multiMaterial ? static_cast<uint32_t>(m_hitPermutations.size()) : 1;
+    uint32_t totalGroupCount = 2 + hitGroupCount;  // rgen + miss + N hit groups
 
+    // Get all shader group handles from the pipeline
+    std::vector<uint8_t> handles(totalGroupCount * handleSize);
     VkResult result = ctx.pfnGetRayTracingShaderGroupHandlesKHR(
-        ctx.device, pipeline, 0, groupCount,
+        ctx.device, pipeline, 0, totalGroupCount,
         handles.size(), handles.data());
     if (result != VK_SUCCESS) {
         throw std::runtime_error("Failed to get ray tracing shader group handles");
     }
 
-    // Compute region sizes (each region must be base-aligned)
+    // Compute region sizes
     VkDeviceSize raygenRegionSize = alignUp(handleSizeAligned, baseAlignment);
     VkDeviceSize missRegionSize = alignUp(handleSizeAligned, baseAlignment);
-    VkDeviceSize hitRegionSize = alignUp(handleSizeAligned, baseAlignment);
+
+    // Hit region: one record per BLAS geometry (not per hit group!)
+    // Each geometry maps to a specific hit group handle.
+    // Vulkan selects: instanceSBTOffset + geometryIndex * sbt.stride
+    uint32_t hitRecordCount = m_multiMaterial ? m_geometryCount : 1;
+    VkDeviceSize hitRegionSize = alignUp(
+        static_cast<VkDeviceSize>(hitRecordCount) * handleSizeAligned, baseAlignment);
     VkDeviceSize totalSbtSize = raygenRegionSize + missRegionSize + hitRegionSize;
 
-    // Create single SBT buffer
+    // Create SBT buffer
     VkBufferCreateInfo sbtBufInfo = {};
     sbtBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     sbtBufInfo.size = totalSbtSize;
@@ -521,12 +666,10 @@ void RTRenderer::createSBT(VulkanContext& ctx) {
         throw std::runtime_error("Failed to create SBT buffer");
     }
 
-    // Map and copy handles to aligned offsets
+    // Map and write SBT data
     void* mapped;
     vmaMapMemory(ctx.allocator, sbtAllocation, &mapped);
     uint8_t* sbtData = static_cast<uint8_t*>(mapped);
-
-    // Zero the entire buffer first
     memset(sbtData, 0, totalSbtSize);
 
     // Copy raygen handle (group 0)
@@ -535,9 +678,23 @@ void RTRenderer::createSBT(VulkanContext& ctx) {
     // Copy miss handle (group 1)
     memcpy(sbtData + raygenRegionSize, handles.data() + 1 * handleSize, handleSize);
 
-    // Copy hit handle (group 2)
-    memcpy(sbtData + raygenRegionSize + missRegionSize,
-           handles.data() + 2 * handleSize, handleSize);
+    // Copy hit records
+    uint8_t* hitBase = sbtData + raygenRegionSize + missRegionSize;
+
+    if (m_multiMaterial && !m_geometryToHitGroup.empty()) {
+        // Multi-material: write one hit record per geometry, each pointing to
+        // the correct permutation's hit group handle
+        for (uint32_t gi = 0; gi < m_geometryCount; gi++) {
+            // m_geometryToHitGroup[gi] is the group index (2-based)
+            uint32_t groupIdx = m_geometryToHitGroup[gi];
+            memcpy(hitBase + gi * handleSizeAligned,
+                   handles.data() + groupIdx * handleSize,
+                   handleSize);
+        }
+    } else {
+        // Single-material: one hit record for group 2
+        memcpy(hitBase, handles.data() + 2 * handleSize, handleSize);
+    }
 
     vmaUnmapMemory(ctx.allocator, sbtAllocation);
 
@@ -560,7 +717,8 @@ void RTRenderer::createSBT(VulkanContext& ctx) {
 
     std::cout << "[info] SBT created (handleSize=" << handleSize
               << ", aligned=" << handleSizeAligned
-              << ", baseAlign=" << baseAlignment << ")" << std::endl;
+              << ", baseAlign=" << baseAlignment
+              << ", hitRecords=" << hitRecordCount << ")" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -586,66 +744,109 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
     // Update camera data
     updateCameraUBO(ctx);
 
-    // Create Material uniform buffer (80 bytes, std140 layout)
-    MaterialUBOData materialData{};
-    if (m_scene && m_scene->hasGltfScene()) {
-        const auto& mat = m_scene->getGltfScene().materials[0];
-        materialData.baseColorFactor = mat.baseColor;
-        materialData.metallicFactor = mat.metallic;
-        materialData.roughnessFactor = mat.roughness;
-        materialData.emissiveFactor = mat.emissive;
-        materialData.emissiveStrength = mat.emissiveStrength;
-        materialData.ior = mat.ior;
-        materialData.clearcoatFactor = mat.clearcoatFactor;
-        materialData.clearcoatRoughnessFactor = mat.clearcoatRoughnessFactor;
-        materialData.sheenColorFactor = mat.sheenColorFactor;
-        materialData.sheenRoughnessFactor = mat.sheenRoughnessFactor;
-        materialData.transmissionFactor = mat.transmissionFactor;
+    // Create Material uniform buffer(s)
+    if (m_multiMaterial && m_scene && m_scene->hasGltfScene()) {
+        // Multi-material: create one UBO per material
+        const auto& materials = m_scene->getGltfScene().materials;
+        size_t matCount = materials.size();
+        m_perMaterialBuffers.resize(matCount);
+        m_perMaterialAllocations.resize(matCount);
+
+        for (size_t mi = 0; mi < matCount; mi++) {
+            MaterialUBOData materialData = materialDataFromGltf(materials[mi]);
+
+            VkBufferCreateInfo matBufInfo = {};
+            matBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            matBufInfo.size = sizeof(MaterialUBOData);
+            matBufInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+            VmaAllocationCreateInfo matAllocInfo = {};
+            matAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+            vmaCreateBuffer(ctx.allocator, &matBufInfo, &matAllocInfo,
+                            &m_perMaterialBuffers[mi], &m_perMaterialAllocations[mi], nullptr);
+
+            void* matMapped;
+            vmaMapMemory(ctx.allocator, m_perMaterialAllocations[mi], &matMapped);
+            memcpy(matMapped, &materialData, sizeof(MaterialUBOData));
+            vmaUnmapMemory(ctx.allocator, m_perMaterialAllocations[mi]);
+        }
+
+        // Also create the single m_materialBuffer pointing to material 0 for
+        // backward compatibility with descriptor writes that reference "Material"
+        m_materialBuffer = m_perMaterialBuffers[0];
+        m_materialAllocation = VK_NULL_HANDLE; // owned by per-material array
+
+        std::cout << "[info] Created " << matCount << " per-material UBOs" << std::endl;
+    } else {
+        // Single-material: one Material UBO (original path)
+        MaterialUBOData materialData{};
+        if (m_scene && m_scene->hasGltfScene()) {
+            materialData = materialDataFromGltf(m_scene->getGltfScene().materials[0]);
+        }
+
+        VkBufferCreateInfo matBufInfo = {};
+        matBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        matBufInfo.size = sizeof(MaterialUBOData);
+        matBufInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+
+        VmaAllocationCreateInfo matAllocInfo = {};
+        matAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+        result = vmaCreateBuffer(ctx.allocator, &matBufInfo, &matAllocInfo,
+                                 &m_materialBuffer, &m_materialAllocation, nullptr);
+        if (result != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create material UBO");
+        }
+
+        void* matMapped;
+        vmaMapMemory(ctx.allocator, m_materialAllocation, &matMapped);
+        memcpy(matMapped, &materialData, sizeof(MaterialUBOData));
+        vmaUnmapMemory(ctx.allocator, m_materialAllocation);
     }
 
-    VkBufferCreateInfo matBufInfo = {};
-    matBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    matBufInfo.size = sizeof(MaterialUBOData);
-    matBufInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-
-    VmaAllocationCreateInfo matAllocInfo = {};
-    matAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
-
-    result = vmaCreateBuffer(ctx.allocator, &matBufInfo, &matAllocInfo,
-                             &m_materialBuffer, &m_materialAllocation, nullptr);
-    if (result != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create material UBO");
-    }
-
-    void* matMapped;
-    vmaMapMemory(ctx.allocator, m_materialAllocation, &matMapped);
-    memcpy(matMapped, &materialData, sizeof(MaterialUBOData));
-    vmaUnmapMemory(ctx.allocator, m_materialAllocation);
-
-    // Get merged bindings from reflection data for pool sizing
+    // Get merged bindings from superset reflection data for pool sizing
     auto mergedBindings = getMergedBindings(stageReflections);
 
-    // Count pool sizes from reflection data
-    std::unordered_map<VkDescriptorType, uint32_t> typeCounts;
+    // Identify the "material set" — the set that contains the Material UBO and textures
+    int materialSetIdx = -1;
     for (auto& b : mergedBindings) {
-        VkDescriptorType vkType;
-        if (b.type == "uniform_buffer") vkType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        else if (b.type == "sampler") vkType = VK_DESCRIPTOR_TYPE_SAMPLER;
-        else if (b.type == "sampled_image") vkType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        else if (b.type == "sampled_cube_image") vkType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        else if (b.type == "storage_image") vkType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        else if (b.type == "storage_buffer") vkType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        else if (b.type == "acceleration_structure") vkType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-        else vkType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        typeCounts[vkType]++;
+        if (b.name == "Material") { materialSetIdx = b.set; break; }
+    }
+
+    // Count pool sizes from reflection data
+    // In multi-material mode, we need N copies of the material set
+    std::unordered_map<VkDescriptorType, uint32_t> typeCounts;
+    uint32_t maxSets = 0;
+
+    const auto& drawRanges = m_scene->getDrawRanges();
+    size_t matCount = (m_scene && m_scene->hasGltfScene()) ?
+        m_scene->getGltfScene().materials.size() : 1;
+    bool multiDesc = m_multiMaterial && materialSetIdx >= 0 && matCount > 1;
+
+    for (auto& b : mergedBindings) {
+        VkDescriptorType vkType = bindingTypeToVkDescriptorType(b.type);
+
+        if (multiDesc && b.set == materialSetIdx) {
+            // Need one descriptor per material for bindings in the material set
+            typeCounts[vkType] += static_cast<uint32_t>(matCount);
+        } else {
+            typeCounts[vkType]++;
+        }
+    }
+
+    // Count descriptor sets needed
+    for (auto& [setIdx, layout] : reflectedSetLayouts) {
+        if (multiDesc && setIdx == materialSetIdx) {
+            maxSets += static_cast<uint32_t>(matCount);
+        } else {
+            maxSets++;
+        }
     }
 
     std::vector<VkDescriptorPoolSize> poolSizes;
     for (auto& [type, count] : typeCounts) {
         poolSizes.push_back({type, count});
     }
-
-    uint32_t maxSets = static_cast<uint32_t>(reflectedSetLayouts.size());
 
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -657,8 +858,10 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
         throw std::runtime_error("Failed to create RT descriptor pool");
     }
 
-    // Allocate descriptor sets
+    // Allocate descriptor sets for non-material sets (shared across all materials)
     for (auto& [setIdx, layout] : reflectedSetLayouts) {
+        if (multiDesc && setIdx == materialSetIdx) continue; // allocated per-material below
+
         VkDescriptorSetAllocateInfo allocSetInfo = {};
         allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         allocSetInfo.descriptorPool = descriptorPool;
@@ -672,93 +875,234 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
         reflectedDescSets[setIdx] = set;
     }
 
-    // Write descriptor sets based on reflection binding names
-    // We need to keep descriptor info structs alive until vkUpdateDescriptorSets
-    struct DescWriteInfo {
-        VkDescriptorBufferInfo bufferInfo;
-        VkDescriptorImageInfo imageInfo;
-        VkWriteDescriptorSetAccelerationStructureKHR asInfo;
-    };
-    std::vector<DescWriteInfo> writeInfos(mergedBindings.size());
-    std::vector<VkWriteDescriptorSet> writes;
+    // Write non-material descriptor sets
+    {
+        struct DescWriteInfo {
+            VkDescriptorBufferInfo bufferInfo;
+            VkDescriptorImageInfo imageInfo;
+            VkWriteDescriptorSetAccelerationStructureKHR asInfo;
+        };
+        std::vector<DescWriteInfo> writeInfos(mergedBindings.size());
+        std::vector<VkWriteDescriptorSet> writes;
 
-    for (size_t i = 0; i < mergedBindings.size(); i++) {
-        auto& b = mergedBindings[i];
-        auto setIt = reflectedDescSets.find(b.set);
-        if (setIt == reflectedDescSets.end()) continue;
+        for (size_t i = 0; i < mergedBindings.size(); i++) {
+            auto& b = mergedBindings[i];
+            if (multiDesc && b.set == materialSetIdx) continue; // handled per-material
 
-        VkWriteDescriptorSet w = {};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = setIt->second;
-        w.dstBinding = static_cast<uint32_t>(b.binding);
-        w.descriptorCount = 1;
+            auto setIt = reflectedDescSets.find(b.set);
+            if (setIt == reflectedDescSets.end()) continue;
 
-        if (b.type == "uniform_buffer") {
-            w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            if (b.name == "Material") {
-                writeInfos[i].bufferInfo = {m_materialBuffer, 0,
-                    static_cast<VkDeviceSize>(b.size > 0 ? b.size : sizeof(MaterialUBOData))};
+            VkWriteDescriptorSet w = {};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = setIt->second;
+            w.dstBinding = static_cast<uint32_t>(b.binding);
+            w.descriptorCount = 1;
+
+            if (b.type == "uniform_buffer") {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                if (b.name == "Material") {
+                    // Single-material path — write material 0
+                    writeInfos[i].bufferInfo = {m_materialBuffer, 0,
+                        static_cast<VkDeviceSize>(b.size > 0 ? b.size : sizeof(MaterialUBOData))};
+                } else {
+                    writeInfos[i].bufferInfo = {cameraBuffer, 0,
+                        static_cast<VkDeviceSize>(b.size > 0 ? b.size : 128)};
+                }
+                w.pBufferInfo = &writeInfos[i].bufferInfo;
+            } else if (b.type == "acceleration_structure") {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+                writeInfos[i].asInfo = {};
+                writeInfos[i].asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+                writeInfos[i].asInfo.accelerationStructureCount = 1;
+                writeInfos[i].asInfo.pAccelerationStructures = &tlas;
+                w.pNext = &writeInfos[i].asInfo;
+            } else if (b.type == "storage_image") {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                writeInfos[i].imageInfo = {};
+                writeInfos[i].imageInfo.imageView = storageImageView;
+                writeInfos[i].imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                w.pImageInfo = &writeInfos[i].imageInfo;
+            } else if (b.type == "storage_buffer") {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                VkBuffer buf = VK_NULL_HANDLE;
+                VkDeviceSize bufSize = 0;
+                if (b.name == "positions") { buf = positionsBuffer; bufSize = positionsSize; }
+                else if (b.name == "normals") { buf = normalsBuffer; bufSize = normalsSize; }
+                else if (b.name == "tex_coords") { buf = texCoordsBuffer; bufSize = texCoordsSize; }
+                else if (b.name == "indices") { buf = indexStorageBuffer; bufSize = indexStorageSize; }
+                if (buf == VK_NULL_HANDLE) {
+                    std::cout << "[warn] Unknown storage buffer name: " << b.name << std::endl;
+                    continue;
+                }
+                writeInfos[i].bufferInfo = {buf, 0, bufSize};
+                w.pBufferInfo = &writeInfos[i].bufferInfo;
+            } else if (b.type == "sampler") {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                auto& tex = m_scene->getTextureForBinding(b.name);
+                writeInfos[i].imageInfo = {};
+                writeInfos[i].imageInfo.sampler = tex.sampler;
+                w.pImageInfo = &writeInfos[i].imageInfo;
+            } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                auto& tex = m_scene->getTextureForBinding(b.name);
+                writeInfos[i].imageInfo = {};
+                writeInfos[i].imageInfo.imageView = tex.imageView;
+                writeInfos[i].imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                w.pImageInfo = &writeInfos[i].imageInfo;
             } else {
-                // Match by name: "Camera" or "Light" -> cameraBuffer
-                writeInfos[i].bufferInfo = {cameraBuffer, 0,
-                    static_cast<VkDeviceSize>(b.size > 0 ? b.size : 128)};
-            }
-            w.pBufferInfo = &writeInfos[i].bufferInfo;
-        } else if (b.type == "acceleration_structure") {
-            w.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-            writeInfos[i].asInfo = {};
-            writeInfos[i].asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
-            writeInfos[i].asInfo.accelerationStructureCount = 1;
-            writeInfos[i].asInfo.pAccelerationStructures = &tlas;
-            w.pNext = &writeInfos[i].asInfo;
-        } else if (b.type == "storage_image") {
-            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            writeInfos[i].imageInfo = {};
-            writeInfos[i].imageInfo.imageView = storageImageView;
-            writeInfos[i].imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            w.pImageInfo = &writeInfos[i].imageInfo;
-        } else if (b.type == "storage_buffer") {
-            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            VkBuffer buf = VK_NULL_HANDLE;
-            VkDeviceSize bufSize = 0;
-            if (b.name == "positions") { buf = positionsBuffer; bufSize = positionsSize; }
-            else if (b.name == "normals") { buf = normalsBuffer; bufSize = normalsSize; }
-            else if (b.name == "tex_coords") { buf = texCoordsBuffer; bufSize = texCoordsSize; }
-            else if (b.name == "indices") { buf = indexStorageBuffer; bufSize = indexStorageSize; }
-            if (buf == VK_NULL_HANDLE) {
-                std::cout << "[warn] Unknown storage buffer name: " << b.name << std::endl;
                 continue;
             }
-            writeInfos[i].bufferInfo = {buf, 0, bufSize};
-            w.pBufferInfo = &writeInfos[i].bufferInfo;
-        } else if (b.type == "sampler") {
-            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-            auto& tex = m_scene->getTextureForBinding(b.name);
-            writeInfos[i].imageInfo = {};
-            writeInfos[i].imageInfo.sampler = tex.sampler;
-            w.pImageInfo = &writeInfos[i].imageInfo;
-        } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
-            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            auto& tex = m_scene->getTextureForBinding(b.name);
-            writeInfos[i].imageInfo = {};
-            writeInfos[i].imageInfo.imageView = tex.imageView;
-            writeInfos[i].imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            w.pImageInfo = &writeInfos[i].imageInfo;
-        } else {
-            continue; // Skip unsupported types
+
+            writes.push_back(w);
         }
 
-        writes.push_back(w);
+        if (!writes.empty()) {
+            vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()),
+                                   writes.data(), 0, nullptr);
+        }
     }
 
-    if (!writes.empty()) {
-        vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()),
-                               writes.data(), 0, nullptr);
+    // Multi-material: allocate and write per-material descriptor sets for the material set
+    if (multiDesc) {
+        auto& matSetLayout = reflectedSetLayouts[materialSetIdx];
+        auto& perMatTextures = m_scene->getPerMaterialTextures();
+        m_perMaterialDescSets.resize(matCount);
+
+        for (size_t mi = 0; mi < matCount; mi++) {
+            VkDescriptorSetAllocateInfo allocSetInfo = {};
+            allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocSetInfo.descriptorPool = descriptorPool;
+            allocSetInfo.descriptorSetCount = 1;
+            allocSetInfo.pSetLayouts = &matSetLayout;
+
+            if (vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &m_perMaterialDescSets[mi]) != VK_SUCCESS) {
+                throw std::runtime_error("Failed to allocate per-material RT descriptor set");
+            }
+
+            // Write this material's descriptors
+            struct DescWriteInfo {
+                VkDescriptorBufferInfo bufferInfo;
+                VkDescriptorImageInfo imageInfo;
+                VkWriteDescriptorSetAccelerationStructureKHR asInfo;
+            };
+            std::vector<DescWriteInfo> writeInfos;
+            std::vector<VkWriteDescriptorSet> writes;
+
+            for (auto& b : mergedBindings) {
+                if (b.set != materialSetIdx) continue;
+
+                DescWriteInfo info = {};
+                VkWriteDescriptorSet w = {};
+                w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w.dstSet = m_perMaterialDescSets[mi];
+                w.dstBinding = static_cast<uint32_t>(b.binding);
+                w.descriptorCount = 1;
+
+                if (b.type == "uniform_buffer") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    if (b.name == "Material") {
+                        info.bufferInfo = {m_perMaterialBuffers[mi], 0, sizeof(MaterialUBOData)};
+                    } else {
+                        // Camera or other UBO in the material set
+                        info.bufferInfo = {cameraBuffer, 0,
+                            static_cast<VkDeviceSize>(b.size > 0 ? b.size : 128)};
+                    }
+                    writeInfos.push_back(info);
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else if (b.type == "sampler") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                    auto& iblTextures = m_scene->getIBLTextures();
+                    auto iblIt = iblTextures.find(b.name);
+                    if (iblIt != iblTextures.end()) {
+                        info.imageInfo = {}; info.imageInfo.sampler = iblIt->second.sampler;
+                    } else {
+                        auto& tex = m_scene->getTextureForBinding(b.name);
+                        info.imageInfo = {}; info.imageInfo.sampler = tex.sampler;
+                    }
+                    writeInfos.push_back(info);
+                    w.pImageInfo = &writeInfos.back().imageInfo;
+                } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                    auto& iblTextures = m_scene->getIBLTextures();
+                    auto iblIt = iblTextures.find(b.name);
+                    if (iblIt != iblTextures.end()) {
+                        info.imageInfo = {};
+                        info.imageInfo.imageView = iblIt->second.imageView;
+                        info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    } else {
+                        GPUTexture* texPtr = nullptr;
+                        if (mi < perMatTextures.size()) {
+                            auto it = perMatTextures[mi].find(b.name);
+                            if (it != perMatTextures[mi].end())
+                                texPtr = const_cast<GPUTexture*>(&it->second);
+                        }
+                        if (texPtr && texPtr->imageView != VK_NULL_HANDLE) {
+                            info.imageInfo = {};
+                            info.imageInfo.imageView = texPtr->imageView;
+                            info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        } else {
+                            auto& tex = m_scene->getTextureForBinding(b.name);
+                            info.imageInfo = {};
+                            info.imageInfo.imageView = tex.imageView;
+                            info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        }
+                    }
+                    writeInfos.push_back(info);
+                    w.pImageInfo = &writeInfos.back().imageInfo;
+                } else if (b.type == "storage_buffer") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    VkBuffer buf = VK_NULL_HANDLE;
+                    VkDeviceSize bufSize = 0;
+                    if (b.name == "positions") { buf = positionsBuffer; bufSize = positionsSize; }
+                    else if (b.name == "normals") { buf = normalsBuffer; bufSize = normalsSize; }
+                    else if (b.name == "tex_coords") { buf = texCoordsBuffer; bufSize = texCoordsSize; }
+                    else if (b.name == "indices") { buf = indexStorageBuffer; bufSize = indexStorageSize; }
+                    if (buf == VK_NULL_HANDLE) {
+                        std::cout << "[warn] Unknown storage buffer name in material set: " << b.name << std::endl;
+                        continue;
+                    }
+                    info.bufferInfo = {buf, 0, bufSize};
+                    writeInfos.push_back(info);
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else if (b.type == "acceleration_structure") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+                    info.asInfo = {};
+                    info.asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+                    info.asInfo.accelerationStructureCount = 1;
+                    info.asInfo.pAccelerationStructures = &tlas;
+                    writeInfos.push_back(info);
+                    w.pNext = &writeInfos.back().asInfo;
+                } else if (b.type == "storage_image") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                    info.imageInfo = {};
+                    info.imageInfo.imageView = storageImageView;
+                    info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    writeInfos.push_back(info);
+                    w.pImageInfo = &writeInfos.back().imageInfo;
+                } else {
+                    continue;
+                }
+                writes.push_back(w);
+            }
+
+            if (!writes.empty()) {
+                vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()),
+                                       writes.data(), 0, nullptr);
+            }
+        }
+
+        // Set the "active" material desc set to material 0 for the reflectedDescSets map
+        // (used in render() for initial binding)
+        reflectedDescSets[materialSetIdx] = m_perMaterialDescSets[0];
+
+        std::cout << "[info] RT multi-material descriptor sets created: "
+                  << matCount << " material set(s)" << std::endl;
     }
 
     std::cout << "[info] RT descriptor set created (reflection-driven: "
               << reflectedSetLayouts.size() << " set(s), "
-              << mergedBindings.size() << " binding(s))" << std::endl;
+              << mergedBindings.size() << " binding(s)"
+              << (multiDesc ? ", multi-material" : "") << ")" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -891,38 +1235,182 @@ void RTRenderer::init(VulkanContext& ctx,
         m_pipelineBase = m_pipelineBase.substr(0, pos);
     }
 
-    // Load reflection JSON for all RT stages
     namespace fs = std::filesystem;
-    std::string rgenJsonPath = m_pipelineBase + ".rgen.json";
-    std::string rmissJsonPath = m_pipelineBase + ".rmiss.json";
-    std::string rchitJsonPath = m_pipelineBase + ".rchit.json";
 
-    if (fs::exists(rgenJsonPath)) {
-        std::cout << "[info] Loading reflection JSON: " << rgenJsonPath << std::endl;
-        stageReflections.push_back(parseReflectionJson(rgenJsonPath));
-    }
-    if (fs::exists(rchitJsonPath)) {
-        std::cout << "[info] Loading reflection JSON: " << rchitJsonPath << std::endl;
-        stageReflections.push_back(parseReflectionJson(rchitJsonPath));
-    }
-    if (fs::exists(rmissJsonPath)) {
-        std::cout << "[info] Loading reflection JSON: " << rmissJsonPath << std::endl;
-        stageReflections.push_back(parseReflectionJson(rmissJsonPath));
+    // Check for manifest to determine multi-material mode
+    ShaderManifest manifest = tryLoadManifest(m_pipelineBase);
+    bool hasMultipleMaterials = m_scene->hasGltfScene() &&
+        m_scene->getGltfScene().materials.size() > 1;
+    bool hasManifest = !manifest.permutations.empty();
+
+    if (hasManifest && hasMultipleMaterials) {
+        // Multi-material mode: load per-permutation rchit shaders
+        m_multiMaterial = true;
+
+        auto groups = m_scene->groupMaterialsByFeatures();
+        size_t totalMaterials = m_scene->getGltfScene().materials.size();
+        m_geometryToPermutation.resize(0); // built from draw ranges below
+
+        int permIdx = 0;
+        for (auto& [suffix, materialIndices] : groups) {
+            std::string resolvedSuffix = suffix;
+            std::string permBase = m_pipelineBase + resolvedSuffix;
+            std::string rchitPath = permBase + ".rchit.spv";
+
+            if (!fs::exists(rchitPath)) {
+                std::cerr << "[warn] Missing rchit shader for permutation '"
+                          << resolvedSuffix << "', falling back to base" << std::endl;
+                permBase = m_pipelineBase;
+                rchitPath = permBase + ".rchit.spv";
+                resolvedSuffix = "";
+            }
+
+            RTHitPermutation perm;
+            perm.suffix = resolvedSuffix;
+            perm.basePath = permBase;
+            perm.materialIndices = materialIndices;
+
+            // Load rchit shader module
+            auto rchitCode = SpvLoader::loadSPIRV(rchitPath);
+            perm.rchitModule = SpvLoader::createShaderModule(ctx.device, rchitCode);
+
+            // Load rchit reflection JSON
+            std::string rchitJsonPath = permBase + ".rchit.json";
+            if (fs::exists(rchitJsonPath)) {
+                perm.rchitRefl = parseReflectionJson(rchitJsonPath);
+            }
+
+            m_hitPermutations.push_back(std::move(perm));
+            permIdx++;
+
+            std::cout << "[info] Loaded RT permutation '" << resolvedSuffix << "' from " << permBase
+                      << " (" << materialIndices.size() << " material(s))" << std::endl;
+        }
+
+        // Build materialToPermutation mapping
+        std::vector<int> materialToPermutation(totalMaterials, 0);
+        for (size_t pi = 0; pi < m_hitPermutations.size(); pi++) {
+            for (int mi : m_hitPermutations[pi].materialIndices) {
+                if (mi < static_cast<int>(totalMaterials)) {
+                    materialToPermutation[mi] = static_cast<int>(pi);
+                }
+            }
+        }
+
+        // Build geometry-to-hit-group mapping from draw ranges
+        const auto& drawRanges = m_scene->getDrawRanges();
+        m_geometryToPermutation.resize(drawRanges.size());
+        m_geometryToHitGroup.resize(drawRanges.size());
+
+        for (size_t gi = 0; gi < drawRanges.size(); gi++) {
+            int matIdx = drawRanges[gi].materialIndex;
+            int pi = (matIdx < static_cast<int>(totalMaterials))
+                ? materialToPermutation[matIdx] : 0;
+            m_geometryToPermutation[gi] = pi;
+            // Hit group index: groups 0,1 are rgen,rmiss; hit groups start at 2
+            m_geometryToHitGroup[gi] = 2 + static_cast<uint32_t>(pi);
+        }
+
+        // Build superset reflection from all permutation rchit shaders
+        // This ensures the descriptor layout covers bindings from ALL permutations
+        stageReflections.clear();
+
+        // Add raygen reflection
+        std::string rgenJsonPath = m_pipelineBase + ".rgen.json";
+        if (fs::exists(rgenJsonPath)) {
+            stageReflections.push_back(parseReflectionJson(rgenJsonPath));
+        }
+
+        // Add all permutation rchit reflections (superset merging)
+        for (auto& perm : m_hitPermutations) {
+            std::string rchitJsonPath = perm.basePath + ".rchit.json";
+            if (fs::exists(rchitJsonPath)) {
+                stageReflections.push_back(parseReflectionJson(rchitJsonPath));
+            }
+        }
+
+        // Add miss reflection
+        std::string rmissJsonPath = m_pipelineBase + ".rmiss.json";
+        if (fs::exists(rmissJsonPath)) {
+            stageReflections.push_back(parseReflectionJson(rmissJsonPath));
+        }
+
+        if (stageReflections.empty()) {
+            throw std::runtime_error("No reflection JSON files found for RT pipeline: " + m_pipelineBase);
+        }
+
+        std::cout << "[info] Multi-material RT mode: " << m_hitPermutations.size()
+                  << " permutation(s), " << totalMaterials << " material(s), "
+                  << drawRanges.size() << " draw range(s)" << std::endl;
+    } else {
+        // Single-material mode
+        m_multiMaterial = false;
+
+        // If manifest exists but only one material, resolve the best permutation
+        std::string resolvedBase = m_pipelineBase;
+        if (hasManifest && m_scene->hasGltfScene()) {
+            auto sceneFeatures = m_scene->detectSceneFeatures();
+            std::string suffix = findPermutationSuffix(manifest, sceneFeatures);
+            if (!suffix.empty()) {
+                std::string candidateBase = m_pipelineBase + suffix;
+                if (fs::exists(candidateBase + ".rchit.spv")) {
+                    resolvedBase = candidateBase;
+                    std::cout << "[info] Resolved single-material RT permutation: " << suffix << std::endl;
+                }
+            }
+        }
+
+        // Load reflection JSON for all RT stages
+        std::string rgenJsonPath = resolvedBase + ".rgen.json";
+        // raygen always uses base (no permutation suffix for rgen)
+        if (!fs::exists(rgenJsonPath)) rgenJsonPath = m_pipelineBase + ".rgen.json";
+        std::string rmissJsonPath = resolvedBase + ".rmiss.json";
+        if (!fs::exists(rmissJsonPath)) rmissJsonPath = m_pipelineBase + ".rmiss.json";
+        std::string rchitJsonPath = resolvedBase + ".rchit.json";
+
+        if (fs::exists(rgenJsonPath)) {
+            std::cout << "[info] Loading reflection JSON: " << rgenJsonPath << std::endl;
+            stageReflections.push_back(parseReflectionJson(rgenJsonPath));
+        }
+        if (fs::exists(rchitJsonPath)) {
+            std::cout << "[info] Loading reflection JSON: " << rchitJsonPath << std::endl;
+            stageReflections.push_back(parseReflectionJson(rchitJsonPath));
+        }
+        if (fs::exists(rmissJsonPath)) {
+            std::cout << "[info] Loading reflection JSON: " << rmissJsonPath << std::endl;
+            stageReflections.push_back(parseReflectionJson(rmissJsonPath));
+        }
+
+        if (stageReflections.empty()) {
+            throw std::runtime_error("No reflection JSON files found for RT pipeline: " + m_pipelineBase);
+        }
     }
 
-    if (stageReflections.empty()) {
-        throw std::runtime_error("No reflection JSON files found for RT pipeline: " + m_pipelineBase);
-    }
-
-    // Load shader modules
+    // Load shader modules (raygen and miss are always from the base pipeline)
     auto rgenCode = SpvLoader::loadSPIRV(rgenSpvPath);
     rgenModule = SpvLoader::createShaderModule(ctx.device, rgenCode);
 
     auto rmissCode = SpvLoader::loadSPIRV(rmissSpvPath);
     rmissModule = SpvLoader::createShaderModule(ctx.device, rmissCode);
 
-    auto rchitCode = SpvLoader::loadSPIRV(rchitSpvPath);
-    rchitModule = SpvLoader::createShaderModule(ctx.device, rchitCode);
+    if (!m_multiMaterial) {
+        // Single-material: load the rchit module passed in (may be permutation-resolved)
+        // Check if we should use a resolved permutation instead
+        std::string resolvedRchitPath = rchitSpvPath;
+        if (hasManifest && m_scene->hasGltfScene()) {
+            auto sceneFeatures = m_scene->detectSceneFeatures();
+            std::string suffix = findPermutationSuffix(manifest, sceneFeatures);
+            if (!suffix.empty()) {
+                std::string candidatePath = m_pipelineBase + suffix + ".rchit.spv";
+                if (fs::exists(candidatePath)) {
+                    resolvedRchitPath = candidatePath;
+                }
+            }
+        }
+        auto rchitCode = SpvLoader::loadSPIRV(resolvedRchitPath);
+        rchitModule = SpvLoader::createShaderModule(ctx.device, rchitCode);
+    }
+    // Multi-material: rchit modules are already loaded in m_hitPermutations
 
     // Create resources
     createStorageImage(ctx);
@@ -936,7 +1424,8 @@ void RTRenderer::init(VulkanContext& ctx,
     // interactive path overrides via updateCamera() before render())
     updateCameraUBO(ctx);
 
-    std::cout << "[info] RT renderer initialized successfully" << std::endl;
+    std::cout << "[info] RT renderer initialized successfully"
+              << (m_multiMaterial ? " (multi-material)" : "") << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -1020,11 +1509,18 @@ void RTRenderer::cleanup(VulkanContext& ctx) {
     }
     reflectedSetLayouts.clear();
     reflectedDescSets.clear();
+    m_perMaterialDescSets.clear();
 
     // Shader modules
     if (rgenModule) vkDestroyShaderModule(ctx.device, rgenModule, nullptr);
     if (rmissModule) vkDestroyShaderModule(ctx.device, rmissModule, nullptr);
     if (rchitModule) vkDestroyShaderModule(ctx.device, rchitModule, nullptr);
+
+    // Multi-material permutation shader modules
+    for (auto& perm : m_hitPermutations) {
+        if (perm.rchitModule) vkDestroyShaderModule(ctx.device, perm.rchitModule, nullptr);
+    }
+    m_hitPermutations.clear();
 
     // Acceleration structures
     if (blas && ctx.pfnDestroyAccelerationStructureKHR) {
@@ -1042,7 +1538,23 @@ void RTRenderer::cleanup(VulkanContext& ctx) {
     if (instanceBuffer) vmaDestroyBuffer(ctx.allocator, instanceBuffer, instanceAllocation);
     if (sbtBuffer) vmaDestroyBuffer(ctx.allocator, sbtBuffer, sbtAllocation);
     if (cameraBuffer) vmaDestroyBuffer(ctx.allocator, cameraBuffer, cameraAllocation);
-    if (m_materialBuffer) vmaDestroyBuffer(ctx.allocator, m_materialBuffer, m_materialAllocation);
+
+    // Per-material UBOs
+    if (!m_perMaterialBuffers.empty()) {
+        for (size_t i = 0; i < m_perMaterialBuffers.size(); i++) {
+            if (m_perMaterialBuffers[i]) {
+                vmaDestroyBuffer(ctx.allocator, m_perMaterialBuffers[i], m_perMaterialAllocations[i]);
+            }
+        }
+        m_perMaterialBuffers.clear();
+        m_perMaterialAllocations.clear();
+        // m_materialBuffer was aliased, do not double-free
+        m_materialBuffer = VK_NULL_HANDLE;
+        m_materialAllocation = VK_NULL_HANDLE;
+    } else {
+        // Single-material path: m_materialBuffer owns its allocation
+        if (m_materialBuffer) vmaDestroyBuffer(ctx.allocator, m_materialBuffer, m_materialAllocation);
+    }
 
     // Storage image
     if (storageImageView) vkDestroyImageView(ctx.device, storageImageView, nullptr);

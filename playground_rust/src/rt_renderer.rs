@@ -5,7 +5,7 @@ use bytemuck;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 use gpu_allocator::MemoryLocation;
 use log::info;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::camera::DefaultCamera;
@@ -75,6 +75,100 @@ impl MaterialUboData {
     }
 }
 
+// ===========================================================================
+// Shader manifest: permutation selection (shared with raster_renderer)
+// ===========================================================================
+
+/// A single permutation entry from the manifest.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ManifestPermutation {
+    suffix: String,
+    features: HashMap<String, bool>,
+}
+
+/// Parsed shader manifest describing available permutations.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
+struct ShaderManifest {
+    #[serde(default)]
+    pipeline: String,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
+    permutations: Vec<ManifestPermutation>,
+}
+
+impl Default for ShaderManifest {
+    fn default() -> Self {
+        Self {
+            pipeline: String::new(),
+            features: Vec::new(),
+            permutations: Vec::new(),
+        }
+    }
+}
+
+/// Parse a .manifest.json file into a ShaderManifest struct.
+fn parse_manifest_json(path: &Path) -> Option<ShaderManifest> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Try to load manifest from a pipeline base path.
+fn try_load_manifest(pipeline_base: &str) -> Option<ShaderManifest> {
+    let path1 = format!("{}.manifest.json", pipeline_base);
+    if Path::new(&path1).exists() {
+        info!("Loading RT shader manifest: {}", path1);
+        if let Some(manifest) = parse_manifest_json(Path::new(&path1)) {
+            if !manifest.permutations.is_empty() {
+                return Some(manifest);
+            }
+        }
+    }
+
+    // Try legacy subdirectory format
+    let p = Path::new(pipeline_base);
+    if let (Some(dir), Some(filename)) = (p.parent(), p.file_name()) {
+        let path2 = dir.join("gltf_pbr").join(format!("{}.manifest.json", filename.to_string_lossy()));
+        if path2.exists() {
+            info!("Loading RT shader manifest: {}", path2.display());
+            if let Some(manifest) = parse_manifest_json(&path2) {
+                if !manifest.permutations.is_empty() {
+                    return Some(manifest);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Find the best matching permutation suffix for a set of material features.
+#[allow(dead_code)]
+fn find_permutation_suffix(manifest: &ShaderManifest, features: &BTreeSet<String>) -> String {
+    let mut wanted: HashMap<String, bool> = HashMap::new();
+    for fname in &manifest.features {
+        wanted.insert(fname.clone(), features.contains(fname));
+    }
+
+    for perm in &manifest.permutations {
+        let mut is_match = true;
+        for fname in &manifest.features {
+            let perm_has = perm.features.get(fname).copied().unwrap_or(false);
+            let want = *wanted.get(fname).unwrap_or(&false);
+            if perm_has != want {
+                is_match = false;
+                break;
+            }
+        }
+        if is_match {
+            return perm.suffix.clone();
+        }
+    }
+
+    String::new()
+}
+
 /// Ray tracing renderer state.
 pub struct RTRenderer {
     pipeline: vk::Pipeline,
@@ -115,6 +209,18 @@ pub struct RTRenderer {
 
     // Texture images for RT (image, allocation, view, sampler)
     texture_images: Vec<(vk::Image, Option<Allocation>, vk::ImageView, vk::Sampler)>,
+
+    // Multi-material: per-material SSBO array (materials data buffer)
+    materials_ssbo: Option<GpuBuffer>,
+    // Multi-material: per-material texture maps (one per material)
+    #[allow(dead_code)]
+    per_material_texture_maps: Vec<HashMap<String, (vk::ImageView, vk::Sampler)>>,
+    // Multi-material: draw ranges from glTF scene
+    #[allow(dead_code)]
+    draw_ranges: Vec<crate::gltf_loader::DrawRange>,
+    // Number of hit shader groups (1 for single-material, N for multi)
+    #[allow(dead_code)]
+    hit_group_count: u32,
 
     pub width: u32,
     pub height: u32,
@@ -183,6 +289,10 @@ impl RTRenderer {
     /// Descriptor set layouts are driven by reflection JSON sidecar files.
     /// If `scene_source` ends with `.glb` or `.gltf`, the BLAS is built from
     /// the glTF mesh; otherwise a procedural sphere is used.
+    ///
+    /// When a `.manifest.json` exists and the glTF has multiple materials,
+    /// uses multi-geometry BLAS + multi-hit-group SBT so different materials
+    /// get different closest-hit shaders.
     pub fn new(
         ctx: &mut VulkanContext,
         shader_base: &str,
@@ -205,52 +315,7 @@ impl RTRenderer {
         // Clone device to avoid borrow conflicts with allocator_mut()
         let device = ctx.device.clone();
 
-        // --- 0. Load reflection JSON for all RT stages ---
-        let rgen_json_path = format!("{}.rgen.json", shader_base);
-        let rchit_json_path = format!("{}.rchit.json", shader_base);
-        let rmiss_json_path = format!("{}.rmiss.json", shader_base);
-
-        let mut reflections: Vec<reflected_pipeline::ReflectionData> = Vec::new();
-        for json_path in &[&rgen_json_path, &rchit_json_path, &rmiss_json_path] {
-            if Path::new(json_path).exists() {
-                let refl = reflected_pipeline::load_reflection(Path::new(json_path))?;
-                info!("Loaded RT reflection: {} (sets: {:?})", json_path,
-                    refl.descriptor_sets.keys().collect::<Vec<_>>());
-                reflections.push(refl);
-            } else {
-                info!("RT reflection file not found (optional): {}", json_path);
-            }
-        }
-
-        // Merge descriptor sets from all RT stages
-        let refl_refs: Vec<&reflected_pipeline::ReflectionData> = reflections.iter().collect();
-        let merged = reflected_pipeline::merge_descriptor_sets(&refl_refs);
-
-        // Create descriptor set layouts from reflection
-        let descriptor_set_layouts = unsafe {
-            reflected_pipeline::create_descriptor_set_layouts_from_merged(&device, &merged)?
-        };
-
-        // Compute pool sizes
-        let (pool_sizes, max_sets) = reflected_pipeline::compute_pool_sizes(&merged);
-
-        info!("RT reflection-driven descriptors: {} sets, {} pool size entries", max_sets, pool_sizes.len());
-
-        // Create pipeline layout from reflection
-        let pipeline_layout = unsafe {
-            reflected_pipeline::create_pipeline_layout_from_merged(&device, &descriptor_set_layouts, &[])?
-        };
-
-        // --- 1. Create storage image (RGBA8_UNORM, STORAGE | TRANSFER_SRC) ---
-        let (storage_image, storage_image_view, storage_image_allocation) =
-            create_storage_image(&device, ctx.allocator_mut(), width, height)?;
-
-        // --- 2. Create camera UBO (128 bytes: inverse_view + inverse_proj) ---
-        // Auto-camera will be set after loading vertices (below); use default for now
-        let (camera_buffer, mut camera_allocation) =
-            create_camera_ubo(&device, ctx.allocator_mut(), width, height, None)?;
-
-        // --- 3. Build BLAS from scene geometry ---
+        // --- 0. Load glTF scene and decide single vs multi-material ---
         let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
 
         let mut gltf_scene_opt: Option<crate::gltf_loader::GltfScene> = if is_gltf {
@@ -264,69 +329,258 @@ impl RTRenderer {
             None
         };
 
-        let (vertices, indices): (Vec<scene::PbrVertex>, Vec<u32>) = if let Some(ref mut gltf_scene) = gltf_scene_opt {
-            // Flatten scene to get draw items with world transforms (matches raster renderer)
-            let draw_items = crate::gltf_loader::flatten_scene(gltf_scene);
-            let mut all_verts: Vec<scene::PbrVertex> = Vec::new();
-            let mut all_indices: Vec<u32> = Vec::new();
-            let mut vertex_offset: u32 = 0;
-            for item in &draw_items {
-                let mesh = &gltf_scene.meshes[item.mesh_index];
-                let world = item.world_transform;
-                let normal_mat = glam::Mat3::from_mat4(world).inverse().transpose();
-                for v in &mesh.vertices {
-                    let pos = world.transform_point3(glam::Vec3::from(v.position));
-                    let norm = (normal_mat * glam::Vec3::from(v.normal)).normalize();
-                    all_verts.push(scene::PbrVertex {
-                        position: pos.into(),
-                        normal: norm.into(),
-                        uv: v.uv,
+        // Check for manifest to decide multi-material mode
+        let manifest = try_load_manifest(shader_base);
+        let has_multiple_materials = gltf_scene_opt
+            .as_ref()
+            .map(|s| s.materials.len() > 1)
+            .unwrap_or(false);
+        let use_multi_material = manifest.is_some() && has_multiple_materials;
+
+        if use_multi_material {
+            info!(
+                "RT multi-material mode enabled: manifest found and {} materials",
+                gltf_scene_opt.as_ref().map(|s| s.materials.len()).unwrap_or(0)
+            );
+        }
+
+        // --- 0b. Flatten geometry and build draw ranges ---
+        let (vertices, indices, draw_ranges): (Vec<scene::PbrVertex>, Vec<u32>, Vec<crate::gltf_loader::DrawRange>) =
+            if let Some(ref mut gltf_scene) = gltf_scene_opt {
+                let draw_items = crate::gltf_loader::flatten_scene(gltf_scene);
+                let mut all_verts: Vec<scene::PbrVertex> = Vec::new();
+                let mut all_indices: Vec<u32> = Vec::new();
+                let mut vertex_offset: u32 = 0;
+                let mut index_offset: u32 = 0;
+                let mut ranges: Vec<crate::gltf_loader::DrawRange> = Vec::new();
+
+                for item in &draw_items {
+                    let mesh = &gltf_scene.meshes[item.mesh_index];
+                    let world = item.world_transform;
+                    let normal_mat = glam::Mat3::from_mat4(world).inverse().transpose();
+                    for v in &mesh.vertices {
+                        let pos = world.transform_point3(glam::Vec3::from(v.position));
+                        let norm = (normal_mat * glam::Vec3::from(v.normal)).normalize();
+                        all_verts.push(scene::PbrVertex {
+                            position: pos.into(),
+                            normal: norm.into(),
+                            uv: v.uv,
+                        });
+                    }
+                    for &idx in &mesh.indices {
+                        all_indices.push(idx + vertex_offset);
+                    }
+
+                    ranges.push(crate::gltf_loader::DrawRange {
+                        index_offset,
+                        index_count: mesh.indices.len() as u32,
+                        material_index: item.material_index,
                     });
+
+                    vertex_offset += mesh.vertices.len() as u32;
+                    index_offset += mesh.indices.len() as u32;
                 }
-                for &idx in &mesh.indices {
-                    all_indices.push(idx + vertex_offset);
-                }
-                vertex_offset += mesh.vertices.len() as u32;
-            }
-            (all_verts, all_indices)
+                (all_verts, all_indices, ranges)
+            } else {
+                let (v, i) = scene::generate_sphere(32, 32);
+                (v, i, Vec::new())
+            };
+
+        // --- 0c. Determine permutation groups ---
+        let groups: BTreeMap<String, Vec<usize>> = if use_multi_material {
+            scene_manager::group_materials_by_features(gltf_scene_opt.as_ref().unwrap())
         } else {
-            scene::generate_sphere(32, 32)
+            BTreeMap::new()
         };
 
-        let (blas, blas_buffer, blas_allocation, blas_device_address) =
-            build_blas(ctx, &vertices, &indices)?;
+        // material_index -> permutation_index (hit group index)
+        let total_materials = gltf_scene_opt
+            .as_ref()
+            .map(|s| s.materials.len())
+            .unwrap_or(0);
+
+        // Build ordered permutation list: (suffix, material_indices)
+        let perm_list: Vec<(String, Vec<usize>)> = if use_multi_material {
+            groups.iter().map(|(s, mi)| (s.clone(), mi.clone())).collect()
+        } else {
+            Vec::new()
+        };
+
+        // material -> permutation index lookup
+        //
+        // NOTE: Multi-hit-group RT (different rchit per permutation) is disabled
+        // because rchit permutations have incompatible binding layouts — the superset
+        // descriptor set cannot satisfy all shaders simultaneously (e.g. a cubemap
+        // bound at a slot where another rchit expects a 2D texture causes DEVICE_LOST).
+        // Instead, we use multi-geometry BLAS (per-material geometry split) with a
+        // single hit group (base rchit) and per-geometry material data via SSBO.
+        // TODO: Fix compiler to harmonize binding indices across all rchit permutations.
+        let material_to_perm: Vec<usize> = vec![0; total_materials.max(1)];
+
+        let hit_group_count = if use_multi_material {
+            perm_list.len() as u32
+        } else {
+            1u32
+        };
+
+        // --- 1. Load reflection JSON for all RT stages ---
+        // Load base rgen / rmiss reflections
+        let rgen_json_path = format!("{}.rgen.json", shader_base);
+        let rmiss_json_path = format!("{}.rmiss.json", shader_base);
+
+        let mut base_reflections: Vec<reflected_pipeline::ReflectionData> = Vec::new();
+        for json_path in &[&rgen_json_path, &rmiss_json_path] {
+            if Path::new(json_path).exists() {
+                let refl = reflected_pipeline::load_reflection(Path::new(json_path))?;
+                info!(
+                    "Loaded RT reflection: {} (sets: {:?})",
+                    json_path,
+                    refl.descriptor_sets.keys().collect::<Vec<_>>()
+                );
+                base_reflections.push(refl);
+            } else {
+                info!("RT reflection file not found (optional): {}", json_path);
+            }
+        }
+
+        // Load rchit reflections (one per permutation, or just the base)
+        let mut rchit_reflections: Vec<reflected_pipeline::ReflectionData> = Vec::new();
+        let mut rchit_spv_paths: Vec<String> = Vec::new();
+
+        if use_multi_material {
+            for (suffix, _mat_indices) in &perm_list {
+                let perm_base = format!("{}{}", shader_base, suffix);
+                let rchit_json = format!("{}.rchit.json", perm_base);
+                let rchit_spv = format!("{}.rchit.spv", perm_base);
+
+                if Path::new(&rchit_json).exists() && Path::new(&rchit_spv).exists() {
+                    let refl = reflected_pipeline::load_reflection(Path::new(&rchit_json))?;
+                    info!(
+                        "Loaded RT rchit permutation reflection: {} (sets: {:?})",
+                        rchit_json,
+                        refl.descriptor_sets.keys().collect::<Vec<_>>()
+                    );
+                    rchit_reflections.push(refl);
+                    rchit_spv_paths.push(rchit_spv);
+                } else {
+                    // Fallback to base rchit
+                    info!(
+                        "Missing rchit for permutation '{}', falling back to base",
+                        suffix
+                    );
+                    let base_rchit_json = format!("{}.rchit.json", shader_base);
+                    let base_rchit_spv = format!("{}.rchit.spv", shader_base);
+                    let refl = reflected_pipeline::load_reflection(Path::new(&base_rchit_json))?;
+                    rchit_reflections.push(refl);
+                    rchit_spv_paths.push(base_rchit_spv);
+                }
+            }
+        } else {
+            // Single-material: just load the base rchit
+            let rchit_json_path = format!("{}.rchit.json", shader_base);
+            if Path::new(&rchit_json_path).exists() {
+                let refl = reflected_pipeline::load_reflection(Path::new(&rchit_json_path))?;
+                info!(
+                    "Loaded RT reflection: {} (sets: {:?})",
+                    rchit_json_path,
+                    refl.descriptor_sets.keys().collect::<Vec<_>>()
+                );
+                rchit_reflections.push(refl);
+            }
+            rchit_spv_paths.push(format!("{}.rchit.spv", shader_base));
+        }
+
+        // Merge all reflections into superset descriptor layout
+        let mut all_refl_refs: Vec<&reflected_pipeline::ReflectionData> =
+            base_reflections.iter().collect();
+        for r in &rchit_reflections {
+            all_refl_refs.push(r);
+        }
+        let merged = reflected_pipeline::merge_descriptor_sets(&all_refl_refs);
+
+        // Create descriptor set layouts from superset reflection
+        let descriptor_set_layouts = unsafe {
+            reflected_pipeline::create_descriptor_set_layouts_from_merged(&device, &merged)?
+        };
+
+        // Compute pool sizes (scale for multi-material if needed)
+        let (pool_sizes, max_sets) = reflected_pipeline::compute_pool_sizes(&merged);
+
+        // If multi-material, we need extra descriptors for the materials SSBO
+        if use_multi_material && hit_group_count > 1 {
+            // Add space for the materials SSBO binding (already accounted in superset)
+            // No extra pool sizes needed since we use a single descriptor set
+        }
+
+        info!(
+            "RT reflection-driven descriptors: {} sets, {} pool size entries",
+            max_sets,
+            pool_sizes.len()
+        );
+
+        // Create pipeline layout from superset reflection
+        let pipeline_layout = unsafe {
+            reflected_pipeline::create_pipeline_layout_from_merged(
+                &device,
+                &descriptor_set_layouts,
+                &[],
+            )?
+        };
+
+        // --- 2. Create storage image (RGBA8_UNORM, STORAGE | TRANSFER_SRC) ---
+        let (storage_image, storage_image_view, storage_image_allocation) =
+            create_storage_image(&device, ctx.allocator_mut(), width, height)?;
+
+        // --- 3. Create camera UBO (128 bytes: inverse_view + inverse_proj) ---
+        let (camera_buffer, mut camera_allocation) =
+            create_camera_ubo(&device, ctx.allocator_mut(), width, height, None)?;
+
+        // --- 4. Build BLAS ---
+        let (blas, blas_buffer, blas_allocation, blas_device_address) = if use_multi_material
+            && !draw_ranges.is_empty()
+        {
+            // Multi-geometry BLAS: one geometry per draw range
+            build_blas_multi_geometry(ctx, &vertices, &indices, &draw_ranges)?
+        } else {
+            // Single-geometry BLAS (original path)
+            build_blas(ctx, &vertices, &indices)?
+        };
 
         // Create SoA storage buffers for closest_hit vertex interpolation
-        let positions_data: Vec<[f32; 4]> = vertices.iter()
+        let positions_data: Vec<[f32; 4]> = vertices
+            .iter()
             .map(|v| [v.position[0], v.position[1], v.position[2], 1.0])
             .collect();
-        let normals_data: Vec<[f32; 4]> = vertices.iter()
+        let normals_data: Vec<[f32; 4]> = vertices
+            .iter()
             .map(|v| [v.normal[0], v.normal[1], v.normal[2], 0.0])
             .collect();
-        let tex_coords_data: Vec<[f32; 2]> = vertices.iter()
-            .map(|v| v.uv)
-            .collect();
+        let tex_coords_data: Vec<[f32; 2]> = vertices.iter().map(|v| v.uv).collect();
 
         let positions_buffer = create_device_address_buffer(
-            &device, ctx.allocator_mut(),
+            &device,
+            ctx.allocator_mut(),
             bytemuck::cast_slice(&positions_data),
             vk::BufferUsageFlags::STORAGE_BUFFER,
             "rt_positions",
         )?;
         let normals_buffer = create_device_address_buffer(
-            &device, ctx.allocator_mut(),
+            &device,
+            ctx.allocator_mut(),
             bytemuck::cast_slice(&normals_data),
             vk::BufferUsageFlags::STORAGE_BUFFER,
             "rt_normals",
         )?;
         let tex_coords_buffer = create_device_address_buffer(
-            &device, ctx.allocator_mut(),
+            &device,
+            ctx.allocator_mut(),
             bytemuck::cast_slice(&tex_coords_data),
             vk::BufferUsageFlags::STORAGE_BUFFER,
             "rt_tex_coords",
         )?;
         let index_storage_buffer = create_device_address_buffer(
-            &device, ctx.allocator_mut(),
+            &device,
+            ctx.allocator_mut(),
             bytemuck::cast_slice(&indices),
             vk::BufferUsageFlags::STORAGE_BUFFER,
             "rt_indices",
@@ -334,12 +588,15 @@ impl RTRenderer {
 
         info!(
             "Created SoA storage buffers: positions={}B, normals={}B, texCoords={}B, indices={}B",
-            positions_data.len() * 16, normals_data.len() * 16,
-            tex_coords_data.len() * 8, indices.len() * 4
+            positions_data.len() * 16,
+            normals_data.len() * 16,
+            tex_coords_data.len() * 8,
+            indices.len() * 4
         );
 
-        // Upload glTF textures and create default textures
-        let mut texture_images: Vec<(vk::Image, Option<Allocation>, vk::ImageView, vk::Sampler)> = Vec::new();
+        // --- 5. Upload textures ---
+        let mut texture_images: Vec<(vk::Image, Option<Allocation>, vk::ImageView, vk::Sampler)> =
+            Vec::new();
         let mut texture_map: HashMap<String, (vk::ImageView, vk::Sampler)> = HashMap::new();
 
         // Create shared sampler for textures
@@ -359,29 +616,122 @@ impl RTRenderer {
 
         // Create 1x1 white default texture (for base_color, metallic_roughness, occlusion)
         let white_pixel: [u8; 4] = [255, 255, 255, 255];
-        let default_white = create_rt_texture_image(ctx, 1, 1, &white_pixel, "rt_default_white")?;
+        let default_white =
+            create_rt_texture_image(ctx, 1, 1, &white_pixel, "rt_default_white")?;
         let default_white_view = default_white.1;
-        texture_images.push((default_white.0, Some(default_white.2), default_white.1, tex_sampler));
+        texture_images.push((
+            default_white.0,
+            Some(default_white.2),
+            default_white.1,
+            tex_sampler,
+        ));
 
         // Create 1x1 black default texture (for emissive)
         let black_pixel: [u8; 4] = [0, 0, 0, 255];
-        let default_black = create_rt_texture_image(ctx, 1, 1, &black_pixel, "rt_default_black")?;
+        let default_black =
+            create_rt_texture_image(ctx, 1, 1, &black_pixel, "rt_default_black")?;
         let default_black_view = default_black.1;
-        texture_images.push((default_black.0, Some(default_black.2), default_black.1, tex_sampler));
+        texture_images.push((
+            default_black.0,
+            Some(default_black.2),
+            default_black.1,
+            tex_sampler,
+        ));
 
-        // Upload glTF material textures
-        if let Some(ref gltf_scene) = gltf_scene_opt {
+        // Per-material texture maps (for multi-material), or single material textures
+        let mut per_material_texture_maps: Vec<HashMap<String, (vk::ImageView, vk::Sampler)>> =
+            Vec::new();
+
+        // Track uploaded textures to avoid duplicates (key: material_index + slot_name)
+        let mut uploaded_tex_cache: HashMap<String, (vk::ImageView, vk::Sampler)> = HashMap::new();
+
+        if use_multi_material {
+            let gltf_scene = gltf_scene_opt.as_ref().unwrap();
+            for mat_idx in 0..gltf_scene.materials.len() {
+                let mat = &gltf_scene.materials[mat_idx];
+                let mut mat_tex_map: HashMap<String, (vk::ImageView, vk::Sampler)> =
+                    HashMap::new();
+
+                let tex_slots: &[(&str, &Option<crate::gltf_loader::TextureImage>)] = &[
+                    ("base_color_tex", &mat.base_color_image),
+                    ("metallic_roughness_tex", &mat.metallic_roughness_image),
+                    ("occlusion_tex", &mat.occlusion_image),
+                    ("emissive_tex", &mat.emissive_image),
+                ];
+
+                for &(tex_name, tex_opt) in tex_slots {
+                    if let Some(tex_data) = tex_opt.as_ref() {
+                        let cache_key = format!("mat{}_{}", mat_idx, tex_name);
+                        if let Some(&(view, sampler)) = uploaded_tex_cache.get(&cache_key) {
+                            mat_tex_map.insert(tex_name.to_string(), (view, sampler));
+                        } else {
+                            info!(
+                                "RT: Uploading texture '{}' for material {}: {}x{}",
+                                tex_name, mat_idx, tex_data.width, tex_data.height
+                            );
+                            let gpu_tex = create_rt_texture_image(
+                                ctx,
+                                tex_data.width,
+                                tex_data.height,
+                                &tex_data.pixels,
+                                &format!("rt_mat{}_{}", mat_idx, tex_name),
+                            )?;
+                            let view = gpu_tex.1;
+                            texture_images.push((
+                                gpu_tex.0,
+                                Some(gpu_tex.2),
+                                gpu_tex.1,
+                                tex_sampler,
+                            ));
+                            mat_tex_map.insert(tex_name.to_string(), (view, tex_sampler));
+                            uploaded_tex_cache
+                                .insert(cache_key, (view, tex_sampler));
+                        }
+                    } else {
+                        let fallback_view = if tex_name == "emissive_tex" {
+                            default_black_view
+                        } else {
+                            default_white_view
+                        };
+                        mat_tex_map.insert(tex_name.to_string(), (fallback_view, tex_sampler));
+                    }
+                }
+
+                per_material_texture_maps.push(mat_tex_map);
+            }
+
+            // Use first material textures as the global texture_map fallback
+            if let Some(first_map) = per_material_texture_maps.first() {
+                texture_map = first_map.clone();
+            }
+        } else if let Some(ref gltf_scene) = gltf_scene_opt {
+            // Single-material: upload textures from material 0
             let gltf_material = if !gltf_scene.materials.is_empty() {
                 Some(&gltf_scene.materials[0])
             } else {
                 None
             };
 
-            let tex_slots: &[(&str, Box<dyn Fn(&crate::gltf_loader::GltfMaterial) -> &Option<crate::gltf_loader::TextureImage>>)] = &[
-                ("base_color_tex", Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.base_color_image)),
-                ("metallic_roughness_tex", Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.metallic_roughness_image)),
-                ("occlusion_tex", Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.occlusion_image)),
-                ("emissive_tex", Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.emissive_image)),
+            let tex_slots: &[(
+                &str,
+                Box<dyn Fn(&crate::gltf_loader::GltfMaterial) -> &Option<crate::gltf_loader::TextureImage>>,
+            )] = &[
+                (
+                    "base_color_tex",
+                    Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.base_color_image),
+                ),
+                (
+                    "metallic_roughness_tex",
+                    Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.metallic_roughness_image),
+                ),
+                (
+                    "occlusion_tex",
+                    Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.occlusion_image),
+                ),
+                (
+                    "emissive_tex",
+                    Box::new(|m: &crate::gltf_loader::GltfMaterial| &m.emissive_image),
+                ),
             ];
 
             for (tex_name, accessor) in tex_slots {
@@ -403,7 +753,6 @@ impl RTRenderer {
                     texture_images.push((gpu_tex.0, Some(gpu_tex.2), gpu_tex.1, tex_sampler));
                     texture_map.insert(tex_name.to_string(), (view, tex_sampler));
                 } else {
-                    // Use appropriate default
                     let fallback_view = if *tex_name == "emissive_tex" {
                         default_black_view
                     } else {
@@ -414,34 +763,67 @@ impl RTRenderer {
             }
         } else {
             // Non-glTF scene: all textures get defaults
-            texture_map.insert("base_color_tex".to_string(), (default_white_view, tex_sampler));
-            texture_map.insert("metallic_roughness_tex".to_string(), (default_white_view, tex_sampler));
-            texture_map.insert("occlusion_tex".to_string(), (default_white_view, tex_sampler));
-            texture_map.insert("emissive_tex".to_string(), (default_black_view, tex_sampler));
+            texture_map.insert(
+                "base_color_tex".to_string(),
+                (default_white_view, tex_sampler),
+            );
+            texture_map.insert(
+                "metallic_roughness_tex".to_string(),
+                (default_white_view, tex_sampler),
+            );
+            texture_map.insert(
+                "occlusion_tex".to_string(),
+                (default_white_view, tex_sampler),
+            );
+            texture_map.insert(
+                "emissive_tex".to_string(),
+                (default_black_view, tex_sampler),
+            );
         }
 
         // Load IBL assets (cubemaps + BRDF LUT)
         load_rt_ibl_assets(ctx, &mut texture_map, &mut texture_images, ibl_name);
 
-        // Compute scene bounds and update camera UBO with auto-camera (shared function)
-        // Get draw_items from glTF scene for node-transform camera
-        let draw_items: Vec<crate::gltf_loader::DrawItem> = if let Some(ref mut gltf_s) = gltf_scene_opt {
-            crate::gltf_loader::flatten_scene(gltf_s)
-        } else {
-            Vec::new()
-        };
+        // Also insert IBL textures into per-material texture maps
+        if use_multi_material {
+            let ibl_keys: Vec<String> = texture_map
+                .keys()
+                .filter(|k| {
+                    k.starts_with("env_") || k.starts_with("brdf_")
+                })
+                .cloned()
+                .collect();
+            for mat_map in &mut per_material_texture_maps {
+                for key in &ibl_keys {
+                    if !mat_map.contains_key(key) {
+                        if let Some(&entry) = texture_map.get(key) {
+                            mat_map.insert(key.clone(), entry);
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- 6. Compute scene bounds and update camera ---
+        let draw_items_for_cam: Vec<crate::gltf_loader::DrawItem> =
+            if let Some(ref mut gltf_s) = gltf_scene_opt {
+                crate::gltf_loader::flatten_scene(gltf_s)
+            } else {
+                Vec::new()
+            };
 
         let vertex_positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
-        let (saved_eye, saved_target, saved_up, saved_far) = scene_manager::compute_auto_camera_from_draw_items(
-            &vertex_positions,
-            &draw_items,
-        );
+        let (saved_eye, saved_target, saved_up, saved_far) =
+            scene_manager::compute_auto_camera_from_draw_items(
+                &vertex_positions,
+                &draw_items_for_cam,
+            );
         {
-            // Overwrite the camera UBO with auto-camera data
             let aspect = width as f32 / height as f32;
             let fov_y = DefaultCamera::FOV_Y_DEG.to_radians();
             let view = crate::camera::look_at(saved_eye, saved_target, saved_up);
-            let proj = crate::camera::perspective(fov_y, aspect, DefaultCamera::NEAR, saved_far);
+            let proj =
+                crate::camera::perspective(fov_y, aspect, DefaultCamera::NEAR, saved_far);
             let inv_view = view.inverse();
             let inv_proj = proj.inverse();
 
@@ -454,7 +836,7 @@ impl RTRenderer {
             }
         }
 
-        // --- 3b. Create material UBO (80 bytes) ---
+        // --- 7. Create material UBO (single-material) and materials SSBO (multi-material) ---
         let material_data = if let Some(ref gs) = gltf_scene_opt {
             if !gs.materials.is_empty() {
                 MaterialUboData::from_gltf_material(&gs.materials[0])
@@ -468,54 +850,107 @@ impl RTRenderer {
         let (material_buffer, material_allocation) =
             create_material_ubo(&device, ctx.allocator_mut(), &material_data)?;
 
-        // --- 4. Build TLAS with single instance ---
-        let (tlas, tlas_buffer, tlas_allocation) =
-            build_tlas(ctx, blas_device_address)?;
+        // Create materials SSBO for multi-material (array of MaterialUboData indexed by geometry)
+        let materials_ssbo = if use_multi_material && !draw_ranges.is_empty() {
+            let mut ssbo_data: Vec<MaterialUboData> = Vec::new();
+            let gltf_scene = gltf_scene_opt.as_ref().unwrap();
 
-        // --- 5. Load shader modules ---
+            // One entry per draw range (geometry), containing that geometry's material data
+            for range in &draw_ranges {
+                let mat_data = if range.material_index < gltf_scene.materials.len() {
+                    MaterialUboData::from_gltf_material(&gltf_scene.materials[range.material_index])
+                } else {
+                    MaterialUboData::default_values()
+                };
+                ssbo_data.push(mat_data);
+            }
+
+            let ssbo_bytes: &[u8] = bytemuck::cast_slice(&ssbo_data);
+            let buf = create_device_address_buffer(
+                &device,
+                ctx.allocator_mut(),
+                ssbo_bytes,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                "rt_materials_ssbo",
+            )?;
+            info!(
+                "Created materials SSBO: {} entries, {} bytes",
+                ssbo_data.len(),
+                ssbo_bytes.len()
+            );
+            Some(buf)
+        } else {
+            None
+        };
+
+        // --- 8. Build TLAS with single instance ---
+        let (tlas, tlas_buffer, tlas_allocation) = build_tlas(ctx, blas_device_address)?;
+
+        // --- 9. Load shader modules and create RT pipeline ---
         let rgen_path = format!("{}.rgen.spv", shader_base);
-        let rchit_path = format!("{}.rchit.spv", shader_base);
         let rmiss_path = format!("{}.rmiss.spv", shader_base);
 
         let rgen_code = spv_loader::load_spirv(Path::new(&rgen_path))?;
-        let rchit_code = spv_loader::load_spirv(Path::new(&rchit_path))?;
         let rmiss_code = spv_loader::load_spirv(Path::new(&rmiss_path))?;
 
         let rgen_module = spv_loader::create_shader_module(&device, &rgen_code)?;
-        let rchit_module = spv_loader::create_shader_module(&device, &rchit_code)?;
         let rmiss_module = spv_loader::create_shader_module(&device, &rmiss_code)?;
 
-        // --- 6. Create RT pipeline ---
+        // Load rchit modules (one per permutation for multi-material, or just one)
+        let mut rchit_modules: Vec<vk::ShaderModule> = Vec::new();
+        for spv_path in &rchit_spv_paths {
+            let code = spv_loader::load_spirv(Path::new(spv_path))?;
+            let module = spv_loader::create_shader_module(&device, &code)?;
+            rchit_modules.push(module);
+            info!("Loaded rchit shader: {}", spv_path);
+        }
+
         let rt_pipeline_loader = ctx.rt_pipeline_loader.as_ref().unwrap();
-        let pipeline = create_rt_pipeline(
+        let pipeline = create_rt_pipeline_multi(
             &device,
             rt_pipeline_loader,
             rgen_module,
             rmiss_module,
-            rchit_module,
+            &rchit_modules,
             pipeline_layout,
         )?;
 
-        // Destroy shader modules (no longer needed after pipeline creation)
+        // Destroy shader modules
         unsafe {
             device.destroy_shader_module(rgen_module, None);
-            device.destroy_shader_module(rchit_module, None);
             device.destroy_shader_module(rmiss_module, None);
+            for m in &rchit_modules {
+                device.destroy_shader_module(*m, None);
+            }
         }
 
-        // --- 7. Create SBT ---
+        // --- 10. Create SBT with per-geometry hit records ---
         let rt_props = ctx.rt_properties.as_ref().unwrap().clone();
         let rt_pipeline_loader_clone = ctx.rt_pipeline_loader.clone().unwrap();
-        let (sbt_buffer, sbt_allocation, raygen_region, miss_region, hit_region) =
-            create_sbt(
-                &device,
-                ctx.allocator_mut(),
-                &rt_pipeline_loader_clone,
-                &rt_props,
-                pipeline,
-            )?;
 
-        // --- 8. Create descriptor pool and allocate sets from reflection ---
+        let (sbt_buffer, sbt_allocation, raygen_region, miss_region, hit_region) =
+            if use_multi_material && !draw_ranges.is_empty() {
+                create_sbt_multi(
+                    &device,
+                    ctx.allocator_mut(),
+                    &rt_pipeline_loader_clone,
+                    &rt_props,
+                    pipeline,
+                    hit_group_count,
+                    &draw_ranges,
+                    &material_to_perm,
+                )?
+            } else {
+                create_sbt(
+                    &device,
+                    ctx.allocator_mut(),
+                    &rt_pipeline_loader_clone,
+                    &rt_props,
+                    pipeline,
+                )?
+            };
+
+        // --- 11. Create descriptor pool and allocate sets from reflection ---
         let descriptor_pool = unsafe {
             let pool_info = vk::DescriptorPoolCreateInfo::default()
                 .max_sets(max_sets)
@@ -555,13 +990,37 @@ impl RTRenderer {
             }
         }
 
-        // --- 9. Write descriptors from reflection data ---
-        let ssbo_map: HashMap<String, (vk::Buffer, u64)> = [
-            ("positions".to_string(), (positions_buffer.buffer, positions_data.len() as u64 * 16)),
-            ("normals".to_string(), (normals_buffer.buffer, normals_data.len() as u64 * 16)),
-            ("tex_coords".to_string(), (tex_coords_buffer.buffer, tex_coords_data.len() as u64 * 8)),
-            ("indices".to_string(), (index_storage_buffer.buffer, indices.len() as u64 * 4)),
-        ].into_iter().collect();
+        // --- 12. Write descriptors from reflection data ---
+        let mut ssbo_map: HashMap<String, (vk::Buffer, u64)> = [
+            (
+                "positions".to_string(),
+                (positions_buffer.buffer, positions_data.len() as u64 * 16),
+            ),
+            (
+                "normals".to_string(),
+                (normals_buffer.buffer, normals_data.len() as u64 * 16),
+            ),
+            (
+                "tex_coords".to_string(),
+                (
+                    tex_coords_buffer.buffer,
+                    tex_coords_data.len() as u64 * 8,
+                ),
+            ),
+            (
+                "indices".to_string(),
+                (index_storage_buffer.buffer, indices.len() as u64 * 4),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        // Add materials SSBO to the map if multi-material
+        if let Some(ref mssbo) = materials_ssbo {
+            let total_size = draw_ranges.len() as u64
+                * std::mem::size_of::<MaterialUboData>() as u64;
+            ssbo_map.insert("materials".to_string(), (mssbo.buffer, total_size));
+        }
 
         write_rt_descriptors(
             &device,
@@ -575,7 +1034,15 @@ impl RTRenderer {
             &texture_map,
         )?;
 
-        info!("RT renderer initialized successfully (reflection-driven)");
+        info!(
+            "RT renderer initialized successfully ({}, {} hit groups)",
+            if use_multi_material {
+                "multi-material"
+            } else {
+                "single-material"
+            },
+            hit_group_count
+        );
 
         Ok(RTRenderer {
             pipeline,
@@ -606,6 +1073,10 @@ impl RTRenderer {
             tex_coords_buffer,
             index_storage_buffer,
             texture_images,
+            materials_ssbo,
+            per_material_texture_maps,
+            draw_ranges,
+            hit_group_count,
             width,
             height,
             has_scene_bounds: true,
@@ -794,6 +1265,13 @@ impl RTRenderer {
             self.tex_coords_buffer.destroy(&dev, ctx.allocator_mut());
             self.index_storage_buffer.destroy(&dev, ctx.allocator_mut());
         }
+
+        // Free materials SSBO (multi-material)
+        if let Some(ref mut ssbo) = self.materials_ssbo {
+            let dev = ctx.device.clone();
+            ssbo.destroy(&dev, ctx.allocator_mut());
+        }
+        self.materials_ssbo = None;
 
         // Free texture images and samplers
         {
@@ -1374,6 +1852,220 @@ fn build_blas(
     Ok((blas, blas_buffer, blas_allocation, blas_device_address))
 }
 
+/// Build a Bottom-Level Acceleration Structure with one geometry per draw range.
+///
+/// Each geometry references a sub-range of the shared vertex/index buffers.
+/// The BLAS geometry index matches the draw range index, which the SBT uses
+/// to select the correct closest-hit shader for each material.
+fn build_blas_multi_geometry(
+    ctx: &mut VulkanContext,
+    vertices: &[scene::PbrVertex],
+    indices: &[u32],
+    draw_ranges: &[crate::gltf_loader::DrawRange],
+) -> Result<(vk::AccelerationStructureKHR, vk::Buffer, Allocation, u64), String> {
+    let device = ctx.device.clone();
+    let as_loader = ctx
+        .accel_struct_loader
+        .clone()
+        .ok_or("Acceleration structure loader not available")?;
+
+    // Upload vertex and index data to GPU buffers with device address support
+    let vertex_data: &[u8] = bytemuck::cast_slice(vertices);
+    let index_data: &[u8] = bytemuck::cast_slice(indices);
+
+    let mut vertex_buffer = create_device_address_buffer(
+        &device,
+        ctx.allocator_mut(),
+        vertex_data,
+        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        "blas_vertices_multi",
+    )?;
+
+    let mut index_buffer = create_device_address_buffer(
+        &device,
+        ctx.allocator_mut(),
+        index_data,
+        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        "blas_indices_multi",
+    )?;
+
+    let vertex_buffer_addr = get_buffer_device_address(&device, vertex_buffer.buffer);
+    let index_buffer_addr = get_buffer_device_address(&device, index_buffer.buffer);
+
+    let vertex_stride = std::mem::size_of::<scene::PbrVertex>() as u64;
+    let max_vertex = if vertices.is_empty() {
+        0u32
+    } else {
+        vertices.len() as u32 - 1
+    };
+
+    // Build one geometry per draw range
+    let mut geometries: Vec<vk::AccelerationStructureGeometryKHR> = Vec::new();
+    let mut build_range_infos: Vec<vk::AccelerationStructureBuildRangeInfoKHR> = Vec::new();
+    let mut primitive_counts: Vec<u32> = Vec::new();
+
+    for range in draw_ranges {
+        let index_byte_offset = range.index_offset as u64 * 4; // u32 = 4 bytes
+
+        let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+            .vertex_format(vk::Format::R32G32B32_SFLOAT)
+            .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                device_address: vertex_buffer_addr,
+            })
+            .vertex_stride(vertex_stride)
+            .max_vertex(max_vertex)
+            .index_type(vk::IndexType::UINT32)
+            .index_data(vk::DeviceOrHostAddressConstKHR {
+                device_address: index_buffer_addr + index_byte_offset,
+            });
+
+        let geometry = vk::AccelerationStructureGeometryKHR::default()
+            .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+            .flags(vk::GeometryFlagsKHR::OPAQUE)
+            .geometry(vk::AccelerationStructureGeometryDataKHR { triangles });
+
+        let prim_count = range.index_count / 3;
+
+        geometries.push(geometry);
+        build_range_infos.push(
+            vk::AccelerationStructureBuildRangeInfoKHR::default()
+                .primitive_count(prim_count)
+                .primitive_offset(0)
+                .first_vertex(0)
+                .transform_offset(0),
+        );
+        primitive_counts.push(prim_count);
+    }
+
+    info!(
+        "Building multi-geometry BLAS: {} geometries, {} total triangles",
+        geometries.len(),
+        primitive_counts.iter().sum::<u32>()
+    );
+
+    let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+        .geometries(&geometries);
+
+    // Query build sizes
+    let mut build_sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
+    unsafe {
+        as_loader.get_acceleration_structure_build_sizes(
+            vk::AccelerationStructureBuildTypeKHR::DEVICE,
+            &build_info,
+            &primitive_counts,
+            &mut build_sizes,
+        );
+    }
+
+    info!(
+        "Multi-geometry BLAS sizes: as={}, scratch={}",
+        build_sizes.acceleration_structure_size, build_sizes.build_scratch_size
+    );
+
+    // Allocate BLAS buffer
+    let blas_buffer_info = vk::BufferCreateInfo::default()
+        .size(build_sizes.acceleration_structure_size)
+        .usage(
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        )
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let blas_buffer = unsafe {
+        device
+            .create_buffer(&blas_buffer_info, None)
+            .map_err(|e| format!("Failed to create multi-geo BLAS buffer: {:?}", e))?
+    };
+
+    let blas_reqs = unsafe { device.get_buffer_memory_requirements(blas_buffer) };
+
+    let blas_allocation = ctx
+        .allocator_mut()
+        .allocate(&AllocationCreateDesc {
+            name: "blas_buffer_multi",
+            requirements: blas_reqs,
+            location: MemoryLocation::GpuOnly,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("Failed to allocate multi-geo BLAS buffer memory: {:?}", e))?;
+
+    unsafe {
+        device
+            .bind_buffer_memory(blas_buffer, blas_allocation.memory(), blas_allocation.offset())
+            .map_err(|e| format!("Failed to bind multi-geo BLAS buffer memory: {:?}", e))?;
+    }
+
+    // Create acceleration structure
+    let as_create_info = vk::AccelerationStructureCreateInfoKHR::default()
+        .buffer(blas_buffer)
+        .offset(0)
+        .size(build_sizes.acceleration_structure_size)
+        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL);
+
+    let blas = unsafe {
+        as_loader
+            .create_acceleration_structure(&as_create_info, None)
+            .map_err(|e| format!("Failed to create multi-geo BLAS: {:?}", e))?
+    };
+
+    // Allocate scratch buffer
+    let mut scratch_buffer = create_device_address_buffer_empty(
+        &device,
+        ctx.allocator_mut(),
+        build_sizes.build_scratch_size,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        "blas_scratch_multi",
+    )?;
+
+    let scratch_addr = get_buffer_device_address(&device, scratch_buffer.buffer);
+
+    // Build BLAS
+    let build_info_final = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+        .dst_acceleration_structure(blas)
+        .geometries(&geometries)
+        .scratch_data(vk::DeviceOrHostAddressKHR {
+            device_address: scratch_addr,
+        });
+
+    let cmd = ctx.begin_single_commands()?;
+    unsafe {
+        as_loader.cmd_build_acceleration_structures(
+            cmd,
+            &[build_info_final],
+            &[&build_range_infos],
+        );
+    }
+    ctx.end_single_commands(cmd)?;
+
+    // Get BLAS device address
+    let blas_addr_info =
+        vk::AccelerationStructureDeviceAddressInfoKHR::default().acceleration_structure(blas);
+    let blas_device_address =
+        unsafe { as_loader.get_acceleration_structure_device_address(&blas_addr_info) };
+
+    info!(
+        "Multi-geometry BLAS built, device address: 0x{:016X}, {} geometries",
+        blas_device_address,
+        draw_ranges.len()
+    );
+
+    // Free scratch and input buffers
+    scratch_buffer.destroy(&device, ctx.allocator_mut());
+    vertex_buffer.destroy(&device, ctx.allocator_mut());
+    index_buffer.destroy(&device, ctx.allocator_mut());
+
+    Ok((blas, blas_buffer, blas_allocation, blas_device_address))
+}
+
 /// Build a Top-Level Acceleration Structure with a single instance.
 fn build_tlas(
     ctx: &mut VulkanContext,
@@ -1572,6 +2264,8 @@ fn build_tlas(
 }
 
 /// Create the RT pipeline with raygen, miss, and closest-hit shader groups.
+/// (Single-hit-group version; kept for reference. Use `create_rt_pipeline_multi` instead.)
+#[allow(dead_code)]
 fn create_rt_pipeline(
     _device: &ash::Device,
     rt_loader: &ash::khr::ray_tracing_pipeline::Device,
@@ -1642,6 +2336,112 @@ fn create_rt_pipeline(
     };
 
     info!("RT pipeline created");
+    Ok(pipeline)
+}
+
+/// Create the RT pipeline with raygen, miss, and multiple closest-hit shader groups.
+///
+/// Layout:
+/// - Stage 0: raygen
+/// - Stage 1: miss
+/// - Stages 2..2+N: closest-hit permutations
+///
+/// Groups:
+/// - Group 0: GENERAL -> raygen (stage 0)
+/// - Group 1: GENERAL -> miss (stage 1)
+/// - Groups 2..2+N: TRIANGLES_HIT_GROUP -> rchit_permutation[i] (stages 2..2+N)
+fn create_rt_pipeline_multi(
+    _device: &ash::Device,
+    rt_loader: &ash::khr::ray_tracing_pipeline::Device,
+    rgen_module: vk::ShaderModule,
+    rmiss_module: vk::ShaderModule,
+    rchit_modules: &[vk::ShaderModule],
+    pipeline_layout: vk::PipelineLayout,
+) -> Result<vk::Pipeline, String> {
+    let entry_name = c"main";
+
+    // Build shader stages: raygen (0), miss (1), rchit[0..N] (2..2+N)
+    let mut shader_stages = vec![
+        // Stage 0: raygen
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::RAYGEN_KHR)
+            .module(rgen_module)
+            .name(entry_name),
+        // Stage 1: miss
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::MISS_KHR)
+            .module(rmiss_module)
+            .name(entry_name),
+    ];
+
+    for &rchit_module in rchit_modules {
+        shader_stages.push(
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR)
+                .module(rchit_module)
+                .name(entry_name),
+        );
+    }
+
+    // Build shader groups
+    let mut shader_groups = vec![
+        // Group 0: raygen (general)
+        vk::RayTracingShaderGroupCreateInfoKHR::default()
+            .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+            .general_shader(0)
+            .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+            .any_hit_shader(vk::SHADER_UNUSED_KHR)
+            .intersection_shader(vk::SHADER_UNUSED_KHR),
+        // Group 1: miss (general)
+        vk::RayTracingShaderGroupCreateInfoKHR::default()
+            .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+            .general_shader(1)
+            .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+            .any_hit_shader(vk::SHADER_UNUSED_KHR)
+            .intersection_shader(vk::SHADER_UNUSED_KHR),
+    ];
+
+    // Groups 2..2+N: one hit group per rchit permutation
+    for i in 0..rchit_modules.len() {
+        let stage_index = 2 + i as u32; // stage indices: 2, 3, ...
+        shader_groups.push(
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
+                .general_shader(vk::SHADER_UNUSED_KHR)
+                .closest_hit_shader(stage_index)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR),
+        );
+    }
+
+    info!(
+        "Creating RT pipeline: {} stages, {} groups ({} hit groups)",
+        shader_stages.len(),
+        shader_groups.len(),
+        rchit_modules.len()
+    );
+
+    let pipeline_info = vk::RayTracingPipelineCreateInfoKHR::default()
+        .stages(&shader_stages)
+        .groups(&shader_groups)
+        .max_pipeline_ray_recursion_depth(1)
+        .layout(pipeline_layout);
+
+    let pipeline = unsafe {
+        rt_loader
+            .create_ray_tracing_pipelines(
+                vk::DeferredOperationKHR::null(),
+                vk::PipelineCache::null(),
+                &[pipeline_info],
+                None,
+            )
+            .map_err(|e| format!("Failed to create multi-hit RT pipeline: {:?}", e))?[0]
+    };
+
+    info!(
+        "RT pipeline created with {} hit groups",
+        rchit_modules.len()
+    );
     Ok(pipeline)
 }
 
@@ -1770,6 +2570,177 @@ fn create_sbt(
     );
 
     Ok((sbt_buffer, sbt_allocation, raygen_region, miss_region, hit_region))
+}
+
+/// Create the Shader Binding Table with per-geometry hit records for multi-material.
+///
+/// The hit region contains one record per BLAS geometry (draw range). Each record
+/// holds the shader group handle of the correct closest-hit group for that
+/// geometry's material, determined by `material_to_perm`.
+///
+/// SBT layout:
+/// - Raygen region: 1 record (group 0 handle)
+/// - Miss region: 1 record (group 1 handle)
+/// - Hit region: N records (one per draw range), each containing the handle
+///   for group `2 + material_to_perm[draw_range.material_index]`
+fn create_sbt_multi(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    rt_loader: &ash::khr::ray_tracing_pipeline::Device,
+    rt_props: &vk::PhysicalDeviceRayTracingPipelinePropertiesKHR,
+    pipeline: vk::Pipeline,
+    hit_group_count: u32,
+    draw_ranges: &[crate::gltf_loader::DrawRange],
+    material_to_perm: &[usize],
+) -> Result<
+    (
+        vk::Buffer,
+        Allocation,
+        vk::StridedDeviceAddressRegionKHR,
+        vk::StridedDeviceAddressRegionKHR,
+        vk::StridedDeviceAddressRegionKHR,
+    ),
+    String,
+> {
+    let handle_size = rt_props.shader_group_handle_size as u64;
+    let handle_alignment = rt_props.shader_group_handle_alignment as u64;
+    let base_alignment = rt_props.shader_group_base_alignment as u64;
+
+    // Aligned handle size (stride within a group)
+    let handle_size_aligned = align_up(handle_size, handle_alignment);
+
+    // Raygen and miss: each one record, aligned to base_alignment
+    let raygen_size = align_up(handle_size_aligned, base_alignment);
+    let miss_size = align_up(handle_size_aligned, base_alignment);
+
+    // Hit region: one record per draw-range geometry
+    let num_hit_records = draw_ranges.len() as u64;
+    let hit_size = align_up(num_hit_records * handle_size_aligned, base_alignment);
+
+    let sbt_total_size = raygen_size + miss_size + hit_size;
+
+    // Total shader groups: 2 (raygen + miss) + hit_group_count
+    let total_groups = 2 + hit_group_count;
+    let handle_data_size = (handle_size as u32 * total_groups) as usize;
+    let handles = unsafe {
+        rt_loader
+            .get_ray_tracing_shader_group_handles(pipeline, 0, total_groups, handle_data_size)
+            .map_err(|e| format!("Failed to get RT shader group handles: {:?}", e))?
+    };
+
+    // Create SBT buffer
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(sbt_total_size)
+        .usage(
+            vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        )
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let sbt_buffer = unsafe {
+        device
+            .create_buffer(&buffer_info, None)
+            .map_err(|e| format!("Failed to create multi-hit SBT buffer: {:?}", e))?
+    };
+
+    let requirements = unsafe { device.get_buffer_memory_requirements(sbt_buffer) };
+
+    let mut sbt_allocation = allocator
+        .allocate(&AllocationCreateDesc {
+            name: "rt_sbt_multi",
+            requirements,
+            location: MemoryLocation::CpuToGpu,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("Failed to allocate multi-hit SBT memory: {:?}", e))?;
+
+    unsafe {
+        device
+            .bind_buffer_memory(sbt_buffer, sbt_allocation.memory(), sbt_allocation.offset())
+            .map_err(|e| format!("Failed to bind multi-hit SBT buffer memory: {:?}", e))?;
+    }
+
+    // Map and copy handles at aligned offsets
+    if let Some(mapped) = sbt_allocation.mapped_slice_mut() {
+        // Zero out entire SBT
+        for byte in mapped[..sbt_total_size as usize].iter_mut() {
+            *byte = 0;
+        }
+
+        let hs = handle_size as usize;
+
+        // Raygen at offset 0 (group 0 handle)
+        mapped[0..hs].copy_from_slice(&handles[0..hs]);
+
+        // Miss at offset raygen_size (group 1 handle)
+        let miss_offset = raygen_size as usize;
+        mapped[miss_offset..miss_offset + hs].copy_from_slice(&handles[hs..hs * 2]);
+
+        // Hit records: one per draw range
+        let hit_base_offset = (raygen_size + miss_size) as usize;
+        let hit_stride = handle_size_aligned as usize;
+
+        for (geo_idx, range) in draw_ranges.iter().enumerate() {
+            // Determine which hit group this geometry should use
+            let perm_idx = if range.material_index < material_to_perm.len() {
+                material_to_perm[range.material_index]
+            } else {
+                0
+            };
+            // Hit groups start at group index 2
+            let group_idx = 2 + perm_idx;
+
+            // Get the handle for this group
+            let handle_start = group_idx * hs;
+            let handle_end = handle_start + hs;
+
+            if handle_end <= handles.len() {
+                let record_offset = hit_base_offset + geo_idx * hit_stride;
+                mapped[record_offset..record_offset + hs]
+                    .copy_from_slice(&handles[handle_start..handle_end]);
+            }
+        }
+    } else {
+        return Err("Multi-hit SBT buffer is not host-visible".to_string());
+    }
+
+    let sbt_base_addr = get_buffer_device_address(device, sbt_buffer);
+
+    let raygen_region = vk::StridedDeviceAddressRegionKHR {
+        device_address: sbt_base_addr,
+        stride: handle_size_aligned,
+        size: raygen_size,
+    };
+
+    let miss_region = vk::StridedDeviceAddressRegionKHR {
+        device_address: sbt_base_addr + raygen_size,
+        stride: handle_size_aligned,
+        size: miss_size,
+    };
+
+    let hit_region = vk::StridedDeviceAddressRegionKHR {
+        device_address: sbt_base_addr + raygen_size + miss_size,
+        stride: handle_size_aligned,
+        size: hit_size,
+    };
+
+    info!(
+        "Multi-hit SBT created: raygen=0x{:X}, miss=0x{:X}, hit=0x{:X} ({} records), total={}",
+        raygen_region.device_address,
+        miss_region.device_address,
+        hit_region.device_address,
+        draw_ranges.len(),
+        sbt_total_size
+    );
+
+    Ok((
+        sbt_buffer,
+        sbt_allocation,
+        raygen_region,
+        miss_region,
+        hit_region,
+    ))
 }
 
 /// Write RT descriptor sets from reflection data.
