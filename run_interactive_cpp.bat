@@ -11,16 +11,19 @@ if not exist playground_cpp\build\Release\lux-playground.exe (
 set SCENE=assets/DamagedHelmet.glb
 set IBL=pisa
 
-REM Prefer layered raster pipeline, fall back to hand-written raster
-if exist shadercache\gltf_pbr_layered+emission+normal_map.frag.spv (
+REM Prefer manifest-based auto-selection, fall back to explicit permutation, then hand-written
+if exist shadercache\gltf_pbr_layered.manifest.json (
+    set PIPELINE=shadercache/gltf_pbr_layered
+    echo Using layered PBR raster pipeline (manifest auto-selection^)
+) else if exist shadercache\gltf_pbr_layered+emission+normal_map.frag.spv (
     set PIPELINE=shadercache/gltf_pbr_layered+emission+normal_map
-    echo Using layered PBR raster pipeline
+    echo Using layered PBR raster pipeline (explicit permutation^)
 ) else if exist shadercache\gltf_pbr.frag.spv (
     set PIPELINE=shadercache/gltf_pbr
     echo Using hand-written PBR raster pipeline
 ) else (
     echo No compiled shaders found. Compile first with:
-    echo   python -m luxc examples/gltf_pbr_layered.lux -o shadercache/ --pipeline GltfForward --features has_normal_map,has_emission
+    echo   compile_all.bat
     exit /b 1
 )
 

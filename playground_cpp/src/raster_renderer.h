@@ -133,6 +133,9 @@ private:
     VkShaderStageFlags pushConstantStageFlags = 0;
     uint32_t pushConstantSize = 0;
 
+    // Command buffer tracking for interactive mode (freed on next frame)
+    VkCommandBuffer m_interactiveCmdBuffer = VK_NULL_HANDLE;
+
     void createOffscreenTarget(VulkanContext& ctx);
     void createRenderPass(VulkanContext& ctx);
     void createFramebuffer(VulkanContext& ctx);

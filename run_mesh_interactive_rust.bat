@@ -27,4 +27,4 @@ echo   IBL:      %IBL%
 echo   Controls: mouse drag = orbit, scroll = zoom, ESC = exit
 echo.
 
-playground_rust\target\release\lux-playground.exe --scene %SCENE% --pipeline %PIPELINE% --ibl %IBL% --interactive
+playground_rust\target\release\lux-playground.exe --scene %SCENE% --pipeline %PIPELINE% --ibl %IBL% --mode mesh --interactive

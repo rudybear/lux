@@ -1323,6 +1323,16 @@ def setup_multi_pipeline(
     # Group materials by features
     groups = group_materials_by_features(scene.materials, per_mat_tex_names)
 
+    # Compute max vertex stride across all permutations (for shared vertex buffer)
+    max_stride = 0
+    for suffix in groups.keys():
+        perm_base = pipeline_base + suffix if suffix else pipeline_base
+        perm_vert_json = Path(perm_base + ".vert.json")
+        if perm_vert_json.exists():
+            with open(perm_vert_json) as f:
+                perm_vr = _json.load(f)
+            max_stride = max(max_stride, perm_vr.get("vertex_stride", 0))
+
     # Build material -> permutation index mapping
     total_materials = len(scene.materials)
     material_to_perm = [0] * total_materials
@@ -1354,6 +1364,7 @@ def setup_multi_pipeline(
         reflected = ReflectedPipeline(
             device, vert_reflection, frag_reflection,
             vert_module, frag_module, color_format,
+            stride_override=max_stride,
         )
 
         perm = PermutationPipeline(
@@ -1421,15 +1432,47 @@ def render(
         raise RuntimeError("No suitable GPU adapter found")
     device = adapter.request_device_sync()
 
-    # Peek at pipeline vertex stride from reflection for vertex padding
-    vert_json = Path(pipeline_base).with_suffix(".vert.json")
-    pipeline_stride = 0
-    if vert_json.exists():
-        with open(vert_json) as f:
-            vert_refl = _json.load(f)
-        pipeline_stride = vert_refl.get("vertex_stride", 0)
+    # Check for multi-pipeline mode: manifest exists AND multiple materials
+    manifest = try_load_manifest(pipeline_base) if render_path == "raster" else None
+    has_multiple_materials = len(scene.materials) > 1
+    use_multi_pipeline = (manifest is not None
+                          and len(manifest.get("permutations", [])) > 0
+                          and has_multiple_materials)
 
-    # Phase 1: Upload scene to GPU
+    # Resolve effective pipeline base and vertex stride BEFORE uploading.
+    # For multi-pipeline: compute max stride across all needed permutations.
+    # For single-pipeline: resolve the feature suffix first, then read stride.
+    effective_base = pipeline_base
+    if use_multi_pipeline:
+        # Determine max vertex stride across all permutations that will be used
+        per_mat_tex = [mat.textures for mat in scene.materials]
+        mat_groups = group_materials_by_features(scene.materials, per_mat_tex)
+        pipeline_stride = 0
+        for suffix, _ in mat_groups.items():
+            perm_base = pipeline_base + suffix if suffix else pipeline_base
+            perm_vert_json = Path(perm_base + ".vert.json")
+            if perm_vert_json.exists():
+                with open(perm_vert_json) as f:
+                    perm_vr = _json.load(f)
+                pipeline_stride = max(pipeline_stride, perm_vr.get("vertex_stride", 0))
+    else:
+        # Single-pipeline: resolve feature suffix first
+        if scene.scene_features and "gltf_pbr_layered" in pipeline_base:
+            suffix = "+".join(sorted(f.replace("has_", "") for f in scene.scene_features))
+            candidate = f"shadercache/gltf_pbr_layered+{suffix}"
+            if Path(candidate + ".frag.spv").exists():
+                print(f"[info] Auto-selected pipeline variant: {candidate}")
+                effective_base = candidate
+
+        # Read vertex stride from the resolved pipeline
+        vert_json = Path(effective_base).with_suffix(".vert.json")
+        pipeline_stride = 0
+        if vert_json.exists():
+            with open(vert_json) as f:
+                vert_refl = _json.load(f)
+            pipeline_stride = vert_refl.get("vertex_stride", 0)
+
+    # Phase 1: Upload scene to GPU (with correct stride for padding)
     print(f"Uploading scene '{scene_source}' to GPU...")
     gpu_scene = upload_scene(device, scene, width, height, pipeline_stride=pipeline_stride)
 
@@ -1452,13 +1495,6 @@ def render(
                 for name, tex in ibl_textures.items():
                     gpu_scene.textures[name] = tex
 
-    # Check for multi-pipeline mode: manifest exists AND multiple materials
-    manifest = try_load_manifest(pipeline_base) if render_path == "raster" else None
-    has_multiple_materials = len(scene.materials) > 1
-    use_multi_pipeline = (manifest is not None
-                          and len(manifest.get("permutations", [])) > 0
-                          and has_multiple_materials)
-
     if use_multi_pipeline:
         # Multi-pipeline mode: one pipeline per material permutation group
         print(f"Creating multi-pipeline from '{pipeline_base}'...")
@@ -1472,16 +1508,6 @@ def render(
             device, permutations, gpu_scene, scene, width, height,
         )
     else:
-        # Single-pipeline mode (original behavior)
-        # Auto-select pipeline variant based on detected scene features
-        effective_base = pipeline_base
-        if scene.scene_features and "gltf_pbr_layered" in pipeline_base:
-            suffix = "+".join(sorted(f.replace("has_", "") for f in scene.scene_features))
-            candidate = f"shadercache/gltf_pbr_layered+{suffix}"
-            if Path(candidate + ".frag.spv").exists():
-                print(f"[info] Auto-selected pipeline variant: {candidate}")
-                effective_base = candidate
-
         # Phase 2: Create pipeline from reflection
         print(f"Creating pipeline from '{effective_base}'...")
         gpu_pipeline, path, frag_refl, pipeline_info = create_pipeline(

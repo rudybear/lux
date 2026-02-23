@@ -149,6 +149,9 @@ private:
     VkDeviceSize m_meshletVertSize = 0;
     VkDeviceSize m_meshletTriSize = 0;
 
+    // Command buffer tracking for interactive mode (freed on next frame)
+    VkCommandBuffer m_interactiveCmdBuffer = VK_NULL_HANDLE;
+
     void createOffscreenTarget(VulkanContext& ctx);
     void createRenderPass(VulkanContext& ctx);
     void createFramebuffer(VulkanContext& ctx);

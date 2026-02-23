@@ -18,7 +18,7 @@ use crate::scene_manager::{self, GpuBuffer, GpuImage, IblAssets};
 use crate::spv_loader;
 use crate::vulkan_context::VulkanContext;
 
-/// Material UBO data matching `properties Material { ... }` in gltf_pbr_layered.lux (std140 layout, 80 bytes).
+/// Material UBO data matching `properties Material { ... }` in gltf_pbr_layered.lux (std140 layout, 144 bytes).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 struct MaterialUboData {
@@ -35,6 +35,14 @@ struct MaterialUboData {
     _pad_before_sheen: f32,              // offset 60, size  4 (padding for vec3 alignment)
     sheen_color_factor: [f32; 3],         // offset 64, size 12
     _pad0: f32,                           // offset 76, size  4
+    // KHR_texture_transform (offset 80 -> 144)
+    base_color_uv_st: [f32; 4],          // offset 80: [offset.x, offset.y, scale.x, scale.y]
+    normal_uv_st: [f32; 4],              // offset 96
+    mr_uv_st: [f32; 4],                  // offset 112
+    base_color_uv_rot: f32,              // offset 128
+    normal_uv_rot: f32,                  // offset 132
+    mr_uv_rot: f32,                      // offset 136
+    _pad1: f32,                          // offset 140
 }
 unsafe impl bytemuck::Pod for MaterialUboData {}
 unsafe impl bytemuck::Zeroable for MaterialUboData {}
@@ -55,6 +63,13 @@ impl MaterialUboData {
             _pad_before_sheen: 0.0,
             sheen_color_factor: [0.0, 0.0, 0.0],
             _pad0: 0.0,
+            base_color_uv_st: [0.0, 0.0, 1.0, 1.0],
+            normal_uv_st: [0.0, 0.0, 1.0, 1.0],
+            mr_uv_st: [0.0, 0.0, 1.0, 1.0],
+            base_color_uv_rot: 0.0,
+            normal_uv_rot: 0.0,
+            mr_uv_rot: 0.0,
+            _pad1: 0.0,
         }
     }
 
@@ -73,6 +88,22 @@ impl MaterialUboData {
             transmission_factor: mat.transmission_factor,
             _pad_before_sheen: 0.0,
             _pad0: 0.0,
+            base_color_uv_st: [
+                mat.base_color_uv_xform.offset[0], mat.base_color_uv_xform.offset[1],
+                mat.base_color_uv_xform.scale[0], mat.base_color_uv_xform.scale[1],
+            ],
+            normal_uv_st: [
+                mat.normal_uv_xform.offset[0], mat.normal_uv_xform.offset[1],
+                mat.normal_uv_xform.scale[0], mat.normal_uv_xform.scale[1],
+            ],
+            mr_uv_st: [
+                mat.metallic_roughness_uv_xform.offset[0], mat.metallic_roughness_uv_xform.offset[1],
+                mat.metallic_roughness_uv_xform.scale[0], mat.metallic_roughness_uv_xform.scale[1],
+            ],
+            base_color_uv_rot: mat.base_color_uv_xform.rotation,
+            normal_uv_rot: mat.normal_uv_xform.rotation,
+            mr_uv_rot: mat.metallic_roughness_uv_xform.rotation,
+            _pad1: 0.0,
         }
     }
 }
@@ -852,12 +883,39 @@ impl MeshShaderRenderer {
             .color_attachments(std::slice::from_ref(&color_ref))
             .depth_stencil_attachment(&depth_ref);
 
+        let mesh_dependencies = [
+            vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                )
+                .dst_stage_mask(
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                )
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                ),
+            vk::SubpassDependency::default()
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+        ];
+
         let render_pass = unsafe {
             device
                 .create_render_pass(
                     &vk::RenderPassCreateInfo::default()
                         .attachments(&attachments)
-                        .subpasses(std::slice::from_ref(&subpass)),
+                        .subpasses(std::slice::from_ref(&subpass))
+                        .dependencies(&mesh_dependencies),
                     None,
                 )
                 .map_err(|e| format!("Failed to create mesh shader render pass: {:?}", e))?

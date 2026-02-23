@@ -37,7 +37,7 @@ struct Args {
     shader: Option<String>,
 
     /// [DEPRECATED: use --scene instead]
-    #[arg(long, value_parser = ["triangle", "fullscreen", "pbr", "rt"])]
+    #[arg(long, value_parser = ["triangle", "fullscreen", "pbr", "rt", "mesh"])]
     mode: Option<String>,
 
     /// Output image width in pixels.
@@ -102,6 +102,12 @@ fn detect_render_path(pipeline_base: &str, force_mode: &str) -> &'static str {
     if force_mode == "rt" && Path::new(&format!("{}.rgen.spv", pipeline_base)).exists() {
         return "rt";
     }
+    if force_mode == "mesh"
+        && Path::new(&format!("{}.mesh.spv", pipeline_base)).exists()
+        && Path::new(&format!("{}.frag.spv", pipeline_base)).exists()
+    {
+        return "mesh";
+    }
     // Prefer raster over RT when both exist (raster supports per-material draw calls)
     if Path::new(&format!("{}.vert.spv", pipeline_base)).exists()
         && Path::new(&format!("{}.frag.spv", pipeline_base)).exists()
@@ -149,6 +155,7 @@ fn run(args: Args) -> Result<(), String> {
 
     let force_mode = match args.mode.as_deref() {
         Some("rt") => "rt",
+        Some("mesh") => "mesh",
         _ => "",
     };
     let render_path = detect_render_path(&pipeline_base, force_mode);

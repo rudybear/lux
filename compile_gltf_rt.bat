@@ -7,7 +7,7 @@ echo.
 
 REM Render with C++ engine (RT requires Vulkan RT extensions)
 if exist playground_cpp\build\Release\lux-playground.exe (
-    echo === Rendering with C++ engine (RT) ===
+    echo === Rendering with C++ engine - RT ===
     playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_rt --ibl pisa --output screenshots/test_gltf_rt_cpp.png --width 512 --height 512
     echo.
 ) else (
@@ -16,12 +16,12 @@ if exist playground_cpp\build\Release\lux-playground.exe (
 
 REM Render with Rust engine (RT requires Vulkan RT extensions)
 if exist playground_rust\target\release\lux-playground.exe (
-    echo === Rendering with Rust engine (RT) ===
+    echo === Rendering with Rust engine - RT ===
     playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_rt --ibl pisa --output screenshots/test_gltf_rt_rust.png --width 512 --height 512
     echo.
 ) else (
     echo Rust engine not built. Build with: cd playground_rust ^&^& cargo build --release
 )
 
-echo Note: Ray tracing requires C++ or Rust engine (Python/wgpu does not support RT)
+echo Note: Ray tracing requires C++ or Rust engine - Python/wgpu does not support RT
 echo Done.

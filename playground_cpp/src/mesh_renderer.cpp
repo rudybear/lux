@@ -98,16 +98,26 @@ void MeshRenderer::createRenderPass(VulkanContext& ctx) {
     subpass.pColorAttachments = &colorRef;
     subpass.pDepthStencilAttachment = &depthRef;
 
-    VkSubpassDependency dependency = {};
-    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dependency.dstSubpass = 0;
-    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dependency.srcAccessMask = 0;
-    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    VkSubpassDependency dependencies[2] = {};
+
+    // EXTERNAL -> 0: ensure prior commands complete before rendering
+    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[0].dstSubpass = 0;
+    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependencies[0].srcAccessMask = 0;
+    dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    // 0 -> EXTERNAL: ensure color writes are visible to subsequent blit/transfer
+    dependencies[1].srcSubpass = 0;
+    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
     VkRenderPassCreateInfo rpInfo = {};
     rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -115,8 +125,8 @@ void MeshRenderer::createRenderPass(VulkanContext& ctx) {
     rpInfo.pAttachments = attachments;
     rpInfo.subpassCount = 1;
     rpInfo.pSubpasses = &subpass;
-    rpInfo.dependencyCount = 1;
-    rpInfo.pDependencies = &dependency;
+    rpInfo.dependencyCount = 2;
+    rpInfo.pDependencies = dependencies;
 
     if (vkCreateRenderPass(ctx.device, &rpInfo, nullptr, &m_renderPass) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create mesh shader render pass");
@@ -1026,6 +1036,12 @@ void MeshRenderer::renderToSwapchain(VulkanContext& ctx,
     (void)swapView;
     (void)swapFormat;
 
+    // Free previous frame's command buffer (fence was already waited on by caller)
+    if (m_interactiveCmdBuffer != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &m_interactiveCmdBuffer);
+        m_interactiveCmdBuffer = VK_NULL_HANDLE;
+    }
+
     // Record all commands (offscreen render + blit to swapchain) into a single
     // command buffer and submit with proper semaphore/fence synchronization.
     VkCommandBufferAllocateInfo allocInfo = {};
@@ -1036,6 +1052,7 @@ void MeshRenderer::renderToSwapchain(VulkanContext& ctx,
 
     VkCommandBuffer cmd;
     vkAllocateCommandBuffers(ctx.device, &allocInfo, &cmd);
+    m_interactiveCmdBuffer = cmd;
 
     VkCommandBufferBeginInfo beginInfo = {};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;

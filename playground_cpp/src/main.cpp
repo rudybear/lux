@@ -177,8 +177,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
 
     // Legacy --mode backwards compatibility: map mode to scene source
     if (!legacyMode.empty()) {
-        if (legacyMode == "rt") {
-            opts.forceMode = "rt";
+        if (legacyMode == "rt" || legacyMode == "mesh") {
+            opts.forceMode = legacyMode;
         }
         if (opts.sceneSource.empty()) {
             if (legacyMode == "triangle")        opts.sceneSource = "triangle";
@@ -224,6 +224,7 @@ static std::string resolveDefaultPipeline(const std::string& scene) {
 
 static std::string detectRenderPath(const std::string& base, const std::string& forceMode = "") {
     if (forceMode == "rt" && fs::exists(base + ".rgen.spv")) return "rt";
+    if (forceMode == "mesh" && fs::exists(base + ".mesh.spv") && fs::exists(base + ".frag.spv")) return "mesh";
     // Prefer raster over RT when both exist (raster supports per-material draw calls)
     if (fs::exists(base + ".vert.spv") && fs::exists(base + ".frag.spv")) return "raster";
     if (fs::exists(base + ".mesh.spv") && fs::exists(base + ".frag.spv")) return "mesh";

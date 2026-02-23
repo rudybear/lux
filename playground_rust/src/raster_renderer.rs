@@ -503,9 +503,27 @@ fn render_triangle_scene(
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
         .color_attachments(std::slice::from_ref(&color_ref));
 
+    let tri_dependencies = [
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+        vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+    ];
+
     let render_pass_info = vk::RenderPassCreateInfo::default()
         .attachments(std::slice::from_ref(&color_attachment))
-        .subpasses(std::slice::from_ref(&subpass));
+        .subpasses(std::slice::from_ref(&subpass))
+        .dependencies(&tri_dependencies);
 
     let render_pass = unsafe {
         device
@@ -733,9 +751,27 @@ fn render_fullscreen_scene(
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
         .color_attachments(std::slice::from_ref(&color_ref));
 
+    let fs_dependencies = [
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+        vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+    ];
+
     let render_pass_info = vk::RenderPassCreateInfo::default()
         .attachments(std::slice::from_ref(&color_attachment))
-        .subpasses(std::slice::from_ref(&subpass));
+        .subpasses(std::slice::from_ref(&subpass))
+        .dependencies(&fs_dependencies);
 
     let render_pass = unsafe {
         device
@@ -1648,9 +1684,38 @@ fn render_pbr_scene(
         .color_attachments(std::slice::from_ref(&color_ref))
         .depth_stencil_attachment(&depth_ref);
 
+    let dependencies = [
+        // EXTERNAL -> 0: ensure prior commands complete before rendering
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+            )
+            .dst_stage_mask(
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+            )
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            ),
+        // 0 -> EXTERNAL: ensure color writes are visible to subsequent blit/transfer
+        vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+    ];
+
     let render_pass_info = vk::RenderPassCreateInfo::default()
         .attachments(&attachments)
-        .subpasses(std::slice::from_ref(&subpass));
+        .subpasses(std::slice::from_ref(&subpass))
+        .dependencies(&dependencies);
 
     let render_pass = unsafe {
         device
@@ -2293,12 +2358,39 @@ impl PersistentRenderer {
             .color_attachments(std::slice::from_ref(&color_ref))
             .depth_stencil_attachment(&depth_ref);
 
+        let mp_dependencies = [
+            vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                )
+                .dst_stage_mask(
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                )
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                ),
+            vk::SubpassDependency::default()
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+        ];
+
         let render_pass = unsafe {
             device
                 .create_render_pass(
                     &vk::RenderPassCreateInfo::default()
                         .attachments(&attachments)
-                        .subpasses(std::slice::from_ref(&subpass)),
+                        .subpasses(std::slice::from_ref(&subpass))
+                        .dependencies(&mp_dependencies),
                     None,
                 )
                 .map_err(|e| format!("Failed to create render pass: {:?}", e))?
@@ -3091,8 +3183,12 @@ impl PersistentRenderer {
                     .module(frag_module).name(entry_name),
             ];
 
-            let (binding_desc, attr_descs) =
-                crate::reflected_pipeline::create_reflected_vertex_input(&vert_refl);
+            // Use stride override for glTF (buffer is always packed at 48-byte stride)
+            let (binding_desc, attr_descs) = if is_gltf {
+                crate::reflected_pipeline::create_reflected_vertex_input_with_stride(&vert_refl, gltf_vertex_stride)
+            } else {
+                crate::reflected_pipeline::create_reflected_vertex_input(&vert_refl)
+            };
 
             let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
                 .vertex_binding_descriptions(&binding_desc)

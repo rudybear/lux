@@ -11,16 +11,19 @@ if not exist playground_cpp\build\Release\lux-playground.exe (
 set SCENE=assets/DamagedHelmet.glb
 set IBL=pisa
 
-REM Prefer layered RT pipeline, fall back to hand-written RT
-if exist shadercache\gltf_pbr_layered+emission+normal_map.rgen.spv (
+REM Prefer manifest-based auto-selection, fall back to explicit permutation, then hand-written
+if exist shadercache\gltf_pbr_layered.manifest.json (
+    set PIPELINE=shadercache/gltf_pbr_layered
+    echo Using layered PBR RT pipeline (manifest auto-selection^)
+) else if exist shadercache\gltf_pbr_layered+emission+normal_map.rgen.spv (
     set PIPELINE=shadercache/gltf_pbr_layered+emission+normal_map
-    echo Using layered PBR RT pipeline
+    echo Using layered PBR RT pipeline (explicit permutation^)
 ) else if exist shadercache\gltf_pbr_rt.rgen.spv (
     set PIPELINE=shadercache/gltf_pbr_rt
     echo Using hand-written PBR RT pipeline
 ) else (
     echo No compiled RT shaders found. Compile first with:
-    echo   python -m luxc examples/gltf_pbr_layered.lux -o shadercache/ --pipeline GltfRT --features has_normal_map,has_emission
+    echo   compile_all.bat
     exit /b 1
 )
 
@@ -31,4 +34,4 @@ echo   IBL:      %IBL%
 echo   Controls: mouse drag = orbit, scroll = zoom, ESC = exit
 echo.
 
-playground_cpp\build\Release\lux-playground.exe --scene %SCENE% --pipeline %PIPELINE% --ibl %IBL% --interactive
+playground_cpp\build\Release\lux-playground.exe --scene %SCENE% --pipeline %PIPELINE% --ibl %IBL% --mode rt --interactive

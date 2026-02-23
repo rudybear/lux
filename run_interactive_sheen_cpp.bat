@@ -9,12 +9,19 @@ if not exist playground_cpp\build\Release\lux-playground.exe (
 )
 
 set SCENE=assets/SheenChair.glb
-set PIPELINE=shadercache/gltf_pbr_layered+normal_map+sheen
 set IBL=pisa
 
-if not exist shadercache\gltf_pbr_layered+normal_map+sheen.frag.spv (
-    echo No compiled sheen shaders found. Compile first with:
-    echo   python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfForward --features has_normal_map,has_sheen -o shadercache/
+REM Prefer manifest-based auto-selection (per-material permutations),
+REM fall back to explicit sheen permutation
+if exist shadercache\gltf_pbr_layered.manifest.json (
+    set PIPELINE=shadercache/gltf_pbr_layered
+    echo Using layered PBR raster pipeline (manifest auto-selection^)
+) else if exist shadercache\gltf_pbr_layered+normal_map+sheen.frag.spv (
+    set PIPELINE=shadercache/gltf_pbr_layered+normal_map+sheen
+    echo Using explicit sheen permutation
+) else (
+    echo No compiled shaders found. Compile first with:
+    echo   compile_all.bat
     exit /b 1
 )
 

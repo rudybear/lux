@@ -17,14 +17,14 @@ echo [2/6] Compiling hand-written RT (gltf_pbr_rt.lux)
 python -m luxc examples/gltf_pbr_rt.lux -o shadercache/
 echo.
 
-REM --- Layered Forward: base (normal_map + emission) ---
-echo [3/6] Compiling layered Forward (normal_map + emission)
-python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfForward --features has_normal_map,has_emission -o shadercache/
+REM --- Layered Forward: all permutations ---
+echo [3/6] Compiling layered Forward (all permutations)
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfForward --all-permutations -o shadercache/
 echo.
 
-REM --- Layered RT: base (normal_map + emission) ---
-echo [4/6] Compiling layered RT (normal_map + emission)
-python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfRT --features has_normal_map,has_emission -o shadercache/ --no-validate
+REM --- Layered RT: all permutations ---
+echo [4/6] Compiling layered RT (all permutations)
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfRT --all-permutations -o shadercache/ --no-validate
 echo.
 
 REM --- Mesh Shader Pipeline (from layered) ---

@@ -87,9 +87,11 @@ class ReflectedPipeline:
         color_format: wgpu.TextureFormat = wgpu.TextureFormat.rgba8unorm,
         depth_format: wgpu.TextureFormat = wgpu.TextureFormat.depth24plus,
         cull_mode: wgpu.CullMode = wgpu.CullMode.back,
+        stride_override: int = 0,
     ):
         self.vert_reflection = vert_reflection
         self.frag_reflection = frag_reflection
+        self._stride_override = stride_override
 
         # Merge descriptor sets from both stages
         merged_sets = self._merge_descriptor_sets()
@@ -324,6 +326,8 @@ class ReflectedPipeline:
         """Create vertex buffer layout from vertex reflection."""
         attrs = self.vert_reflection.get("vertex_attributes", [])
         stride = self.vert_reflection.get("vertex_stride", 0)
+        if self._stride_override > stride:
+            stride = self._stride_override
 
         if not attrs:
             return []
