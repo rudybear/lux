@@ -2593,6 +2593,7 @@ impl MeshShaderRenderer {
             .as_ref()
             .ok_or("Mesh shader loader not available")?;
 
+        ctx.cmd_begin_label(cmd, "Mesh Dispatch", [0.2, 0.2, 0.8, 1.0]);
         unsafe {
             device.cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
 
@@ -2716,6 +2717,7 @@ impl MeshShaderRenderer {
 
             device.cmd_end_render_pass(cmd);
         }
+        ctx.cmd_end_label(cmd);
 
         Ok(cmd)
     }

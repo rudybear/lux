@@ -264,3 +264,36 @@ class TestConstantFolding:
         """)
         # HALF should be inlined to 0.5 constant
         assert "OpConstant" in asm and "0.5" in asm
+
+
+class TestOpMemberName:
+    def test_opmembername_uniform_block(self):
+        """Uniform block members emit OpMemberName for debug readability."""
+        asm = _compile_stage("""
+        vertex {
+            in pos: vec3;
+            uniform MVP { model: mat4, view: mat4, projection: mat4 }
+            fn main() {
+                builtin_position = projection * view * model * vec4(pos, 1.0);
+            }
+        }
+        """)
+        assert "OpMemberName" in asm
+        assert '"model"' in asm
+        assert '"view"' in asm
+        assert '"projection"' in asm
+
+    def test_opmembername_push_constants(self):
+        """Push constant block members emit OpMemberName for debug readability."""
+        asm = _compile_stage("""
+        fragment {
+            out color: vec4;
+            push Material { base_color: vec3, roughness: scalar }
+            fn main() {
+                color = vec4(base_color, roughness);
+            }
+        }
+        """)
+        assert "OpMemberName" in asm
+        assert '"base_color"' in asm
+        assert '"roughness"' in asm

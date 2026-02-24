@@ -225,6 +225,8 @@ class TypeRegistry:
             return self.int32()
         elif component == "uint":
             return self.uint32()
+        elif component == "bool":
+            return self.bool_type()
         raise ValueError(f"Unknown component type: {component}")
 
     def _ensure_type(self, key: str, decl: str) -> str:

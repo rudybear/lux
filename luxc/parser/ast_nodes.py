@@ -78,6 +78,7 @@ class StructField:
 class TypeAlias:
     name: str
     target_type: str
+    strict: bool = False
     loc: Optional[SourceLocation] = None
 
 
@@ -402,7 +403,7 @@ class Param:
 
 # --- Statements ---
 
-Stmt = "LetStmt | AssignStmt | ReturnStmt | IfStmt | ExprStmt"
+Stmt = "LetStmt | AssignStmt | ReturnStmt | IfStmt | ExprStmt | DebugPrintStmt | AssertStmt | DebugBlock"
 
 
 @dataclass
@@ -437,6 +438,26 @@ class IfStmt:
 @dataclass
 class ExprStmt:
     expr: Expr
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class DebugPrintStmt:
+    format_string: str
+    args: list
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class AssertStmt:
+    condition: object  # Expr
+    message: Optional[str] = None
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class DebugBlock:
+    body: list
     loc: Optional[SourceLocation] = None
 
 

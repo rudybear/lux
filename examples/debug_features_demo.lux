@@ -1,0 +1,129 @@
+// Debug Features Demo — demonstrates Lux debug instrumentation
+//
+// Compile with --debug to enable debug_print, assert, and @[debug] blocks:
+//   python -m luxc examples/debug_features_demo.lux --debug -o shadercache/
+//
+// Without --debug, all debug statements are stripped (zero cost in release):
+//   python -m luxc examples/debug_features_demo.lux -o shadercache/
+//
+// Use --warn-nan to get static warnings about risky float operations:
+//   python -m luxc examples/debug_features_demo.lux --warn-nan -o shadercache/
+
+import brdf;
+import debug;
+
+// --- Semantic types: prevent mixing coordinate spaces at compile time ---
+// These are compile-time only — zero SPIR-V overhead.
+// "type strict" means WorldPos and ViewPos are NOT interchangeable,
+// even though both wrap vec3.
+type strict WorldPos = vec3;
+type strict WorldNormal = vec3;
+type strict LinearColor = vec3;
+
+vertex {
+    in position: vec3;
+    in normal: vec3;
+    in uv: vec2;
+    out world_pos: vec3;
+    out world_normal: vec3;
+    out frag_uv: vec2;
+
+    uniform MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+
+    fn main() {
+        let wp: vec3 = (model * vec4(position, 1.0)).xyz;
+        let wn: vec3 = normalize((model * vec4(normal, 0.0)).xyz);
+
+        world_pos = wp;
+        world_normal = wn;
+        frag_uv = uv;
+        builtin_position = projection * view * vec4(wp, 1.0);
+    }
+}
+
+fragment {
+    in world_pos: vec3;
+    in world_normal: vec3;
+    in frag_uv: vec2;
+    out color: vec4;
+
+    sampler2d albedo_tex;
+
+    push Material {
+        roughness: scalar,
+        metallic: scalar,
+    }
+
+    fn main() {
+        let albedo: vec3 = sample(albedo_tex, frag_uv).xyz;
+        let n: WorldNormal = normalize(world_normal);
+        let v: vec3 = normalize(vec3(0.0, 0.0, 1.0));
+
+        // --- assert: validate material parameters ---
+        // In debug mode, prints failure message and continues.
+        // In release mode, completely stripped — zero instructions.
+        assert(roughness >= 0.0, "roughness must be non-negative");
+        assert(roughness <= 1.0, "roughness exceeds valid range");
+        assert(metallic >= 0.0, "metallic must be non-negative");
+        assert(metallic <= 1.0, "metallic exceeds valid range");
+
+        // --- debug_print: inspect values at runtime ---
+        // Visible in Vulkan validation layer output (VK_EXT_debug_printf).
+        // Stripped to zero instructions in release.
+        debug_print("roughness={} metallic={}", roughness, metallic);
+        debug_print("albedo=({}, {}, {})", albedo.x, albedo.y, albedo.z);
+
+        // Assert normal is unit length
+        assert(length(n) > 0.9, "normal not unit length");
+
+        let n_dot_v: scalar = max(dot(n, v), 0.001);
+
+        // --- @[debug] block: entire block stripped in release ---
+        // Unlike runtime "if" — zero instructions emitted, not just skipped.
+        @[debug] {
+            debug_print("NdotV={}", n_dot_v);
+            assert(n_dot_v > 0.0, "negative NdotV");
+
+            // Use stdlib debug visualization helpers
+            let normal_viz: vec3 = debug_normal(n);
+            debug_print("normal_viz=({}, {}, {})", normal_viz.x, normal_viz.y, normal_viz.z);
+
+            let rough_heat: vec3 = debug_heatmap(roughness);
+            debug_print("roughness heatmap=({}, {}, {})", rough_heat.x, rough_heat.y, rough_heat.z);
+        }
+
+        // PBR shading
+        let f0: vec3 = mix(vec3(0.04), albedo, metallic);
+        let diffuse_color: vec3 = albedo * (1.0 - metallic);
+
+        let light_dir: vec3 = normalize(vec3(1.0, 1.0, 1.0));
+        let n_dot_l: scalar = max(dot(n, light_dir), 0.0);
+        let h: vec3 = normalize(light_dir + v);
+        let n_dot_h: scalar = max(dot(n, h), 0.0);
+
+        let alpha: scalar = roughness * roughness;
+        let d: scalar = ggx_ndf(n_dot_h, alpha);
+        let g: scalar = smith_ggx(n_dot_v, n_dot_l, alpha);
+        let f: vec3 = fresnel_schlick(max(dot(h, v), 0.0), f0);
+
+        let specular: vec3 = f * d * g;
+        let denom: scalar = 4.0 * n_dot_v * n_dot_l + 0.0001;
+        let kd: vec3 = (vec3(1.0) - f) * (1.0 - metallic);
+        let radiance: vec3 = vec3(3.0);
+
+        let result: vec3 = (kd * diffuse_color / 3.14159 + specular / denom) * radiance * n_dot_l;
+
+        // Debug block: check for NaN/Inf in final color (common PBR bug)
+        @[debug] {
+            assert(!any_nan(result), "NaN in final color!");
+            assert(!any_inf(result), "Inf in final color!");
+            debug_print("final color=({}, {}, {})", result.x, result.y, result.z);
+        }
+
+        color = vec4(result, 1.0);
+    }
+}

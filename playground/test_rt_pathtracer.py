@@ -41,7 +41,6 @@ def compile_shader(lux_source: Path) -> bool:
         str(lux_source),
         "-o", str(SHADERCACHE),
         "--emit-asm",
-        "--no-validate",
     ]
     print(f"  Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))

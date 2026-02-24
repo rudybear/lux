@@ -103,6 +103,7 @@ struct CLIOptions {
     std::string output = "output.png";
     bool interactive = false;
     bool headless = true;
+    bool forceValidation = false;
 };
 
 static void printUsage(const char* program) {
@@ -121,6 +122,7 @@ static void printUsage(const char* program) {
               << "  --output <PATH>        Output PNG path (default: output.png)\n"
               << "  --interactive          Open GLFW preview window\n"
               << "  --headless             Offscreen render only (default)\n"
+              << "  --validation           Enable Vulkan validation layers (even in release)\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -166,6 +168,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
         } else if (arg == "--headless") {
             opts.headless = true;
             opts.interactive = false;
+        } else if (arg == "--validation") {
+            opts.forceValidation = true;
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -253,7 +257,7 @@ static int runHeadless(const CLIOptions& opts) {
     // Initialize Vulkan context
     VulkanContext ctx;
     try {
-        ctx.init(needRT, true);
+        ctx.init(needRT, true, nullptr, opts.forceValidation);
     } catch (const std::exception& e) {
         std::cerr << "[error] Failed to initialize Vulkan: " << e.what() << std::endl;
         return 1;
@@ -392,7 +396,7 @@ static int runInteractive(CLIOptions opts) {
     // Initialize Vulkan context with surface
     VulkanContext ctx;
     try {
-        ctx.init(needRT, false, window);
+        ctx.init(needRT, false, window, opts.forceValidation);
     } catch (const std::exception& e) {
         std::cerr << "[error] Failed to initialize Vulkan: " << e.what() << std::endl;
         glfwDestroyWindow(window);

@@ -589,3 +589,34 @@ class TestConstantFolding:
         """
         compile_source(src, "fold_builtin", tmp_path, validate=True)
         assert (tmp_path / "fold_builtin.frag.spv").exists()
+
+
+@requires_spirv_tools
+class TestGltfPBRCompilation:
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def test_gltf_pbr_rt_validates(self, tmp_path):
+        """Compile gltf_pbr.lux (forward raster pipeline) and validate SPIR-V."""
+        src = (EXAMPLES / "gltf_pbr.lux").read_text()
+        compile_source(src, "gltf_pbr", tmp_path, validate=True,
+                       source_dir=EXAMPLES)
+        assert (tmp_path / "gltf_pbr.vert.spv").exists()
+        assert (tmp_path / "gltf_pbr.frag.spv").exists()
+
+    def test_layered_rt_permutation_validates(self, tmp_path):
+        """Compile gltf_pbr_layered.lux with GltfRT pipeline and a feature set."""
+        src = (EXAMPLES / "gltf_pbr_layered.lux").read_text()
+        compile_source(
+            src, "gltf_layered_rt", tmp_path, validate=True,
+            source_dir=EXAMPLES,
+            pipeline="GltfRT",
+            features={"has_normal_map", "has_emission"},
+        )
+        # RT pipeline generates raygen, closest_hit, and miss shaders
+        # At minimum the closest_hit and miss should exist
+        spv_files = list(tmp_path.glob("*.spv"))
+        assert len(spv_files) >= 2, f"Expected at least 2 .spv files, got: {[f.name for f in spv_files]}"

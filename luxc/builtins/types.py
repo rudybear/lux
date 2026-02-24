@@ -61,6 +61,12 @@ class BindlessTextureArrayType(LuxType):
 
 
 @dataclass(frozen=True)
+class SemanticType(LuxType):
+    """A named wrapper around a base type. Not implicitly convertible to other SemanticTypes."""
+    base_type: LuxType
+
+
+@dataclass(frozen=True)
 class RuntimeArrayType(LuxType):
     """Type representing a runtime-sized array (storage buffer element type)."""
     element_type_name: str  # name of the element type (e.g., "vec4", "uint")
@@ -127,19 +133,37 @@ TYPE_MAP: dict[str, LuxType] = {
 # User-defined type aliases: name -> target type name
 _type_aliases: dict[str, str] = {}
 
+# Strict (semantic) type aliases: name -> SemanticType
+_strict_type_aliases: dict[str, SemanticType] = {}
+
 
 def register_type_alias(alias_name: str, target_name: str) -> None:
     """Register a user-defined type alias (e.g., Radiance -> vec3)."""
     _type_aliases[alias_name] = target_name
 
 
+def register_strict_type_alias(alias_name: str, base_type: LuxType) -> SemanticType:
+    """Register a strict type alias that provides compile-time type safety."""
+    st = SemanticType(alias_name, base_type)
+    _strict_type_aliases[alias_name] = st
+    return st
+
+
+def clear_strict_type_aliases() -> None:
+    _strict_type_aliases.clear()
+
+
 def clear_type_aliases() -> None:
     """Clear all user-defined type aliases (for test isolation)."""
     _type_aliases.clear()
+    _strict_type_aliases.clear()
 
 
 def resolve_type(name: str) -> LuxType | None:
-    # Check built-in types first
+    # Check strict type aliases first (returns SemanticType, not underlying)
+    if name in _strict_type_aliases:
+        return _strict_type_aliases[name]
+    # Check built-in types
     t = TYPE_MAP.get(name)
     if t is not None:
         return t
@@ -154,6 +178,9 @@ def resolve_type(name: str) -> LuxType | None:
 
 def resolve_alias_chain(name: str) -> str:
     """Resolve a type alias chain to the final built-in type name."""
+    # Check strict type aliases
+    if name in _strict_type_aliases:
+        return _strict_type_aliases[name].base_type.name
     seen = set()
     current = name
     while current in _type_aliases and current not in seen:
@@ -164,7 +191,14 @@ def resolve_alias_chain(name: str) -> str:
 
 def is_type_alias(name: str) -> bool:
     """Check if a name is a registered type alias."""
-    return name in _type_aliases
+    return name in _type_aliases or name in _strict_type_aliases
+
+
+def unwrap_semantic_type(t: LuxType) -> LuxType:
+    """If t is a SemanticType, return its base type; otherwise return t as-is."""
+    if isinstance(t, SemanticType):
+        return t.base_type
+    return t
 
 
 def vector_component_type(vt: VectorType) -> LuxType:
@@ -179,10 +213,14 @@ def vector_size(type_name: str) -> int | None:
 
 
 def is_numeric(t: LuxType) -> bool:
+    if isinstance(t, SemanticType):
+        return is_numeric(t.base_type)
     return isinstance(t, (ScalarType, VectorType, MatrixType))
 
 
 def is_float_based(t: LuxType) -> bool:
+    if isinstance(t, SemanticType):
+        return is_float_based(t.base_type)
     if isinstance(t, ScalarType) and t.name == "scalar":
         return True
     if isinstance(t, VectorType) and t.component == "scalar":

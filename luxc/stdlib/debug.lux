@@ -1,0 +1,53 @@
+// Lux Standard Library: Debug Visualization
+// Helper functions for common debug visualizations.
+
+/// Visualize a normal vector as RGB (maps [-1,1] to [0,1])
+fn debug_normal(n: vec3) -> vec3 {
+    return n * 0.5 + vec3(0.5);
+}
+
+/// Visualize depth as grayscale (0=near=black, 1=far=white)
+fn debug_depth(z: scalar, near: scalar, far: scalar) -> vec3 {
+    let linear: scalar = (z - near) / (far - near);
+    return vec3(clamp(linear, 0.0, 1.0));
+}
+
+/// Visualize a scalar value as a heatmap (blue=0, green=0.5, red=1)
+fn debug_heatmap(v: scalar) -> vec3 {
+    let clamped: scalar = clamp(v, 0.0, 1.0);
+    let r: scalar = clamp(clamped * 2.0 - 1.0, 0.0, 1.0);
+    let g: scalar = 1.0 - abs(clamped * 2.0 - 1.0);
+    let b: scalar = clamp(1.0 - clamped * 2.0, 0.0, 1.0);
+    return vec3(r, g, b);
+}
+
+/// Visualize an integer index as a distinct hue (golden ratio spacing)
+fn debug_index_color(idx: scalar) -> vec3 {
+    let h: scalar = fract(idx * 0.618033988749895);
+    // Simplified HSV to RGB with S=0.8, V=0.9
+    let s: scalar = 0.8;
+    let val: scalar = 0.9;
+    let c: scalar = val * s;
+    let hprime: scalar = h * 6.0;
+    let x: scalar = c * (1.0 - abs(mod(hprime, 2.0) - 1.0));
+    let m: scalar = val - c;
+    // Piecewise RGB selection
+    let r: scalar = m + c * step(0.0, hprime) * step(hprime, 1.0)
+                   + x * step(1.0, hprime) * step(hprime, 2.0)
+                   + x * step(4.0, hprime) * step(hprime, 5.0)
+                   + c * step(5.0, hprime) * step(hprime, 6.0);
+    let g: scalar = m + x * step(0.0, hprime) * step(hprime, 1.0)
+                   + c * step(1.0, hprime) * step(hprime, 3.0)
+                   + x * step(3.0, hprime) * step(hprime, 4.0);
+    let b2: scalar = m + x * step(2.0, hprime) * step(hprime, 3.0)
+                    + c * step(3.0, hprime) * step(hprime, 5.0)
+                    + x * step(5.0, hprime) * step(hprime, 6.0);
+    return vec3(r, g, b2);
+}
+
+/// UV checkerboard pattern (helps spot UV issues)
+fn debug_uv_checker(uv: vec2, scale: scalar) -> vec3 {
+    let c: vec2 = floor(uv * scale);
+    let checker: scalar = mod(c.x + c.y, 2.0);
+    return vec3(checker * 0.8 + 0.1);
+}

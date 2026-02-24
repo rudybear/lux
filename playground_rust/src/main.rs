@@ -63,6 +63,10 @@ struct Args {
     /// IBL environment name (default: auto-detect pisa/neutral from assets/ibl/).
     #[arg(long)]
     ibl: Option<String>,
+
+    /// Enable Vulkan validation layers even in release builds.
+    #[arg(long)]
+    validation: bool,
 }
 
 fn main() {
@@ -175,9 +179,9 @@ fn run(args: Args) -> Result<(), String> {
         } else {
             (args.width, args.height)
         };
-        run_interactive(&pipeline_base, &scene_source, render_path, iw, ih, ibl_name)?;
+        run_interactive(&pipeline_base, &scene_source, render_path, iw, ih, ibl_name, args.validation)?;
     } else {
-        run_headless(&pipeline_base, &scene_source, render_path, args.width, args.height, &args.output, ibl_name)?;
+        run_headless(&pipeline_base, &scene_source, render_path, args.width, args.height, &args.output, ibl_name, args.validation)?;
     }
 
     Ok(())
@@ -192,11 +196,12 @@ fn run_headless(
     height: u32,
     output: &str,
     ibl_name: &str,
+    force_validation: bool,
 ) -> Result<(), String> {
     let enable_rt = render_path == "rt";
 
     info!("Creating Vulkan context (RT: {})...", enable_rt);
-    let mut ctx = vulkan_context::VulkanContext::new(enable_rt)?;
+    let mut ctx = vulkan_context::VulkanContext::new(enable_rt, force_validation)?;
 
     let output_path = Path::new(output);
 
@@ -418,6 +423,7 @@ fn run_interactive(
     width: u32,
     height: u32,
     ibl_name: &str,
+    force_validation: bool,
 ) -> Result<(), String> {
     use ash::vk;
     use scene_manager::Renderer;
@@ -439,6 +445,7 @@ fn run_interactive(
         use_rt: bool,
         use_mesh: bool,
         ibl_name: String,
+        force_validation: bool,
         // Vulkan state (initialized after window creation)
         ctx: Option<vulkan_context::VulkanContext>,
         renderer: Option<Box<dyn Renderer>>,
@@ -458,7 +465,7 @@ fn run_interactive(
             };
 
             info!("Initializing Vulkan with window surface...");
-            let mut ctx = match vulkan_context::VulkanContext::new_with_window(window, self.use_rt) {
+            let mut ctx = match vulkan_context::VulkanContext::new_with_window(window, self.use_rt, self.force_validation) {
                 Ok(c) => c,
                 Err(e) => {
                     error!("Failed to create Vulkan context: {}", e);
@@ -776,6 +783,7 @@ fn run_interactive(
         use_rt,
         use_mesh,
         ibl_name: ibl_name.to_string(),
+        force_validation,
         ctx: None,
         renderer: None,
         orbit: OrbitCamera::new(),

@@ -25,7 +25,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     return VK_FALSE;
 }
 
-void VulkanContext::init(bool enableRT, bool headless, GLFWwindow* window) {
+void VulkanContext::init(bool enableRT, bool headless, GLFWwindow* window, bool forceValidation) {
     // Build instance
     vkb::InstanceBuilder instanceBuilder;
     instanceBuilder.set_app_name("lux-playground")
@@ -34,6 +34,11 @@ void VulkanContext::init(bool enableRT, bool headless, GLFWwindow* window) {
 
 #ifndef NDEBUG
     instanceBuilder.request_validation_layers(true);
+#else
+    if (forceValidation) {
+        instanceBuilder.request_validation_layers(true);
+        std::cout << "[info] Validation layers force-enabled via --validation flag" << std::endl;
+    }
 #endif
 
     auto instanceResult = instanceBuilder.build();
@@ -226,6 +231,12 @@ void VulkanContext::init(bool enableRT, bool headless, GLFWwindow* window) {
         throw std::runtime_error("Failed to create VMA allocator");
     }
 
+    // Load debug utils label function pointers (for RenderDoc markers)
+    pfnCmdBeginDebugUtilsLabel = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
+        vkGetDeviceProcAddr(device, "vkCmdBeginDebugUtilsLabelEXT"));
+    pfnCmdEndDebugUtilsLabel = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
+        vkGetDeviceProcAddr(device, "vkCmdEndDebugUtilsLabelEXT"));
+
     // Load RT function pointers if supported
     if (rtSupported) {
         pfnCreateAccelerationStructureKHR = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
@@ -389,4 +400,19 @@ VkDeviceAddress VulkanContext::getBufferDeviceAddress(VkBuffer buffer) {
     info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
     info.buffer = buffer;
     return vkGetBufferDeviceAddress(device, &info);
+}
+
+void VulkanContext::cmdBeginLabel(VkCommandBuffer cmd, const char* name, float r, float g, float b, float a) {
+    if (pfnCmdBeginDebugUtilsLabel) {
+        VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+        label.pLabelName = name;
+        label.color[0] = r; label.color[1] = g; label.color[2] = b; label.color[3] = a;
+        pfnCmdBeginDebugUtilsLabel(cmd, &label);
+    }
+}
+
+void VulkanContext::cmdEndLabel(VkCommandBuffer cmd) {
+    if (pfnCmdEndDebugUtilsLabel) {
+        pfnCmdEndDebugUtilsLabel(cmd);
+    }
 }

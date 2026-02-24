@@ -26,7 +26,7 @@ echo.
 
 REM --- Layered RT: all permutations ---
 echo [4/7] Compiling layered RT (all permutations)
-python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfRT --all-permutations -o shadercache/ --no-validate
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfRT --all-permutations -o shadercache/
 echo.
 
 REM --- Bindless Forward: single uber-shader ---

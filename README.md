@@ -290,6 +290,8 @@ All three engines support reflection-driven descriptor binding, glTF loading, cu
 - **Compile-time features** — `features { has_normal_map: bool }` with `if` guards on any declaration; `--features` and `--all-permutations` for shader permutation generation; per-material permutation selection via manifest across all engines
 - **Material property pipeline** — `properties` block in surface declarations abstracts runtime material data; compiler generates std140 UBO + reflection JSON with defaults; qualified `Material.field` access in layer expressions; all engines wire glTF material properties automatically
 - **Bindless rendering** — `--bindless` uber-shaders with runtime descriptor arrays, materials SSBO, `nonuniformEXT` texture indexing, and per-geometry `gl_GeometryIndexEXT` for RT; single pipeline per mode eliminates per-material descriptor switching (C++ and Rust, requires descriptor indexing)
+- **Debug instrumentation** — `debug_print("x={}", x)` via `NonSemantic.DebugPrintf`, `assert(cond, "msg")` with conditional failure output, `@[debug] { ... }` blocks — all stripped to zero instructions in release builds; `--warn-nan` static analysis flags unguarded division, sqrt, normalize, pow, log
+- **Semantic types** — `type strict WorldPos = vec3;` prevents mixing coordinate spaces at compile time (WorldPos vs ViewPos) with zero runtime cost; builtins like `normalize` and `dot` accept semantic types transparently
 - **Algorithm/schedule separation** — swap BRDF variants and tonemapping without touching material code
 - **Math-first syntax** — `scalar` not `float`, `builtin_position` not `gl_Position`
 - **Auto-layout** — locations, descriptor sets, and bindings assigned by declaration order
@@ -301,7 +303,7 @@ All three engines support reflection-driven descriptor binding, glTF loading, cu
 - **AI generation** — `--ai "description"` generates shaders from natural language
 - **One file, multi-stage** — vertex, fragment, and RT stages in a single `.lux` file
 - **Full SPIR-V output** — compiles to validated `.spv` binaries via `spirv-as` + `spirv-val`
-- **40+ built-in functions** — math, vector, matrix, texture sampling (2D + cubemap + explicit LOD), RT instructions
+- **40+ built-in functions** — math, vector, matrix, texture sampling (2D + cubemap + explicit LOD), RT instructions, NaN/Inf detection
 - **glTF 2.0 PBR** — tangent normal mapping, metallic-roughness, image-based lighting, multi-scattering
 - **Rendering engine** — unified scene/pipeline architecture with Python, C++, and Rust Vulkan backends
 - **IBL pipeline** — offline HDR preprocessing to specular cubemap + irradiance + BRDF LUT
@@ -437,7 +439,9 @@ Options:
   --list-features       List available features and exit
   --define KEY=VALUE  Set compile-time parameter (e.g., --define max_vertices=64)
   --no-reflection     Skip .lux.json reflection metadata
-  -g, --debug         Emit OpLine/OpSource debug info
+  -g, --debug         Enable debug instrumentation (OpLine, debug_print, assert, @[debug] blocks)
+  --warn-nan          Static analysis warnings for risky float operations
+  --bindless          Emit bindless descriptor uber-shaders
   --transpile         Transpile GLSL input to Lux
   --ai DESCRIPTION    Generate shader from natural language
   --ai-model MODEL    Model for AI generation (default: claude-sonnet-4-20250514)
@@ -460,6 +464,7 @@ Options:
 | `sampler2d` | `OpTypeSampledImage` | Combined image sampler |
 | `samplerCube` | `OpTypeSampledImage (Cube)` | Cubemap image sampler |
 | `acceleration_structure` | `OpTypeAccelerationStructureKHR` | RT top-level acceleration structure |
+| `type strict Foo = vec3` | Same as base type | Compile-time type safety, zero SPIR-V cost |
 
 ### Stage Blocks
 
@@ -779,6 +784,59 @@ The approach is data-driven: at runtime the engine queries hardware capabilities
 
 Mesh shaders require `VK_EXT_mesh_shader` and are supported in the C++ and Rust engines only -- Python/wgpu does not expose mesh shader support.
 
+### Debug Instrumentation
+
+Lux provides first-class debug features that compile to zero instructions in release builds. Use `--debug` to enable:
+
+```lux
+import debug;
+
+// Semantic types: prevent mixing coordinate spaces at compile time
+type strict WorldPos = vec3;
+type strict WorldNormal = vec3;
+
+fragment {
+    in world_normal: vec3;
+    out color: vec4;
+
+    push Material { roughness: scalar, metallic: scalar }
+
+    fn main() {
+        let n: WorldNormal = normalize(world_normal);
+
+        // Runtime assertions (prints failure, continues — no shader kill)
+        assert(roughness >= 0.0, "roughness must be non-negative");
+        assert(roughness <= 1.0, "roughness exceeds valid range");
+
+        // Runtime value inspection (visible in Vulkan validation layer output)
+        debug_print("roughness={} metallic={}", roughness, metallic);
+
+        // Entire block stripped in release — zero instructions, not just skipped
+        @[debug] {
+            debug_print("normal=({}, {}, {})", n.x, n.y, n.z);
+            assert(!any_nan(n), "NaN in normal!");
+
+            // Stdlib debug visualization helpers
+            let viz: vec3 = debug_normal(n);
+            let heat: vec3 = debug_heatmap(roughness);
+        }
+
+        color = vec4(n * 0.5 + vec3(0.5), 1.0);
+    }
+}
+```
+
+```bash
+# Debug mode: all instrumentation active
+luxc debug_features_demo.lux --debug -o shadercache/
+
+# Release mode: debug_print, assert, @[debug] blocks all stripped
+luxc debug_features_demo.lux -o shadercache/
+
+# Static analysis: warns about unguarded division, sqrt, normalize, pow, log
+luxc debug_features_demo.lux --warn-nan -o shadercache/
+```
+
 ### Ray Tracing Stages (Manual)
 
 Or write RT stages manually with full control:
@@ -877,12 +935,13 @@ Import modules with `import <name>;` — functions are inlined at the call site.
 | `texture` | 11 | TBN normal perturbation, normal unpacking, triplanar projection (weights, UVs, blending), parallax offset, UV rotation, UV tiling |
 | `toon` | 1 | Cartoon cel-shading with quantized NdotL + rim lighting (`@layer` function) |
 | `compositing` | 2 | IBL multi-scattering (Fdez-Aguera 2019), layer compositing helpers |
+| `debug` | 5 | Normal visualization, depth grayscale, scalar heatmap, index coloring, UV checkerboard |
 
 ### Built-in Functions
 
 **GLSL.std.450**: `normalize`, `reflect`, `refract`, `pow`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2` (2-arg atan), `exp`, `exp2`, `log`, `log2`, `sqrt`, `inversesqrt`, `abs`, `sign`, `floor`, `ceil`, `fract`, `min`, `max`, `clamp`, `mix`, `step`, `smoothstep`, `length`, `distance`, `cross`, `fma`, `mod`
 
-**Native SPIR-V**: `dot` (OpDot)
+**Native SPIR-V**: `dot` (OpDot), `any_nan` (OpIsNan + OpAny), `any_inf` (OpIsInf + OpAny)
 
 **Texture**: `sample(tex, uv)` (OpImageSampleImplicitLod), `sample_lod(tex, uv, lod)` (OpImageSampleExplicitLod — explicit mip level for IBL pre-filtered environment maps)
 
@@ -923,7 +982,9 @@ input.lux
   -> Import Resolver      (stdlib + local .lux modules)
   -> Surface Expander     (surface/geometry/pipeline -> stage blocks)
   -> Autodiff Expander    (@differentiable -> gradient functions)
-  -> Type Checker         (resolve types, check operators, validate)
+  -> Type Checker         (resolve types, check operators, validate semantic types)
+  -> Debug Stripper       (remove debug_print/assert/@[debug] in release)
+  -> NaN Checker          (static warnings for risky float ops, --warn-nan)
   -> Constant Folder      (compile-time evaluation)
   -> Layout Assigner      (auto-assign location/set/binding)
   -> SPIR-V Builder       (emit .spvasm text per stage)
@@ -947,6 +1008,7 @@ luxc/
         symbols.py           # symbol table, scopes
         type_checker.py      # type checking + overload resolution
         layout_assigner.py   # auto-assign locations/bindings/sets
+        nan_checker.py       # static NaN/division-by-zero warnings (--warn-nan)
     autodiff/
         forward_diff.py      # forward-mode autodiff expansion
     builtins/
@@ -981,6 +1043,7 @@ luxc/
         lighting.lux         # multi-light shading (directional, point, spot)
         toon.lux             # @layer cartoon cel-shading + rim lighting
         compositing.lux      # IBL multi-scattering, layer compositing helpers
+        debug.lux            # debug visualization helpers (normal, depth, heatmap, checkerboard)
     transpiler/
         glsl_ast.py          # GLSL AST nodes
         glsl_parser.py       # GLSL subset parser
@@ -1012,6 +1075,7 @@ examples/
     viz_param_sweep.lux      # parameter sweep heatmaps (viridis)
     viz_furnace_test.lux     # white furnace test (energy conservation)
     viz_layer_energy.lux     # per-layer energy breakdown (stacked area)
+    debug_features_demo.lux  # debug_print, assert, @[debug], semantic types, any_nan/any_inf
 playground/
     engine.py                # unified rendering engine (scene/pipeline separation)
     reflected_pipeline.py    # reflection-driven descriptor binding
@@ -1051,6 +1115,7 @@ tests/
     test_gltf_extensions.py
     test_mesh_shader.py         # P13 mesh shader tests (compilation, expansion, reflection)
     test_brdf_visualization.py  # P15 BRDF visualization tests (10 tests)
+    test_debug_features.py      # P20 debug instrumentation + semantic types (22 tests)
 tools/
     generate_training_data.py
     visualize_brdf.py        # BRDF visualization CLI (compile + render + composite)
@@ -1086,6 +1151,7 @@ tools/
 | `viz_param_sweep.lux` | Parameter sweep heatmaps: roughness x metallic, roughness x NdotV |
 | `viz_furnace_test.lux` | White furnace test: energy conservation with hemisphere integration |
 | `viz_layer_energy.lux` | Per-layer energy breakdown: stacked area chart of BRDF contributions |
+| `debug_features_demo.lux` | Debug instrumentation: `debug_print`, `assert`, `@[debug]` blocks, semantic types, `any_nan`/`any_inf` |
 
 ## Screenshot Tests
 
@@ -1164,6 +1230,7 @@ run_mesh_interactive_rust.bat # Interactive mesh shader viewer (Rust)
 | `--width <N>` | Output width (default: 512, interactive: 1024) |
 | `--height <N>` | Output height (default: 512, interactive: 768) |
 | `--output <PATH>` | Output PNG path for headless mode |
+| `--validation` | Force Vulkan validation layers ON in release builds |
 
 ### IBL Preprocessing
 
@@ -1184,7 +1251,7 @@ Output: specular cubemap (6 faces x 5 mips), irradiance cubemap, and BRDF integr
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 425 tests
+# 461 tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.

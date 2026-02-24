@@ -8,6 +8,7 @@ from luxc.parser.ast_nodes import (
     TernaryExpr, AssignTarget,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
     StorageImageDecl, StorageBufferDecl, BindlessTextureArrayDecl,
+    DebugPrintStmt, AssertStmt, DebugBlock,
 )
 from luxc.codegen.spirv_types import TypeRegistry
 from luxc.codegen.glsl_ext import GLSL_STD_450, LUX_TO_GLSL
@@ -139,12 +140,42 @@ class SpvGenerator:
         self._debug_source_id: str | None = None
         self._debug_current_line: int = -1  # track last emitted line to avoid redundancy
 
+        # DebugPrintf extension (NonSemantic.DebugPrintf)
+        self._debug_printf_ext_id: str | None = None
+        self._has_debug_printf: bool = False  # set to True if any debug_print/assert is found
+        self._debug_string_ids: dict[str, str] = {}  # format_string -> OpString %id
+
     def _next_label(self) -> str:
         self._label_counter += 1
         return f"%label_{self._label_counter}"
 
+    def _scan_for_debug_stmts(self, stmts: list) -> bool:
+        """Check if any debug_print or assert statements exist in the function bodies."""
+        for stmt in stmts:
+            if isinstance(stmt, (DebugPrintStmt, AssertStmt)):
+                return True
+            if isinstance(stmt, DebugBlock):
+                if self._scan_for_debug_stmts(stmt.body):
+                    return True
+            if isinstance(stmt, IfStmt):
+                if self._scan_for_debug_stmts(stmt.then_body):
+                    return True
+                if self._scan_for_debug_stmts(stmt.else_body):
+                    return True
+        return False
+
     def generate(self) -> str:
         self.glsl_ext_id = self.reg.next_id()
+
+        # Pre-scan for debug_print/assert to know if we need DebugPrintf extension
+        for fn in self.stage.functions:
+            if self._scan_for_debug_stmts(fn.body):
+                self._has_debug_printf = True
+                break
+
+        # Reserve ID for DebugPrintf extension if needed
+        if self._has_debug_printf:
+            self._debug_printf_ext_id = self.reg.next_id()
 
         # Pre-declare types we'll need
         self._declare_globals()
@@ -182,14 +213,12 @@ class SpvGenerator:
             lines.append('OpExtension "SPV_EXT_mesh_shader"')
         if has_bindless:
             lines.append('OpExtension "SPV_EXT_descriptor_indexing"')
+        if self._has_debug_printf:
+            lines.append('OpExtension "SPV_KHR_non_semantic_info"')
         lines.append(f"{self.glsl_ext_id} = OpExtInstImport \"GLSL.std.450\"")
+        if self._has_debug_printf:
+            lines.append(f'{self._debug_printf_ext_id} = OpExtInstImport "NonSemantic.DebugPrintf"')
         lines.append("OpMemoryModel Logical GLSL450")
-
-        # Debug source info (OpString / OpSource)
-        if self.debug and self.source_name:
-            self._debug_source_id = self.reg.next_id()
-            lines.append(f'{self._debug_source_id} = OpString "{self.source_name}"')
-            lines.append(f"OpSource GLSL 450 {self._debug_source_id}")
 
         # Entry point
         if is_rt:
@@ -221,6 +250,16 @@ class SpvGenerator:
             wg_size = defines.get('workgroup_size', 32)
             lines.append(f"OpExecutionMode %main LocalSize {wg_size} 1 1")
 
+        # Debug source info (OpString / OpSource) — must come after OpEntryPoint/OpExecutionMode
+        if self.debug and self.source_name:
+            self._debug_source_id = self.reg.next_id()
+            lines.append(f'{self._debug_source_id} = OpString "{self.source_name}"')
+            lines.append(f"OpSource GLSL 450 {self._debug_source_id}")
+
+        # DebugPrintf format strings (OpString)
+        for fmt_str, str_id in self._debug_string_ids.items():
+            lines.append(f'{str_id} = OpString "{fmt_str}"')
+
         # Debug names
         lines.append('OpName %main "main"')
         for name, vid in self.var_map.items():
@@ -232,6 +271,28 @@ class SpvGenerator:
         if self.per_vertex_struct_id:
             lines.append(f'OpName {self.per_vertex_struct_id} "gl_PerVertex"')
             lines.append(f'OpName {self.per_vertex_var_id} ""')
+
+        # OpMemberName for struct fields (RenderDoc / spirv-cross readability)
+        for ub in self.stage.uniforms:
+            sid = self.uniform_struct_ids.get(ub.name)
+            if sid:
+                for i, field in enumerate(ub.fields):
+                    lines.append(f'OpMemberName {sid} {i} "{field.name}"')
+        for pb in self.stage.push_constants:
+            sid = self.push_struct_ids.get(pb.name)
+            if sid:
+                for i, field in enumerate(pb.fields):
+                    lines.append(f'OpMemberName {sid} {i} "{field.name}"')
+        if self.per_vertex_struct_id:
+            lines.append(f'OpMemberName {self.per_vertex_struct_id} 0 "gl_Position"')
+            lines.append(f'OpMemberName {self.per_vertex_struct_id} 1 "gl_PointSize"')
+            lines.append(f'OpMemberName {self.per_vertex_struct_id} 2 "gl_ClipDistance"')
+            lines.append(f'OpMemberName {self.per_vertex_struct_id} 3 "gl_CullDistance"')
+        # Bindless material struct member names
+        if "BindlessMaterialData" in self.reg._types:
+            bms_id = self.reg._types["BindlessMaterialData"]
+            for i, (fname, _) in enumerate(_BINDLESS_MATERIAL_FIELDS):
+                lines.append(f'OpMemberName {bms_id} {i} "{fname}"')
 
         # Decorations
         lines.extend(self.decorations)
@@ -764,6 +825,8 @@ class SpvGenerator:
             elif isinstance(stmt, IfStmt):
                 self._pre_declare_locals(stmt.then_body)
                 self._pre_declare_locals(stmt.else_body)
+            elif isinstance(stmt, DebugBlock):
+                self._pre_declare_locals(stmt.body)
 
     def _emit_debug_line(self, node, lines: list[str]) -> None:
         """Emit OpLine before a statement/expression if debug mode is on and the node has a loc."""
@@ -830,6 +893,91 @@ class SpvGenerator:
         elif isinstance(stmt, ExprStmt):
             _, expr_lines = self._gen_expr(stmt.expr)
             lines.extend(expr_lines)
+
+        elif isinstance(stmt, DebugPrintStmt):
+            lines.extend(self._gen_debug_print(stmt))
+
+        elif isinstance(stmt, AssertStmt):
+            lines.extend(self._gen_assert(stmt))
+
+        elif isinstance(stmt, DebugBlock):
+            # Flatten: emit body statements inline
+            for s in stmt.body:
+                lines.extend(self._gen_stmt(s))
+
+        return lines
+
+    def _get_or_create_debug_string(self, fmt: str) -> str:
+        """Get or create an OpString ID for a debug format string."""
+        if fmt not in self._debug_string_ids:
+            str_id = self.reg.next_id()
+            self._debug_string_ids[fmt] = str_id
+        return self._debug_string_ids[fmt]
+
+    def _gen_debug_print(self, stmt: DebugPrintStmt) -> list[str]:
+        """Generate SPIR-V for debug_print statement using NonSemantic.DebugPrintf."""
+        lines = []
+        if not self._debug_printf_ext_id:
+            return lines
+
+        # Get format string ID
+        fmt_id = self._get_or_create_debug_string(stmt.format_string)
+
+        # Evaluate arguments
+        arg_ids = []
+        for arg in stmt.args:
+            aid, alines = self._gen_expr(arg)
+            lines.extend(alines)
+            arg_ids.append(aid)
+
+        # Emit OpExtInst for DebugPrintf (instruction number 1)
+        void_type = self.reg.void()
+        result = self.reg.next_id()
+        args_str = " ".join(arg_ids)
+        if args_str:
+            lines.append(f"{result} = OpExtInst {void_type} {self._debug_printf_ext_id} 1 {fmt_id} {args_str}")
+        else:
+            lines.append(f"{result} = OpExtInst {void_type} {self._debug_printf_ext_id} 1 {fmt_id}")
+
+        return lines
+
+    def _gen_assert(self, stmt: AssertStmt) -> list[str]:
+        """Generate SPIR-V for assert statement: conditional debugPrintf on failure."""
+        lines = []
+        if not self._debug_printf_ext_id:
+            return lines
+
+        # Evaluate condition
+        cond_id, cond_lines = self._gen_expr(stmt.condition)
+        lines.extend(cond_lines)
+
+        # Create labels for branch
+        ok_label = self._next_label()
+        fail_label = self._next_label()
+        merge_label = self._next_label()
+
+        lines.append(f"OpSelectionMerge {merge_label} None")
+        lines.append(f"OpBranchConditional {cond_id} {ok_label} {fail_label}")
+
+        # Fail block: print assertion message
+        lines.append(f"{fail_label} = OpLabel")
+        msg = stmt.message or "assertion failed"
+        loc_info = ""
+        if stmt.loc:
+            loc_info = f" [{self.source_name}:{stmt.loc.line}]"
+        fmt_str = f"ASSERT FAILED{loc_info}: {msg}"
+        fmt_id = self._get_or_create_debug_string(fmt_str)
+        void_type = self.reg.void()
+        result = self.reg.next_id()
+        lines.append(f"{result} = OpExtInst {void_type} {self._debug_printf_ext_id} 1 {fmt_id}")
+        lines.append(f"OpBranch {merge_label}")
+
+        # OK block
+        lines.append(f"{ok_label} = OpLabel")
+        lines.append(f"OpBranch {merge_label}")
+
+        # Merge
+        lines.append(f"{merge_label} = OpLabel")
 
         return lines
 
@@ -1520,6 +1668,21 @@ class SpvGenerator:
         # transpose -> OpTranspose (core SPIR-V, not GLSL.std.450)
         if fname == "transpose":
             lines.append(f"{result} = OpTranspose {result_type} {arg_ids[0]}")
+            return result, lines
+
+        # any_nan / any_inf -> OpIsNan / OpIsInf (core SPIR-V ops)
+        if fname in ("any_nan", "any_inf"):
+            op = "OpIsNan" if fname == "any_nan" else "OpIsInf"
+            arg_type_name = resolve_alias_chain(expr.args[0].resolved_type)
+            arg_lux_type = resolve_type(arg_type_name)
+            bool_type = self.reg.bool_type()
+            if isinstance(arg_lux_type, VectorType):
+                bvec_type = self.reg.vec(arg_lux_type.size, "bool")
+                nan_vec = self.reg.next_id()
+                lines.append(f"{nan_vec} = {op} {bvec_type} {arg_ids[0]}")
+                lines.append(f"{result} = OpAny {bool_type} {nan_vec}")
+            else:
+                lines.append(f"{result} = {op} {bool_type} {arg_ids[0]}")
             return result, lines
 
         # User-defined function — inline it

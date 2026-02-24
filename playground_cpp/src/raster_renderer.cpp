@@ -1889,9 +1889,11 @@ void RasterRenderer::render(VulkanContext& ctx) {
     rpBeginInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
     rpBeginInfo.pClearValues = clearValues.data();
 
+    ctx.cmdBeginLabel(cmd, "Raster Pass", 0.2f, 0.8f, 0.2f, 1.0f);
     vkCmdBeginRenderPass(cmd, &rpBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
     recordDrawCommands(cmd);
     vkCmdEndRenderPass(cmd);
+    ctx.cmdEndLabel(cmd);
     ctx.endSingleTimeCommands(cmd);
 }
 
@@ -2002,9 +2004,11 @@ void RasterRenderer::renderToSwapchain(VulkanContext& ctx,
     rpBeginInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
     rpBeginInfo.pClearValues = clearValues.data();
 
+    ctx.cmdBeginLabel(cmd, "Raster Pass", 0.2f, 0.8f, 0.2f, 1.0f);
     vkCmdBeginRenderPass(cmd, &rpBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
     recordDrawCommands(cmd);
     vkCmdEndRenderPass(cmd);
+    ctx.cmdEndLabel(cmd);
 
     // --- Blit offscreen -> swapchain ---
     blitToSwapchain(ctx, cmd, swapImage, extent);

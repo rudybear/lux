@@ -26,6 +26,7 @@ struct_def: "struct" IDENT "{" struct_field ("," struct_field)* ","? "}"
 struct_field: IDENT ":" type
 
 type_alias: "type" IDENT "=" type ";"
+          | "type" "strict" IDENT "=" type ";" -> strict_type_alias
 
 import_decl: "import" IDENT ";"
 
@@ -155,6 +156,9 @@ param: IDENT ":" type
           | assign_stmt
           | return_stmt
           | if_stmt
+          | debug_print_stmt
+          | assert_stmt
+          | debug_block
           | expr_stmt
 
 let_stmt: "let" IDENT ":" type "=" expr ";"
@@ -163,6 +167,12 @@ return_stmt: "return" expr ";"
 if_stmt: "if" "(" expr ")" "{" statement* "}" ("else" "{" statement* "}")?
 
 expr_stmt: expr ";"
+
+debug_print_stmt: "debug_print" "(" STRING ("," expr)* ")" ";"
+assert_stmt: "assert" "(" expr ("," STRING)? ")" ";"
+debug_block: "@[debug]" "{" statement* "}"
+
+STRING: "\"" /[^"]*/ "\""
 
 ?assign_target: swizzle_access -> assign_swizzle
               | field_access   -> assign_field

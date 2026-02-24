@@ -98,6 +98,12 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
                "sinh", "cosh", "tanh", "asinh", "acosh", "atanh"]:
         add(_float_overloads_1(fn))
 
+    # --- NaN/Inf detection ---
+    # any_nan(vecN) -> bool, any_inf(vecN) -> bool
+    for vt in [SCALAR, VEC2, VEC3, VEC4]:
+        add([FuncSig("any_nan", (vt,), BOOL)])
+        add([FuncSig("any_inf", (vt,), BOOL)])
+
     # --- Matrix functions ---
     # determinant(matN) -> scalar
     for mt in [MAT2, MAT3, MAT4]:
@@ -183,5 +189,9 @@ def _type_matches(param: LuxType, arg: LuxType) -> bool:
         return True
     # Allow scalar literals to match int/uint parameters (numeric promotion)
     if arg.name == "scalar" and param.name in ("int", "uint"):
+        return True
+    # Allow SemanticType to match its base type for builtin functions
+    from luxc.builtins.types import SemanticType
+    if isinstance(arg, SemanticType) and param.name == arg.base_type.name:
         return True
     return False

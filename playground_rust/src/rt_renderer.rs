@@ -300,7 +300,9 @@ pub fn render_rt(
     // Record command buffer
     let device_clone = ctx.device.clone();
     let cmd = ctx.begin_single_commands()?;
+    ctx.cmd_begin_label(cmd, "RT Trace", [0.8, 0.2, 0.2, 1.0]);
     renderer.render_internal(&device_clone, ctx.rt_pipeline_loader.as_ref().unwrap(), cmd);
+    ctx.cmd_end_label(cmd);
 
     // Copy storage image to staging buffer for readback
     let mut staging =
@@ -1655,7 +1657,9 @@ impl scene_manager::Renderer for RTRenderer {
         // Record trace commands using the internal method
         let rt_loader = ctx.rt_pipeline_loader.as_ref()
             .ok_or("RT pipeline loader not available")?;
+        ctx.cmd_begin_label(cmd, "RT Trace", [0.8, 0.2, 0.2, 1.0]);
         self.render_internal(device, rt_loader, cmd);
+        ctx.cmd_end_label(cmd);
 
         // Return the command buffer still recording (so blit_to_swapchain can be appended)
         Ok(cmd)
@@ -4695,6 +4699,7 @@ fn render_rt_bindless(
         vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
     );
 
+    ctx.cmd_begin_label(cmd, "RT Trace", [0.8, 0.2, 0.2, 1.0]);
     unsafe {
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::RAY_TRACING_KHR, pipeline);
         device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::RAY_TRACING_KHR, pipeline_layout, 0, &descriptor_sets, &[]);
@@ -4704,6 +4709,7 @@ fn render_rt_bindless(
     unsafe {
         rt_pipeline_loader_clone.cmd_trace_rays(cmd, &raygen_region, &miss_region, &hit_region, &callable_region, width, height, 1);
     }
+    ctx.cmd_end_label(cmd);
 
     // Transition GENERAL -> TRANSFER_SRC_OPTIMAL
     screenshot::cmd_transition_image(

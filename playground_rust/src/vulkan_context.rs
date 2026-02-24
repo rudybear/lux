@@ -24,6 +24,9 @@ pub struct VulkanContext {
     pub mesh_shader_loader: Option<ash::ext::mesh_shader::Device>,
     pub mesh_shader_properties: Option<vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>>,
 
+    // Debug utils device loader (for RenderDoc markers / debug labels)
+    pub debug_utils_device: Option<ash::ext::debug_utils::Device>,
+
     // Bindless descriptor indexing support
     pub bindless_supported: bool,
 
@@ -77,7 +80,7 @@ impl VulkanContext {
     ///
     /// If `request_rt` is true, will attempt to enable ray tracing extensions.
     /// If the GPU does not support them, `rt_pipeline_loader` etc. will be None.
-    pub fn new(request_rt: bool) -> Result<Self, String> {
+    pub fn new(request_rt: bool, force_validation: bool) -> Result<Self, String> {
         // --- Entry ---
         let entry = unsafe {
             ash::Entry::load().map_err(|e| format!("Failed to load Vulkan: {}", e))?
@@ -94,8 +97,11 @@ impl VulkanContext {
         let mut layer_names: Vec<CString> = Vec::new();
         let mut extension_names: Vec<CString> = Vec::new();
 
-        // Enable validation layers in debug builds
-        let enable_validation = cfg!(debug_assertions);
+        // Enable validation layers in debug builds or when --validation is passed
+        let enable_validation = cfg!(debug_assertions) || force_validation;
+        if force_validation && !cfg!(debug_assertions) {
+            info!("Validation layers force-enabled via --validation flag");
+        }
         if enable_validation {
             let validation_layer = CString::new("VK_LAYER_KHRONOS_validation").unwrap();
             let available_layers = unsafe {
@@ -417,6 +423,9 @@ impl VulkanContext {
             (None, None)
         };
 
+        // --- Debug utils device loader for RenderDoc markers ---
+        let debug_utils_device = Some(ash::ext::debug_utils::Device::new(&instance, &device));
+
         info!("Vulkan context initialized successfully");
 
         Ok(VulkanContext {
@@ -426,6 +435,7 @@ impl VulkanContext {
             mesh_shader_supported: enable_mesh,
             mesh_shader_loader,
             mesh_shader_properties,
+            debug_utils_device,
             bindless_supported,
             allocator_inner: Some(allocator),
             allocator: Mutex::new(Some(())),
@@ -469,10 +479,29 @@ impl VulkanContext {
             .expect("Allocator already destroyed")
     }
 
+    /// Begin a debug utils label (RenderDoc marker) on the given command buffer.
+    pub fn cmd_begin_label(&self, cmd: vk::CommandBuffer, name: &str, color: [f32; 4]) {
+        if let Some(ref debug) = self.debug_utils_device {
+            let c_name = std::ffi::CString::new(name).unwrap();
+            let label = vk::DebugUtilsLabelEXT::default()
+                .label_name(&c_name)
+                .color(color);
+            unsafe { debug.cmd_begin_debug_utils_label(cmd, &label); }
+        }
+    }
+
+    /// End a debug utils label (RenderDoc marker) on the given command buffer.
+    pub fn cmd_end_label(&self, cmd: vk::CommandBuffer) {
+        if let Some(ref debug) = self.debug_utils_device {
+            unsafe { debug.cmd_end_debug_utils_label(cmd); }
+        }
+    }
+
     /// Create a VulkanContext with a window surface for interactive rendering.
     pub fn new_with_window(
         window: &(impl HasDisplayHandle + HasWindowHandle),
         request_rt: bool,
+        force_validation: bool,
     ) -> Result<Self, String> {
         let entry = unsafe {
             ash::Entry::load().map_err(|e| format!("Failed to load Vulkan: {}", e))?
@@ -499,7 +528,10 @@ impl VulkanContext {
 
         let mut extension_names: Vec<*const i8> = surface_extensions.to_vec();
 
-        let enable_validation = cfg!(debug_assertions);
+        let enable_validation = cfg!(debug_assertions) || force_validation;
+        if force_validation && !cfg!(debug_assertions) {
+            info!("Validation layers force-enabled via --validation flag");
+        }
         let mut layer_names: Vec<CString> = Vec::new();
         let mut extra_extensions: Vec<CString> = Vec::new();
         if enable_validation {
@@ -812,6 +844,9 @@ impl VulkanContext {
 
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
 
+        // --- Debug utils device loader for RenderDoc markers ---
+        let debug_utils_device = Some(ash::ext::debug_utils::Device::new(&instance, &device));
+
         info!("Vulkan context (with window) initialized successfully");
 
         let mut ctx = VulkanContext {
@@ -821,6 +856,7 @@ impl VulkanContext {
             mesh_shader_supported: enable_mesh,
             mesh_shader_loader,
             mesh_shader_properties,
+            debug_utils_device,
             bindless_supported,
             allocator_inner: Some(allocator),
             allocator: Mutex::new(Some(())),

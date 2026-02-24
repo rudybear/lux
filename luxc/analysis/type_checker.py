@@ -7,11 +7,12 @@ from luxc.parser.ast_nodes import (
     CallExpr, ConstructorExpr, FieldAccess, SwizzleAccess, IndexAccess,
     TernaryExpr, AssignTarget,
     TypeAlias, ImportDecl, SurfaceDecl, GeometryDecl, PipelineDecl,
+    DebugPrintStmt, AssertStmt, DebugBlock,
 )
 from luxc.builtins.types import (
     LuxType, resolve_type, TYPE_MAP, SCALAR, BOOL, VOID,
     VEC2, VEC3, VEC4, MAT2, MAT3, MAT4,
-    VectorType, MatrixType, ScalarType, is_numeric,
+    VectorType, MatrixType, ScalarType, BoolType, is_numeric,
     register_type_alias, clear_type_aliases,
     RuntimeArrayType,
 )
@@ -69,7 +70,11 @@ class TypeChecker:
             t = resolve_type(ta.target_type)
             if t is None:
                 raise TypeCheckError(f"Unknown target type '{ta.target_type}' in type alias '{ta.name}'")
-            register_type_alias(ta.name, ta.target_type)
+            if ta.strict:
+                from luxc.builtins.types import register_strict_type_alias
+                register_strict_type_alias(ta.name, t)
+            else:
+                register_type_alias(ta.name, ta.target_type)
 
     def _register_constants(self):
         for c in self.module.constants:
@@ -274,6 +279,21 @@ class TypeChecker:
         elif isinstance(stmt, ExprStmt):
             self._check_expr(stmt.expr, scope)
 
+        elif isinstance(stmt, DebugPrintStmt):
+            # Type-check each arg — must be numeric/vector
+            for arg in stmt.args:
+                t = self._check_expr(arg, scope)
+                if not is_numeric(t) and not isinstance(t, BoolType):
+                    pass  # Allow any type for debug_print flexibility
+
+        elif isinstance(stmt, AssertStmt):
+            ct = self._check_expr(stmt.condition, scope)
+            # Condition should be bool-like (bool or scalar comparison result)
+
+        elif isinstance(stmt, DebugBlock):
+            for s in stmt.body:
+                self._check_stmt(s, scope, ret_type)
+
     def _check_assign_target(self, target, scope: Scope) -> LuxType:
         if isinstance(target, AssignTarget):
             return self._check_expr(target.expr, scope)
@@ -427,6 +447,50 @@ class TypeChecker:
 
 
 def _check_binary_op(op: str, left: LuxType, right: LuxType) -> LuxType:
+    from luxc.builtins.types import SemanticType, unwrap_semantic_type
+
+    # Handle SemanticType in binary operations
+    left_is_semantic = isinstance(left, SemanticType)
+    right_is_semantic = isinstance(right, SemanticType)
+
+    if left_is_semantic or right_is_semantic:
+        # Both semantic: must be the same semantic type (not just same underlying)
+        if left_is_semantic and right_is_semantic:
+            if left.name != right.name:
+                raise TypeCheckError(
+                    f"Cannot apply '{op}' to incompatible semantic types {left.name} and {right.name}"
+                )
+            # Delegate to base-type check, then wrap result back
+            base_result = _check_binary_op(op, left.base_type, right.base_type)
+            # Comparison/logical ops always return bool
+            if isinstance(base_result, type(BOOL)) or base_result == BOOL:
+                return BOOL
+            return left
+
+        # One semantic, one plain: allow scalar promotion (scalar op SemanticType -> SemanticType)
+        if left_is_semantic and isinstance(right, ScalarType):
+            base_result = _check_binary_op(op, left.base_type, right)
+            if isinstance(base_result, type(BOOL)) or base_result == BOOL:
+                return BOOL
+            return left
+        if right_is_semantic and isinstance(left, ScalarType):
+            base_result = _check_binary_op(op, left, right.base_type)
+            if isinstance(base_result, type(BOOL)) or base_result == BOOL:
+                return BOOL
+            return right
+
+        # One semantic, one non-scalar plain: check if base types match
+        if left_is_semantic:
+            base_result = _check_binary_op(op, left.base_type, right)
+            if isinstance(base_result, type(BOOL)) or base_result == BOOL:
+                return BOOL
+            return left
+        if right_is_semantic:
+            base_result = _check_binary_op(op, left, right.base_type)
+            if isinstance(base_result, type(BOOL)) or base_result == BOOL:
+                return BOOL
+            return right
+
     if op in ("==", "!=", "<", ">", "<=", ">="):
         return BOOL
     if op in ("&&", "||"):
@@ -487,5 +551,15 @@ def _check_binary_op(op: str, left: LuxType, right: LuxType) -> LuxType:
 
 
 def _implicit_convert(from_type: LuxType, to_type: LuxType) -> bool:
-    # No implicit conversions in v1
+    from luxc.builtins.types import SemanticType, unwrap_semantic_type
+    # SemanticType("A") -> its base type: OK (implicit unwrap)
+    if isinstance(from_type, SemanticType) and not isinstance(to_type, SemanticType):
+        return from_type.base_type.name == to_type.name
+    # base type -> SemanticType("A"): OK (implicit wrap / construction)
+    if not isinstance(from_type, SemanticType) and isinstance(to_type, SemanticType):
+        return from_type.name == to_type.base_type.name
+    # SemanticType("A") -> SemanticType("B"): NO (even if same underlying)
+    if isinstance(from_type, SemanticType) and isinstance(to_type, SemanticType):
+        return from_type.name == to_type.name
+    # No other implicit conversions
     return False

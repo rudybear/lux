@@ -882,6 +882,7 @@ void MeshRenderer::render(VulkanContext& ctx) {
     rpBegin.clearValueCount = 2;
     rpBegin.pClearValues = clearValues;
 
+    ctx.cmdBeginLabel(cmd, "Mesh Dispatch", 0.2f, 0.2f, 0.8f, 1.0f);
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
     if (m_bindlessMode) {
@@ -1001,6 +1002,7 @@ void MeshRenderer::render(VulkanContext& ctx) {
     }
 
     vkCmdEndRenderPass(cmd);
+    ctx.cmdEndLabel(cmd);
     ctx.endSingleTimeCommands(cmd);
 }
 
@@ -1140,6 +1142,7 @@ void MeshRenderer::renderToSwapchain(VulkanContext& ctx,
     rpBegin.clearValueCount = 2;
     rpBegin.pClearValues = clearValues;
 
+    ctx.cmdBeginLabel(cmd, "Mesh Dispatch", 0.2f, 0.2f, 0.8f, 1.0f);
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
     if (m_bindlessMode) {
@@ -1249,6 +1252,7 @@ void MeshRenderer::renderToSwapchain(VulkanContext& ctx,
     }
 
     vkCmdEndRenderPass(cmd);
+    ctx.cmdEndLabel(cmd);
 
     // --- Blit offscreen -> swapchain ---
     blitToSwapchain(ctx, cmd, swapImage, extent);

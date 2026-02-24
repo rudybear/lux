@@ -657,6 +657,7 @@ fn render_triangle_scene(
         })
         .clear_values(&clear_values);
 
+    ctx.cmd_begin_label(cmd, "Raster Pass", [0.2, 0.8, 0.2, 1.0]);
     unsafe {
         device.cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -664,6 +665,7 @@ fn render_triangle_scene(
         device.cmd_draw(cmd, 3, 1, 0, 0);
         device.cmd_end_render_pass(cmd);
     }
+    ctx.cmd_end_label(cmd);
 
     // Copy to staging and read back
     let mut staging = screenshot::StagingBuffer::new(
@@ -880,12 +882,14 @@ fn render_fullscreen_scene(
         })
         .clear_values(&clear_values);
 
+    ctx.cmd_begin_label(cmd, "Raster Pass", [0.2, 0.8, 0.2, 1.0]);
     unsafe {
         device.cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
         device.cmd_draw(cmd, 3, 1, 0, 0);
         device.cmd_end_render_pass(cmd);
     }
+    ctx.cmd_end_label(cmd);
 
     let mut staging = screenshot::StagingBuffer::new(
         device,
@@ -1528,6 +1532,7 @@ fn render_pbr_scene_bindless(
         .render_area(vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width, height } })
         .clear_values(&clear_values);
 
+    ctx.cmd_begin_label(cmd, "Raster Pass", [0.2, 0.8, 0.2, 1.0]);
     unsafe {
         device.cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -1570,6 +1575,7 @@ fn render_pbr_scene_bindless(
 
         device.cmd_end_render_pass(cmd);
     }
+    ctx.cmd_end_label(cmd);
 
     let mut staging = screenshot::StagingBuffer::new(device, ctx.allocator_mut(), width, height)?;
     screenshot::cmd_copy_image_to_buffer(device, cmd, color_image.image, staging.buffer, width, height);
@@ -2427,6 +2433,7 @@ fn render_pbr_scene(
         })
         .clear_values(&clear_values);
 
+    ctx.cmd_begin_label(cmd, "Raster Pass", [0.2, 0.8, 0.2, 1.0]);
     unsafe {
         device.cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -2467,6 +2474,7 @@ fn render_pbr_scene(
 
         device.cmd_end_render_pass(cmd);
     }
+    ctx.cmd_end_label(cmd);
 
     let mut staging = screenshot::StagingBuffer::new(
         device,
@@ -3984,6 +3992,7 @@ impl PersistentRenderer {
             })
             .clear_values(&clear_values);
 
+        ctx.cmd_begin_label(cmd, "Raster Pass", [0.2, 0.8, 0.2, 1.0]);
         unsafe {
             device.cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
 
@@ -4081,6 +4090,7 @@ impl PersistentRenderer {
 
             device.cmd_end_render_pass(cmd);
         }
+        ctx.cmd_end_label(cmd);
 
         Ok(cmd)
     }

@@ -77,6 +77,10 @@ def main(argv: list[str] | None = None) -> None:
         help="Emit bindless descriptor uber-shaders (requires VK_EXT_descriptor_indexing)",
     )
     parser.add_argument(
+        "--warn-nan", action="store_true", default=False,
+        help="Enable static analysis warnings for potential NaN/Inf operations",
+    )
+    parser.add_argument(
         "--version", action="version", version="luxc 0.1.0"
     )
 
@@ -193,6 +197,7 @@ def main(argv: list[str] | None = None) -> None:
                     emit_reflection=not args.no_reflection, debug=args.debug,
                     source_name=input_path.name, pipeline=args.pipeline,
                     defines=defines, bindless=args.bindless,
+                    warn_nan=args.warn_nan,
                 )
             except Exception as e:
                 print(f"Error: {e}", file=sys.stderr)
@@ -222,6 +227,7 @@ def main(argv: list[str] | None = None) -> None:
                     emit_reflection=not args.no_reflection, debug=args.debug,
                     source_name=input_path.name, pipeline=args.pipeline,
                     features=perm, defines=defines, bindless=args.bindless,
+                    warn_nan=args.warn_nan,
                 )
             except Exception as e:
                 print(f"Error (features={sorted(perm)}): {e}", file=sys.stderr)
@@ -253,6 +259,7 @@ def main(argv: list[str] | None = None) -> None:
             features=feature_set,
             defines=defines,
             bindless=args.bindless,
+            warn_nan=args.warn_nan,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

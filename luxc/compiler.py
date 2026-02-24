@@ -10,9 +10,34 @@ from luxc.codegen.spv_assembler import assemble_and_validate
 from luxc.codegen.reflection import generate_reflection, emit_reflection_json
 from luxc.builtins.types import clear_type_aliases
 from luxc.features.evaluator import collect_feature_names, strip_features
+from luxc.parser.ast_nodes import (
+    DebugPrintStmt, AssertStmt, DebugBlock, IfStmt, FunctionDef,
+)
 
 # Standard library search path
 _STDLIB_DIR = Path(__file__).parent / "stdlib"
+
+
+def _strip_debug_stmts_from_body(stmts: list) -> list:
+    """Remove DebugPrintStmt, AssertStmt, and DebugBlock from a statement list."""
+    result = []
+    for stmt in stmts:
+        if isinstance(stmt, (DebugPrintStmt, AssertStmt, DebugBlock)):
+            continue
+        if isinstance(stmt, IfStmt):
+            stmt.then_body = _strip_debug_stmts_from_body(stmt.then_body)
+            stmt.else_body = _strip_debug_stmts_from_body(stmt.else_body)
+        result.append(stmt)
+    return result
+
+
+def strip_debug_stmts(module) -> None:
+    """Strip all debug statements from the module (release mode)."""
+    for fn in module.functions:
+        fn.body = _strip_debug_stmts_from_body(fn.body)
+    for stage in module.stages:
+        for fn in stage.functions:
+            fn.body = _strip_debug_stmts_from_body(fn.body)
 
 
 def _resolve_imports(module, source_dir: Path | None = None):
@@ -77,6 +102,7 @@ def compile_source(
     features: set[str] | None = None,
     defines: dict[str, int] | None = None,
     bindless: bool = False,
+    warn_nan: bool = False,
 ) -> None:
     # Clear type aliases from previous compilations
     clear_type_aliases()
@@ -107,6 +133,16 @@ def compile_source(
         return
 
     type_check(module)
+
+    # Run NaN/Inf static analysis warnings (after type checking, before codegen)
+    if warn_nan:
+        from luxc.analysis.nan_checker import check_nan_warnings
+        check_nan_warnings(module)
+
+    # Strip debug statements in release mode (after type checking so errors are caught)
+    if not debug:
+        strip_debug_stmts(module)
+
     constant_fold(module)
     assign_layouts(module)
 

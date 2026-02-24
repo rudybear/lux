@@ -21,6 +21,7 @@ from luxc.parser.ast_nodes import (
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
     StorageImageDecl, StorageBufferDecl, MeshOutputDecl, TaskPayloadDecl,
     FeaturesDecl, ConditionalBlock, FeatureRef, FeatureAnd, FeatureOr, FeatureNot,
+    DebugPrintStmt, AssertStmt, DebugBlock,
 )
 
 _CONSTRUCTOR_TYPES = frozenset({
@@ -111,7 +112,12 @@ class LuxTransformer(Transformer):
     def type_alias(self, args):
         name = args[0]
         target = _extract_type(args[1])
-        return TypeAlias(str(name), target, _tok_loc(name))
+        return TypeAlias(str(name), target, strict=False, loc=_tok_loc(name))
+
+    def strict_type_alias(self, args):
+        name = args[0]
+        target = _extract_type(args[1])
+        return TypeAlias(str(name), target, strict=True, loc=_tok_loc(name))
 
     def import_decl(self, args):
         name = args[0]
@@ -460,6 +466,24 @@ class LuxTransformer(Transformer):
 
     def expr_stmt(self, args):
         return ExprStmt(args[0])
+
+    # --- Debug statements ---
+
+    def debug_print_stmt(self, args):
+        # args[0] is the STRING token (with quotes), rest are exprs
+        fmt_str = str(args[0])[1:-1]  # strip quotes
+        exprs = list(args[1:])
+        return DebugPrintStmt(fmt_str, exprs)
+
+    def assert_stmt(self, args):
+        condition = args[0]
+        message = None
+        if len(args) > 1 and isinstance(args[1], Token) and args[1].type == "STRING":
+            message = str(args[1])[1:-1]  # strip quotes
+        return AssertStmt(condition, message)
+
+    def debug_block(self, args):
+        return DebugBlock(list(args))
 
     # --- Assignment targets ---
 

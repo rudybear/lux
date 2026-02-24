@@ -2,7 +2,7 @@
 REM Compile glTF PBR Layered — Ray Tracing pipeline, all permutations
 REM Uses the unified layered surface declaration with --all-permutations
 echo === Compiling glTF PBR Layered - RT, all permutations ===
-python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfRT --all-permutations -o shadercache/ --no-validate
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfRT --all-permutations -o shadercache/
 echo.
 
 REM Render with C++ engine - RT requires Vulkan RT extensions

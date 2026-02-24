@@ -1641,9 +1641,11 @@ void RTRenderer::render(VulkanContext& ctx) {
     }
 
     // Trace rays
+    ctx.cmdBeginLabel(cmd, "RT Trace", 0.8f, 0.2f, 0.2f, 1.0f);
     ctx.pfnCmdTraceRaysKHR(cmd,
         &raygenSBT, &missSBT, &hitSBT, &callableSBT,
         renderWidth, renderHeight, 1);
+    ctx.cmdEndLabel(cmd);
 
     // Transition storage image to TRANSFER_SRC_OPTIMAL for readback
     barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;

@@ -56,6 +56,14 @@ public:
     // Mesh shader properties
     VkPhysicalDeviceMeshShaderPropertiesEXT meshShaderProperties = {};
 
+    // Debug utils label function pointers (for RenderDoc markers)
+    PFN_vkCmdBeginDebugUtilsLabelEXT pfnCmdBeginDebugUtilsLabel = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT pfnCmdEndDebugUtilsLabel = nullptr;
+
+    // Debug utils label helpers
+    void cmdBeginLabel(VkCommandBuffer cmd, const char* name, float r=0, float g=1, float b=0, float a=1);
+    void cmdEndLabel(VkCommandBuffer cmd);
+
     // Check mesh shader support
     bool supportsMeshShader() const { return meshShaderSupported; }
 
@@ -63,7 +71,7 @@ public:
     bool supportsBindless() const { return bindlessSupported; }
 
     // Initialize Vulkan context
-    void init(bool enableRT, bool headless, GLFWwindow* window = nullptr);
+    void init(bool enableRT, bool headless, GLFWwindow* window = nullptr, bool forceValidation = false);
 
     // Create swapchain for interactive mode
     void createSwapchain(uint32_t width, uint32_t height);
