@@ -35,10 +35,11 @@ struct ReflectionData {
 
     struct BindingInfo {
         int binding = 0;
-        std::string type; // "uniform_buffer", "sampler", "sampled_image", "acceleration_structure", "storage_image"
+        std::string type; // "uniform_buffer", "sampler", "sampled_image", "acceleration_structure", "storage_image", "storage_buffer", "bindless_combined_image_sampler_array"
         std::string name;
         std::vector<FieldInfo> fields;
         int size = 0;
+        int max_count = 0;  // for bindless arrays (e.g. 1024)
         std::vector<std::string> stage_flags;
     };
 
@@ -71,6 +72,9 @@ struct ReflectionData {
         std::string outputTopology = "triangles";
     };
     std::optional<MeshOutputInfo> meshOutput;
+
+    // Bindless descriptor support
+    bool bindlessEnabled = false;
 };
 
 /**
@@ -136,6 +140,7 @@ struct MergedBindingInfo {
     std::string type;
     std::string name;
     int size;
+    int max_count = 0;  // for bindless arrays
     VkShaderStageFlags stageFlags;
 };
 

@@ -132,6 +132,16 @@ private:
     VkShaderModule rmissModule = VK_NULL_HANDLE;
     VkShaderModule rchitModule = VK_NULL_HANDLE;  // single-material fallback
 
+    // --- Bindless RT mode (Phase 5) ---
+    bool m_bindlessMode = false;
+    BindlessTextureArray m_bindlessTextures;
+    BindlessMaterialsSSBO m_bindlessMaterials;
+    int m_bindlessTextureSet = -1;       // descriptor set index for texture array
+    int m_bindlessTextureBinding = -1;   // binding index for texture array
+    int m_bindlessMaterialsSet = -1;     // descriptor set index for materials SSBO
+    int m_bindlessMaterialsBinding = -1; // binding index for materials SSBO
+    uint32_t m_bindlessMaxCount = 1024;  // max bindless texture count
+
     // --- Multi-material RT fields ---
     bool m_multiMaterial = false;
     uint32_t m_geometryCount = 1;  // number of BLAS geometries (one per draw range)

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from luxc.builtins.types import (
     LuxType, SCALAR, INT, UINT, BOOL, VOID,
     VEC2, VEC3, VEC4, MAT2, MAT3, MAT4, SAMPLER2D, SAMPLER_CUBE,
-    ACCELERATION_STRUCTURE, STORAGE_IMAGE, IVEC2, UVEC2,
+    ACCELERATION_STRUCTURE, STORAGE_IMAGE, BINDLESS_TEXTURE_ARRAY, IVEC2, UVEC2,
     VectorType, MatrixType, ScalarType,
 )
 
@@ -118,6 +118,15 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     # texture sampling with explicit LOD
     add([FuncSig("sample_lod", (SAMPLER2D, VEC2, SCALAR), VEC4)])
     add([FuncSig("sample_lod", (SAMPLER_CUBE, VEC3, SCALAR), VEC4)])
+
+    # bindless texture sampling (array, index, uv)
+    add([FuncSig("sample_bindless", (BINDLESS_TEXTURE_ARRAY, INT, VEC2), VEC4)])
+    add([FuncSig("sample_bindless", (BINDLESS_TEXTURE_ARRAY, UINT, VEC2), VEC4)])
+    add([FuncSig("sample_bindless", (BINDLESS_TEXTURE_ARRAY, SCALAR, VEC2), VEC4)])
+    # bindless texture sampling with explicit LOD (array, index, uv, lod)
+    add([FuncSig("sample_bindless_lod", (BINDLESS_TEXTURE_ARRAY, INT, VEC2, SCALAR), VEC4)])
+    add([FuncSig("sample_bindless_lod", (BINDLESS_TEXTURE_ARRAY, UINT, VEC2, SCALAR), VEC4)])
+    add([FuncSig("sample_bindless_lod", (BINDLESS_TEXTURE_ARRAY, SCALAR, VEC2, SCALAR), VEC4)])
 
     # --- RT instructions ---
     # trace_ray(accel, ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,

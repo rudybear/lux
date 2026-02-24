@@ -961,6 +961,22 @@ surface GltfPBR {
 
 ---
 
+### Phase 21: Shared Stdlib Refactoring
+
+The bindless uber-shader's PBR orchestration logic (`_emit_bindless_layer_body()` in `surface_expander.py`) duplicates the same material pipeline that the non-bindless path builds declaratively from `.lux` surface layers. While the math functions (`gltf_pbr`, `ibl_contribution`, `tonemap_aces`, etc.) are correctly in stdlib, the orchestration — sRGB-to-linear conversions, optional layer branching, texture sampling, and final composition — is hardcoded in the expander.
+
+**Goal:** Unify both paths so the stdlib owns the full PBR pipeline, not just individual math functions.
+
+| Item | Description |
+|------|-------------|
+| `stdlib/pbr_pipeline.lux` | Top-level orchestration function: takes `BindlessMaterialData` + UVs + view/normal vectors, returns final `vec4` color. Handles sRGB-to-linear, optional layer branching via material flags, texture sampling, IBL contribution, tonemapping, and linear-to-sRGB output. |
+| Unify bindless + non-bindless | Both code paths call the same stdlib pipeline. Non-bindless wraps per-material UBO data into the same struct interface. Eliminates duplicated orchestration in `surface_expander.py`. |
+| Surface expander simplification | `_emit_bindless_layer_body()` reduces to: load material data, call `pbr_pipeline()`, store output. No more hardcoded PBR logic in the expander. |
+| Optional layer functions | `stdlib/pbr_layers.lux` — individual layer application functions (`apply_normal_map`, `apply_clearcoat`, `apply_sheen`, `apply_emission`, `apply_transmission`) that the pipeline function calls conditionally based on `material_flags`. |
+| Backward compatibility | Existing `.lux` files with explicit `layers [...]` syntax continue to work unchanged. The stdlib pipeline is an alternative for bindless/uber-shader use cases. |
+
+---
+
 ## What Makes This Different From Everything Else
 
 | Language | What it is | What Lux is |

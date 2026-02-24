@@ -98,6 +98,11 @@ private:
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     std::unordered_map<int, VkDescriptorSet> m_descriptorSets;
 
+    // --- Bindless mode (single uber-shader + material SSBO + texture array) ---
+    bool m_bindlessMode = false;
+    BindlessTextureArray m_bindlessTextures;
+    BindlessMaterialsSSBO m_bindlessMaterials;
+
     // --- Multi-pipeline mode (per-material permutation selection) ---
     bool m_multiPipeline = false;
     std::vector<MeshPermutationPipeline> m_meshPermutations;
@@ -159,6 +164,9 @@ private:
     void setupDescriptors(VulkanContext& ctx);
     void uploadMeshletData(VulkanContext& ctx);
     void uploadVertexData(VulkanContext& ctx);
+
+    // Bindless mode setup (single pipeline + materials SSBO + texture array)
+    void setupBindlessMode(VulkanContext& ctx);
 
     // Multi-pipeline setup (mesh shader permutations)
     void setupMeshMultiPipeline(VulkanContext& ctx, const ShaderManifest& manifest);

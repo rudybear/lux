@@ -109,6 +109,13 @@ def _assign_stage_layouts(stage: StageBlock, binding_start: int) -> None:
             sb.binding = binding
             binding += 1
 
+    # Auto-assign bindless texture array bindings (typically a separate set)
+    for bta in getattr(stage, 'bindless_texture_arrays', []):
+        if bta.set_number is None:
+            bta.set_number = set_num + 1  # default: next descriptor set
+        if bta.binding is None:
+            bta.binding = 0
+
 
 def compute_std140_offsets(fields: list) -> list[int]:
     """Compute std140 offsets for block fields.

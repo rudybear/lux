@@ -40,6 +40,36 @@ pub struct ReflectionData {
     pub callable_data: Vec<CallableDataInfo>,
     #[serde(default)]
     pub mesh_output: Option<MeshOutputInfo>,
+    #[serde(default)]
+    pub bindless: Option<BindlessInfo>,
+}
+
+/// Bindless rendering metadata from reflection JSON.
+#[derive(Debug, Deserialize)]
+pub struct BindlessInfo {
+    pub enabled: bool,
+    #[serde(default)]
+    pub materials_ssbo: Option<BindlessResourceInfo>,
+    #[serde(default)]
+    pub texture_array: Option<BindlessTextureInfo>,
+}
+
+/// Reference to a bindless resource (materials SSBO).
+#[derive(Debug, Deserialize)]
+pub struct BindlessResourceInfo {
+    pub set: u32,
+    pub binding: u32,
+    #[serde(default)]
+    pub element_type: String,
+}
+
+/// Reference to a bindless texture array.
+#[derive(Debug, Deserialize)]
+pub struct BindlessTextureInfo {
+    pub set: u32,
+    pub binding: u32,
+    #[serde(default)]
+    pub max_count: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +93,10 @@ pub struct BindingInfo {
     pub size: u32,
     #[serde(default)]
     pub stage_flags: Vec<String>,
+    #[serde(default)]
+    pub max_count: u32,
+    #[serde(default)]
+    pub element_type: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -210,6 +244,7 @@ fn binding_type_to_vk(btype: &str) -> vk::DescriptorType {
         "storage_image" => vk::DescriptorType::STORAGE_IMAGE,
         "storage_buffer" => vk::DescriptorType::STORAGE_BUFFER,
         "acceleration_structure" => vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+        "bindless_combined_image_sampler_array" => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
         _ => vk::DescriptorType::UNIFORM_BUFFER,
     }
 }
@@ -430,6 +465,83 @@ pub unsafe fn create_descriptor_set_layouts_from_merged(
     Ok(layouts)
 }
 
+/// Create VkDescriptorSetLayouts with bindless support from merged binding info.
+///
+/// For sets containing a `bindless_combined_image_sampler_array` binding:
+/// - Uses UPDATE_AFTER_BIND_POOL_BIT flag on the set layout
+/// - Adds PARTIALLY_BOUND | UPDATE_AFTER_BIND | VARIABLE_DESCRIPTOR_COUNT flags
+/// - Sets descriptor_count to max_count (e.g. 1024) for the bindless binding
+pub unsafe fn create_descriptor_set_layouts_bindless(
+    device: &ash::Device,
+    merged: &HashMap<u32, Vec<BindingInfo>>,
+) -> Result<HashMap<u32, vk::DescriptorSetLayout>, String> {
+    let mut layouts = HashMap::new();
+
+    for (&set_idx, bindings) in merged {
+        // Check if any binding in this set is a bindless array
+        let has_bindless = bindings.iter().any(|b| b.binding_type == "bindless_combined_image_sampler_array");
+
+        let vk_bindings: Vec<vk::DescriptorSetLayoutBinding> = bindings
+            .iter()
+            .map(|b| {
+                let count = if b.binding_type == "bindless_combined_image_sampler_array" {
+                    if b.max_count > 0 { b.max_count } else { 1024 }
+                } else {
+                    1
+                };
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b.binding)
+                    .descriptor_type(binding_type_to_vk(&b.binding_type))
+                    .descriptor_count(count)
+                    .stage_flags(stage_flags_from_strings(&b.stage_flags))
+            })
+            .collect();
+
+        if has_bindless {
+            // Build per-binding flags: bindless bindings get special flags, others get empty
+            let binding_flags: Vec<vk::DescriptorBindingFlags> = bindings
+                .iter()
+                .map(|b| {
+                    if b.binding_type == "bindless_combined_image_sampler_array" {
+                        vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+                            | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
+                    } else {
+                        vk::DescriptorBindingFlags::empty()
+                    }
+                })
+                .collect();
+
+            let mut binding_flags_info =
+                vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                    .binding_flags(&binding_flags);
+
+            let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+                .bindings(&vk_bindings)
+                .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+                .push_next(&mut binding_flags_info);
+
+            let layout = device
+                .create_descriptor_set_layout(&layout_info, None)
+                .map_err(|e| format!("Failed to create bindless descriptor set layout for set {}: {:?}", set_idx, e))?;
+
+            layouts.insert(set_idx, layout);
+        } else {
+            // Standard (non-bindless) set layout
+            let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+                .bindings(&vk_bindings);
+
+            let layout = device
+                .create_descriptor_set_layout(&layout_info, None)
+                .map_err(|e| format!("Failed to create descriptor set layout for set {}: {:?}", set_idx, e))?;
+
+            layouts.insert(set_idx, layout);
+        }
+    }
+
+    Ok(layouts)
+}
+
 /// Compute descriptor pool sizes from merged reflection data.
 pub fn compute_pool_sizes(
     merged: &HashMap<u32, Vec<BindingInfo>>,
@@ -455,6 +567,56 @@ pub fn compute_pool_sizes(
         .collect();
 
     (pool_sizes, total_sets)
+}
+
+/// Compute descriptor pool sizes from merged reflection data with bindless support.
+///
+/// Bindless bindings (`bindless_combined_image_sampler_array`) contribute their
+/// `max_count` (or 1024 default) to the pool size instead of just 1.
+pub fn compute_pool_sizes_bindless(
+    merged: &HashMap<u32, Vec<BindingInfo>>,
+) -> (Vec<vk::DescriptorPoolSize>, u32) {
+    let mut type_counts: HashMap<vk::DescriptorType, u32> = HashMap::new();
+    let mut total_sets = 0u32;
+    let mut has_bindless_set = false;
+
+    for bindings in merged.values() {
+        total_sets += 1;
+        for b in bindings {
+            let vk_type = binding_type_to_vk(&b.binding_type);
+            let count = if b.binding_type == "bindless_combined_image_sampler_array" {
+                has_bindless_set = true;
+                if b.max_count > 0 { b.max_count } else { 1024 }
+            } else {
+                1
+            };
+            *type_counts.entry(vk_type).or_insert(0) += count;
+        }
+    }
+
+    let pool_sizes: Vec<vk::DescriptorPoolSize> = type_counts
+        .iter()
+        .map(|(&ty, &count)| {
+            vk::DescriptorPoolSize::default()
+                .ty(ty)
+                .descriptor_count(count)
+        })
+        .collect();
+
+    let _ = has_bindless_set;
+    (pool_sizes, total_sets)
+}
+
+/// Check whether a set of merged bindings contains any bindless bindings.
+pub fn has_bindless_bindings(merged: &HashMap<u32, Vec<BindingInfo>>) -> bool {
+    for bindings in merged.values() {
+        for b in bindings {
+            if b.binding_type == "bindless_combined_image_sampler_array" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Create a pipeline layout from merged descriptor set layouts (ordered by set index).

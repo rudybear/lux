@@ -274,6 +274,10 @@ pub struct MeshShaderRenderer {
     shared_set0: vk::DescriptorSet,
     meshlet_groups: Vec<MeshletGroup>,
 
+    // Bindless mode (single pipeline, materials SSBO + texture array)
+    bindless_mode: bool,
+    bindless_materials_ssbo: Option<scene_manager::BindlessMaterialsSSBO>,
+
     // Cached reflection for multi-pipeline setup
     mesh_refl: Option<reflected_pipeline::ReflectionData>,
 
@@ -392,6 +396,14 @@ impl MeshShaderRenderer {
         } else {
             None
         };
+
+        // --- Bindless detection: check if the fragment reflection has bindless enabled ---
+        let use_bindless = frag_refl.bindless.as_ref().map_or(false, |b| b.enabled) && ctx.bindless_supported;
+        if use_bindless {
+            info!("Mesh shader bindless mode detected: redirecting to new_bindless");
+            return Self::new_bindless(ctx, scene_source, pipeline_base, width, height, ibl_name,
+                                      mesh_refl, frag_refl, gltf_scene);
+        }
 
         // Check for manifest to decide multi-pipeline mode
         let manifest = try_load_manifest(pipeline_base);
@@ -1473,6 +1485,8 @@ impl MeshShaderRenderer {
                 shared_set0_layout,
                 shared_set0,
                 meshlet_groups,
+                bindless_mode: false,
+                bindless_materials_ssbo: None,
                 mesh_refl: None,
                 auto_eye,
                 auto_target,
@@ -1820,6 +1834,8 @@ impl MeshShaderRenderer {
                 shared_set0_layout: vk::DescriptorSetLayout::null(),
                 shared_set0: vk::DescriptorSet::null(),
                 meshlet_groups: Vec::new(),
+                bindless_mode: false,
+                bindless_materials_ssbo: None,
                 mesh_refl: None,
                 auto_eye,
                 auto_target,
@@ -1828,6 +1844,660 @@ impl MeshShaderRenderer {
                 has_scene_bounds,
             })
         }
+    }
+
+    /// Bindless constructor: single mesh+frag pipeline with materials SSBO + texture array.
+    ///
+    /// Uses `meshletOffset` and `material_index` push constants per dispatch to select
+    /// the correct meshlet region and material in the bindless uber-shader.
+    fn new_bindless(
+        ctx: &mut VulkanContext,
+        scene_source: &str,
+        pipeline_base: &str,
+        width: u32,
+        height: u32,
+        ibl_name: &str,
+        mesh_refl: reflected_pipeline::ReflectionData,
+        frag_refl: reflected_pipeline::ReflectionData,
+        gltf_scene: Option<crate::gltf_loader::GltfScene>,
+    ) -> Result<Self, String> {
+        let device = ctx.device.clone();
+
+        let mesh_output = mesh_refl.mesh_output.as_ref();
+        let max_verts = mesh_output.map(|m| m.max_vertices).unwrap_or(64);
+        let max_prims = mesh_output.map(|m| m.max_primitives).unwrap_or(124);
+
+        // --- Phase 1: Load scene geometry ---
+        let mut auto_eye = glam::Vec3::new(0.0, 0.0, 3.0);
+        let mut auto_target = glam::Vec3::ZERO;
+        let mut auto_up = glam::Vec3::new(0.0, 1.0, 0.0);
+        let mut auto_far = 100.0f32;
+        let mut has_scene_bounds = false;
+
+        let mut tangent_data_raw: Vec<[f32; 4]> = Vec::new();
+        let mut draw_ranges: Vec<crate::gltf_loader::DrawRange> = Vec::new();
+
+        let mut gltf_scene = gltf_scene;
+
+        let (vertices, indices): (Vec<scene::PbrVertex>, Vec<u32>) =
+            if let Some(ref mut gltf_s) = gltf_scene {
+                if gltf_s.meshes.is_empty() {
+                    return Err(format!("No meshes found in glTF file: {}", scene_source));
+                }
+                let draw_items = crate::gltf_loader::flatten_scene(gltf_s);
+                if draw_items.is_empty() {
+                    return Err(format!("No draw items in glTF scene: {}", scene_source));
+                }
+
+                let mut all_verts: Vec<scene::PbrVertex> = Vec::new();
+                let mut all_indices: Vec<u32> = Vec::new();
+                let mut vertex_offset: u32 = 0;
+                let mut vertex_positions: Vec<[f32; 3]> = Vec::new();
+                let mut index_offset: u32 = 0;
+
+                for item in &draw_items {
+                    let mesh = &gltf_s.meshes[item.mesh_index];
+                    let world = item.world_transform;
+                    let normal_mat = glam::Mat3::from_mat4(world).inverse().transpose();
+
+                    for v in &mesh.vertices {
+                        let pos = world.transform_point3(glam::Vec3::from(v.position));
+                        let norm = (normal_mat * glam::Vec3::from(v.normal)).normalize();
+                        vertex_positions.push([pos.x, pos.y, pos.z]);
+                        all_verts.push(scene::PbrVertex {
+                            position: pos.into(),
+                            normal: norm.into(),
+                            uv: v.uv,
+                        });
+                        let tan3 = (normal_mat * glam::Vec3::from_slice(&v.tangent[..3])).normalize();
+                        tangent_data_raw.push([tan3.x, tan3.y, tan3.z, v.tangent[3]]);
+                    }
+                    for &idx in &mesh.indices {
+                        all_indices.push(idx + vertex_offset);
+                    }
+
+                    draw_ranges.push(crate::gltf_loader::DrawRange {
+                        index_offset,
+                        index_count: mesh.indices.len() as u32,
+                        material_index: item.material_index,
+                    });
+                    index_offset += mesh.indices.len() as u32;
+                    vertex_offset += mesh.vertices.len() as u32;
+                }
+
+                has_scene_bounds = true;
+                let (eye, target, up, far) = scene_manager::compute_auto_camera_from_draw_items(&vertex_positions, &draw_items);
+                auto_eye = eye;
+                auto_target = target;
+                auto_up = up;
+                auto_far = far;
+
+                (all_verts, all_indices)
+            } else {
+                scene::generate_sphere(32, 32)
+            };
+
+        if tangent_data_raw.is_empty() {
+            tangent_data_raw = vec![[1.0, 0.0, 0.0, 1.0]; vertices.len()];
+        }
+
+        // --- Phase 2: Build meshlets per draw range ---
+        let has_multiple_draw_ranges = draw_ranges.len() > 1;
+        let mut meshlet_groups: Vec<MeshletGroup> = Vec::new();
+
+        let (meshlet_descs, meshlet_vertices_vec, meshlet_triangles_vec) =
+            if has_multiple_draw_ranges {
+                let mut all_meshlets: Vec<crate::meshlet::MeshletDescriptor> = Vec::new();
+                let mut all_meshlet_vertices: Vec<u32> = Vec::new();
+                let mut all_meshlet_triangles: Vec<u32> = Vec::new();
+
+                for range in &draw_ranges {
+                    if range.index_count == 0 { continue; }
+                    let range_start = range.index_offset as usize;
+                    let range_end = range_start + range.index_count as usize;
+                    let range_indices = &indices[range_start..range_end];
+
+                    let build_result = meshlet::build_meshlets(range_indices, vertices.len() as u32, max_verts, max_prims);
+                    if build_result.meshlets.is_empty() { continue; }
+
+                    let group = MeshletGroup {
+                        first_meshlet: all_meshlets.len() as u32,
+                        meshlet_count: build_result.meshlets.len() as u32,
+                        material_index: range.material_index,
+                        permutation_index: 0,
+                    };
+
+                    let vertex_base = all_meshlet_vertices.len() as u32;
+                    let triangle_base = all_meshlet_triangles.len() as u32;
+                    let mut offset_meshlets = build_result.meshlets;
+                    for m in &mut offset_meshlets {
+                        m.vertex_offset += vertex_base;
+                        m.triangle_offset += triangle_base;
+                    }
+
+                    all_meshlets.extend_from_slice(&offset_meshlets);
+                    all_meshlet_vertices.extend_from_slice(&build_result.meshlet_vertices);
+                    all_meshlet_triangles.extend_from_slice(&build_result.meshlet_triangles);
+                    meshlet_groups.push(group);
+                }
+
+                info!("Bindless mesh: built {} meshlets across {} material group(s)", all_meshlets.len(), meshlet_groups.len());
+                (all_meshlets, all_meshlet_vertices, all_meshlet_triangles)
+            } else {
+                let meshlet_result = meshlet::build_meshlets(&indices, vertices.len() as u32, max_verts, max_prims);
+                // Single group covering all meshlets
+                meshlet_groups.push(MeshletGroup {
+                    first_meshlet: 0,
+                    meshlet_count: meshlet_result.meshlets.len() as u32,
+                    material_index: 0,
+                    permutation_index: 0,
+                });
+                info!("Bindless mesh: built {} meshlets from {} triangles", meshlet_result.meshlets.len(), indices.len() / 3);
+                (meshlet_result.meshlets, meshlet_result.meshlet_vertices, meshlet_result.meshlet_triangles)
+            };
+
+        let meshlet_count = meshlet_descs.len() as u32;
+
+        // --- Phase 3: Upload storage buffers ---
+        let meshlet_desc_size = meshlet_descs.len() as u64 * 16;
+        let meshlet_desc_buffer = create_buffer_with_data(&device, ctx.allocator_mut(), bytemuck::cast_slice(&meshlet_descs), vk::BufferUsageFlags::STORAGE_BUFFER, "mesh_bl_meshlet_descriptors")?;
+
+        let meshlet_verts_size = if meshlet_vertices_vec.is_empty() { 4u64 } else { meshlet_vertices_vec.len() as u64 * 4 };
+        let meshlet_verts_data: Vec<u32> = if meshlet_vertices_vec.is_empty() { vec![0u32] } else { meshlet_vertices_vec };
+        let meshlet_verts_buffer = create_buffer_with_data(&device, ctx.allocator_mut(), bytemuck::cast_slice(&meshlet_verts_data), vk::BufferUsageFlags::STORAGE_BUFFER, "mesh_bl_meshlet_vertices")?;
+
+        let meshlet_tris_size = if meshlet_triangles_vec.is_empty() { 4u64 } else { meshlet_triangles_vec.len() as u64 * 4 };
+        let meshlet_tris_data: Vec<u32> = if meshlet_triangles_vec.is_empty() { vec![0u32] } else { meshlet_triangles_vec };
+        let meshlet_tris_buffer = create_buffer_with_data(&device, ctx.allocator_mut(), bytemuck::cast_slice(&meshlet_tris_data), vk::BufferUsageFlags::STORAGE_BUFFER, "mesh_bl_meshlet_triangles")?;
+
+        let positions_data: Vec<[f32; 4]> = vertices.iter().map(|v| [v.position[0], v.position[1], v.position[2], 1.0]).collect();
+        let normals_data: Vec<[f32; 4]> = vertices.iter().map(|v| [v.normal[0], v.normal[1], v.normal[2], 0.0]).collect();
+        let tex_coords_data: Vec<[f32; 2]> = vertices.iter().map(|v| v.uv).collect();
+
+        let positions_size = positions_data.len() as u64 * 16;
+        let normals_size = normals_data.len() as u64 * 16;
+        let tex_coords_size = tex_coords_data.len() as u64 * 8;
+
+        let positions_buffer = create_buffer_with_data(&device, ctx.allocator_mut(), bytemuck::cast_slice(&positions_data), vk::BufferUsageFlags::STORAGE_BUFFER, "mesh_bl_positions")?;
+        let normals_buffer = create_buffer_with_data(&device, ctx.allocator_mut(), bytemuck::cast_slice(&normals_data), vk::BufferUsageFlags::STORAGE_BUFFER, "mesh_bl_normals")?;
+        let tex_coords_buffer = create_buffer_with_data(&device, ctx.allocator_mut(), bytemuck::cast_slice(&tex_coords_data), vk::BufferUsageFlags::STORAGE_BUFFER, "mesh_bl_tex_coords")?;
+
+        let tangents_data: Vec<[f32; 4]> = tangent_data_raw;
+        let tangents_size = tangents_data.len() as u64 * 16;
+        let tangents_buffer = create_buffer_with_data(&device, ctx.allocator_mut(), bytemuck::cast_slice(&tangents_data), vk::BufferUsageFlags::STORAGE_BUFFER, "mesh_bl_tangents")?;
+
+        // --- Phase 4: Uniform buffers ---
+        let aspect = width as f32 / height as f32;
+        let (model, view, proj) = if has_scene_bounds {
+            (glam::Mat4::IDENTITY, crate::camera::look_at(auto_eye, auto_target, auto_up), crate::camera::perspective(45.0f32.to_radians(), aspect, 0.1, auto_far))
+        } else {
+            (DefaultCamera::model(), DefaultCamera::view(), DefaultCamera::projection(aspect))
+        };
+
+        let mut mvp_data = [0u8; 192];
+        mvp_data[0..64].copy_from_slice(bytemuck::cast_slice(model.as_ref()));
+        mvp_data[64..128].copy_from_slice(bytemuck::cast_slice(view.as_ref()));
+        mvp_data[128..192].copy_from_slice(bytemuck::cast_slice(proj.as_ref()));
+
+        let mvp_buffer = create_buffer_with_data(&device, ctx.allocator_mut(), &mvp_data, vk::BufferUsageFlags::UNIFORM_BUFFER, "mesh_bl_mvp")?;
+
+        let light_dir = glam::Vec3::new(1.0, 0.8, 0.6).normalize();
+        let camera_pos = if has_scene_bounds { auto_eye } else { DefaultCamera::EYE };
+        let mut light_data = [0u8; 32];
+        light_data[0..12].copy_from_slice(bytemuck::cast_slice(light_dir.as_ref()));
+        light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
+        light_data[16..28].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
+        light_data[28..32].copy_from_slice(&0.0f32.to_le_bytes());
+
+        let light_buffer = create_buffer_with_data(&device, ctx.allocator_mut(), &light_data, vk::BufferUsageFlags::UNIFORM_BUFFER, "mesh_bl_light")?;
+
+        // Material UBO (for legacy single-material fallback fields)
+        let material_data = if let Some(ref gs) = gltf_scene {
+            if !gs.materials.is_empty() { MaterialUboData::from_gltf_material(&gs.materials[0]) }
+            else { MaterialUboData::default_values() }
+        } else { MaterialUboData::default_values() };
+
+        let material_buffer = create_buffer_with_data(&device, ctx.allocator_mut(), bytemuck::bytes_of(&material_data), vk::BufferUsageFlags::UNIFORM_BUFFER, "mesh_bl_material")?;
+
+        // --- Phase 5: Textures ---
+        let sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR).min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_w(vk::SamplerAddressMode::REPEAT),
+                None,
+            ).map_err(|e| format!("Failed to create sampler: {:?}", e))?
+        };
+
+        let default_texture = create_default_white_texture(ctx)?;
+        let default_black_texture = create_texture_image(ctx, 1, 1, &[0u8, 0, 0, 255], "bl_default_black")?;
+        let default_normal_texture = create_texture_image(ctx, 1, 1, &[128u8, 128, 255, 255], "bl_default_normal")?;
+
+        // Build per-material texture maps
+        let mut per_material_textures: Vec<HashMap<String, GpuImage>> = Vec::new();
+        if let Some(ref gs) = gltf_scene {
+            for (mat_idx, mat) in gs.materials.iter().enumerate() {
+                let mut tex_map: HashMap<String, GpuImage> = HashMap::new();
+                let tex_slots: Vec<(&str, Option<&crate::gltf_loader::TextureImage>)> = vec![
+                    ("base_color_tex", mat.base_color_image.as_ref()),
+                    ("normal_tex", mat.normal_image.as_ref()),
+                    ("metallic_roughness_tex", mat.metallic_roughness_image.as_ref()),
+                    ("occlusion_tex", mat.occlusion_image.as_ref()),
+                    ("emissive_tex", mat.emissive_image.as_ref()),
+                    ("clearcoat_tex", mat.clearcoat_image.as_ref()),
+                    ("clearcoat_roughness_tex", mat.clearcoat_roughness_image.as_ref()),
+                    ("sheen_color_tex", mat.sheen_color_image.as_ref()),
+                    ("transmission_tex", mat.transmission_image.as_ref()),
+                ];
+                for (name, img_opt) in tex_slots {
+                    if let Some(tex_data) = img_opt {
+                        let label = format!("mesh_bl_{}[{}]", name, mat_idx);
+                        let gpu_img = create_texture_image(ctx, tex_data.width, tex_data.height, &tex_data.pixels, &label)?;
+                        tex_map.insert(name.to_string(), gpu_img);
+                    }
+                }
+                per_material_textures.push(tex_map);
+            }
+        }
+
+        // Single-material fallback texture_images map
+        let mut texture_images: HashMap<String, GpuImage> = HashMap::new();
+        if gltf_scene.is_none() {
+            let tex_pixels = scene::generate_procedural_texture(512);
+            let proc_texture = create_texture_image(ctx, 512, 512, &tex_pixels, "bl_procedural_albedo")?;
+            texture_images.insert("base_color_tex".to_string(), proc_texture);
+        }
+
+        let ibl_assets = load_ibl_assets(ctx, ibl_name);
+
+        // --- Phase 6: Build bindless texture array + materials SSBO ---
+        let (bindless_tex_array, dedup_map) = scene_manager::build_bindless_texture_array_from_gpu_images(
+            &per_material_textures, sampler,
+            default_texture.view, default_black_texture.view, default_normal_texture.view,
+        );
+
+        info!("Mesh bindless: {} unique textures in bindless array", bindless_tex_array.texture_count);
+
+        let materials_ssbo = if let Some(ref gs) = gltf_scene {
+            scene_manager::build_materials_ssbo(
+                &device, ctx.allocator_mut(), gs, &dedup_map,
+                &per_material_textures,
+                default_texture.view, default_black_texture.view, default_normal_texture.view,
+            )?
+        } else {
+            let default_mat = scene_manager::BindlessMaterialData {
+                base_color_factor: [1.0, 1.0, 1.0, 1.0],
+                emissive_factor: [0.0, 0.0, 0.0],
+                metallic_factor: 0.0, roughness_factor: 1.0, emissive_strength: 1.0,
+                ior: 1.5, clearcoat_factor: 0.0, clearcoat_roughness: 0.0,
+                sheen_roughness: 0.0, transmission_factor: 0.0,
+                _pad_before_sheen: 0.0, sheen_color_factor: [0.0, 0.0, 0.0], _pad_after_sheen: 0.0,
+                base_color_tex_index: -1, normal_tex_index: -1, metallic_roughness_tex_index: -1,
+                occlusion_tex_index: -1, emissive_tex_index: -1, clearcoat_tex_index: -1,
+                clearcoat_roughness_tex_index: -1, sheen_color_tex_index: -1, transmission_tex_index: -1,
+                material_flags: 0, index_offset: 0.0, _padding: 0,
+            };
+            let buf = create_buffer_with_data(&device, ctx.allocator_mut(), bytemuck::bytes_of(&default_mat), vk::BufferUsageFlags::STORAGE_BUFFER, "mesh_bl_materials_ssbo")?;
+            scene_manager::BindlessMaterialsSSBO { buffer: buf, material_count: 1 }
+        };
+
+        info!("Mesh bindless: {} materials in SSBO", materials_ssbo.material_count);
+
+        // --- Phase 7: Render pass, framebuffer ---
+        let color_image = create_offscreen_image(&device, ctx.allocator_mut(), width, height, vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC, vk::ImageAspectFlags::COLOR, "mesh_bl_color")?;
+        let depth_image = create_offscreen_image(&device, ctx.allocator_mut(), width, height, vk::Format::D32_SFLOAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, vk::ImageAspectFlags::DEPTH, "mesh_bl_depth")?;
+
+        let attachments = [
+            vk::AttachmentDescription::default()
+                .format(vk::Format::R8G8B8A8_UNORM).samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR).store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE).stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED).final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+            vk::AttachmentDescription::default()
+                .format(vk::Format::D32_SFLOAT).samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR).store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE).stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED).final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+        ];
+
+        let color_ref = vk::AttachmentReference::default().attachment(0).layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let depth_ref = vk::AttachmentReference::default().attachment(1).layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(std::slice::from_ref(&color_ref))
+            .depth_stencil_attachment(&depth_ref);
+
+        let dependencies = [
+            vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL).dst_subpass(0)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+            vk::SubpassDependency::default()
+                .src_subpass(0).dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+        ];
+
+        let render_pass = unsafe {
+            device.create_render_pass(
+                &vk::RenderPassCreateInfo::default().attachments(&attachments).subpasses(std::slice::from_ref(&subpass)).dependencies(&dependencies),
+                None,
+            ).map_err(|e| format!("Failed to create mesh bindless render pass: {:?}", e))?
+        };
+
+        let fb_attachments = [color_image.view, depth_image.view];
+        let framebuffer = unsafe {
+            device.create_framebuffer(
+                &vk::FramebufferCreateInfo::default().render_pass(render_pass).attachments(&fb_attachments).width(width).height(height).layers(1),
+                None,
+            ).map_err(|e| format!("Failed to create mesh bindless framebuffer: {:?}", e))?
+        };
+
+        // --- Phase 8: Descriptor set layouts (bindless-aware) ---
+        let merged = reflected_pipeline::merge_descriptor_sets(&[&mesh_refl, &frag_refl]);
+        let ds_layouts = unsafe {
+            reflected_pipeline::create_descriptor_set_layouts_bindless(&device, &merged)?
+        };
+
+        // Push constant ranges from mesh + frag
+        let mut push_ranges: Vec<vk::PushConstantRange> = Vec::new();
+        for pc in &mesh_refl.push_constants {
+            push_ranges.push(vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::MESH_EXT).offset(0).size(pc.size));
+        }
+        for pc in &frag_refl.push_constants {
+            // Fragment push constants share offset 0 with mesh stage in bindless mode
+            // (mesh: {meshletOffset: u32, material_index: u32}, frag: {model: mat4, material_index: u32})
+            // Use the maximum of both for a combined push constant range
+            let frag_flags = reflected_pipeline::stage_flags_from_strings_public(&pc.stage_flags);
+            push_ranges.push(vk::PushConstantRange::default().stage_flags(frag_flags).offset(0).size(pc.size));
+        }
+
+        let pipeline_layout = unsafe {
+            reflected_pipeline::create_pipeline_layout_from_merged(&device, &ds_layouts, &push_ranges)?
+        };
+
+        // --- Phase 9: Descriptor pool + allocation ---
+        let (pool_sizes, max_sets) = reflected_pipeline::compute_pool_sizes_bindless(&merged);
+
+        let descriptor_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default().max_sets(max_sets).pool_sizes(&pool_sizes).flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
+                None,
+            ).map_err(|e| format!("Failed to create mesh bindless descriptor pool: {:?}", e))?
+        };
+
+        let max_set_idx = ds_layouts.keys().copied().max().unwrap_or(0);
+        let mut ordered_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
+        let mut set_indices: Vec<u32> = Vec::new();
+        for i in 0..=max_set_idx {
+            if let Some(&layout) = ds_layouts.get(&i) {
+                ordered_layouts.push(layout);
+                set_indices.push(i);
+            }
+        }
+
+        let actual_tex_count = bindless_tex_array.texture_count.max(1);
+        let mut variable_counts: Vec<u32> = vec![0; ordered_layouts.len()];
+        for (layout_idx, &set_idx) in set_indices.iter().enumerate() {
+            if let Some(bindings) = merged.get(&set_idx) {
+                for b in bindings {
+                    if b.binding_type == "bindless_combined_image_sampler_array" {
+                        variable_counts[layout_idx] = actual_tex_count;
+                    }
+                }
+            }
+        }
+
+        let mut variable_count_info = vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
+            .descriptor_counts(&variable_counts);
+
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&ordered_layouts)
+            .push_next(&mut variable_count_info);
+
+        let descriptor_sets = unsafe {
+            device.allocate_descriptor_sets(&alloc_info)
+                .map_err(|e| format!("Failed to allocate mesh bindless descriptor sets: {:?}", e))?
+        };
+
+        let mut ds_map: HashMap<u32, vk::DescriptorSet> = HashMap::new();
+        for (idx, &set_idx) in set_indices.iter().enumerate() {
+            ds_map.insert(set_idx, descriptor_sets[idx]);
+        }
+
+        // --- Phase 10: Write descriptors (non-bindless sets) ---
+        {
+            let ssbo_map: HashMap<&str, (vk::Buffer, u64)> = [
+                ("meshlet_descriptors", (meshlet_desc_buffer.buffer, meshlet_desc_size)),
+                ("meshlet_vertices", (meshlet_verts_buffer.buffer, meshlet_verts_size)),
+                ("meshlet_triangles", (meshlet_tris_buffer.buffer, meshlet_tris_size)),
+                ("positions", (positions_buffer.buffer, positions_size)),
+                ("normals", (normals_buffer.buffer, normals_size)),
+                ("tex_coords", (tex_coords_buffer.buffer, tex_coords_size)),
+                ("tangents", (tangents_buffer.buffer, tangents_size)),
+                ("materials", (materials_ssbo.buffer.buffer, materials_ssbo.material_count as u64 * std::mem::size_of::<scene_manager::BindlessMaterialData>() as u64)),
+            ].into_iter().collect();
+
+            let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+            let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
+            let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+            let total_bindings: usize = merged.values().map(|v| v.len()).sum();
+            buffer_infos.reserve(total_bindings);
+            image_infos.reserve(total_bindings);
+
+            for (&set_idx, bindings) in &merged {
+                let ds = match ds_map.get(&set_idx) {
+                    Some(&ds) => ds,
+                    None => continue,
+                };
+
+                for binding in bindings {
+                    // Skip the bindless texture array (written separately)
+                    if binding.binding_type == "bindless_combined_image_sampler_array" {
+                        continue;
+                    }
+
+                    let vk_type = reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
+                    match vk_type {
+                        vk::DescriptorType::UNIFORM_BUFFER => {
+                            let (buffer, range) = match binding.name.as_str() {
+                                "MVP" => (mvp_buffer.buffer, binding.size as u64),
+                                "Light" => (light_buffer.buffer, binding.size as u64),
+                                "Material" => (material_buffer.buffer, std::mem::size_of::<MaterialUboData>() as u64),
+                                _ => continue,
+                            };
+                            let idx = buffer_infos.len();
+                            buffer_infos.push(vk::DescriptorBufferInfo::default().buffer(buffer).offset(0).range(range));
+                            writes.push(
+                                vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                    .buffer_info(unsafe { std::slice::from_raw_parts(&buffer_infos[idx] as *const _, 1) }),
+                            );
+                        }
+                        vk::DescriptorType::STORAGE_BUFFER => {
+                            let (buffer, size) = match ssbo_map.get(binding.name.as_str()) {
+                                Some(&(buf, sz)) => (buf, sz),
+                                None => continue,
+                            };
+                            let idx = buffer_infos.len();
+                            buffer_infos.push(vk::DescriptorBufferInfo::default().buffer(buffer).offset(0).range(size));
+                            writes.push(
+                                vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                    .buffer_info(unsafe { std::slice::from_raw_parts(&buffer_infos[idx] as *const _, 1) }),
+                            );
+                        }
+                        vk::DescriptorType::SAMPLER => {
+                            let actual_sampler = ibl_assets.sampler_for_binding(&binding.name).unwrap_or(sampler);
+                            let idx = image_infos.len();
+                            image_infos.push(vk::DescriptorImageInfo::default().sampler(actual_sampler));
+                            writes.push(
+                                vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                                    .image_info(unsafe { std::slice::from_raw_parts(&image_infos[idx] as *const _, 1) }),
+                            );
+                        }
+                        vk::DescriptorType::SAMPLED_IMAGE => {
+                            let is_cube = reflected_pipeline::is_cube_image_binding(&binding.binding_type);
+                            let view = if is_cube || binding.name == "brdf_lut" {
+                                ibl_assets.view_for_binding(&binding.name).unwrap_or(default_texture.view)
+                            } else {
+                                let fallback = match binding.name.as_str() {
+                                    "emissive_tex" => default_black_texture.view,
+                                    "normal_tex" => default_normal_texture.view,
+                                    _ => default_texture.view,
+                                };
+                                texture_images.get(&binding.name).map(|img| img.view).unwrap_or(fallback)
+                            };
+                            let idx = image_infos.len();
+                            image_infos.push(vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
+                            writes.push(
+                                vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                    .image_info(unsafe { std::slice::from_raw_parts(&image_infos[idx] as *const _, 1) }),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if !writes.is_empty() {
+                unsafe { device.update_descriptor_sets(&writes, &[]); }
+            }
+        }
+
+        // --- Write bindless texture array ---
+        if bindless_tex_array.texture_count > 0 {
+            let bindless_set_idx = frag_refl.bindless.as_ref().and_then(|b| b.texture_array.as_ref()).map(|ta| ta.set).unwrap_or(2);
+            let bindless_binding = frag_refl.bindless.as_ref().and_then(|b| b.texture_array.as_ref()).map(|ta| ta.binding).unwrap_or(0);
+
+            if let Some(&ds) = ds_map.get(&bindless_set_idx) {
+                let img_infos: Vec<vk::DescriptorImageInfo> = (0..bindless_tex_array.texture_count as usize)
+                    .map(|i| {
+                        vk::DescriptorImageInfo::default()
+                            .sampler(bindless_tex_array.samplers[i])
+                            .image_view(bindless_tex_array.image_views[i])
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    })
+                    .collect();
+
+                let write = vk::WriteDescriptorSet::default()
+                    .dst_set(ds).dst_binding(bindless_binding)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&img_infos);
+
+                unsafe { device.update_descriptor_sets(&[write], &[]); }
+                info!("Mesh bindless: wrote {} textures to set {} binding {}", bindless_tex_array.texture_count, bindless_set_idx, bindless_binding);
+            }
+        }
+
+        // --- Phase 11: Load shaders and create pipeline ---
+        let mesh_path = format!("{}.mesh.spv", pipeline_base);
+        let frag_path = format!("{}.frag.spv", pipeline_base);
+
+        let mesh_code = spv_loader::load_spirv(Path::new(&mesh_path))?;
+        let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
+        let mesh_module = spv_loader::create_shader_module(&device, &mesh_code)?;
+        let frag_module = spv_loader::create_shader_module(&device, &frag_code)?;
+
+        let entry_name = c"main";
+        let shader_stages = [
+            vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::MESH_EXT).module(mesh_module).name(entry_name),
+            vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(frag_module).name(entry_name),
+        ];
+
+        let viewport = vk::Viewport::default().width(width as f32).height(height as f32).max_depth(1.0);
+        let scissor = vk::Rect2D::default().extent(vk::Extent2D { width, height });
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewports(std::slice::from_ref(&viewport)).scissors(std::slice::from_ref(&scissor));
+        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL).cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE).line_width(1.0);
+        let multisampling = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true).depth_write_enable(true).depth_compare_op(vk::CompareOp::LESS);
+        let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default().color_write_mask(vk::ColorComponentFlags::RGBA);
+        let color_blending = vk::PipelineColorBlendStateCreateInfo::default().attachments(std::slice::from_ref(&color_blend_attachment));
+
+        let pipeline = unsafe {
+            device.create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::GraphicsPipelineCreateInfo::default()
+                    .stages(&shader_stages).viewport_state(&viewport_state)
+                    .rasterization_state(&rasterizer).multisample_state(&multisampling)
+                    .depth_stencil_state(&depth_stencil).color_blend_state(&color_blending)
+                    .layout(pipeline_layout).render_pass(render_pass).subpass(0)],
+                None,
+            ).map_err(|e| format!("Failed to create mesh bindless pipeline: {:?}", e))?[0]
+        };
+
+        info!("MeshShaderRenderer initialized (bindless): {}x{}, {} meshlets, {} material groups",
+              width, height, meshlet_count, meshlet_groups.len());
+
+        Ok(MeshShaderRenderer {
+            pipeline,
+            pipeline_layout,
+            descriptor_pool,
+            ds_layouts,
+            descriptor_sets,
+            mesh_module,
+            frag_module,
+            render_pass,
+            framebuffer,
+            color_image,
+            depth_image,
+            width,
+            height,
+            meshlet_count,
+            meshlet_desc_buffer,
+            meshlet_verts_buffer,
+            meshlet_tris_buffer,
+            positions_buffer,
+            normals_buffer,
+            tex_coords_buffer,
+            tangents_buffer,
+            meshlet_desc_size,
+            meshlet_verts_size,
+            meshlet_tris_size,
+            positions_size,
+            normals_size,
+            tex_coords_size,
+            tangents_size,
+            mvp_buffer,
+            light_buffer,
+            material_buffer,
+            sampler,
+            default_texture,
+            default_black_texture,
+            default_normal_texture,
+            texture_images,
+            per_material_textures,
+            ibl_assets,
+            multi_pipeline: false, // not multi-pipeline mode
+            mesh_permutations: Vec::new(),
+            material_to_permutation: Vec::new(),
+            shared_set0_layout: vk::DescriptorSetLayout::null(),
+            shared_set0: vk::DescriptorSet::null(),
+            meshlet_groups,
+            bindless_mode: true,
+            bindless_materials_ssbo: Some(materials_ssbo),
+            mesh_refl: None,
+            auto_eye,
+            auto_target,
+            auto_up,
+            auto_far,
+            has_scene_bounds,
+        })
     }
 
     /// Update camera uniforms (MVP + light view_pos).
@@ -1926,7 +2596,45 @@ impl MeshShaderRenderer {
         unsafe {
             device.cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
 
-            if self.multi_pipeline && !self.mesh_permutations.is_empty() {
+            if self.bindless_mode {
+                // ---- Bindless draw ----
+                // Single pipeline, all descriptor sets bound once, per-group push constants
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    &self.descriptor_sets,
+                    &[],
+                );
+
+                if self.meshlet_groups.is_empty() {
+                    // Fallback: dispatch all meshlets with default push constants
+                    let pc_data: [u32; 2] = [0, 0]; // meshletOffset=0, material_index=0
+                    device.cmd_push_constants(
+                        cmd,
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::MESH_EXT,
+                        0,
+                        bytemuck::cast_slice(&pc_data),
+                    );
+                    ms_loader.cmd_draw_mesh_tasks(cmd, self.meshlet_count, 1, 1);
+                } else {
+                    for group in &self.meshlet_groups {
+                        // Push {meshletOffset: u32, material_index: u32} (8 bytes at offset 0)
+                        let pc_data: [u32; 2] = [group.first_meshlet, group.material_index as u32];
+                        device.cmd_push_constants(
+                            cmd,
+                            self.pipeline_layout,
+                            vk::ShaderStageFlags::MESH_EXT,
+                            0,
+                            bytemuck::cast_slice(&pc_data),
+                        );
+                        ms_loader.cmd_draw_mesh_tasks(cmd, group.meshlet_count, 1, 1);
+                    }
+                }
+            } else if self.multi_pipeline && !self.mesh_permutations.is_empty() {
                 // ---- Multi-pipeline draw ----
                 // Bind shared set 0 once (meshlet data + SoA buffers + MVP + Light)
                 if self.shared_set0 != vk::DescriptorSet::null() {
@@ -2166,6 +2874,12 @@ impl MeshShaderRenderer {
                 tex.destroy(&device, ctx.allocator_mut());
             }
         }
+        // Clean up bindless materials SSBO
+        if let Some(ref mut ssbo) = self.bindless_materials_ssbo {
+            ssbo.buffer.destroy(&device, ctx.allocator_mut());
+        }
+        self.bindless_materials_ssbo = None;
+
         self.ibl_assets.destroy(&device, ctx.allocator_mut());
         self.mvp_buffer.destroy(&device, ctx.allocator_mut());
         self.light_buffer.destroy(&device, ctx.allocator_mut());

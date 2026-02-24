@@ -215,6 +215,8 @@ ReflectionData jsonToReflection(const JsonValue& root) {
                 if (bi_it != b.object.end()) bi.name = bi_it->second.asString();
                 bi_it = b.object.find("size");
                 if (bi_it != b.object.end()) bi.size = bi_it->second.asInt();
+                bi_it = b.object.find("max_count");
+                if (bi_it != b.object.end()) bi.max_count = bi_it->second.asInt();
 
                 // Fields
                 bi_it = b.object.find("fields");
@@ -305,6 +307,16 @@ ReflectionData jsonToReflection(const JsonValue& root) {
     it = obj.find("vertex_stride");
     if (it != obj.end()) data.vertex_stride = it->second.asInt();
 
+    // Parse bindless section if present
+    it = obj.find("bindless");
+    if (it != obj.end() && it->second.type == JsonValue::Object) {
+        auto& bless = it->second.object;
+        auto enabledIt = bless.find("enabled");
+        if (enabledIt != bless.end() && enabledIt->second.type == JsonValue::Bool) {
+            data.bindlessEnabled = enabledIt->second.boolean;
+        }
+    }
+
     // Parse mesh_output metadata if present
     it = obj.find("mesh_output");
     if (it != obj.end() && it->second.type == JsonValue::Object) {
@@ -370,6 +382,7 @@ VkDescriptorType bindingTypeToVkDescriptorType(const std::string& type) {
     if (type == "storage_image") return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     if (type == "storage_buffer") return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     if (type == "acceleration_structure") return VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    if (type == "bindless_combined_image_sampler_array") return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 }
 
@@ -394,26 +407,39 @@ static VkShaderStageFlags stageFlagsFromStrings(const std::vector<std::string>& 
     return result;
 }
 
+// Internal helper struct to track bindless info per (set, binding) during merging
+struct BindingMergeInfo {
+    VkDescriptorSetLayoutBinding vkBinding = {};
+    bool isBindless = false;
+    int maxCount = 0;
+};
+
 std::unordered_map<int, VkDescriptorSetLayout> createDescriptorSetLayouts(
     VkDevice device,
     const ReflectionData& vertReflection,
     const ReflectionData& fragReflection
 ) {
     // Merge descriptor sets from both stages
-    std::unordered_map<int, std::unordered_map<int, VkDescriptorSetLayoutBinding>> merged;
+    std::unordered_map<int, std::unordered_map<int, BindingMergeInfo>> merged;
 
     auto mergeStage = [&](const ReflectionData& refl) {
         for (auto& [setIdx, bindings] : refl.descriptor_sets) {
             for (auto& b : bindings) {
                 auto& existing = merged[setIdx][b.binding];
-                if (existing.descriptorCount == 0) {
-                    existing.binding = static_cast<uint32_t>(b.binding);
-                    existing.descriptorType = bindingTypeToVkDescriptorType(b.type);
-                    existing.descriptorCount = 1;
-                    existing.stageFlags = stageFlagsFromStrings(b.stage_flags);
-                    existing.pImmutableSamplers = nullptr;
+                if (existing.vkBinding.descriptorCount == 0) {
+                    existing.vkBinding.binding = static_cast<uint32_t>(b.binding);
+                    existing.vkBinding.descriptorType = bindingTypeToVkDescriptorType(b.type);
+                    existing.vkBinding.stageFlags = stageFlagsFromStrings(b.stage_flags);
+                    existing.vkBinding.pImmutableSamplers = nullptr;
+                    if (b.type == "bindless_combined_image_sampler_array") {
+                        existing.isBindless = true;
+                        existing.maxCount = b.max_count > 0 ? b.max_count : 1024;
+                        existing.vkBinding.descriptorCount = static_cast<uint32_t>(existing.maxCount);
+                    } else {
+                        existing.vkBinding.descriptorCount = 1;
+                    }
                 } else {
-                    existing.stageFlags |= stageFlagsFromStrings(b.stage_flags);
+                    existing.vkBinding.stageFlags |= stageFlagsFromStrings(b.stage_flags);
                 }
             }
         }
@@ -425,16 +451,54 @@ std::unordered_map<int, VkDescriptorSetLayout> createDescriptorSetLayouts(
     std::unordered_map<int, VkDescriptorSetLayout> layouts;
     for (auto& [setIdx, bindingMap] : merged) {
         std::vector<VkDescriptorSetLayoutBinding> bindings;
-        for (auto& [_, b] : bindingMap) {
-            bindings.push_back(b);
+        std::vector<int> bindingOrder;  // track original binding indices for flag arrays
+        bool hasBindless = false;
+
+        for (auto& [bIdx, info] : bindingMap) {
+            bindings.push_back(info.vkBinding);
+            bindingOrder.push_back(bIdx);
+            if (info.isBindless) hasBindless = true;
         }
-        std::sort(bindings.begin(), bindings.end(),
-                  [](const auto& a, const auto& b) { return a.binding < b.binding; });
+        // Sort by binding number
+        std::vector<size_t> sortIndices(bindings.size());
+        for (size_t i = 0; i < sortIndices.size(); i++) sortIndices[i] = i;
+        std::sort(sortIndices.begin(), sortIndices.end(),
+                  [&](size_t a, size_t b) { return bindings[a].binding < bindings[b].binding; });
+        std::vector<VkDescriptorSetLayoutBinding> sortedBindings(bindings.size());
+        std::vector<int> sortedOrder(bindings.size());
+        for (size_t i = 0; i < sortIndices.size(); i++) {
+            sortedBindings[i] = bindings[sortIndices[i]];
+            sortedOrder[i] = bindingOrder[sortIndices[i]];
+        }
 
         VkDescriptorSetLayoutCreateInfo layoutInfo = {};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-        layoutInfo.pBindings = bindings.data();
+        layoutInfo.bindingCount = static_cast<uint32_t>(sortedBindings.size());
+        layoutInfo.pBindings = sortedBindings.data();
+
+        // Set up bindless flags if needed
+        std::vector<VkDescriptorBindingFlags> bindingFlags;
+        VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo = {};
+
+        if (hasBindless) {
+            layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+
+            bindingFlags.resize(sortedBindings.size(), 0);
+            for (size_t i = 0; i < sortedBindings.size(); i++) {
+                int bIdx = sortedOrder[i];
+                auto& info = bindingMap[bIdx];
+                if (info.isBindless) {
+                    bindingFlags[i] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                                      VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                                      VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+                }
+            }
+
+            flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+            flagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
+            flagsInfo.pBindingFlags = bindingFlags.data();
+            layoutInfo.pNext = &flagsInfo;
+        }
 
         VkDescriptorSetLayout layout;
         if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &layout) != VK_SUCCESS) {
@@ -451,20 +515,26 @@ std::unordered_map<int, VkDescriptorSetLayout> createDescriptorSetLayoutsMultiSt
     const std::vector<ReflectionData>& stages
 ) {
     // Merge descriptor sets from all stages
-    std::unordered_map<int, std::unordered_map<int, VkDescriptorSetLayoutBinding>> merged;
+    std::unordered_map<int, std::unordered_map<int, BindingMergeInfo>> merged;
 
     for (auto& refl : stages) {
         for (auto& [setIdx, bindings] : refl.descriptor_sets) {
             for (auto& b : bindings) {
                 auto& existing = merged[setIdx][b.binding];
-                if (existing.descriptorCount == 0) {
-                    existing.binding = static_cast<uint32_t>(b.binding);
-                    existing.descriptorType = bindingTypeToVkDescriptorType(b.type);
-                    existing.descriptorCount = 1;
-                    existing.stageFlags = stageFlagsFromStrings(b.stage_flags);
-                    existing.pImmutableSamplers = nullptr;
+                if (existing.vkBinding.descriptorCount == 0) {
+                    existing.vkBinding.binding = static_cast<uint32_t>(b.binding);
+                    existing.vkBinding.descriptorType = bindingTypeToVkDescriptorType(b.type);
+                    existing.vkBinding.stageFlags = stageFlagsFromStrings(b.stage_flags);
+                    existing.vkBinding.pImmutableSamplers = nullptr;
+                    if (b.type == "bindless_combined_image_sampler_array") {
+                        existing.isBindless = true;
+                        existing.maxCount = b.max_count > 0 ? b.max_count : 1024;
+                        existing.vkBinding.descriptorCount = static_cast<uint32_t>(existing.maxCount);
+                    } else {
+                        existing.vkBinding.descriptorCount = 1;
+                    }
                 } else {
-                    existing.stageFlags |= stageFlagsFromStrings(b.stage_flags);
+                    existing.vkBinding.stageFlags |= stageFlagsFromStrings(b.stage_flags);
                 }
             }
         }
@@ -473,16 +543,54 @@ std::unordered_map<int, VkDescriptorSetLayout> createDescriptorSetLayoutsMultiSt
     std::unordered_map<int, VkDescriptorSetLayout> layouts;
     for (auto& [setIdx, bindingMap] : merged) {
         std::vector<VkDescriptorSetLayoutBinding> bindings;
-        for (auto& [_, b] : bindingMap) {
-            bindings.push_back(b);
+        std::vector<int> bindingOrder;
+        bool hasBindless = false;
+
+        for (auto& [bIdx, info] : bindingMap) {
+            bindings.push_back(info.vkBinding);
+            bindingOrder.push_back(bIdx);
+            if (info.isBindless) hasBindless = true;
         }
-        std::sort(bindings.begin(), bindings.end(),
-                  [](const auto& a, const auto& b) { return a.binding < b.binding; });
+        // Sort by binding number
+        std::vector<size_t> sortIndices(bindings.size());
+        for (size_t i = 0; i < sortIndices.size(); i++) sortIndices[i] = i;
+        std::sort(sortIndices.begin(), sortIndices.end(),
+                  [&](size_t a, size_t b) { return bindings[a].binding < bindings[b].binding; });
+        std::vector<VkDescriptorSetLayoutBinding> sortedBindings(bindings.size());
+        std::vector<int> sortedOrder(bindings.size());
+        for (size_t i = 0; i < sortIndices.size(); i++) {
+            sortedBindings[i] = bindings[sortIndices[i]];
+            sortedOrder[i] = bindingOrder[sortIndices[i]];
+        }
 
         VkDescriptorSetLayoutCreateInfo layoutInfo = {};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-        layoutInfo.pBindings = bindings.data();
+        layoutInfo.bindingCount = static_cast<uint32_t>(sortedBindings.size());
+        layoutInfo.pBindings = sortedBindings.data();
+
+        // Set up bindless flags if needed
+        std::vector<VkDescriptorBindingFlags> bindingFlags;
+        VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo = {};
+
+        if (hasBindless) {
+            layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+
+            bindingFlags.resize(sortedBindings.size(), 0);
+            for (size_t i = 0; i < sortedBindings.size(); i++) {
+                int bIdx = sortedOrder[i];
+                auto& info = bindingMap[bIdx];
+                if (info.isBindless) {
+                    bindingFlags[i] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                                      VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                                      VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+                }
+            }
+
+            flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+            flagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
+            flagsInfo.pBindingFlags = bindingFlags.data();
+            layoutInfo.pNext = &flagsInfo;
+        }
 
         VkDescriptorSetLayout layout;
         if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &layout) != VK_SUCCESS) {
@@ -558,10 +666,12 @@ std::vector<MergedBindingInfo> getMergedBindings(
                     info.type = b.type;
                     info.name = b.name;
                     info.size = b.size;
+                    info.max_count = b.max_count;
                     info.stageFlags = stageFlagsFromStrings(b.stage_flags);
                     merged[key] = info;
                 } else {
                     it->second.stageFlags |= stageFlagsFromStrings(b.stage_flags);
+                    if (b.max_count > 0) it->second.max_count = b.max_count;
                 }
             }
         }

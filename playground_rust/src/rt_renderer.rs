@@ -16,7 +16,7 @@ use crate::screenshot;
 use crate::spv_loader;
 use crate::vulkan_context::VulkanContext;
 
-/// Material UBO data matching `properties Material { ... }` in gltf_pbr_layered.lux (std140 layout, 80 bytes).
+/// Material UBO data matching `properties Material { ... }` in gltf_pbr_layered.lux (std140 layout, 144 bytes).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 struct MaterialUboData {
@@ -33,6 +33,14 @@ struct MaterialUboData {
     _pad_before_sheen: f32,              // offset 60, size  4 (padding for vec3 alignment)
     sheen_color_factor: [f32; 3],         // offset 64, size 12
     _pad0: f32,                           // offset 76, size  4
+    // KHR_texture_transform (offset 80 -> 144)
+    base_color_uv_st: [f32; 4],          // offset 80: [offset.x, offset.y, scale.x, scale.y]
+    normal_uv_st: [f32; 4],              // offset 96
+    mr_uv_st: [f32; 4],                  // offset 112
+    base_color_uv_rot: f32,              // offset 128
+    normal_uv_rot: f32,                  // offset 132
+    mr_uv_rot: f32,                      // offset 136
+    _pad1: f32,                          // offset 140
 }
 unsafe impl bytemuck::Pod for MaterialUboData {}
 unsafe impl bytemuck::Zeroable for MaterialUboData {}
@@ -53,6 +61,13 @@ impl MaterialUboData {
             _pad_before_sheen: 0.0,
             sheen_color_factor: [0.0, 0.0, 0.0],
             _pad0: 0.0,
+            base_color_uv_st: [0.0, 0.0, 1.0, 1.0],
+            normal_uv_st: [0.0, 0.0, 1.0, 1.0],
+            mr_uv_st: [0.0, 0.0, 1.0, 1.0],
+            base_color_uv_rot: 0.0,
+            normal_uv_rot: 0.0,
+            mr_uv_rot: 0.0,
+            _pad1: 0.0,
         }
     }
 
@@ -71,6 +86,22 @@ impl MaterialUboData {
             transmission_factor: mat.transmission_factor,
             _pad_before_sheen: 0.0,
             _pad0: 0.0,
+            base_color_uv_st: [
+                mat.base_color_uv_xform.offset[0], mat.base_color_uv_xform.offset[1],
+                mat.base_color_uv_xform.scale[0], mat.base_color_uv_xform.scale[1],
+            ],
+            normal_uv_st: [
+                mat.normal_uv_xform.offset[0], mat.normal_uv_xform.offset[1],
+                mat.normal_uv_xform.scale[0], mat.normal_uv_xform.scale[1],
+            ],
+            mr_uv_st: [
+                mat.metallic_roughness_uv_xform.offset[0], mat.metallic_roughness_uv_xform.offset[1],
+                mat.metallic_roughness_uv_xform.scale[0], mat.metallic_roughness_uv_xform.scale[1],
+            ],
+            base_color_uv_rot: mat.base_color_uv_xform.rotation,
+            normal_uv_rot: mat.normal_uv_xform.rotation,
+            mr_uv_rot: mat.metallic_roughness_uv_xform.rotation,
+            _pad1: 0.0,
         }
     }
 }
@@ -222,6 +253,10 @@ pub struct RTRenderer {
     #[allow(dead_code)]
     hit_group_count: u32,
 
+    // Bindless mode: materials SSBO + texture array
+    bindless_mode: bool,
+    bindless_materials_ssbo: Option<scene_manager::BindlessMaterialsSSBO>,
+
     pub width: u32,
     pub height: u32,
 
@@ -247,6 +282,17 @@ pub fn render_rt(
 
     if !ctx.supports_rt() {
         return Err("Ray tracing is not supported on this GPU".to_string());
+    }
+
+    // --- Bindless detection: check if the rchit reflection has bindless enabled ---
+    let rchit_json_path = format!("{}.rchit.json", shader_base);
+    if Path::new(&rchit_json_path).exists() && ctx.bindless_supported {
+        if let Ok(rchit_refl) = reflected_pipeline::load_reflection(Path::new(&rchit_json_path)) {
+            if rchit_refl.bindless.as_ref().map_or(false, |b| b.enabled) {
+                info!("RT bindless mode detected: redirecting to render_rt_bindless");
+                return render_rt_bindless(ctx, shader_base, scene_source, width, height, output_path, ibl_name);
+            }
+        }
     }
 
     let mut renderer = RTRenderer::new(ctx, shader_base, scene_source, width, height, ibl_name)?;
@@ -331,23 +377,30 @@ impl RTRenderer {
 
         // Check for manifest to decide multi-material mode
         let manifest = try_load_manifest(shader_base);
-        let has_multiple_materials = gltf_scene_opt
+        let _has_multiple_materials = gltf_scene_opt
             .as_ref()
             .map(|s| s.materials.len() > 1)
             .unwrap_or(false);
-        // NOTE: Multi-material RT is disabled because Vulkan RT binds descriptor sets
-        // ONCE before traceRays — all hit shaders share the same textures/UBOs.
-        // Per-geometry material switching would require bindless textures or texture
-        // arrays indexed by gl_GeometryIndexEXT, which needs shader-level changes.
-        // For now, use single-material mode with scene-wide feature detection.
-        // TODO: Add bindless texture support for true per-geometry materials in RT.
-        let use_multi_material = false;
 
-        if use_multi_material {
-            info!(
-                "RT multi-material mode enabled: manifest found and {} materials",
-                gltf_scene_opt.as_ref().map(|s| s.materials.len()).unwrap_or(0)
-            );
+        // Detect bindless mode from base rchit reflection JSON
+        let bindless_mode = {
+            let rchit_json_check = format!("{}.rchit.json", shader_base);
+            if Path::new(&rchit_json_check).exists() && ctx.bindless_supported {
+                if let Ok(refl) = reflected_pipeline::load_reflection(Path::new(&rchit_json_check)) {
+                    refl.bindless.as_ref().map_or(false, |b| b.enabled)
+                } else { false }
+            } else { false }
+        };
+
+        // Non-bindless RT is single-material only (descriptor sets bind once before traceRays).
+        // Multi-material permutation groups are disabled; bindless uses multi-geometry instead.
+        let use_multi_material = false;
+        // Bindless needs multi-geometry BLAS so gl_GeometryIndexEXT maps to material index.
+        let use_multi_geometry = bindless_mode && _has_multiple_materials;
+
+        if bindless_mode {
+            info!("RT bindless interactive mode enabled: multi-geometry BLAS for {} materials",
+                  gltf_scene_opt.as_ref().map(|s| s.materials.len()).unwrap_or(0));
         }
 
         // --- 0b. Flatten geometry and build draw ranges ---
@@ -531,11 +584,19 @@ impl RTRenderer {
 
         // Create descriptor set layouts from superset reflection
         let descriptor_set_layouts = unsafe {
-            reflected_pipeline::create_descriptor_set_layouts_from_merged(&device, &merged)?
+            if bindless_mode {
+                reflected_pipeline::create_descriptor_set_layouts_bindless(&device, &merged)?
+            } else {
+                reflected_pipeline::create_descriptor_set_layouts_from_merged(&device, &merged)?
+            }
         };
 
         // Compute pool sizes (scale for multi-material if needed)
-        let (pool_sizes, max_sets) = reflected_pipeline::compute_pool_sizes(&merged);
+        let (pool_sizes, max_sets) = if bindless_mode {
+            reflected_pipeline::compute_pool_sizes_bindless(&merged)
+        } else {
+            reflected_pipeline::compute_pool_sizes(&merged)
+        };
 
         // If multi-material, we need extra descriptors for the materials SSBO
         if use_multi_material && hit_group_count > 1 {
@@ -567,15 +628,14 @@ impl RTRenderer {
             create_camera_ubo(&device, ctx.allocator_mut(), width, height, None)?;
 
         // --- 4. Build BLAS ---
-        let (blas, blas_buffer, blas_allocation, blas_device_address) = if use_multi_material
-            && !draw_ranges.is_empty()
-        {
-            // Multi-geometry BLAS: one geometry per draw range
-            build_blas_multi_geometry(ctx, &vertices, &indices, &draw_ranges)?
-        } else {
-            // Single-geometry BLAS (original path)
-            build_blas(ctx, &vertices, &indices)?
-        };
+        let (blas, blas_buffer, blas_allocation, blas_device_address) =
+            if (use_multi_material || use_multi_geometry) && !draw_ranges.is_empty() {
+                // Multi-geometry BLAS: one geometry per draw range
+                build_blas_multi_geometry(ctx, &vertices, &indices, &draw_ranges)?
+            } else {
+                // Single-geometry BLAS (original path)
+                build_blas(ctx, &vertices, &indices)?
+            };
 
         // Create SoA storage buffers for closest_hit vertex interpolation
         let positions_data: Vec<[f32; 4]> = vertices
@@ -688,7 +748,8 @@ impl RTRenderer {
         // Track uploaded textures to avoid duplicates (key: material_index + slot_name)
         let mut uploaded_tex_cache: HashMap<String, (vk::ImageView, vk::Sampler)> = HashMap::new();
 
-        if use_multi_material {
+        if use_multi_material || (bindless_mode && gltf_scene_opt.as_ref().map_or(false, |s| !s.materials.is_empty())) {
+            // Multi-material or bindless: upload textures for ALL materials
             let gltf_scene = gltf_scene_opt.as_ref().unwrap();
             for mat_idx in 0..gltf_scene.materials.len() {
                 let mat = &gltf_scene.materials[mat_idx];
@@ -735,14 +796,10 @@ impl RTRenderer {
                             uploaded_tex_cache
                                 .insert(cache_key, (view, tex_sampler));
                         }
-                    } else {
-                        let fallback_view = match tex_name {
-                            "emissive_tex" | "sheen_color_tex" | "transmission_tex" => default_black_view,
-                            "normal_tex" => default_normal_view,
-                            _ => default_white_view,
-                        };
-                        mat_tex_map.insert(tex_name.to_string(), (fallback_view, tex_sampler));
                     }
+                    // If texture is missing, do NOT insert a default.
+                    // The SSBO lookup will return -1, and the shader will
+                    // use the material factor directly without texture sampling.
                 }
 
                 per_material_texture_maps.push(mat_tex_map);
@@ -853,6 +910,10 @@ impl RTRenderer {
         load_rt_ibl_assets(ctx, &mut texture_map, &mut texture_images, ibl_name);
 
         // Also insert IBL textures into per-material texture maps
+        // NOTE: Only for multi_material mode (non-bindless). In bindless mode, IBL
+        // textures are bound at their own descriptor bindings (set 1), NOT in the
+        // bindless 2D texture array (set 2). Mixing cubemap views into the 2D array
+        // causes undefined sampling behavior (black/garbage textures).
         if use_multi_material {
             let ibl_keys: Vec<String> = texture_map
                 .keys()
@@ -951,6 +1012,79 @@ impl RTRenderer {
             None
         };
 
+        // --- 7b. Build bindless texture array and materials SSBO (bindless mode) ---
+        let (bindless_tex_array, bindless_materials_ssbo) = if bindless_mode {
+            let (tex_array, dedup_map) = scene_manager::build_bindless_texture_array_from_views(
+                &per_material_texture_maps,
+            );
+            info!(
+                "RT bindless interactive: {} unique textures in bindless array",
+                tex_array.texture_count
+            );
+
+            let mat_ssbo = if let Some(ref gs) = gltf_scene_opt {
+                // Index by geometry (draw range) so gl_GeometryIndexEXT maps correctly
+                scene_manager::build_materials_ssbo_by_geometry(
+                    &device,
+                    ctx.allocator_mut(),
+                    gs,
+                    &dedup_map,
+                    &per_material_texture_maps,
+                    default_white_view,
+                    default_black_view,
+                    default_normal_view,
+                    &draw_ranges,
+                )?
+            } else {
+                // Procedural scene: single default material
+                let default_mat = scene_manager::BindlessMaterialData {
+                    base_color_factor: [1.0, 1.0, 1.0, 1.0],
+                    emissive_factor: [0.0, 0.0, 0.0],
+                    metallic_factor: 0.0,
+                    roughness_factor: 1.0,
+                    emissive_strength: 1.0,
+                    ior: 1.5,
+                    clearcoat_factor: 0.0,
+                    clearcoat_roughness: 0.0,
+                    sheen_roughness: 0.0,
+                    transmission_factor: 0.0,
+                    _pad_before_sheen: 0.0,
+                    sheen_color_factor: [0.0, 0.0, 0.0],
+                    _pad_after_sheen: 0.0,
+                    base_color_tex_index: -1,
+                    normal_tex_index: -1,
+                    metallic_roughness_tex_index: -1,
+                    occlusion_tex_index: -1,
+                    emissive_tex_index: -1,
+                    clearcoat_tex_index: -1,
+                    clearcoat_roughness_tex_index: -1,
+                    sheen_color_tex_index: -1,
+                    transmission_tex_index: -1,
+                    material_flags: 0,
+                    index_offset: 0.0,
+                    _padding: 0,
+                };
+                let buf = scene_manager::create_buffer_with_data(
+                    &device,
+                    ctx.allocator_mut(),
+                    bytemuck::bytes_of(&default_mat),
+                    vk::BufferUsageFlags::STORAGE_BUFFER,
+                    "rt_bl_materials_ssbo",
+                )?;
+                scene_manager::BindlessMaterialsSSBO {
+                    buffer: buf,
+                    material_count: 1,
+                }
+            };
+            info!(
+                "RT bindless interactive: {} materials in SSBO",
+                mat_ssbo.material_count
+            );
+            (Some(tex_array), Some(mat_ssbo))
+        } else {
+            (None, None)
+        };
+
         // --- 8. Build TLAS with single instance ---
         let (tlas, tlas_buffer, tlas_allocation) = build_tlas(ctx, blas_device_address)?;
 
@@ -992,9 +1126,17 @@ impl RTRenderer {
             }
         }
 
-        // --- 10. Create SBT with per-geometry hit records ---
+        // --- 10. Create SBT ---
+        // Bindless multi-geometry: replicate single hit group for each geometry
+        // Non-bindless multi-material: per-geometry hit records with different shaders
         let rt_props = ctx.rt_properties.as_ref().unwrap().clone();
         let rt_pipeline_loader_clone = ctx.rt_pipeline_loader.clone().unwrap();
+
+        // For bindless multi-geometry, the SBT hit region must have one entry per
+        // BLAS geometry because the Vulkan SBT lookup formula is:
+        //   hit_record = hit_base + stride * (instanceSBTOffset + geometryIndex)
+        // With only 1 entry, geometries > 0 read past the SBT buffer (UB).
+        let num_hit_replicas = if use_multi_geometry { draw_ranges.len().max(1) as u32 } else { 1u32 };
 
         let (sbt_buffer, sbt_allocation, raygen_region, miss_region, hit_region) =
             if use_multi_material && !draw_ranges.is_empty() {
@@ -1009,53 +1151,101 @@ impl RTRenderer {
                     &material_to_perm,
                 )?
             } else {
-                create_sbt(
+                // Bindless or single-material: simple SBT with replicated hit entries
+                create_sbt_replicated(
                     &device,
                     ctx.allocator_mut(),
                     &rt_pipeline_loader_clone,
                     &rt_props,
                     pipeline,
+                    num_hit_replicas,
                 )?
             };
 
         // --- 11. Create descriptor pool and allocate sets from reflection ---
-        let descriptor_pool = unsafe {
-            let pool_info = vk::DescriptorPoolCreateInfo::default()
-                .max_sets(max_sets)
-                .pool_sizes(&pool_sizes);
-            device
-                .create_descriptor_pool(&pool_info, None)
-                .map_err(|e| format!("Failed to create RT descriptor pool: {:?}", e))?
+        let descriptor_pool = if bindless_mode {
+            unsafe {
+                let pool_info = vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(max_sets)
+                    .pool_sizes(&pool_sizes)
+                    .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND);
+                device
+                    .create_descriptor_pool(&pool_info, None)
+                    .map_err(|e| format!("Failed to create RT bindless descriptor pool: {:?}", e))?
+            }
+        } else {
+            unsafe {
+                let pool_info = vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(max_sets)
+                    .pool_sizes(&pool_sizes);
+                device
+                    .create_descriptor_pool(&pool_info, None)
+                    .map_err(|e| format!("Failed to create RT descriptor pool: {:?}", e))?
+            }
         };
 
         let max_set_idx = descriptor_set_layouts.keys().copied().max().unwrap_or(0);
         let mut ordered_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
+        let mut set_indices: Vec<u32> = Vec::new();
         for i in 0..=max_set_idx {
             if let Some(&layout) = descriptor_set_layouts.get(&i) {
                 ordered_layouts.push(layout);
+                set_indices.push(i);
             }
         }
 
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(&ordered_layouts);
+        let descriptor_sets = if bindless_mode {
+            // Bindless: need variable descriptor count for the texture array set
+            let actual_tex_count = bindless_tex_array
+                .as_ref()
+                .map(|t| t.texture_count)
+                .unwrap_or(1)
+                .max(1);
+            let mut variable_counts: Vec<u32> = vec![0; ordered_layouts.len()];
 
-        let descriptor_sets = unsafe {
-            device
-                .allocate_descriptor_sets(&alloc_info)
-                .map_err(|e| format!("Failed to allocate RT descriptor sets: {:?}", e))?
+            // Find which set has the bindless_combined_image_sampler_array binding
+            for (layout_idx, &set_idx) in set_indices.iter().enumerate() {
+                if let Some(bindings) = merged.get(&set_idx) {
+                    for b in bindings {
+                        if b.binding_type == "bindless_combined_image_sampler_array" {
+                            variable_counts[layout_idx] = actual_tex_count;
+                        }
+                    }
+                }
+            }
+
+            let mut variable_count_info =
+                vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
+                    .descriptor_counts(&variable_counts);
+
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&ordered_layouts)
+                .push_next(&mut variable_count_info);
+
+            unsafe {
+                device
+                    .allocate_descriptor_sets(&alloc_info)
+                    .map_err(|e| {
+                        format!("Failed to allocate RT bindless descriptor sets: {:?}", e)
+                    })?
+            }
+        } else {
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&ordered_layouts);
+
+            unsafe {
+                device
+                    .allocate_descriptor_sets(&alloc_info)
+                    .map_err(|e| format!("Failed to allocate RT descriptor sets: {:?}", e))?
+            }
         };
 
         // Build map: set_index -> descriptor_set
         let mut ds_map: HashMap<u32, vk::DescriptorSet> = HashMap::new();
-        {
-            let mut ds_idx = 0;
-            for i in 0..=max_set_idx {
-                if descriptor_set_layouts.contains_key(&i) {
-                    ds_map.insert(i, descriptor_sets[ds_idx]);
-                    ds_idx += 1;
-                }
-            }
+        for (idx, &set_idx) in set_indices.iter().enumerate() {
+            ds_map.insert(set_idx, descriptor_sets[idx]);
         }
 
         // --- 12. Write descriptors from reflection data ---
@@ -1083,11 +1273,18 @@ impl RTRenderer {
         .into_iter()
         .collect();
 
-        // Add materials SSBO to the map if multi-material
+        // Add materials SSBO to the map if multi-material (non-bindless)
         if let Some(ref mssbo) = materials_ssbo {
             let total_size = draw_ranges.len() as u64
                 * std::mem::size_of::<MaterialUboData>() as u64;
             ssbo_map.insert("materials".to_string(), (mssbo.buffer, total_size));
+        }
+
+        // Add bindless materials SSBO to the map
+        if let Some(ref bl_ssbo) = bindless_materials_ssbo {
+            let total_size = bl_ssbo.material_count as u64
+                * std::mem::size_of::<scene_manager::BindlessMaterialData>() as u64;
+            ssbo_map.insert("materials".to_string(), (bl_ssbo.buffer.buffer, total_size));
         }
 
         write_rt_descriptors(
@@ -1102,9 +1299,63 @@ impl RTRenderer {
             &texture_map,
         )?;
 
+        // --- 12b. Write bindless texture array descriptor ---
+        if bindless_mode {
+            if let Some(ref tex_array) = bindless_tex_array {
+                if tex_array.texture_count > 0 {
+                    // Find the bindless set and binding from reflection
+                    let rchit_refl = &rchit_reflections
+                        .first()
+                        .unwrap_or(&base_reflections[0]);
+                    let bindless_set_idx = rchit_refl
+                        .bindless
+                        .as_ref()
+                        .and_then(|b| b.texture_array.as_ref())
+                        .map(|ta| ta.set)
+                        .unwrap_or(2);
+                    let bindless_binding = rchit_refl
+                        .bindless
+                        .as_ref()
+                        .and_then(|b| b.texture_array.as_ref())
+                        .map(|ta| ta.binding)
+                        .unwrap_or(0);
+
+                    if let Some(&ds) = ds_map.get(&bindless_set_idx) {
+                        let img_infos: Vec<vk::DescriptorImageInfo> =
+                            (0..tex_array.texture_count as usize)
+                                .map(|i| {
+                                    vk::DescriptorImageInfo::default()
+                                        .sampler(tex_array.samplers[i])
+                                        .image_view(tex_array.image_views[i])
+                                        .image_layout(
+                                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                        )
+                                })
+                                .collect();
+
+                        let write = vk::WriteDescriptorSet::default()
+                            .dst_set(ds)
+                            .dst_binding(bindless_binding)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(&img_infos);
+
+                        unsafe {
+                            device.update_descriptor_sets(&[write], &[]);
+                        }
+                        info!(
+                            "RT bindless interactive: wrote {} textures to set {} binding {}",
+                            tex_array.texture_count, bindless_set_idx, bindless_binding
+                        );
+                    }
+                }
+            }
+        }
+
         info!(
             "RT renderer initialized successfully ({}, {} hit groups)",
-            if use_multi_material {
+            if bindless_mode {
+                "bindless"
+            } else if use_multi_material {
                 "multi-material"
             } else {
                 "single-material"
@@ -1145,6 +1396,8 @@ impl RTRenderer {
             per_material_texture_maps,
             draw_ranges,
             hit_group_count,
+            bindless_mode,
+            bindless_materials_ssbo,
             width,
             height,
             has_scene_bounds: true,
@@ -1340,6 +1593,13 @@ impl RTRenderer {
             ssbo.destroy(&dev, ctx.allocator_mut());
         }
         self.materials_ssbo = None;
+
+        // Free bindless materials SSBO
+        if let Some(ref mut bl_ssbo) = self.bindless_materials_ssbo {
+            let dev = ctx.device.clone();
+            bl_ssbo.buffer.destroy(&dev, ctx.allocator_mut());
+        }
+        self.bindless_materials_ssbo = None;
 
         // Free texture images and samplers
         {
@@ -1687,7 +1947,7 @@ fn create_camera_ubo(
     Ok((buffer, allocation))
 }
 
-/// Create material UBO buffer (80 bytes, host-visible for potential updates).
+/// Create material UBO buffer (144 bytes, host-visible for potential updates).
 fn create_material_ubo(
     device: &ash::Device,
     allocator: &mut Allocator,
@@ -2611,9 +2871,10 @@ fn create_sbt(
 
     let sbt_base_addr = get_buffer_device_address(device, sbt_buffer);
 
+    // Raygen: size must equal stride per Vulkan spec
     let raygen_region = vk::StridedDeviceAddressRegionKHR {
         device_address: sbt_base_addr,
-        stride: handle_size_aligned,
+        stride: raygen_size,
         size: raygen_size,
     };
 
@@ -2634,6 +2895,143 @@ fn create_sbt(
         raygen_region.device_address,
         miss_region.device_address,
         hit_region.device_address,
+        sbt_total_size
+    );
+
+    Ok((sbt_buffer, sbt_allocation, raygen_region, miss_region, hit_region))
+}
+
+/// Create SBT with replicated hit group entries for multi-geometry BLAS.
+///
+/// When using multi-geometry BLAS with a single hit shader (bindless mode),
+/// the SBT hit region must contain one entry per BLAS geometry because the
+/// Vulkan SBT lookup formula is:
+///   hit_record = hit_base + stride * (instanceSBTOffset + geometryIndex)
+/// With only 1 entry, geometries > 0 read past the SBT buffer (UB).
+/// This function replicates the single hit group handle N times.
+fn create_sbt_replicated(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    rt_loader: &ash::khr::ray_tracing_pipeline::Device,
+    rt_props: &vk::PhysicalDeviceRayTracingPipelinePropertiesKHR,
+    pipeline: vk::Pipeline,
+    num_hit_records: u32,
+) -> Result<
+    (
+        vk::Buffer,
+        Allocation,
+        vk::StridedDeviceAddressRegionKHR,
+        vk::StridedDeviceAddressRegionKHR,
+        vk::StridedDeviceAddressRegionKHR,
+    ),
+    String,
+> {
+    let handle_size = rt_props.shader_group_handle_size as u64;
+    let handle_alignment = rt_props.shader_group_handle_alignment as u64;
+    let base_alignment = rt_props.shader_group_base_alignment as u64;
+
+    let handle_size_aligned = align_up(handle_size, handle_alignment);
+
+    let raygen_size = align_up(handle_size_aligned, base_alignment);
+    let miss_size = align_up(handle_size_aligned, base_alignment);
+    let hit_size = align_up(handle_size_aligned * num_hit_records as u64, base_alignment);
+
+    let sbt_total_size = raygen_size + miss_size + hit_size;
+
+    // Get shader group handles (3 groups: raygen, miss, hit)
+    let group_count = 3u32;
+    let handle_data_size = (handle_size as u32 * group_count) as usize;
+    let handles = unsafe {
+        rt_loader
+            .get_ray_tracing_shader_group_handles(pipeline, 0, group_count, handle_data_size)
+            .map_err(|e| format!("Failed to get RT shader group handles: {:?}", e))?
+    };
+
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(sbt_total_size)
+        .usage(
+            vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        )
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let sbt_buffer = unsafe {
+        device
+            .create_buffer(&buffer_info, None)
+            .map_err(|e| format!("Failed to create SBT buffer: {:?}", e))?
+    };
+
+    let requirements = unsafe { device.get_buffer_memory_requirements(sbt_buffer) };
+
+    let mut sbt_allocation = allocator
+        .allocate(&AllocationCreateDesc {
+            name: "rt_sbt_replicated",
+            requirements,
+            location: MemoryLocation::CpuToGpu,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("Failed to allocate SBT memory: {:?}", e))?;
+
+    unsafe {
+        device
+            .bind_buffer_memory(sbt_buffer, sbt_allocation.memory(), sbt_allocation.offset())
+            .map_err(|e| format!("Failed to bind SBT buffer memory: {:?}", e))?;
+    }
+
+    if let Some(mapped) = sbt_allocation.mapped_slice_mut() {
+        for byte in mapped[..sbt_total_size as usize].iter_mut() {
+            *byte = 0;
+        }
+
+        let hs = handle_size as usize;
+        let hsa = handle_size_aligned as usize;
+
+        // Raygen at offset 0
+        mapped[0..hs].copy_from_slice(&handles[0..hs]);
+
+        // Miss at offset raygen_size
+        let miss_offset = raygen_size as usize;
+        mapped[miss_offset..miss_offset + hs].copy_from_slice(&handles[hs..hs * 2]);
+
+        // Hit: replicate the single hit group handle for each geometry
+        let hit_base = (raygen_size + miss_size) as usize;
+        let hit_handle = &handles[hs * 2..hs * 3];
+        for i in 0..num_hit_records as usize {
+            let offset = hit_base + i * hsa;
+            mapped[offset..offset + hs].copy_from_slice(hit_handle);
+        }
+    } else {
+        return Err("SBT buffer is not host-visible".to_string());
+    }
+
+    let sbt_base_addr = get_buffer_device_address(device, sbt_buffer);
+
+    // Raygen: size must equal stride per Vulkan spec
+    let raygen_region = vk::StridedDeviceAddressRegionKHR {
+        device_address: sbt_base_addr,
+        stride: raygen_size,
+        size: raygen_size,
+    };
+
+    let miss_region = vk::StridedDeviceAddressRegionKHR {
+        device_address: sbt_base_addr + raygen_size,
+        stride: handle_size_aligned,
+        size: miss_size,
+    };
+
+    let hit_region = vk::StridedDeviceAddressRegionKHR {
+        device_address: sbt_base_addr + raygen_size + miss_size,
+        stride: handle_size_aligned,
+        size: hit_size,
+    };
+
+    info!(
+        "SBT created (replicated): raygen=0x{:X}, miss=0x{:X}, hit=0x{:X}, hit_records={}, total={}",
+        raygen_region.device_address,
+        miss_region.device_address,
+        hit_region.device_address,
+        num_hit_records,
         sbt_total_size
     );
 
@@ -2775,9 +3173,10 @@ fn create_sbt_multi(
 
     let sbt_base_addr = get_buffer_device_address(device, sbt_buffer);
 
+    // Raygen: size must equal stride per Vulkan spec
     let raygen_region = vk::StridedDeviceAddressRegionKHR {
         device_address: sbt_base_addr,
-        stride: handle_size_aligned,
+        stride: raygen_size,
         size: raygen_size,
     };
 
@@ -2853,6 +3252,11 @@ fn write_rt_descriptors(
         };
 
         for binding in bindings {
+            // Skip bindless texture array — written separately
+            if binding.binding_type == "bindless_combined_image_sampler_array" {
+                continue;
+            }
+
             let vk_type = reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
 
             match vk_type {
@@ -3732,4 +4136,670 @@ fn get_buffer_device_address(device: &ash::Device, buffer: vk::Buffer) -> u64 {
 /// Align a value up to the given alignment (must be power of two).
 fn align_up(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) & !(alignment - 1)
+}
+
+// ===========================================================================
+// Bindless RT rendering path
+// ===========================================================================
+
+/// Bindless RT rendering: single uber-rchit shader with materials SSBO + bindless texture array.
+///
+/// Uses multi-geometry BLAS (one geometry per draw range) so `gl_GeometryIndexEXT`
+/// in the closest-hit shader indexes into the materials SSBO to look up per-material
+/// PBR factors and texture indices. A single hit group is used (no permutation SBT).
+fn render_rt_bindless(
+    ctx: &mut VulkanContext,
+    shader_base: &str,
+    scene_source: &str,
+    width: u32,
+    height: u32,
+    output_path: &Path,
+    ibl_name: &str,
+) -> Result<(), String> {
+    info!("RT bindless render: {}x{}, scene='{}'", width, height, scene_source);
+
+    let device = ctx.device.clone();
+
+    // --- 0. Load glTF scene ---
+    let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
+    let mut gltf_scene_opt: Option<crate::gltf_loader::GltfScene> = if is_gltf {
+        info!("Loading glTF mesh for RT bindless BLAS: {}", scene_source);
+        let gs = crate::gltf_loader::load_gltf(Path::new(scene_source))?;
+        if gs.meshes.is_empty() {
+            return Err(format!("No meshes found in glTF file: {}", scene_source));
+        }
+        Some(gs)
+    } else {
+        None
+    };
+
+    // --- 0b. Flatten geometry and build draw ranges ---
+    let (vertices, indices, draw_ranges): (Vec<scene::PbrVertex>, Vec<u32>, Vec<crate::gltf_loader::DrawRange>) =
+        if let Some(ref mut gltf_scene) = gltf_scene_opt {
+            let draw_items = crate::gltf_loader::flatten_scene(gltf_scene);
+            let mut all_verts: Vec<scene::PbrVertex> = Vec::new();
+            let mut all_indices: Vec<u32> = Vec::new();
+            let mut vertex_offset: u32 = 0;
+            let mut index_offset: u32 = 0;
+            let mut ranges: Vec<crate::gltf_loader::DrawRange> = Vec::new();
+
+            for item in &draw_items {
+                let mesh = &gltf_scene.meshes[item.mesh_index];
+                let world = item.world_transform;
+                let normal_mat = glam::Mat3::from_mat4(world).inverse().transpose();
+                for v in &mesh.vertices {
+                    let pos = world.transform_point3(glam::Vec3::from(v.position));
+                    let norm = (normal_mat * glam::Vec3::from(v.normal)).normalize();
+                    all_verts.push(scene::PbrVertex {
+                        position: pos.into(),
+                        normal: norm.into(),
+                        uv: v.uv,
+                    });
+                }
+                for &idx in &mesh.indices {
+                    all_indices.push(idx + vertex_offset);
+                }
+
+                ranges.push(crate::gltf_loader::DrawRange {
+                    index_offset,
+                    index_count: mesh.indices.len() as u32,
+                    material_index: item.material_index,
+                });
+
+                vertex_offset += mesh.vertices.len() as u32;
+                index_offset += mesh.indices.len() as u32;
+            }
+            (all_verts, all_indices, ranges)
+        } else {
+            let (v, i) = scene::generate_sphere(32, 32);
+            (v, i, Vec::new())
+        };
+
+    // --- 1. Load reflection JSON for all RT stages ---
+    let rgen_json_path = format!("{}.rgen.json", shader_base);
+    let rmiss_json_path = format!("{}.rmiss.json", shader_base);
+    let rchit_json_path = format!("{}.rchit.json", shader_base);
+
+    let mut all_reflections: Vec<reflected_pipeline::ReflectionData> = Vec::new();
+    for json_path in &[&rgen_json_path, &rmiss_json_path] {
+        if Path::new(json_path).exists() {
+            let refl = reflected_pipeline::load_reflection(Path::new(json_path))?;
+            info!("Loaded RT bindless reflection: {} (sets: {:?})", json_path, refl.descriptor_sets.keys().collect::<Vec<_>>());
+            all_reflections.push(refl);
+        }
+    }
+
+    let rchit_refl = reflected_pipeline::load_reflection(Path::new(&rchit_json_path))?;
+    info!("Loaded RT bindless rchit reflection: {} (sets: {:?})", rchit_json_path, rchit_refl.descriptor_sets.keys().collect::<Vec<_>>());
+
+    // Merge all reflections for superset descriptor layout
+    let mut all_refl_refs: Vec<&reflected_pipeline::ReflectionData> = all_reflections.iter().collect();
+    all_refl_refs.push(&rchit_refl);
+    let merged = reflected_pipeline::merge_descriptor_sets(&all_refl_refs);
+
+    // --- 2. Create bindless descriptor set layouts ---
+    let descriptor_set_layouts = unsafe {
+        reflected_pipeline::create_descriptor_set_layouts_bindless(&device, &merged)?
+    };
+
+    // Pipeline layout (no push constants for RT bindless — gl_GeometryIndexEXT handles material)
+    let pipeline_layout = unsafe {
+        reflected_pipeline::create_pipeline_layout_from_merged(&device, &descriptor_set_layouts, &[])?
+    };
+
+    // --- 3. Create storage image ---
+    let (storage_image, storage_image_view, storage_image_allocation) =
+        create_storage_image(&device, ctx.allocator_mut(), width, height)?;
+
+    // --- 4. Create camera UBO ---
+    let vertex_positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+    let draw_items_for_cam: Vec<crate::gltf_loader::DrawItem> =
+        if let Some(ref mut gs) = gltf_scene_opt {
+            crate::gltf_loader::flatten_scene(gs)
+        } else {
+            Vec::new()
+        };
+    let (auto_eye, auto_target, auto_up, auto_far) =
+        scene_manager::compute_auto_camera_from_draw_items(&vertex_positions, &draw_items_for_cam);
+
+    let (camera_buffer, camera_allocation) =
+        create_camera_ubo(&device, ctx.allocator_mut(), width, height, Some((auto_eye, auto_target, auto_up, auto_far)))?;
+
+    // --- 5. Build multi-geometry BLAS (one geometry per draw range) ---
+    let (blas, blas_buffer, blas_allocation, blas_device_address) = if !draw_ranges.is_empty() && draw_ranges.len() > 1 {
+        build_blas_multi_geometry(ctx, &vertices, &indices, &draw_ranges)?
+    } else {
+        build_blas(ctx, &vertices, &indices)?
+    };
+
+    // --- 6. SoA storage buffers ---
+    let positions_data: Vec<[f32; 4]> = vertices.iter().map(|v| [v.position[0], v.position[1], v.position[2], 1.0]).collect();
+    let normals_data: Vec<[f32; 4]> = vertices.iter().map(|v| [v.normal[0], v.normal[1], v.normal[2], 0.0]).collect();
+    let tex_coords_data: Vec<[f32; 2]> = vertices.iter().map(|v| v.uv).collect();
+
+    let positions_buffer = create_device_address_buffer(&device, ctx.allocator_mut(), bytemuck::cast_slice(&positions_data), vk::BufferUsageFlags::STORAGE_BUFFER, "rt_bl_positions")?;
+    let normals_buffer = create_device_address_buffer(&device, ctx.allocator_mut(), bytemuck::cast_slice(&normals_data), vk::BufferUsageFlags::STORAGE_BUFFER, "rt_bl_normals")?;
+    let tex_coords_buffer = create_device_address_buffer(&device, ctx.allocator_mut(), bytemuck::cast_slice(&tex_coords_data), vk::BufferUsageFlags::STORAGE_BUFFER, "rt_bl_tex_coords")?;
+    let index_storage_buffer = create_device_address_buffer(&device, ctx.allocator_mut(), bytemuck::cast_slice(&indices), vk::BufferUsageFlags::STORAGE_BUFFER, "rt_bl_indices")?;
+
+    // --- 7. Upload per-material textures ---
+    let mut texture_images: Vec<(vk::Image, Option<gpu_allocator::vulkan::Allocation>, vk::ImageView, vk::Sampler)> = Vec::new();
+
+    let tex_sampler = {
+        let sampler_create = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT);
+        unsafe { device.create_sampler(&sampler_create, None).map_err(|e| format!("Failed to create RT bindless sampler: {:?}", e))? }
+    };
+
+    // Default textures
+    let white_pixel: [u8; 4] = [255, 255, 255, 255];
+    let default_white = create_rt_texture_image(ctx, 1, 1, &white_pixel, "rt_bl_default_white")?;
+    let default_white_view = default_white.1;
+    texture_images.push((default_white.0, Some(default_white.2), default_white.1, tex_sampler));
+
+    let black_pixel: [u8; 4] = [0, 0, 0, 255];
+    let default_black = create_rt_texture_image(ctx, 1, 1, &black_pixel, "rt_bl_default_black")?;
+    let default_black_view = default_black.1;
+    texture_images.push((default_black.0, Some(default_black.2), default_black.1, tex_sampler));
+
+    let flat_normal_pixel: [u8; 4] = [128, 128, 255, 255];
+    let default_normal = create_rt_texture_image(ctx, 1, 1, &flat_normal_pixel, "rt_bl_default_normal")?;
+    let default_normal_view = default_normal.1;
+    texture_images.push((default_normal.0, Some(default_normal.2), default_normal.1, tex_sampler));
+
+    // Build per-material texture maps
+    let mut per_material_texture_maps: Vec<HashMap<String, (vk::ImageView, vk::Sampler)>> = Vec::new();
+    let mut uploaded_tex_cache: HashMap<String, (vk::ImageView, vk::Sampler)> = HashMap::new();
+    let mut texture_map: HashMap<String, (vk::ImageView, vk::Sampler)> = HashMap::new();
+
+    if let Some(ref gltf_scene) = gltf_scene_opt {
+        for mat_idx in 0..gltf_scene.materials.len() {
+            let mat = &gltf_scene.materials[mat_idx];
+            let mut mat_tex_map: HashMap<String, (vk::ImageView, vk::Sampler)> = HashMap::new();
+
+            let tex_slots: &[(&str, &Option<crate::gltf_loader::TextureImage>)] = &[
+                ("base_color_tex", &mat.base_color_image),
+                ("normal_tex", &mat.normal_image),
+                ("metallic_roughness_tex", &mat.metallic_roughness_image),
+                ("occlusion_tex", &mat.occlusion_image),
+                ("emissive_tex", &mat.emissive_image),
+                ("sheen_color_tex", &mat.sheen_color_image),
+                ("clearcoat_tex", &mat.clearcoat_image),
+                ("clearcoat_roughness_tex", &mat.clearcoat_roughness_image),
+                ("transmission_tex", &mat.transmission_image),
+            ];
+
+            for &(tex_name, tex_opt) in tex_slots {
+                if let Some(tex_data) = tex_opt.as_ref() {
+                    let cache_key = format!("mat{}_{}", mat_idx, tex_name);
+                    if let Some(&(view, sampler)) = uploaded_tex_cache.get(&cache_key) {
+                        mat_tex_map.insert(tex_name.to_string(), (view, sampler));
+                    } else {
+                        let gpu_tex = create_rt_texture_image(ctx, tex_data.width, tex_data.height, &tex_data.pixels, &format!("rt_bl_mat{}_{}", mat_idx, tex_name))?;
+                        let view = gpu_tex.1;
+                        texture_images.push((gpu_tex.0, Some(gpu_tex.2), gpu_tex.1, tex_sampler));
+                        mat_tex_map.insert(tex_name.to_string(), (view, tex_sampler));
+                        uploaded_tex_cache.insert(cache_key, (view, tex_sampler));
+                    }
+                }
+                // If texture is missing, do NOT insert a default.
+                // The SSBO lookup returns -1, shader uses factor directly.
+            }
+
+            per_material_texture_maps.push(mat_tex_map);
+        }
+
+        if let Some(first_map) = per_material_texture_maps.first() {
+            texture_map = first_map.clone();
+        }
+    }
+
+    // Load IBL assets into texture_map
+    load_rt_ibl_assets(ctx, &mut texture_map, &mut texture_images, ibl_name);
+
+    // NOTE: Do NOT insert IBL cubemap views into per_material_texture_maps for bindless.
+    // IBL textures (env_specular, env_irradiance, brdf_lut) are cubemap/2D views bound
+    // at their own descriptor bindings, not in the bindless 2D texture array.
+    // Mixing cubemap views into a sampler2D array causes undefined sampling behavior.
+
+    // --- 8. Build bindless texture array and materials SSBO ---
+    let (bindless_tex_array, dedup_map) = scene_manager::build_bindless_texture_array_from_views(&per_material_texture_maps);
+
+    info!("RT bindless: {} unique textures in bindless array", bindless_tex_array.texture_count);
+
+    let materials_ssbo = if let Some(ref gs) = gltf_scene_opt {
+        // Index by geometry (draw range) so gl_GeometryIndexEXT maps correctly
+        scene_manager::build_materials_ssbo_by_geometry(
+            &device, ctx.allocator_mut(), gs, &dedup_map,
+            &per_material_texture_maps,
+            default_white_view, default_black_view, default_normal_view,
+            &draw_ranges,
+        )?
+    } else {
+        // Procedural scene: single default material
+        let default_mat = scene_manager::BindlessMaterialData {
+            base_color_factor: [1.0, 1.0, 1.0, 1.0],
+            emissive_factor: [0.0, 0.0, 0.0],
+            metallic_factor: 0.0,
+            roughness_factor: 1.0,
+            emissive_strength: 1.0,
+            ior: 1.5,
+            clearcoat_factor: 0.0,
+            clearcoat_roughness: 0.0,
+            sheen_roughness: 0.0,
+            transmission_factor: 0.0,
+            _pad_before_sheen: 0.0,
+            sheen_color_factor: [0.0, 0.0, 0.0],
+            _pad_after_sheen: 0.0,
+            base_color_tex_index: -1,
+            normal_tex_index: -1,
+            metallic_roughness_tex_index: -1,
+            occlusion_tex_index: -1,
+            emissive_tex_index: -1,
+            clearcoat_tex_index: -1,
+            clearcoat_roughness_tex_index: -1,
+            sheen_color_tex_index: -1,
+            transmission_tex_index: -1,
+            material_flags: 0,
+            index_offset: 0.0,
+            _padding: 0,
+        };
+        let buf = scene_manager::create_buffer_with_data(
+            &device, ctx.allocator_mut(),
+            bytemuck::bytes_of(&default_mat),
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "rt_bl_materials_ssbo",
+        )?;
+        scene_manager::BindlessMaterialsSSBO { buffer: buf, material_count: 1 }
+    };
+
+    info!("RT bindless: {} materials in SSBO", materials_ssbo.material_count);
+
+    // --- 9. Create material UBO (for non-bindless descriptor writes) ---
+    let material_data = if let Some(ref gs) = gltf_scene_opt {
+        if !gs.materials.is_empty() {
+            MaterialUboData::from_gltf_material(&gs.materials[0])
+        } else {
+            MaterialUboData::default_values()
+        }
+    } else {
+        MaterialUboData::default_values()
+    };
+    let (material_buffer, material_allocation) = create_material_ubo(&device, ctx.allocator_mut(), &material_data)?;
+
+    // --- 10. Build TLAS ---
+    let (tlas, tlas_buffer, tlas_allocation) = build_tlas(ctx, blas_device_address)?;
+
+    // --- 11. Load shader modules and create RT pipeline ---
+    let rgen_path = format!("{}.rgen.spv", shader_base);
+    let rmiss_path = format!("{}.rmiss.spv", shader_base);
+    let rchit_path = format!("{}.rchit.spv", shader_base);
+
+    let rgen_code = spv_loader::load_spirv(Path::new(&rgen_path))?;
+    let rmiss_code = spv_loader::load_spirv(Path::new(&rmiss_path))?;
+    let rchit_code = spv_loader::load_spirv(Path::new(&rchit_path))?;
+
+    let rgen_module = spv_loader::create_shader_module(&device, &rgen_code)?;
+    let rmiss_module = spv_loader::create_shader_module(&device, &rmiss_code)?;
+    let rchit_module = spv_loader::create_shader_module(&device, &rchit_code)?;
+
+    let rt_pipeline_loader = ctx.rt_pipeline_loader.as_ref().unwrap();
+    let pipeline = create_rt_pipeline_multi(&device, rt_pipeline_loader, rgen_module, rmiss_module, &[rchit_module], pipeline_layout)?;
+
+    unsafe {
+        device.destroy_shader_module(rgen_module, None);
+        device.destroy_shader_module(rmiss_module, None);
+        device.destroy_shader_module(rchit_module, None);
+    }
+
+    // --- 12. Create SBT with replicated hit entries for multi-geometry BLAS ---
+    let rt_props = ctx.rt_properties.as_ref().unwrap().clone();
+    let rt_pipeline_loader_clone = ctx.rt_pipeline_loader.clone().unwrap();
+    let num_hit_replicas = if draw_ranges.len() > 1 { draw_ranges.len() as u32 } else { 1u32 };
+
+    let (sbt_buffer, sbt_allocation, raygen_region, miss_region, hit_region) = create_sbt_replicated(
+        &device, ctx.allocator_mut(), &rt_pipeline_loader_clone, &rt_props, pipeline, num_hit_replicas,
+    )?;
+
+    // --- 13. Create descriptor pool and allocate sets (bindless-aware) ---
+    let (pool_sizes, max_sets) = reflected_pipeline::compute_pool_sizes_bindless(&merged);
+
+    let descriptor_pool = unsafe {
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(max_sets)
+            .pool_sizes(&pool_sizes)
+            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND);
+        device.create_descriptor_pool(&pool_info, None)
+            .map_err(|e| format!("Failed to create RT bindless descriptor pool: {:?}", e))?
+    };
+
+    // Allocate descriptor sets, with variable count for the bindless set
+    let max_set_idx = descriptor_set_layouts.keys().copied().max().unwrap_or(0);
+    let mut ordered_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
+    let mut set_indices: Vec<u32> = Vec::new();
+    for i in 0..=max_set_idx {
+        if let Some(&layout) = descriptor_set_layouts.get(&i) {
+            ordered_layouts.push(layout);
+            set_indices.push(i);
+        }
+    }
+
+    // Build variable count info for the bindless texture array set
+    let actual_tex_count = bindless_tex_array.texture_count.max(1);
+    let mut variable_counts: Vec<u32> = vec![0; ordered_layouts.len()];
+
+    // Find which set has the bindless_combined_image_sampler_array binding
+    for (layout_idx, &set_idx) in set_indices.iter().enumerate() {
+        if let Some(bindings) = merged.get(&set_idx) {
+            for b in bindings {
+                if b.binding_type == "bindless_combined_image_sampler_array" {
+                    variable_counts[layout_idx] = actual_tex_count;
+                }
+            }
+        }
+    }
+
+    let mut variable_count_info = vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
+        .descriptor_counts(&variable_counts);
+
+    let alloc_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&ordered_layouts)
+        .push_next(&mut variable_count_info);
+
+    let descriptor_sets = unsafe {
+        device.allocate_descriptor_sets(&alloc_info)
+            .map_err(|e| format!("Failed to allocate RT bindless descriptor sets: {:?}", e))?
+    };
+
+    let mut ds_map: HashMap<u32, vk::DescriptorSet> = HashMap::new();
+    for (idx, &set_idx) in set_indices.iter().enumerate() {
+        ds_map.insert(set_idx, descriptor_sets[idx]);
+    }
+
+    // --- 14. Write descriptors ---
+    // Non-bindless sets: set 0 (camera, TLAS, storage image), set 1 (IBL, SoA, materials SSBO)
+    let ssbo_map: HashMap<String, (vk::Buffer, u64)> = [
+        ("positions".to_string(), (positions_buffer.buffer, positions_data.len() as u64 * 16)),
+        ("normals".to_string(), (normals_buffer.buffer, normals_data.len() as u64 * 16)),
+        ("tex_coords".to_string(), (tex_coords_buffer.buffer, tex_coords_data.len() as u64 * 8)),
+        ("indices".to_string(), (index_storage_buffer.buffer, indices.len() as u64 * 4)),
+        ("materials".to_string(), (materials_ssbo.buffer.buffer, materials_ssbo.material_count as u64 * std::mem::size_of::<scene_manager::BindlessMaterialData>() as u64)),
+    ].into_iter().collect();
+
+    // Write non-bindless descriptors using the existing write_rt_descriptors for sets 0 and 1
+    // (skip set 2 which is the bindless texture array)
+    {
+        let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+        let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
+        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+        let mut as_bindings: Vec<(u32, u32)> = Vec::new();
+
+        let total_bindings: usize = merged.values().map(|v| v.len()).sum();
+        buffer_infos.reserve(total_bindings);
+        image_infos.reserve(total_bindings);
+
+        for (&set_idx, bindings) in &merged {
+            let ds = match ds_map.get(&set_idx) {
+                Some(&ds) => ds,
+                None => continue,
+            };
+
+            for binding in bindings {
+                // Skip the bindless texture array binding (written separately)
+                if binding.binding_type == "bindless_combined_image_sampler_array" {
+                    continue;
+                }
+
+                let vk_type = reflected_pipeline::binding_type_to_vk_public(&binding.binding_type);
+
+                match vk_type {
+                    vk::DescriptorType::UNIFORM_BUFFER => {
+                        let (buffer, range) = match binding.name.as_str() {
+                            "Material" => (material_buffer, std::mem::size_of::<MaterialUboData>() as u64),
+                            _ => {
+                                let r = if binding.size > 0 { binding.size as u64 } else { 128 };
+                                (camera_buffer, r)
+                            }
+                        };
+                        let idx = buffer_infos.len();
+                        buffer_infos.push(vk::DescriptorBufferInfo::default().buffer(buffer).offset(0).range(range));
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds).dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                .buffer_info(unsafe { std::slice::from_raw_parts(&buffer_infos[idx] as *const _, 1) }),
+                        );
+                    }
+                    vk::DescriptorType::STORAGE_IMAGE => {
+                        let idx = image_infos.len();
+                        image_infos.push(vk::DescriptorImageInfo::default().image_view(storage_image_view).image_layout(vk::ImageLayout::GENERAL));
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds).dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                                .image_info(unsafe { std::slice::from_raw_parts(&image_infos[idx] as *const _, 1) }),
+                        );
+                    }
+                    vk::DescriptorType::STORAGE_BUFFER => {
+                        if let Some(&(buf, size)) = ssbo_map.get(&binding.name) {
+                            let idx = buffer_infos.len();
+                            buffer_infos.push(vk::DescriptorBufferInfo::default().buffer(buf).offset(0).range(size));
+                            writes.push(
+                                vk::WriteDescriptorSet::default()
+                                    .dst_set(ds).dst_binding(binding.binding)
+                                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                    .buffer_info(unsafe { std::slice::from_raw_parts(&buffer_infos[idx] as *const _, 1) }),
+                            );
+                        }
+                    }
+                    vk::DescriptorType::SAMPLER => {
+                        let tex_name = binding.name.trim_end_matches("_sampler").to_string();
+                        let actual_sampler = texture_map.get(&tex_name).or_else(|| texture_map.get(&binding.name)).map(|t| t.1)
+                            .unwrap_or_else(|| texture_map.values().next().map(|t| t.1).unwrap_or(vk::Sampler::null()));
+                        let idx = image_infos.len();
+                        image_infos.push(vk::DescriptorImageInfo::default().sampler(actual_sampler));
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds).dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::SAMPLER)
+                                .image_info(unsafe { std::slice::from_raw_parts(&image_infos[idx] as *const _, 1) }),
+                        );
+                    }
+                    vk::DescriptorType::SAMPLED_IMAGE => {
+                        let tex_name = binding.name.trim_end_matches("_image").to_string();
+                        let view = texture_map.get(&tex_name).or_else(|| texture_map.get(&binding.name)).map(|t| t.0)
+                            .unwrap_or_else(|| texture_map.values().next().map(|t| t.0).unwrap_or(vk::ImageView::null()));
+                        let idx = image_infos.len();
+                        image_infos.push(vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds).dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                .image_info(unsafe { std::slice::from_raw_parts(&image_infos[idx] as *const _, 1) }),
+                        );
+                    }
+                    vk::DescriptorType::ACCELERATION_STRUCTURE_KHR => {
+                        as_bindings.push((set_idx, binding.binding));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if !writes.is_empty() {
+            unsafe { device.update_descriptor_sets(&writes, &[]); }
+        }
+
+        // Write AS descriptors
+        for (set_idx, binding_idx) in &as_bindings {
+            let ds = match ds_map.get(set_idx) {
+                Some(&ds) => ds,
+                None => continue,
+            };
+            let as_arr = [tlas];
+            let mut as_write_info = vk::WriteDescriptorSetAccelerationStructureKHR::default()
+                .acceleration_structures(&as_arr);
+            let mut write = vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(*binding_idx)
+                .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                .descriptor_count(1);
+            write = write.push_next(&mut as_write_info);
+            unsafe { device.update_descriptor_sets(&[write], &[]); }
+        }
+    }
+
+    // --- 15. Write bindless texture array to set 2, binding 0 ---
+    if bindless_tex_array.texture_count > 0 {
+        // Find the bindless set
+        let bindless_set_idx = rchit_refl.bindless.as_ref().and_then(|b| b.texture_array.as_ref()).map(|ta| ta.set).unwrap_or(2);
+        let bindless_binding = rchit_refl.bindless.as_ref().and_then(|b| b.texture_array.as_ref()).map(|ta| ta.binding).unwrap_or(0);
+
+        if let Some(&ds) = ds_map.get(&bindless_set_idx) {
+            let img_infos: Vec<vk::DescriptorImageInfo> = (0..bindless_tex_array.texture_count as usize)
+                .map(|i| {
+                    vk::DescriptorImageInfo::default()
+                        .sampler(bindless_tex_array.samplers[i])
+                        .image_view(bindless_tex_array.image_views[i])
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                })
+                .collect();
+
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(bindless_binding)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&img_infos);
+
+            unsafe { device.update_descriptor_sets(&[write], &[]); }
+            info!("RT bindless: wrote {} textures to set {} binding {}", bindless_tex_array.texture_count, bindless_set_idx, bindless_binding);
+        }
+    }
+
+    info!("RT bindless renderer initialized: {} draw ranges, {} textures, {} materials",
+          draw_ranges.len(), bindless_tex_array.texture_count, materials_ssbo.material_count);
+
+    // --- 16. Record and execute trace ---
+    let cmd = ctx.begin_single_commands()?;
+
+    // Transition storage image UNDEFINED -> GENERAL
+    screenshot::cmd_transition_image(
+        &device, cmd, storage_image,
+        vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL,
+        vk::AccessFlags::empty(), vk::AccessFlags::SHADER_WRITE,
+        vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+    );
+
+    unsafe {
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::RAY_TRACING_KHR, pipeline);
+        device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::RAY_TRACING_KHR, pipeline_layout, 0, &descriptor_sets, &[]);
+    }
+
+    let callable_region = vk::StridedDeviceAddressRegionKHR::default();
+    unsafe {
+        rt_pipeline_loader_clone.cmd_trace_rays(cmd, &raygen_region, &miss_region, &hit_region, &callable_region, width, height, 1);
+    }
+
+    // Transition GENERAL -> TRANSFER_SRC_OPTIMAL
+    screenshot::cmd_transition_image(
+        &device, cmd, storage_image,
+        vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::TRANSFER_READ,
+        vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR, vk::PipelineStageFlags::TRANSFER,
+    );
+
+    // Copy to staging and save
+    let mut staging = screenshot::StagingBuffer::new(&device, ctx.allocator_mut(), width, height)?;
+    screenshot::cmd_copy_image_to_buffer(&device, cmd, storage_image, staging.buffer, width, height);
+    ctx.end_single_commands(cmd)?;
+
+    let pixels = staging.read_pixels(width, height)?;
+    screenshot::save_png(&pixels, width, height, output_path)?;
+    info!("Saved RT bindless render to {:?}", output_path);
+
+    // --- Cleanup ---
+    staging.destroy(&device, ctx.allocator_mut());
+
+    unsafe {
+        device.destroy_pipeline(pipeline, None);
+        device.destroy_pipeline_layout(pipeline_layout, None);
+        device.destroy_descriptor_pool(descriptor_pool, None);
+        for (_, layout) in &descriptor_set_layouts {
+            device.destroy_descriptor_set_layout(*layout, None);
+        }
+    }
+
+    if let Some(as_loader) = ctx.accel_struct_loader.as_ref() {
+        unsafe {
+            as_loader.destroy_acceleration_structure(blas, None);
+            as_loader.destroy_acceleration_structure(tlas, None);
+        }
+    }
+
+    {
+        let _ = ctx.allocator_mut().free(blas_allocation);
+        unsafe { device.destroy_buffer(blas_buffer, None); }
+    }
+    {
+        let _ = ctx.allocator_mut().free(tlas_allocation);
+        unsafe { device.destroy_buffer(tlas_buffer, None); }
+    }
+    {
+        let _ = ctx.allocator_mut().free(sbt_allocation);
+        unsafe { device.destroy_buffer(sbt_buffer, None); }
+    }
+
+    unsafe { device.destroy_image_view(storage_image_view, None); }
+    {
+        let _ = ctx.allocator_mut().free(storage_image_allocation);
+        unsafe { device.destroy_image(storage_image, None); }
+    }
+
+    {
+        let _ = ctx.allocator_mut().free(camera_allocation);
+        unsafe { device.destroy_buffer(camera_buffer, None); }
+    }
+    {
+        let _ = ctx.allocator_mut().free(material_allocation);
+        unsafe { device.destroy_buffer(material_buffer, None); }
+    }
+
+    {
+        let mut pb = positions_buffer;
+        let mut nb = normals_buffer;
+        let mut tb = tex_coords_buffer;
+        let mut ib = index_storage_buffer;
+        pb.destroy(&device, ctx.allocator_mut());
+        nb.destroy(&device, ctx.allocator_mut());
+        tb.destroy(&device, ctx.allocator_mut());
+        ib.destroy(&device, ctx.allocator_mut());
+    }
+
+    {
+        let mut mb = materials_ssbo.buffer;
+        mb.destroy(&device, ctx.allocator_mut());
+    }
+
+    {
+        let mut destroyed_samplers = std::collections::HashSet::new();
+        for (image, alloc, view, sampler) in texture_images {
+            unsafe { device.destroy_image_view(view, None); }
+            if let Some(a) = alloc {
+                let _ = ctx.allocator_mut().free(a);
+            }
+            unsafe {
+                device.destroy_image(image, None);
+                if destroyed_samplers.insert(sampler) {
+                    device.destroy_sampler(sampler, None);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

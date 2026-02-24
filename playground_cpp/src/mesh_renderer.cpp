@@ -791,6 +791,28 @@ void MeshRenderer::init(VulkanContext& ctx, SceneManager& scene,
     createRenderPass(ctx);
     createFramebuffer(ctx);
 
+    // Check for bindless mode: fragment reflection has bindless enabled AND hardware supports it
+    if (m_fragReflection.bindlessEnabled && ctx.supportsBindless()) {
+        std::cout << "[mesh] Bindless mode detected (reflection + hardware support)" << std::endl;
+        m_bindlessMode = true;
+
+        // Load fragment shader
+        auto fragCode = SpvLoader::loadSPIRV(pipelineBase + ".frag.spv");
+        m_fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
+
+        // Build bindless resources from scene
+        m_bindlessTextures = m_scene->buildBindlessTextureArray(ctx);
+        m_bindlessMaterials = m_scene->buildMaterialsSSBO(ctx, m_bindlessTextures);
+
+        // Setup bindless pipeline and descriptors
+        setupBindlessMode(ctx);
+
+        std::cout << "[mesh] Mesh shader renderer initialized (bindless): " << pipelineBase
+                  << ", " << m_bindlessTextures.textureCount << " texture(s), "
+                  << m_bindlessMaterials.materialCount << " material(s)" << std::endl;
+        return;
+    }
+
     // Check for manifest to enable multi-pipeline mode
     ShaderManifest manifest = tryLoadManifest(pipelineBase);
     bool hasMultipleMaterials = m_scene->hasGltfScene() &&
@@ -862,7 +884,53 @@ void MeshRenderer::render(VulkanContext& ctx) {
 
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-    if (m_multiPipeline) {
+    if (m_bindlessMode) {
+        // Bindless mode: single pipeline, all descriptor sets bound once,
+        // per-group push constants for meshletOffset + material_index.
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+
+        // Bind all descriptor sets (0, 1, 2) once
+        int maxSet = -1;
+        for (auto& [idx, _] : m_descriptorSets) {
+            maxSet = std::max(maxSet, idx);
+        }
+        for (int i = 0; i <= maxSet; i++) {
+            auto it = m_descriptorSets.find(i);
+            if (it != m_descriptorSets.end()) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        m_pipelineLayout, static_cast<uint32_t>(i),
+                                        1, &it->second, 0, nullptr);
+            }
+        }
+
+        // Dispatch per meshlet group with push constants
+        struct MeshBindlessPushConstants {
+            uint32_t meshletOffset;
+            uint32_t materialIndex;
+        };
+
+        if (!m_meshletGroups.empty()) {
+            // Multi-material: dispatch per group
+            for (auto& group : m_meshletGroups) {
+                MeshBindlessPushConstants pc;
+                pc.meshletOffset = group.firstMeshlet;
+                pc.materialIndex = static_cast<uint32_t>(group.materialIndex);
+                vkCmdPushConstants(cmd, m_pipelineLayout,
+                                   VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(pc), &pc);
+                ctx.pfnCmdDrawMeshTasksEXT(cmd, group.meshletCount, 1, 1);
+            }
+        } else {
+            // Single material: dispatch all meshlets at once
+            MeshBindlessPushConstants pc;
+            pc.meshletOffset = 0;
+            pc.materialIndex = 0;
+            vkCmdPushConstants(cmd, m_pipelineLayout,
+                               VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(pc), &pc);
+            ctx.pfnCmdDrawMeshTasksEXT(cmd, m_totalMeshlets, 1, 1);
+        }
+    } else if (m_multiPipeline) {
         // Multi-pipeline mode: dispatch meshlet groups with per-material pipeline switching.
         // Bind shared set 0 once (meshlet data + SoA buffers + MVP + Light)
         if (m_sharedSet0 != VK_NULL_HANDLE && !m_meshPermutations.empty()) {
@@ -1074,7 +1142,51 @@ void MeshRenderer::renderToSwapchain(VulkanContext& ctx,
 
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-    if (m_multiPipeline) {
+    if (m_bindlessMode) {
+        // Bindless mode: single pipeline, all descriptor sets bound once,
+        // per-group push constants for meshletOffset + material_index.
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+
+        // Bind all descriptor sets (0, 1, 2) once
+        int maxSet = -1;
+        for (auto& [idx, _] : m_descriptorSets) {
+            maxSet = std::max(maxSet, idx);
+        }
+        for (int i = 0; i <= maxSet; i++) {
+            auto it = m_descriptorSets.find(i);
+            if (it != m_descriptorSets.end()) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        m_pipelineLayout, static_cast<uint32_t>(i),
+                                        1, &it->second, 0, nullptr);
+            }
+        }
+
+        // Dispatch per meshlet group with push constants
+        struct MeshBindlessPushConstants {
+            uint32_t meshletOffset;
+            uint32_t materialIndex;
+        };
+
+        if (!m_meshletGroups.empty()) {
+            for (auto& group : m_meshletGroups) {
+                MeshBindlessPushConstants pc;
+                pc.meshletOffset = group.firstMeshlet;
+                pc.materialIndex = static_cast<uint32_t>(group.materialIndex);
+                vkCmdPushConstants(cmd, m_pipelineLayout,
+                                   VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(pc), &pc);
+                ctx.pfnCmdDrawMeshTasksEXT(cmd, group.meshletCount, 1, 1);
+            }
+        } else {
+            MeshBindlessPushConstants pc;
+            pc.meshletOffset = 0;
+            pc.materialIndex = 0;
+            vkCmdPushConstants(cmd, m_pipelineLayout,
+                               VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(pc), &pc);
+            ctx.pfnCmdDrawMeshTasksEXT(cmd, m_totalMeshlets, 1, 1);
+        }
+    } else if (m_multiPipeline) {
         // Multi-pipeline mode: dispatch meshlet groups with per-material pipeline switching.
         if (m_sharedSet0 != VK_NULL_HANDLE && !m_meshPermutations.empty()) {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1156,6 +1268,361 @@ void MeshRenderer::renderToSwapchain(VulkanContext& ctx,
     submitInfo.pSignalSemaphores = &signalSem;
 
     vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, fence);
+}
+
+// --------------------------------------------------------------------------
+// Bindless mode setup: single pipeline + materials SSBO + bindless texture array
+// --------------------------------------------------------------------------
+
+void MeshRenderer::setupBindlessMode(VulkanContext& ctx) {
+    std::vector<ReflectionData> stages = {m_meshReflection, m_fragReflection};
+    auto mergedBindings = getMergedBindings(stages);
+
+    // ---- Descriptor set layouts ----
+    // Set 0: MVP UBO (from mesh shader)
+    // Set 1: Light UBO + IBL samplers/images + materials SSBO (from fragment shader)
+    // Set 2: Bindless texture array (from fragment shader)
+    //
+    // We create set 0 and set 1 normally, but set 2 needs special bindless flags.
+
+    // Create set 0 and set 1 layouts via the standard multi-stage helper
+    // (it will also create set 2 but we'll override that)
+    auto standardLayouts = createDescriptorSetLayoutsMultiStage(ctx.device, stages);
+
+    // Override set 2 with proper bindless layout (UPDATE_AFTER_BIND + variable count)
+    int bindlessSetIdx = -1;
+    uint32_t bindlessMaxCount = 1024;
+
+    for (auto& b : mergedBindings) {
+        if (b.type == "bindless_combined_image_sampler_array") {
+            bindlessSetIdx = b.set;
+            if (b.max_count > 0) bindlessMaxCount = static_cast<uint32_t>(b.max_count);
+            break;
+        }
+    }
+
+    if (bindlessSetIdx >= 0) {
+        // Destroy the standard layout for this set (we'll create a proper bindless one)
+        auto stdIt = standardLayouts.find(bindlessSetIdx);
+        if (stdIt != standardLayouts.end()) {
+            vkDestroyDescriptorSetLayout(ctx.device, stdIt->second, nullptr);
+            standardLayouts.erase(stdIt);
+        }
+
+        // Create bindless descriptor set layout with UPDATE_AFTER_BIND
+        VkDescriptorSetLayoutBinding bindlessBinding = {};
+        bindlessBinding.binding = 0;
+        bindlessBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindlessBinding.descriptorCount = bindlessMaxCount;
+        bindlessBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorBindingFlags bindingFlags =
+            VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+            VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT |
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+
+        VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo = {};
+        flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+        flagsInfo.bindingCount = 1;
+        flagsInfo.pBindingFlags = &bindingFlags;
+
+        VkDescriptorSetLayoutCreateInfo bindlessLayoutInfo = {};
+        bindlessLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        bindlessLayoutInfo.pNext = &flagsInfo;
+        bindlessLayoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        bindlessLayoutInfo.bindingCount = 1;
+        bindlessLayoutInfo.pBindings = &bindlessBinding;
+
+        VkDescriptorSetLayout bindlessLayout;
+        if (vkCreateDescriptorSetLayout(ctx.device, &bindlessLayoutInfo, nullptr, &bindlessLayout) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create bindless descriptor set layout for mesh renderer");
+        }
+        standardLayouts[bindlessSetIdx] = bindlessLayout;
+    }
+
+    // Store all layouts
+    m_setLayouts = standardLayouts;
+
+    // ---- Pipeline layout ----
+    m_pipelineLayout = createReflectedPipelineLayoutMultiStage(ctx.device, m_setLayouts, stages);
+
+    // ---- Graphics pipeline ----
+    VkPipelineShaderStageCreateInfo shaderStages[2] = {};
+    shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStages[0].stage = VK_SHADER_STAGE_MESH_BIT_EXT;
+    shaderStages[0].module = m_meshModule;
+    shaderStages[0].pName = "main";
+
+    shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    shaderStages[1].module = m_fragModule;
+    shaderStages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vertexInput = {};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport viewport = {0, 0, (float)m_width, (float)m_height, 0, 1};
+    VkRect2D scissor = {{0, 0}, {m_width, m_height}};
+    VkPipelineViewportStateCreateInfo viewportState = {};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1; viewportState.pViewports = &viewport;
+    viewportState.scissorCount = 1; viewportState.pScissors = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer = {};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth = 1.0f;
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+    VkPipelineMultisampleStateCreateInfo multisampling = {};
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil = {};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+    VkPipelineColorBlendAttachmentState colorBlendAtt = {};
+    colorBlendAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo colorBlending = {};
+    colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlending.attachmentCount = 1;
+    colorBlending.pAttachments = &colorBlendAtt;
+
+    VkGraphicsPipelineCreateInfo pipeInfo = {};
+    pipeInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipeInfo.stageCount = 2;
+    pipeInfo.pStages = shaderStages;
+    pipeInfo.pVertexInputState = &vertexInput;
+    pipeInfo.pInputAssemblyState = &inputAssembly;
+    pipeInfo.pViewportState = &viewportState;
+    pipeInfo.pRasterizationState = &rasterizer;
+    pipeInfo.pMultisampleState = &multisampling;
+    pipeInfo.pDepthStencilState = &depthStencil;
+    pipeInfo.pColorBlendState = &colorBlending;
+    pipeInfo.layout = m_pipelineLayout;
+    pipeInfo.renderPass = m_renderPass;
+    pipeInfo.subpass = 0;
+
+    if (vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeInfo,
+                                  nullptr, &m_pipeline) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create bindless mesh shader pipeline");
+    }
+
+    // ---- Descriptor pool ----
+    // Count pool sizes from merged bindings
+    std::unordered_map<VkDescriptorType, uint32_t> typeCounts;
+    for (auto& b : mergedBindings) {
+        VkDescriptorType vkType = bindingTypeToVkDescriptorType(b.type);
+        if (b.type == "bindless_combined_image_sampler_array") {
+            typeCounts[vkType] += bindlessMaxCount;
+        } else {
+            typeCounts[vkType]++;
+        }
+    }
+
+    std::vector<VkDescriptorPoolSize> poolSizes;
+    for (auto& [type, count] : typeCounts) {
+        poolSizes.push_back({type, count});
+    }
+
+    uint32_t maxSets = static_cast<uint32_t>(m_setLayouts.size());
+
+    VkDescriptorPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+    poolInfo.maxSets = maxSets;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+
+    if (vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &m_descriptorPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create bindless descriptor pool for mesh renderer");
+    }
+
+    // ---- Allocate descriptor sets ----
+    for (auto& [setIdx, layout] : m_setLayouts) {
+        if (setIdx == bindlessSetIdx) continue; // allocate bindless set separately
+        VkDescriptorSetAllocateInfo allocSetInfo = {};
+        allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocSetInfo.descriptorPool = m_descriptorPool;
+        allocSetInfo.descriptorSetCount = 1;
+        allocSetInfo.pSetLayouts = &layout;
+
+        VkDescriptorSet set;
+        if (vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &set) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate mesh shader descriptor set " + std::to_string(setIdx));
+        }
+        m_descriptorSets[setIdx] = set;
+    }
+
+    // Allocate bindless set 2 with variable descriptor count
+    if (bindlessSetIdx >= 0) {
+        uint32_t actualTexCount = m_bindlessTextures.textureCount;
+        if (actualTexCount == 0) actualTexCount = 1; // need at least 1
+
+        VkDescriptorSetVariableDescriptorCountAllocateInfo varCountInfo = {};
+        varCountInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO;
+        varCountInfo.descriptorSetCount = 1;
+        varCountInfo.pDescriptorCounts = &actualTexCount;
+
+        auto& bindlessLayout = m_setLayouts[bindlessSetIdx];
+        VkDescriptorSetAllocateInfo allocSetInfo = {};
+        allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocSetInfo.pNext = &varCountInfo;
+        allocSetInfo.descriptorPool = m_descriptorPool;
+        allocSetInfo.descriptorSetCount = 1;
+        allocSetInfo.pSetLayouts = &bindlessLayout;
+
+        VkDescriptorSet set;
+        if (vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &set) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate bindless texture descriptor set");
+        }
+        m_descriptorSets[bindlessSetIdx] = set;
+    }
+
+    // ---- Write descriptor sets ----
+    // We need to write bindings for sets 0, 1, and 2 separately.
+
+    // Storage for descriptor write infos (must remain alive until vkUpdateDescriptorSets)
+    struct DescWriteInfo {
+        VkDescriptorBufferInfo bufferInfo;
+        VkDescriptorImageInfo imageInfo;
+    };
+    std::vector<DescWriteInfo> writeInfos;
+    writeInfos.reserve(mergedBindings.size());
+    std::vector<VkWriteDescriptorSet> writes;
+
+    for (auto& b : mergedBindings) {
+        // Skip bindless texture array binding (handled separately below)
+        if (b.type == "bindless_combined_image_sampler_array") continue;
+
+        auto setIt = m_descriptorSets.find(b.set);
+        if (setIt == m_descriptorSets.end()) continue;
+
+        DescWriteInfo info = {};
+        VkWriteDescriptorSet w = {};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = setIt->second;
+        w.dstBinding = static_cast<uint32_t>(b.binding);
+        w.descriptorCount = 1;
+
+        if (b.type == "uniform_buffer") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            if (b.name == "MVP") {
+                info.bufferInfo = {m_mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
+            } else if (b.name == "Light") {
+                info.bufferInfo = {m_lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+            } else if (b.name == "Material") {
+                info.bufferInfo = {m_materialBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : sizeof(MaterialUBOData))};
+            } else {
+                info.bufferInfo = {m_mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
+            }
+            writeInfos.push_back(info);
+            w.pBufferInfo = &writeInfos.back().bufferInfo;
+        } else if (b.type == "storage_buffer") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            VkBuffer buf = VK_NULL_HANDLE;
+            VkDeviceSize bufSize = 0;
+
+            // Check for materials SSBO first (bindless-specific)
+            if (b.name == "materials") {
+                buf = m_bindlessMaterials.buffer;
+                bufSize = static_cast<VkDeviceSize>(m_bindlessMaterials.materialCount) * sizeof(BindlessMaterialData);
+            }
+            // Standard mesh shader storage buffers
+            else if (b.name == "meshlet_descriptors") { buf = m_meshletDescBuffer; bufSize = m_meshletDescSize; }
+            else if (b.name == "meshlet_vertices") { buf = m_meshletVertBuffer; bufSize = m_meshletVertSize; }
+            else if (b.name == "meshlet_triangles") { buf = m_meshletTriBuffer; bufSize = m_meshletTriSize; }
+            else if (b.name == "positions") { buf = m_positionsBuffer; bufSize = m_positionsSize; }
+            else if (b.name == "normals") { buf = m_normalsBuffer; bufSize = m_normalsSize; }
+            else if (b.name == "tex_coords") { buf = m_texCoordsBuffer; bufSize = m_texCoordsSize; }
+            else if (b.name == "tangents") { buf = m_tangentsBuffer; bufSize = m_tangentsSize; }
+
+            if (buf == VK_NULL_HANDLE) {
+                std::cout << "[warn] Bindless mode: unknown storage buffer '" << b.name
+                          << "' at set=" << b.set << " binding=" << b.binding << std::endl;
+                continue;
+            }
+            info.bufferInfo = {buf, 0, bufSize};
+            writeInfos.push_back(info);
+            w.pBufferInfo = &writeInfos.back().bufferInfo;
+        } else if (b.type == "sampler") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            auto& iblTextures = m_scene->getIBLTextures();
+            auto iblIt = iblTextures.find(b.name);
+            if (iblIt != iblTextures.end()) {
+                info.imageInfo = {}; info.imageInfo.sampler = iblIt->second.sampler;
+            } else {
+                auto& tex = m_scene->getTextureForBinding(b.name);
+                info.imageInfo = {}; info.imageInfo.sampler = tex.sampler;
+            }
+            writeInfos.push_back(info);
+            w.pImageInfo = &writeInfos.back().imageInfo;
+        } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
+            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            auto& iblTextures = m_scene->getIBLTextures();
+            auto iblIt = iblTextures.find(b.name);
+            if (iblIt != iblTextures.end()) {
+                info.imageInfo = {};
+                info.imageInfo.imageView = iblIt->second.imageView;
+                info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            } else {
+                auto& tex = m_scene->getTextureForBinding(b.name);
+                info.imageInfo = {};
+                info.imageInfo.imageView = tex.imageView;
+                info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+            writeInfos.push_back(info);
+            w.pImageInfo = &writeInfos.back().imageInfo;
+        } else {
+            continue;
+        }
+
+        writes.push_back(w);
+    }
+
+    if (!writes.empty()) {
+        vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
+    }
+
+    // ---- Write bindless texture array (set 2, binding 0) ----
+    if (bindlessSetIdx >= 0 && m_bindlessTextures.textureCount > 0) {
+        auto setIt = m_descriptorSets.find(bindlessSetIdx);
+        if (setIt != m_descriptorSets.end()) {
+            std::vector<VkDescriptorImageInfo> imageInfos(m_bindlessTextures.textureCount);
+            for (uint32_t i = 0; i < m_bindlessTextures.textureCount; i++) {
+                imageInfos[i].sampler = m_bindlessTextures.samplers[i];
+                imageInfos[i].imageView = m_bindlessTextures.imageViews[i];
+                imageInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+
+            VkWriteDescriptorSet texWrite = {};
+            texWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            texWrite.dstSet = setIt->second;
+            texWrite.dstBinding = 0;
+            texWrite.dstArrayElement = 0;
+            texWrite.descriptorCount = m_bindlessTextures.textureCount;
+            texWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            texWrite.pImageInfo = imageInfos.data();
+
+            vkUpdateDescriptorSets(ctx.device, 1, &texWrite, 0, nullptr);
+
+            std::cout << "[mesh] Wrote " << m_bindlessTextures.textureCount
+                      << " bindless texture(s) to set " << bindlessSetIdx << std::endl;
+        }
+    }
+
+    std::cout << "[mesh] Bindless pipeline and descriptors created: "
+              << m_setLayouts.size() << " set(s)" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -1612,10 +2079,19 @@ void MeshRenderer::cleanupPermutations(VulkanContext& ctx) {
 void MeshRenderer::cleanup(VulkanContext& ctx) {
     vkDeviceWaitIdle(ctx.device);
 
+    // Cleanup bindless resources
+    if (m_bindlessMaterials.buffer) {
+        vmaDestroyBuffer(ctx.allocator, m_bindlessMaterials.buffer, m_bindlessMaterials.allocation);
+        m_bindlessMaterials.buffer = VK_NULL_HANDLE;
+    }
+    // Note: bindless texture image views/samplers are owned by SceneManager, not destroyed here
+    m_bindlessTextures = {};
+    m_bindlessMaterials = {};
+
     // Cleanup multi-pipeline resources
     cleanupPermutations(ctx);
 
-    // Cleanup single-pipeline resources
+    // Cleanup single-pipeline / bindless pipeline resources
     if (m_pipeline) vkDestroyPipeline(ctx.device, m_pipeline, nullptr);
     if (m_pipelineLayout) vkDestroyPipelineLayout(ctx.device, m_pipelineLayout, nullptr);
 

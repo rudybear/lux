@@ -23,6 +23,32 @@ class TypeCheckError(Exception):
     pass
 
 
+# Field types for BindlessMaterialData struct (SSBO)
+_BINDLESS_MATERIAL_FIELD_TYPES = {
+    "baseColorFactor": "vec4",
+    "emissiveFactor": "vec3",
+    "metallicFactor": "scalar",
+    "roughnessFactor": "scalar",
+    "emissionStrength": "scalar",
+    "ior": "scalar",
+    "clearcoatFactor": "scalar",
+    "clearcoatRoughness": "scalar",
+    "transmissionFactor": "scalar",
+    "sheenRoughness": "scalar",
+    "sheenColorFactor": "vec3",
+    "base_color_tex_index": "int",
+    "normal_tex_index": "int",
+    "metallic_roughness_tex_index": "int",
+    "occlusion_tex_index": "int",
+    "emissive_tex_index": "int",
+    "clearcoat_tex_index": "int",
+    "clearcoat_roughness_tex_index": "int",
+    "sheen_color_tex_index": "int",
+    "transmission_tex_index": "int",
+    "material_flags": "uint",
+}
+
+
 def type_check(module: Module) -> None:
     checker = TypeChecker(module)
     checker.check()
@@ -133,6 +159,10 @@ class TypeChecker:
         for si in getattr(stage, 'storage_images', []):
             from luxc.builtins.types import STORAGE_IMAGE
             scope.define(Symbol(si.name, STORAGE_IMAGE, "storage_image"))
+
+        for bta in getattr(stage, 'bindless_texture_arrays', []):
+            from luxc.builtins.types import BINDLESS_TEXTURE_ARRAY
+            scope.define(Symbol(bta.name, BINDLESS_TEXTURE_ARRAY, "bindless_texture_array"))
 
         # Register storage buffer variables (runtime arrays)
         for sb in getattr(stage, 'storage_buffers', []):
@@ -330,6 +360,16 @@ class TypeChecker:
                     expr.resolved_type = field_type.name
                     return field_type
                 raise TypeCheckError(f"Unknown field '{expr.field}' in block '{obj_type.name}'")
+            # SSBO struct field access (e.g. materials[idx].baseColorFactor)
+            if obj_type.name == "BindlessMaterialData":
+                field_types = _BINDLESS_MATERIAL_FIELD_TYPES.get(expr.field)
+                if field_types is not None:
+                    result = resolve_type(field_types)
+                    if result is None:
+                        result = SCALAR
+                    expr.resolved_type = result.name
+                    return result
+                # Unknown field — fallback to scalar
             # For other field access (struct fields, etc.) - simplified
             expr.resolved_type = SCALAR.name
             return SCALAR
@@ -391,6 +431,15 @@ def _check_binary_op(op: str, left: LuxType, right: LuxType) -> LuxType:
         return BOOL
     if op in ("&&", "||"):
         return BOOL
+
+    # Bitwise operators: &, |, ^
+    if op in ("&", "|", "^"):
+        if isinstance(left, ScalarType) and isinstance(right, ScalarType):
+            # Prefer uint if either operand is uint
+            if left.name == "uint" or right.name == "uint":
+                return resolve_type("uint")
+            return left
+        raise TypeCheckError(f"Cannot apply '{op}' to {left.name} and {right.name}")
 
     # Arithmetic: +, -, *, /, %
     if op in ("+", "-", "/", "%"):

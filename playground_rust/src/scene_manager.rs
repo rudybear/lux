@@ -1349,3 +1349,526 @@ fn load_brdf_lut(
         allocation: gpu_image.allocation,
     })
 }
+
+// ===========================================================================
+// Bindless rendering support
+// ===========================================================================
+
+/// Material flags for bindless material data.
+pub const BINDLESS_MAT_FLAG_NORMAL_MAP: u32 = 0x1;
+pub const BINDLESS_MAT_FLAG_CLEARCOAT: u32 = 0x2;
+pub const BINDLESS_MAT_FLAG_SHEEN: u32 = 0x4;
+pub const BINDLESS_MAT_FLAG_EMISSION: u32 = 0x8;
+pub const BINDLESS_MAT_FLAG_TRANSMISSION: u32 = 0x10;
+
+/// Bindless material data matching the shader's `BindlessMaterialData` struct (std430, 128 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct BindlessMaterialData {
+    pub base_color_factor: [f32; 4],          // offset 0
+    pub emissive_factor: [f32; 3],            // offset 16
+    pub metallic_factor: f32,                 // offset 28
+    pub roughness_factor: f32,                // offset 32
+    pub emissive_strength: f32,               // offset 36
+    pub ior: f32,                             // offset 40
+    pub clearcoat_factor: f32,                // offset 44
+    pub clearcoat_roughness: f32,             // offset 48
+    pub transmission_factor: f32,             // offset 52 (matches shader index 8)
+    pub sheen_roughness: f32,                 // offset 56 (matches shader index 9)
+    pub _pad_before_sheen: f32,              // offset 60
+    pub sheen_color_factor: [f32; 3],         // offset 64
+    pub _pad_after_sheen: f32,               // offset 76
+    pub base_color_tex_index: i32,            // offset 80
+    pub normal_tex_index: i32,                // offset 84
+    pub metallic_roughness_tex_index: i32,    // offset 88
+    pub occlusion_tex_index: i32,             // offset 92
+    pub emissive_tex_index: i32,              // offset 96
+    pub clearcoat_tex_index: i32,             // offset 100
+    pub clearcoat_roughness_tex_index: i32,   // offset 104
+    pub sheen_color_tex_index: i32,           // offset 108
+    pub transmission_tex_index: i32,          // offset 112
+    pub material_flags: u32,                  // offset 116
+    pub index_offset: f32,                    // offset 120 — per-geometry index offset for RT (float for shader compat)
+    pub _padding: u32,                        // offset 124
+}
+// Total: 128 bytes (std430)
+
+unsafe impl bytemuck::Pod for BindlessMaterialData {}
+unsafe impl bytemuck::Zeroable for BindlessMaterialData {}
+
+/// Collected bindless texture array: all unique (imageView, sampler) pairs.
+pub struct BindlessTextureArray {
+    pub image_views: Vec<vk::ImageView>,
+    pub samplers: Vec<vk::Sampler>,
+    pub texture_count: u32,
+}
+
+/// Materials SSBO for bindless rendering: one `BindlessMaterialData` per scene material.
+pub struct BindlessMaterialsSSBO {
+    pub buffer: GpuBuffer,
+    pub material_count: u32,
+}
+
+/// Build a bindless texture array by collecting all unique (imageView, sampler) pairs
+/// from per-material texture maps.
+///
+/// The per-material texture maps are `Vec<HashMap<String, (vk::ImageView, vk::Sampler)>>`
+/// where each entry maps a texture slot name (e.g., "base_color_tex") to a GPU resource pair.
+///
+/// Returns the array and a dedup map: imageView -> index in the array.
+pub fn build_bindless_texture_array_from_views(
+    per_mat_textures: &[std::collections::HashMap<String, (vk::ImageView, vk::Sampler)>],
+) -> (BindlessTextureArray, std::collections::HashMap<vk::ImageView, u32>) {
+    use std::collections::HashMap;
+
+    let mut views: Vec<vk::ImageView> = Vec::new();
+    let mut samplers: Vec<vk::Sampler> = Vec::new();
+    let mut dedup: HashMap<vk::ImageView, u32> = HashMap::new();
+
+    // Only include material texture slots (not IBL cubemaps or other non-material textures)
+    let valid_slots = [
+        "base_color_tex", "normal_tex", "metallic_roughness_tex",
+        "occlusion_tex", "emissive_tex", "clearcoat_tex",
+        "clearcoat_roughness_tex", "sheen_color_tex", "transmission_tex",
+    ];
+    for (mat_i, mat_tex) in per_mat_textures.iter().enumerate() {
+        for (slot, &(view, sampler)) in mat_tex {
+            if !valid_slots.contains(&slot.as_str()) { continue; }
+            if !dedup.contains_key(&view) {
+                let idx = views.len() as u32;
+                dedup.insert(view, idx);
+                views.push(view);
+                samplers.push(sampler);
+                info!("  bindless tex[{}] = mat {} slot '{}'  (view={:?})", idx, mat_i, slot, view);
+            }
+        }
+    }
+
+    let count = views.len() as u32;
+    info!("Bindless texture array: {} unique textures", count);
+
+    (
+        BindlessTextureArray {
+            image_views: views,
+            samplers,
+            texture_count: count,
+        },
+        dedup,
+    )
+}
+
+/// Build a bindless texture array from per-material GpuImage maps.
+///
+/// This variant works with `Vec<HashMap<String, GpuImage>>` as used in the raster
+/// and mesh renderers. A shared sampler handle is used for all textures.
+pub fn build_bindless_texture_array_from_gpu_images(
+    per_mat_textures: &[std::collections::HashMap<String, GpuImage>],
+    sampler: vk::Sampler,
+    default_white_view: vk::ImageView,
+    default_black_view: vk::ImageView,
+    default_normal_view: vk::ImageView,
+) -> (BindlessTextureArray, std::collections::HashMap<vk::ImageView, u32>) {
+    use std::collections::HashMap;
+
+    let mut views: Vec<vk::ImageView> = Vec::new();
+    let mut samplers: Vec<vk::Sampler> = Vec::new();
+    let mut dedup: HashMap<vk::ImageView, u32> = HashMap::new();
+
+    // Always add default textures at known indices
+    let add_view = |views: &mut Vec<vk::ImageView>,
+                    samplers: &mut Vec<vk::Sampler>,
+                    dedup: &mut HashMap<vk::ImageView, u32>,
+                    view: vk::ImageView,
+                    samp: vk::Sampler| -> u32 {
+        if let Some(&idx) = dedup.get(&view) {
+            idx
+        } else {
+            let idx = views.len() as u32;
+            dedup.insert(view, idx);
+            views.push(view);
+            samplers.push(samp);
+            idx
+        }
+    };
+
+    add_view(&mut views, &mut samplers, &mut dedup, default_white_view, sampler);
+    add_view(&mut views, &mut samplers, &mut dedup, default_black_view, sampler);
+    add_view(&mut views, &mut samplers, &mut dedup, default_normal_view, sampler);
+
+    for mat_tex in per_mat_textures {
+        for (_slot, img) in mat_tex {
+            add_view(&mut views, &mut samplers, &mut dedup, img.view, sampler);
+        }
+    }
+
+    let count = views.len() as u32;
+    info!("Bindless texture array (GpuImage): {} unique textures", count);
+
+    (
+        BindlessTextureArray {
+            image_views: views,
+            samplers,
+            texture_count: count,
+        },
+        dedup,
+    )
+}
+
+/// Build the materials SSBO for bindless rendering.
+///
+/// Creates one `BindlessMaterialData` per scene material, with texture indices
+/// pointing into the bindless texture array (via the dedup map) and material flags.
+pub fn build_materials_ssbo(
+    device: &ash::Device,
+    allocator: &mut gpu_allocator::vulkan::Allocator,
+    scene: &crate::gltf_loader::GltfScene,
+    dedup: &std::collections::HashMap<vk::ImageView, u32>,
+    per_mat_textures: &[std::collections::HashMap<String, GpuImage>],
+    default_white_view: vk::ImageView,
+    default_black_view: vk::ImageView,
+    default_normal_view: vk::ImageView,
+) -> Result<BindlessMaterialsSSBO, String> {
+    let mut materials: Vec<BindlessMaterialData> = Vec::new();
+
+    let lookup = |mat_idx: usize, slot: &str, default_view: vk::ImageView| -> i32 {
+        if mat_idx < per_mat_textures.len() {
+            if let Some(img) = per_mat_textures[mat_idx].get(slot) {
+                if let Some(&idx) = dedup.get(&img.view) {
+                    return idx as i32;
+                }
+            }
+        }
+        // Return default texture index
+        dedup.get(&default_view).copied().unwrap_or(0) as i32
+    };
+
+    for (mi, mat) in scene.materials.iter().enumerate() {
+        let mut flags: u32 = 0;
+        if mat.normal_image.is_some() {
+            flags |= BINDLESS_MAT_FLAG_NORMAL_MAP;
+        }
+        if mat.has_clearcoat {
+            flags |= BINDLESS_MAT_FLAG_CLEARCOAT;
+        }
+        if mat.has_sheen {
+            flags |= BINDLESS_MAT_FLAG_SHEEN;
+        }
+        if mat.emissive_image.is_some() || mat.emissive.iter().any(|&e| e > 0.0) {
+            flags |= BINDLESS_MAT_FLAG_EMISSION;
+        }
+        if mat.has_transmission {
+            flags |= BINDLESS_MAT_FLAG_TRANSMISSION;
+        }
+
+        materials.push(BindlessMaterialData {
+            base_color_factor: mat.base_color,
+            emissive_factor: mat.emissive,
+            metallic_factor: mat.metallic,
+            roughness_factor: mat.roughness,
+            emissive_strength: mat.emissive_strength,
+            ior: mat.ior,
+            clearcoat_factor: mat.clearcoat_factor,
+            clearcoat_roughness: mat.clearcoat_roughness_factor,
+            sheen_roughness: mat.sheen_roughness_factor,
+            transmission_factor: mat.transmission_factor,
+            _pad_before_sheen: 0.0,
+            sheen_color_factor: mat.sheen_color_factor,
+            _pad_after_sheen: 0.0,
+            base_color_tex_index: lookup(mi, "base_color_tex", default_white_view),
+            normal_tex_index: lookup(mi, "normal_tex", default_normal_view),
+            metallic_roughness_tex_index: lookup(mi, "metallic_roughness_tex", default_white_view),
+            occlusion_tex_index: lookup(mi, "occlusion_tex", default_white_view),
+            emissive_tex_index: lookup(mi, "emissive_tex", default_black_view),
+            clearcoat_tex_index: lookup(mi, "clearcoat_tex", default_white_view),
+            clearcoat_roughness_tex_index: lookup(mi, "clearcoat_roughness_tex", default_white_view),
+            sheen_color_tex_index: lookup(mi, "sheen_color_tex", default_black_view),
+            transmission_tex_index: lookup(mi, "transmission_tex", default_black_view),
+            material_flags: flags,
+            index_offset: 0.0,
+            _padding: 0,
+        });
+    }
+
+    // Ensure at least one material entry
+    if materials.is_empty() {
+        materials.push(BindlessMaterialData {
+            base_color_factor: [1.0, 1.0, 1.0, 1.0],
+            emissive_factor: [0.0, 0.0, 0.0],
+            metallic_factor: 0.0,
+            roughness_factor: 1.0,
+            emissive_strength: 1.0,
+            ior: 1.5,
+            clearcoat_factor: 0.0,
+            clearcoat_roughness: 0.0,
+            sheen_roughness: 0.0,
+            transmission_factor: 0.0,
+            _pad_before_sheen: 0.0,
+            sheen_color_factor: [0.0, 0.0, 0.0],
+            _pad_after_sheen: 0.0,
+            base_color_tex_index: 0,
+            normal_tex_index: -1,
+            metallic_roughness_tex_index: -1,
+            occlusion_tex_index: -1,
+            emissive_tex_index: -1,
+            clearcoat_tex_index: -1,
+            clearcoat_roughness_tex_index: -1,
+            sheen_color_tex_index: -1,
+            transmission_tex_index: -1,
+            material_flags: 0,
+            index_offset: 0.0,
+            _padding: 0,
+        });
+    }
+
+    let material_count = materials.len() as u32;
+    let data: &[u8] = bytemuck::cast_slice(&materials);
+
+    info!(
+        "Bindless materials SSBO: {} materials, {} bytes (128 bytes each)",
+        material_count,
+        data.len()
+    );
+
+    let buffer = create_buffer_with_data(
+        device,
+        allocator,
+        data,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        "bindless_materials_ssbo",
+    )?;
+
+    Ok(BindlessMaterialsSSBO {
+        buffer,
+        material_count,
+    })
+}
+
+/// Build the materials SSBO for bindless RT rendering.
+///
+/// This variant works with per-material texture maps as used in the RT renderer
+/// (Vec<HashMap<String, (vk::ImageView, vk::Sampler)>>).
+pub fn build_materials_ssbo_from_views(
+    device: &ash::Device,
+    allocator: &mut gpu_allocator::vulkan::Allocator,
+    scene: &crate::gltf_loader::GltfScene,
+    dedup: &std::collections::HashMap<vk::ImageView, u32>,
+    per_mat_textures: &[std::collections::HashMap<String, (vk::ImageView, vk::Sampler)>],
+    default_white_view: vk::ImageView,
+    default_black_view: vk::ImageView,
+    default_normal_view: vk::ImageView,
+) -> Result<BindlessMaterialsSSBO, String> {
+    let mut materials: Vec<BindlessMaterialData> = Vec::new();
+
+    let lookup = |mat_idx: usize, slot: &str, _default_view: vk::ImageView| -> i32 {
+        if mat_idx < per_mat_textures.len() {
+            if let Some(&(view, _sampler)) = per_mat_textures[mat_idx].get(slot) {
+                if let Some(&idx) = dedup.get(&view) {
+                    return idx as i32;
+                }
+            }
+        }
+        -1  // No texture for this slot — shader uses material factor directly
+    };
+
+    for (mi, mat) in scene.materials.iter().enumerate() {
+        let mut flags: u32 = 0;
+        if mat.normal_image.is_some() {
+            flags |= BINDLESS_MAT_FLAG_NORMAL_MAP;
+        }
+        if mat.has_clearcoat {
+            flags |= BINDLESS_MAT_FLAG_CLEARCOAT;
+        }
+        if mat.has_sheen {
+            flags |= BINDLESS_MAT_FLAG_SHEEN;
+        }
+        if mat.emissive_image.is_some() || mat.emissive.iter().any(|&e| e > 0.0) {
+            flags |= BINDLESS_MAT_FLAG_EMISSION;
+        }
+        if mat.has_transmission {
+            flags |= BINDLESS_MAT_FLAG_TRANSMISSION;
+        }
+
+        materials.push(BindlessMaterialData {
+            base_color_factor: mat.base_color,
+            emissive_factor: mat.emissive,
+            metallic_factor: mat.metallic,
+            roughness_factor: mat.roughness,
+            emissive_strength: mat.emissive_strength,
+            ior: mat.ior,
+            clearcoat_factor: mat.clearcoat_factor,
+            clearcoat_roughness: mat.clearcoat_roughness_factor,
+            sheen_roughness: mat.sheen_roughness_factor,
+            transmission_factor: mat.transmission_factor,
+            _pad_before_sheen: 0.0,
+            sheen_color_factor: mat.sheen_color_factor,
+            _pad_after_sheen: 0.0,
+            base_color_tex_index: lookup(mi, "base_color_tex", default_white_view),
+            normal_tex_index: lookup(mi, "normal_tex", default_normal_view),
+            metallic_roughness_tex_index: lookup(mi, "metallic_roughness_tex", default_white_view),
+            occlusion_tex_index: lookup(mi, "occlusion_tex", default_white_view),
+            emissive_tex_index: lookup(mi, "emissive_tex", default_black_view),
+            clearcoat_tex_index: lookup(mi, "clearcoat_tex", default_white_view),
+            clearcoat_roughness_tex_index: lookup(mi, "clearcoat_roughness_tex", default_white_view),
+            sheen_color_tex_index: lookup(mi, "sheen_color_tex", default_black_view),
+            transmission_tex_index: lookup(mi, "transmission_tex", default_black_view),
+            material_flags: flags,
+            index_offset: 0.0,
+            _padding: 0,
+        });
+    }
+
+    if materials.is_empty() {
+        materials.push(bytemuck::Zeroable::zeroed());
+    }
+
+    let material_count = materials.len() as u32;
+    let data: &[u8] = bytemuck::cast_slice(&materials);
+
+    info!(
+        "Bindless materials SSBO (from views): {} materials, {} bytes",
+        material_count,
+        data.len()
+    );
+
+    let buffer = create_buffer_with_data(
+        device,
+        allocator,
+        data,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        "bindless_materials_ssbo",
+    )?;
+
+    Ok(BindlessMaterialsSSBO {
+        buffer,
+        material_count,
+    })
+}
+
+/// Build a bindless materials SSBO indexed by **geometry** (draw range), not by material.
+///
+/// `gl_GeometryIndexEXT` in the RT closest-hit shader returns the geometry index within the
+/// BLAS, which corresponds to the draw range index. Each SSBO entry at index `i` must contain
+/// the material data for `draw_ranges[i].material_index`.
+pub fn build_materials_ssbo_by_geometry(
+    device: &ash::Device,
+    allocator: &mut gpu_allocator::vulkan::Allocator,
+    scene: &crate::gltf_loader::GltfScene,
+    dedup: &std::collections::HashMap<vk::ImageView, u32>,
+    per_mat_textures: &[std::collections::HashMap<String, (vk::ImageView, vk::Sampler)>],
+    default_white_view: vk::ImageView,
+    default_black_view: vk::ImageView,
+    default_normal_view: vk::ImageView,
+    draw_ranges: &[crate::gltf_loader::DrawRange],
+) -> Result<BindlessMaterialsSSBO, String> {
+    let lookup = |mat_idx: usize, slot: &str, _default_view: vk::ImageView| -> i32 {
+        if mat_idx < per_mat_textures.len() {
+            if let Some(&(view, _sampler)) = per_mat_textures[mat_idx].get(slot) {
+                if let Some(&idx) = dedup.get(&view) {
+                    return idx as i32;
+                }
+            }
+        }
+        -1  // No texture for this slot — shader uses material factor directly
+    };
+
+    let mut materials: Vec<BindlessMaterialData> = Vec::new();
+
+    // One entry per draw range (geometry), NOT per material
+    for (geo_idx, range) in draw_ranges.iter().enumerate() {
+        let mi = range.material_index;
+        let mat = if mi < scene.materials.len() {
+            &scene.materials[mi]
+        } else {
+            info!(
+                "Geometry {} references material {} which is out of range ({}), using defaults",
+                geo_idx, mi, scene.materials.len()
+            );
+            materials.push(bytemuck::Zeroable::zeroed());
+            continue;
+        };
+
+        let mut flags: u32 = 0;
+        if mat.normal_image.is_some() {
+            flags |= BINDLESS_MAT_FLAG_NORMAL_MAP;
+        }
+        if mat.has_clearcoat {
+            flags |= BINDLESS_MAT_FLAG_CLEARCOAT;
+        }
+        if mat.has_sheen {
+            flags |= BINDLESS_MAT_FLAG_SHEEN;
+        }
+        if mat.emissive_image.is_some() || mat.emissive.iter().any(|&e| e > 0.0) {
+            flags |= BINDLESS_MAT_FLAG_EMISSION;
+        }
+        if mat.has_transmission {
+            flags |= BINDLESS_MAT_FLAG_TRANSMISSION;
+        }
+
+        materials.push(BindlessMaterialData {
+            base_color_factor: mat.base_color,
+            emissive_factor: mat.emissive,
+            metallic_factor: mat.metallic,
+            roughness_factor: mat.roughness,
+            emissive_strength: mat.emissive_strength,
+            ior: mat.ior,
+            clearcoat_factor: mat.clearcoat_factor,
+            clearcoat_roughness: mat.clearcoat_roughness_factor,
+            sheen_roughness: mat.sheen_roughness_factor,
+            transmission_factor: mat.transmission_factor,
+            _pad_before_sheen: 0.0,
+            sheen_color_factor: mat.sheen_color_factor,
+            _pad_after_sheen: 0.0,
+            base_color_tex_index: lookup(mi, "base_color_tex", default_white_view),
+            normal_tex_index: lookup(mi, "normal_tex", default_normal_view),
+            metallic_roughness_tex_index: lookup(mi, "metallic_roughness_tex", default_white_view),
+            occlusion_tex_index: lookup(mi, "occlusion_tex", default_white_view),
+            emissive_tex_index: lookup(mi, "emissive_tex", default_black_view),
+            clearcoat_tex_index: lookup(mi, "clearcoat_tex", default_white_view),
+            clearcoat_roughness_tex_index: lookup(mi, "clearcoat_roughness_tex", default_white_view),
+            sheen_color_tex_index: lookup(mi, "sheen_color_tex", default_black_view),
+            transmission_tex_index: lookup(mi, "transmission_tex", default_black_view),
+            material_flags: flags,
+            index_offset: range.index_offset as f32,
+            _padding: 0,
+        });
+
+        let m = materials.last().unwrap();
+        info!(
+            "Geometry {} -> material {} '{}': flags=0x{:x}, metallic={:.2}, roughness={:.2}, \
+             sheen_rough={:.2}, transmission={:.2}, index_offset={}, \
+             tex[bc={}, norm={}, mr={}, occ={}, em={}, cc={}, ccr={}, sheen={}, trans={}]",
+            geo_idx, mi, mat.name,
+            flags, m.metallic_factor, m.roughness_factor,
+            m.sheen_roughness, m.transmission_factor, m.index_offset,
+            m.base_color_tex_index, m.normal_tex_index, m.metallic_roughness_tex_index,
+            m.occlusion_tex_index, m.emissive_tex_index, m.clearcoat_tex_index,
+            m.clearcoat_roughness_tex_index, m.sheen_color_tex_index, m.transmission_tex_index,
+        );
+    }
+
+    if materials.is_empty() {
+        materials.push(bytemuck::Zeroable::zeroed());
+    }
+
+    let material_count = materials.len() as u32;
+    let data: &[u8] = bytemuck::cast_slice(&materials);
+
+    info!(
+        "Bindless materials SSBO (by geometry): {} entries (geometries), {} bytes",
+        material_count,
+        data.len()
+    );
+
+    let buffer = create_buffer_with_data(
+        device,
+        allocator,
+        data,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        "bindless_materials_ssbo_by_geo",
+    )?;
+
+    Ok(BindlessMaterialsSSBO {
+        buffer,
+        material_count,
+    })
+}

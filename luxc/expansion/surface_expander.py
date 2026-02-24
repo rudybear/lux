@@ -22,7 +22,7 @@ from luxc.parser.ast_nodes import (
     GeometryDecl, PipelineDecl,
     ScheduleDecl, EnvironmentDecl, ProceduralDecl,
     RayPayloadDecl, HitAttributeDecl, AccelDecl, StorageImageDecl,
-    StorageBufferDecl, IndexAccess, FieldAccess,
+    StorageBufferDecl, BindlessTextureArrayDecl, IndexAccess, FieldAccess,
     IfStmt, TaskPayloadDecl, PropertiesBlock,
 )
 
@@ -67,7 +67,7 @@ def _resolve_schedule(module: Module, name: str) -> dict[str, str]:
     raise ValueError(f"Schedule '{name}' not found")
 
 
-def expand_surfaces(module: Module, pipeline_filter: str | None = None) -> None:
+def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless: bool = False) -> None:
     """Expand pipeline/surface/geometry declarations into stage blocks.
 
     If a pipeline declaration references a surface and geometry by name,
@@ -134,7 +134,8 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None) -> None:
             environment = environments.get(env_name) if env_name else None
             procedural = procedurals.get(procedural_name) if procedural_name else None
             stages = _expand_rt_pipeline(
-                surface, environment, procedural, module, schedule, max_bounces
+                surface, environment, procedural, module, schedule, max_bounces,
+                bindless=bindless,
             )
             module.stages.extend(stages)
         elif mode == "mesh_shader":
@@ -142,13 +143,15 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None) -> None:
             surface = surfaces.get(surf_name) if surf_name else None
             geometry = geometries.get(geo_name) if geo_name else None
             stages = _expand_mesh_pipeline(
-                surface, geometry, module, schedule, pipeline, use_task_shader
+                surface, geometry, module, schedule, pipeline, use_task_shader,
+                bindless=bindless,
             )
             module.stages.extend(stages)
         elif surf_name and surf_name in surfaces:
             surface = surfaces[surf_name]
             geometry = geometries.get(geo_name) if geo_name else None
-            stages = _expand_pipeline(surface, geometry, module, schedule)
+            stages = _expand_pipeline(surface, geometry, module, schedule,
+                                      bindless=bindless)
             # Tag fragment stages with set offset so uniforms don't clash
             # with vertex uniforms when combined in a pipeline
             for s in stages:
@@ -174,6 +177,7 @@ def _expand_pipeline(
     geometry: GeometryDecl | None,
     module: Module,
     schedule: dict[str, str] | None = None,
+    bindless: bool = False,
 ) -> list[StageBlock]:
     """Generate vertex and fragment stages from surface + geometry."""
     stages = []
@@ -182,7 +186,10 @@ def _expand_pipeline(
         vert = _expand_geometry_to_vertex(geometry)
         stages.append(vert)
 
-    frag = _expand_surface_to_fragment(surface, module, geometry, schedule)
+    if bindless and surface.layers is not None:
+        frag = _expand_bindless_fragment(surface, module, geometry, schedule)
+    else:
+        frag = _expand_surface_to_fragment(surface, module, geometry, schedule)
     stages.append(frag)
     return stages
 
@@ -839,6 +846,7 @@ def _expand_rt_pipeline(
     module: Module,
     schedule: dict[str, str] | None = None,
     max_bounces: int = 1,
+    bindless: bool = False,
 ) -> list[StageBlock]:
     """Generate ray tracing stages from pipeline declarations."""
     stages = []
@@ -849,7 +857,10 @@ def _expand_rt_pipeline(
 
     # 2. Closest-hit shader from surface
     if surface:
-        chit = _expand_surface_to_closest_hit(surface, module, schedule)
+        if bindless and surface.layers is not None:
+            chit = _expand_bindless_closest_hit(surface, module, schedule)
+        else:
+            chit = _expand_surface_to_closest_hit(surface, module, schedule)
         stages.append(chit)
 
         # 3. Any-hit shader if surface has opacity
@@ -1688,6 +1699,7 @@ def _expand_mesh_pipeline(
     schedule: dict[str, str] | None = None,
     pipeline: PipelineDecl | None = None,
     use_task_shader: bool = False,
+    bindless: bool = False,
 ) -> list[StageBlock]:
     """Generate mesh + fragment stages (and optionally task) from pipeline declarations.
 
@@ -1704,14 +1716,17 @@ def _expand_mesh_pipeline(
         task._descriptor_set_offset = 0
         stages.append(task)
 
-    # 2. Mesh shader
-    mesh = _expand_geometry_to_mesh(geometry, module, defines)
+    # 2. Mesh shader (bindless adds material_index to push constants)
+    mesh = _expand_geometry_to_mesh(geometry, module, defines, bindless=bindless)
     mesh._descriptor_set_offset = 1 if use_task_shader else 0
     stages.append(mesh)
 
-    # 3. Fragment shader (identical to raster path)
+    # 3. Fragment shader (bindless or standard)
     if surface:
-        frag = _expand_surface_to_fragment(surface, module, geometry, schedule)
+        if bindless and surface.layers is not None:
+            frag = _expand_bindless_fragment(surface, module, geometry, schedule)
+        else:
+            frag = _expand_surface_to_fragment(surface, module, geometry, schedule)
         frag._descriptor_set_offset = (2 if use_task_shader else 1)
         stages.append(frag)
 
@@ -1722,6 +1737,7 @@ def _expand_geometry_to_mesh(
     geometry: GeometryDecl | None,
     module: Module,
     defines: dict[str, int],
+    bindless: bool = False,
 ) -> StageBlock:
     """Generate a mesh stage from a geometry declaration.
 
@@ -1747,11 +1763,11 @@ def _expand_geometry_to_mesh(
     if geometry and any(f.name == "tangent" for f in geometry.fields):
         stage.storage_buffers.append(StorageBufferDecl("tangents", "vec4"))
 
-    # Push constant for meshlet offset (multi-pipeline dispatch)
-    stage.push_constants.append(PushBlock(
-        "mesh_params",
-        [BlockField("meshletOffset", "uint")],
-    ))
+    # Push constant for meshlet offset (+ material_index in bindless mode)
+    pc_fields = [BlockField("meshletOffset", "uint")]
+    if bindless:
+        pc_fields.append(BlockField("material_index", "uint"))
+    stage.push_constants.append(PushBlock("mesh_params", pc_fields))
 
     # Transform uniform (from geometry declaration)
     if geometry and geometry.transform:
@@ -1976,6 +1992,621 @@ def _expand_task_shader(defines: dict[str, int]) -> StageBlock:
     body.append(ExprStmt(CallExpr(VarRef("emit_mesh_tasks"), [
         NumberLit("1"), NumberLit("1"), NumberLit("1"),
     ])))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
+# =========================================================================
+# Bindless Descriptor Expansion (uber-shaders)
+# =========================================================================
+
+# Feature flag bits for BindlessMaterialData.material_flags
+_FLAG_NORMAL_MAP   = 0x1
+_FLAG_CLEARCOAT    = 0x2
+_FLAG_SHEEN        = 0x4
+_FLAG_EMISSION     = 0x8
+_FLAG_TRANSMISSION = 0x10
+
+# Texture slot names in declaration order (matches BindlessMaterialData struct)
+_BINDLESS_TEX_SLOTS = [
+    "base_color_tex",
+    "normal_tex",
+    "metallic_roughness_tex",
+    "occlusion_tex",
+    "emissive_tex",
+    "clearcoat_tex",
+    "clearcoat_roughness_tex",
+    "sheen_color_tex",
+    "transmission_tex",
+]
+
+# Corresponding index field names in the materials SSBO struct
+_BINDLESS_TEX_INDEX_FIELDS = [
+    "base_color_tex_index",
+    "normal_tex_index",
+    "metallic_roughness_tex_index",
+    "occlusion_tex_index",
+    "emissive_tex_index",
+    "clearcoat_tex_index",
+    "clearcoat_roughness_tex_index",
+    "sheen_color_tex_index",
+    "transmission_tex_index",
+]
+
+
+def _build_bindless_material_struct_fields() -> list[BlockField]:
+    """Return the fields for BindlessMaterialData (std430 SSBO layout)."""
+    return [
+        # PBR factors
+        BlockField("baseColorFactor", "vec4"),
+        BlockField("emissiveFactor", "vec3"),
+        BlockField("metallicFactor", "scalar"),
+        BlockField("roughnessFactor", "scalar"),
+        BlockField("emissionStrength", "scalar"),
+        BlockField("ior", "scalar"),
+        BlockField("clearcoatFactor", "scalar"),
+        BlockField("clearcoatRoughness", "scalar"),
+        BlockField("transmissionFactor", "scalar"),
+        BlockField("sheenRoughness", "scalar"),
+        BlockField("_pad0", "scalar"),  # padding to align sheenColorFactor
+        BlockField("sheenColorFactor", "vec3"),
+        BlockField("_pad1", "scalar"),  # padding after vec3
+        # Texture indices (int, -1 = no texture)
+        BlockField("base_color_tex_index", "int"),
+        BlockField("normal_tex_index", "int"),
+        BlockField("metallic_roughness_tex_index", "int"),
+        BlockField("occlusion_tex_index", "int"),
+        BlockField("emissive_tex_index", "int"),
+        BlockField("clearcoat_tex_index", "int"),
+        BlockField("clearcoat_roughness_tex_index", "int"),
+        BlockField("sheen_color_tex_index", "int"),
+        BlockField("transmission_tex_index", "int"),
+        # Feature flags
+        BlockField("material_flags", "uint"),
+        # Per-geometry index offset for RT barycentric interpolation (float for type compat)
+        BlockField("index_offset", "scalar"),
+        BlockField("_pad3", "uint"),
+    ]
+
+
+def _emit_bindless_layer_body(
+    surface: SurfaceDecl,
+    mat_idx_expr,
+    schedule: dict[str, str] | None = None,
+    is_rt: bool = False,
+) -> tuple[list, str]:
+    """Generate shared uber-shader body for bindless mode.
+
+    Works for both raster/mesh fragment and RT closest-hit.
+    Uses mat_idx_expr to index into materials[] SSBO and
+    sample_bindless/sample_bindless_lod for texture array access.
+
+    Returns (body_stmts, output_var_name).
+    """
+    body = []
+
+    # Determine type from the source expression
+    # geometry_index is int, push constant material_index is uint
+    mat_idx_type = "int" if is_rt else "uint"
+    body.append(LetStmt("mat_idx", mat_idx_type, mat_idx_expr))
+
+    # --- Load PBR factors from materials SSBO ---
+    def _mat_field(local_name, field_name, lux_type):
+        """Generate: let <local_name>: <type> = materials[mat_idx].<field_name>;"""
+        return LetStmt(local_name, lux_type,
+            FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")), field_name))
+
+    body.append(_mat_field("mat_baseColor", "baseColorFactor", "vec4"))
+    body.append(_mat_field("mat_emissiveFactor", "emissiveFactor", "vec3"))
+    body.append(_mat_field("mat_metallic", "metallicFactor", "scalar"))
+    body.append(_mat_field("mat_roughness", "roughnessFactor", "scalar"))
+    body.append(_mat_field("mat_emissionStrength", "emissionStrength", "scalar"))
+    body.append(_mat_field("mat_flags", "material_flags", "uint"))
+
+    # --- Texture index loads ---
+    body.append(_mat_field("tex_baseColor", "base_color_tex_index", "int"))
+    body.append(_mat_field("tex_normal", "normal_tex_index", "int"))
+    body.append(_mat_field("tex_mr", "metallic_roughness_tex_index", "int"))
+    body.append(_mat_field("tex_occlusion", "occlusion_tex_index", "int"))
+    body.append(_mat_field("tex_emissive", "emissive_tex_index", "int"))
+    body.append(_mat_field("tex_clearcoat", "clearcoat_tex_index", "int"))
+    body.append(_mat_field("tex_clearcoatRough", "clearcoat_roughness_tex_index", "int"))
+    body.append(_mat_field("tex_sheenColor", "sheen_color_tex_index", "int"))
+    body.append(_mat_field("tex_transmission", "transmission_tex_index", "int"))
+
+    # Use the appropriate sample function
+    sample_fn = "sample_bindless_lod" if is_rt else "sample_bindless"
+
+    def _sample_tex(tex_idx_var, result_var, result_type="vec4"):
+        """Generate: if (tex_idx >= 0) result = sample_bindless(textures, tex_idx, uv);"""
+        if is_rt:
+            sample_call = CallExpr(VarRef(sample_fn), [
+                VarRef("textures"), VarRef(tex_idx_var), VarRef("uv"), NumberLit("0.0")])
+        else:
+            sample_call = CallExpr(VarRef(sample_fn), [
+                VarRef("textures"), VarRef(tex_idx_var), VarRef("uv")])
+        sample_call.resolved_type = "vec4"
+        return IfStmt(
+            BinaryOp(">=", VarRef(tex_idx_var), NumberLit("0")),
+            [AssignStmt(AssignTarget(VarRef(result_var)), sample_call)],
+            [],
+        )
+
+    # --- Base color: srgb_to_linear(texture) * factor (per glTF spec) ---
+    body.append(LetStmt("albedo", "vec4", VarRef("mat_baseColor")))
+    body.append(LetStmt("bc_tex_sample", "vec4",
+        ConstructorExpr("vec4", [NumberLit("1.0")])))
+    body.append(_sample_tex("tex_baseColor", "bc_tex_sample"))
+    body.append(IfStmt(
+        BinaryOp(">=", VarRef("tex_baseColor"), NumberLit("0")),
+        [
+            # glTF base color textures are sRGB-encoded; convert to linear before PBR math
+            LetStmt("bc_linear", "vec3",
+                CallExpr(VarRef("srgb_to_linear"), [
+                    SwizzleAccess(VarRef("bc_tex_sample"), "xyz")])),
+            AssignStmt(AssignTarget(VarRef("albedo")),
+                ConstructorExpr("vec4", [
+                    BinaryOp("*", SwizzleAccess(VarRef("mat_baseColor"), "xyz"),
+                        VarRef("bc_linear")),
+                    SwizzleAccess(VarRef("mat_baseColor"), "w"),
+                ])),
+        ],
+        [],
+    ))
+    body.append(LetStmt("layer_albedo", "vec3", SwizzleAccess(VarRef("albedo"), "xyz")))
+
+    # --- Metallic/Roughness: factor * texture (B=metallic, G=roughness) ---
+    body.append(LetStmt("layer_roughness", "scalar", VarRef("mat_roughness")))
+    body.append(LetStmt("layer_metallic", "scalar", VarRef("mat_metallic")))
+    body.append(LetStmt("mr_sample", "vec4",
+        ConstructorExpr("vec4", [NumberLit("1.0")])))
+    body.append(_sample_tex("tex_mr", "mr_sample"))
+    body.append(IfStmt(
+        BinaryOp(">=", VarRef("tex_mr"), NumberLit("0")),
+        [
+            AssignStmt(AssignTarget(VarRef("layer_roughness")),
+                BinaryOp("*", VarRef("mat_roughness"),
+                    SwizzleAccess(VarRef("mr_sample"), "y"))),
+            AssignStmt(AssignTarget(VarRef("layer_metallic")),
+                BinaryOp("*", VarRef("mat_metallic"),
+                    SwizzleAccess(VarRef("mr_sample"), "z"))),
+        ],
+        [],
+    ))
+
+    # --- Direct lighting ---
+    body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
+        VarRef("n"), VarRef("v"), VarRef("l"),
+        VarRef("layer_albedo"), VarRef("layer_roughness"),
+        VarRef("layer_metallic"),
+    ])))
+    body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
+        VarRef("direct"),
+        ConstructorExpr("vec3", [
+            NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95"),
+        ]),
+    )))
+
+    result_var = "direct_lit"
+
+    # --- Transmission (flag check) ---
+    body.append(LetStmt("result_pre_ibl", "vec3", VarRef(result_var)))
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"),
+                NumberLit(str(_FLAG_TRANSMISSION))),
+            NumberLit("0")),
+        [
+            LetStmt("trans_factor", "scalar",
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "transmissionFactor")),
+            LetStmt("trans_ior", "scalar",
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "ior")),
+            LetStmt("transmitted", "vec3", CallExpr(
+                VarRef("transmission_replace"), [
+                    VarRef("result_pre_ibl"), VarRef("layer_albedo"),
+                    VarRef("layer_roughness"),
+                    VarRef("trans_factor"), VarRef("trans_ior"),
+                    VarRef("n"), VarRef("v"), VarRef("l"),
+                    NumberLit("0.0"),
+                    ConstructorExpr("vec3", [NumberLit("1.0")]),
+                    NumberLit("1000000.0"),
+                ])),
+            AssignStmt(AssignTarget(VarRef("result_pre_ibl")), VarRef("transmitted")),
+        ],
+        [],
+    ))
+    result_var = "result_pre_ibl"
+
+    # --- IBL ---
+    body.append(LetStmt("r", "vec3", CallExpr(VarRef("reflect"), [
+        BinaryOp("*", VarRef("v"), UnaryOp("-", NumberLit("1.0"))),
+        VarRef("n"),
+    ])))
+
+    if is_rt:
+        body.append(LetStmt("prefiltered", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_specular"), VarRef("r"),
+                BinaryOp("*", VarRef("layer_roughness"), NumberLit("8.0")),
+            ]), "xyz")))
+        body.append(LetStmt("irradiance", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_irradiance"), VarRef("n"), NumberLit("0.0"),
+            ]), "xyz")))
+        body.append(LetStmt("brdf_sample", "vec2", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("brdf_lut"),
+                ConstructorExpr("vec2", [VarRef("n_dot_v"), VarRef("layer_roughness")]),
+                NumberLit("0.0"),
+            ]), "xy")))
+    else:
+        body.append(LetStmt("prefiltered", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_specular"), VarRef("r"),
+                BinaryOp("*", VarRef("layer_roughness"), NumberLit("8.0")),
+            ]), "xyz")))
+        body.append(LetStmt("irradiance", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_irradiance"), VarRef("n"), NumberLit("0.0"),
+            ]), "xyz")))
+        body.append(LetStmt("brdf_sample", "vec2", SwizzleAccess(
+            CallExpr(VarRef("sample"), [
+                VarRef("brdf_lut"),
+                ConstructorExpr("vec2", [VarRef("n_dot_v"), VarRef("layer_roughness")]),
+            ]), "xy")))
+
+    body.append(LetStmt("ambient", "vec3", CallExpr(
+        VarRef("ibl_contribution"), [
+            VarRef("layer_albedo"), VarRef("layer_roughness"),
+            VarRef("layer_metallic"),
+            VarRef("n_dot_v"), VarRef("prefiltered"), VarRef("irradiance"),
+            VarRef("brdf_sample"),
+        ])))
+
+    body.append(LetStmt("hdr_partial", "vec3",
+        BinaryOp("+", VarRef(result_var), VarRef("ambient"))))
+    result_var = "hdr_partial"
+
+    # --- Sheen (flag check) ---
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_SHEEN))),
+            NumberLit("0")),
+        [
+            LetStmt("sheen_color_val", "vec3",
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "sheenColorFactor")),
+            LetStmt("sheen_roughness_val", "scalar",
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "sheenRoughness")),
+            LetStmt("sheen_tex_sample", "vec4",
+                ConstructorExpr("vec4", [NumberLit("1.0")])),
+            _sample_tex("tex_sheenColor", "sheen_tex_sample"),
+            # glTF sheen color textures are sRGB-encoded
+            AssignStmt(AssignTarget(VarRef("sheen_color_val")),
+                BinaryOp("*", VarRef("sheen_color_val"),
+                    CallExpr(VarRef("srgb_to_linear"), [
+                        SwizzleAccess(VarRef("sheen_tex_sample"), "xyz")]))),
+            LetStmt("sheened", "vec3", CallExpr(
+                VarRef("sheen_over"), [
+                    VarRef(result_var), VarRef("n"), VarRef("v"), VarRef("l"),
+                    VarRef("sheen_color_val"), VarRef("sheen_roughness_val"),
+                ])),
+            AssignStmt(AssignTarget(VarRef(result_var)), VarRef("sheened")),
+        ],
+        [],
+    ))
+
+    # --- Clearcoat (flag check) ---
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_CLEARCOAT))),
+            NumberLit("0")),
+        [
+            LetStmt("coat_factor", "scalar",
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "clearcoatFactor")),
+            LetStmt("coat_roughness", "scalar",
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "clearcoatRoughness")),
+            LetStmt("coat_tex_sample", "vec4",
+                ConstructorExpr("vec4", [NumberLit("1.0")])),
+            _sample_tex("tex_clearcoat", "coat_tex_sample"),
+            AssignStmt(AssignTarget(VarRef("coat_factor")),
+                BinaryOp("*", VarRef("coat_factor"),
+                    SwizzleAccess(VarRef("coat_tex_sample"), "x"))),
+            LetStmt("coat_rough_sample", "vec4",
+                ConstructorExpr("vec4", [NumberLit("1.0")])),
+            _sample_tex("tex_clearcoatRough", "coat_rough_sample"),
+            AssignStmt(AssignTarget(VarRef("coat_roughness")),
+                BinaryOp("*", VarRef("coat_roughness"),
+                    SwizzleAccess(VarRef("coat_rough_sample"), "y"))),
+            LetStmt("coated", "vec3", CallExpr(
+                VarRef("coat_over"), [
+                    VarRef(result_var), VarRef("n"), VarRef("v"), VarRef("l"),
+                    VarRef("coat_factor"), VarRef("coat_roughness"),
+                ])),
+            AssignStmt(AssignTarget(VarRef(result_var)), VarRef("coated")),
+        ],
+        [],
+    ))
+
+    # --- Emission (flag check) ---
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_EMISSION))),
+            NumberLit("0")),
+        [
+            LetStmt("em_color", "vec3", BinaryOp("*",
+                VarRef("mat_emissiveFactor"), VarRef("mat_emissionStrength"))),
+            LetStmt("em_tex_sample", "vec4",
+                ConstructorExpr("vec4", [NumberLit("1.0")])),
+            _sample_tex("tex_emissive", "em_tex_sample"),
+            # glTF emissive textures are sRGB-encoded
+            AssignStmt(AssignTarget(VarRef("em_color")),
+                BinaryOp("*", VarRef("em_color"),
+                    CallExpr(VarRef("srgb_to_linear"), [
+                        SwizzleAccess(VarRef("em_tex_sample"), "xyz")]))),
+            AssignStmt(AssignTarget(VarRef(result_var)),
+                BinaryOp("+", VarRef(result_var), VarRef("em_color"))),
+        ],
+        [],
+    ))
+
+    # --- Tonemap + output ---
+    tonemap_strategy = schedule.get("tonemap", "none") if schedule else "none"
+    if tonemap_strategy == "aces":
+        body.append(LetStmt("tonemapped", "vec3",
+            CallExpr(VarRef("tonemap_aces"), [VarRef(result_var)])))
+        body.append(LetStmt("final_color", "vec3",
+            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
+        output_var = "final_color"
+    elif tonemap_strategy == "reinhard":
+        body.append(LetStmt("tonemapped", "vec3",
+            CallExpr(VarRef("tonemap_reinhard"), [VarRef(result_var)])))
+        body.append(LetStmt("final_color", "vec3",
+            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
+        output_var = "final_color"
+    else:
+        output_var = result_var
+
+    return body, output_var
+
+
+def _expand_bindless_fragment(
+    surface: SurfaceDecl,
+    module: Module,
+    geometry: GeometryDecl | None = None,
+    schedule: dict[str, str] | None = None,
+) -> StageBlock:
+    """Generate a bindless uber-shader fragment stage.
+
+    Uses materials SSBO + bindless texture array instead of per-material
+    descriptor sets. Material index comes from push constant.
+    """
+    stage = StageBlock(stage_type="fragment")
+
+    # Standard fragment inputs (from geometry or defaults)
+    frag_inputs = []
+    if geometry and geometry.outputs:
+        for binding in geometry.outputs.bindings:
+            if binding.name != "clip_pos":
+                inp_type = _infer_output_type(binding.name)
+                frag_inputs.append((binding.name, inp_type))
+    else:
+        frag_inputs = [
+            ("frag_normal", "vec3"),
+            ("frag_pos", "vec3"),
+        ]
+
+    for name, type_name in frag_inputs:
+        v = VarDecl(name, type_name)
+        v._is_input = True
+        stage.inputs.append(v)
+
+    # Ensure frag_uv input exists
+    has_frag_uv = any(name == "frag_uv" for name, _ in frag_inputs)
+    if not has_frag_uv:
+        frag_inputs.append(("frag_uv", "vec2"))
+        v = VarDecl("frag_uv", "vec2")
+        v._is_input = True
+        stage.inputs.append(v)
+
+    # Fragment output
+    out = VarDecl("color", "vec4")
+    out._is_input = False
+    stage.outputs.append(out)
+
+    # --- Uniforms: Light ---
+    stage.uniforms.append(UniformBlock("Light", [
+        BlockField("light_dir", "vec3"),
+        BlockField("view_pos", "vec3"),
+    ]))
+
+    # --- Materials SSBO (replaces per-material UBO) ---
+    stage.storage_buffers.append(StorageBufferDecl(
+        "materials", "BindlessMaterialData"))
+
+    # --- IBL samplers (kept as regular samplers — scene-global, not per-material) ---
+    for sam in surface.samplers:
+        if sam.type_name == "samplerCube" or sam.name in ("brdf_lut",):
+            stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
+
+    # --- Bindless texture array ---
+    stage.bindless_texture_arrays.append(BindlessTextureArrayDecl("textures"))
+
+    # --- Push constants: model + material_index ---
+    stage.push_constants.append(PushBlock("PushConstants", [
+        BlockField("model", "mat4"),
+        BlockField("material_index", "uint"),
+    ]))
+
+    # --- Generate main body ---
+    body = []
+
+    # UV alias
+    body.append(LetStmt("uv", "vec2", VarRef("frag_uv")))
+
+    # Determine normal/position variables
+    has_pos = any(n in ("world_pos", "frag_pos") for n, _ in frag_inputs)
+    pos_var = next(
+        (n for n, _ in frag_inputs if n in ("world_pos", "frag_pos")),
+        "world_pos",
+    )
+    normal_var = next(
+        (n for n, _ in frag_inputs if n in ("frag_normal", "world_normal")),
+        "frag_normal",
+    )
+
+    # n, v, l setup
+    body.append(LetStmt("n", "vec3", CallExpr(VarRef("normalize"), [VarRef(normal_var)])))
+    if has_pos:
+        body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
+            BinaryOp("-", VarRef("view_pos"), VarRef(pos_var))])))
+    else:
+        body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
+            ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("0.0"), NumberLit("1.0")])])))
+    body.append(LetStmt("l", "vec3", CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+    body.append(LetStmt("n_dot_v", "scalar", CallExpr(VarRef("max"), [
+        CallExpr(VarRef("dot"), [VarRef("n"), VarRef("v")]),
+        NumberLit("0.001"),
+    ])))
+
+    # Bindless uber-shader body (material_index from push constant)
+    uber_body, output_var = _emit_bindless_layer_body(
+        surface, VarRef("material_index"), schedule, is_rt=False)
+    body.extend(uber_body)
+
+    # Output final color
+    body.append(AssignStmt(
+        AssignTarget(VarRef("color")),
+        ConstructorExpr("vec4", [VarRef(output_var), NumberLit("1.0")]),
+    ))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
+def _expand_bindless_closest_hit(
+    surface: SurfaceDecl,
+    module: Module,
+    schedule: dict[str, str] | None = None,
+) -> StageBlock:
+    """Generate a bindless uber-shader closest-hit stage.
+
+    Uses materials SSBO + bindless texture array. Material index
+    comes from gl_GeometryIndexEXT (set per BLAS geometry).
+    """
+    stage = StageBlock(stage_type="closest_hit")
+
+    # Incoming ray payload
+    stage.ray_payloads.append(RayPayloadDecl("payload", "vec4"))
+
+    # Hit attributes (barycentrics)
+    stage.hit_attributes.append(HitAttributeDecl("bary", "vec2"))
+
+    # Storage buffers for vertex data (SoA layout)
+    stage.storage_buffers.append(StorageBufferDecl("positions", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("normals", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("tex_coords", "vec2"))
+    stage.storage_buffers.append(StorageBufferDecl("indices", "uint"))
+
+    # Materials SSBO
+    stage.storage_buffers.append(StorageBufferDecl(
+        "materials", "BindlessMaterialData"))
+
+    # IBL samplers (scene-global)
+    for sam in surface.samplers:
+        if sam.type_name == "samplerCube" or sam.name in ("brdf_lut",):
+            stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
+
+    # Bindless texture array
+    stage.bindless_texture_arrays.append(BindlessTextureArrayDecl("textures"))
+
+    # --- Generate main body ---
+    body = []
+
+    # Load per-geometry index offset from materials SSBO (indexed by geometry_index)
+    body.append(LetStmt("geo_index_offset", "scalar",
+        FieldAccess(IndexAccess(VarRef("materials"), VarRef("geometry_index")),
+            "index_offset")))
+
+    # Barycentric interpolation preamble — offset primitive_id by geometry's index_offset
+    body.append(LetStmt("base", "scalar",
+        BinaryOp("+",
+            BinaryOp("*", VarRef("geo_index_offset"), NumberLit("1.0")),
+            BinaryOp("*", VarRef("primitive_id"), NumberLit("3.0")))))
+    body.append(LetStmt("i0", "uint", IndexAccess(VarRef("indices"), VarRef("base"))))
+    body.append(LetStmt("i1", "uint", IndexAccess(VarRef("indices"),
+        BinaryOp("+", VarRef("base"), NumberLit("1.0")))))
+    body.append(LetStmt("i2", "uint", IndexAccess(VarRef("indices"),
+        BinaryOp("+", VarRef("base"), NumberLit("2.0")))))
+
+    body.append(LetStmt("b", "vec2", VarRef("bary")))
+    body.append(LetStmt("bw", "scalar", BinaryOp("-",
+        BinaryOp("-", NumberLit("1.0"), SwizzleAccess(VarRef("b"), "x")),
+        SwizzleAccess(VarRef("b"), "y"))))
+
+    # Interpolate position
+    body.append(LetStmt("p0", "vec4", IndexAccess(VarRef("positions"), VarRef("i0"))))
+    body.append(LetStmt("p1", "vec4", IndexAccess(VarRef("positions"), VarRef("i1"))))
+    body.append(LetStmt("p2", "vec4", IndexAccess(VarRef("positions"), VarRef("i2"))))
+    body.append(LetStmt("hit_pos", "vec3", BinaryOp("+",
+        BinaryOp("+",
+            BinaryOp("*", SwizzleAccess(VarRef("p0"), "xyz"), VarRef("bw")),
+            BinaryOp("*", SwizzleAccess(VarRef("p1"), "xyz"),
+                SwizzleAccess(VarRef("b"), "x"))),
+        BinaryOp("*", SwizzleAccess(VarRef("p2"), "xyz"),
+            SwizzleAccess(VarRef("b"), "y")))))
+
+    # Interpolate normal
+    body.append(LetStmt("n0", "vec4", IndexAccess(VarRef("normals"), VarRef("i0"))))
+    body.append(LetStmt("n1", "vec4", IndexAccess(VarRef("normals"), VarRef("i1"))))
+    body.append(LetStmt("n2", "vec4", IndexAccess(VarRef("normals"), VarRef("i2"))))
+    body.append(LetStmt("n", "vec3", CallExpr(VarRef("normalize"), [
+        BinaryOp("+",
+            BinaryOp("+",
+                BinaryOp("*", SwizzleAccess(VarRef("n0"), "xyz"), VarRef("bw")),
+                BinaryOp("*", SwizzleAccess(VarRef("n1"), "xyz"),
+                    SwizzleAccess(VarRef("b"), "x"))),
+            BinaryOp("*", SwizzleAccess(VarRef("n2"), "xyz"),
+                SwizzleAccess(VarRef("b"), "y")))])))
+
+    # Interpolate UV
+    body.append(LetStmt("uv0", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i0"))))
+    body.append(LetStmt("uv1", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i1"))))
+    body.append(LetStmt("uv2", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i2"))))
+    body.append(LetStmt("uv", "vec2", BinaryOp("+",
+        BinaryOp("+",
+            BinaryOp("*", VarRef("uv0"), VarRef("bw")),
+            BinaryOp("*", VarRef("uv1"), SwizzleAccess(VarRef("b"), "x"))),
+        BinaryOp("*", VarRef("uv2"), SwizzleAccess(VarRef("b"), "y")))))
+
+    # View and light directions (RT-specific)
+    body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
+        UnaryOp("-", VarRef("world_ray_direction"))])))
+    body.append(LetStmt("l", "vec3",
+        CallExpr(VarRef("normalize"), [
+            ConstructorExpr("vec3", [
+                NumberLit("1.0"), NumberLit("0.8"), NumberLit("0.6")])])))
+    body.append(LetStmt("n_dot_v", "scalar", CallExpr(VarRef("max"), [
+        CallExpr(VarRef("dot"), [VarRef("n"), VarRef("v")]),
+        NumberLit("0.001"),
+    ])))
+
+    # Bindless uber-shader body (material index from gl_GeometryIndexEXT)
+    uber_body, output_var = _emit_bindless_layer_body(
+        surface, VarRef("geometry_index"), schedule, is_rt=True)
+    body.extend(uber_body)
+
+    # Write to payload
+    body.append(AssignStmt(
+        AssignTarget(VarRef("payload")),
+        ConstructorExpr("vec4", [VarRef(output_var), NumberLit("1.0")]),
+    ))
 
     stage.functions.append(FunctionDef("main", [], None, body))
     return stage

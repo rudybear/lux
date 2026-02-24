@@ -73,6 +73,10 @@ def main(argv: list[str] | None = None) -> None:
         help="Define compile-time integer constant (e.g., --define max_vertices=64)",
     )
     parser.add_argument(
+        "--bindless", action="store_true",
+        help="Emit bindless descriptor uber-shaders (requires VK_EXT_descriptor_indexing)",
+    )
+    parser.add_argument(
         "--version", action="version", version="luxc 0.1.0"
     )
 
@@ -188,7 +192,7 @@ def main(argv: list[str] | None = None) -> None:
                     emit_asm=args.emit_asm, validate=not args.no_validate,
                     emit_reflection=not args.no_reflection, debug=args.debug,
                     source_name=input_path.name, pipeline=args.pipeline,
-                    defines=defines,
+                    defines=defines, bindless=args.bindless,
                 )
             except Exception as e:
                 print(f"Error: {e}", file=sys.stderr)
@@ -217,7 +221,7 @@ def main(argv: list[str] | None = None) -> None:
                     emit_asm=args.emit_asm, validate=not args.no_validate,
                     emit_reflection=not args.no_reflection, debug=args.debug,
                     source_name=input_path.name, pipeline=args.pipeline,
-                    features=perm, defines=defines,
+                    features=perm, defines=defines, bindless=args.bindless,
                 )
             except Exception as e:
                 print(f"Error (features={sorted(perm)}): {e}", file=sys.stderr)
@@ -248,6 +252,7 @@ def main(argv: list[str] | None = None) -> None:
             pipeline=args.pipeline,
             features=feature_set,
             defines=defines,
+            bindless=args.bindless,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

@@ -118,6 +118,30 @@ void VulkanContext::init(bool enableRT, bool headless, GLFWwindow* window) {
         std::cout << "[info] VK_EXT_mesh_shader not available. Mesh shader features disabled." << std::endl;
     }
 
+    // Query physical device for descriptor indexing (bindless) feature support
+    {
+        VkPhysicalDeviceVulkan12Features supported12 = {};
+        supported12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+
+        VkPhysicalDeviceFeatures2 features2 = {};
+        features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features2.pNext = &supported12;
+        vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+
+        bindlessSupported =
+            supported12.runtimeDescriptorArray &&
+            supported12.shaderSampledImageArrayNonUniformIndexing &&
+            supported12.descriptorBindingPartiallyBound &&
+            supported12.descriptorBindingVariableDescriptorCount &&
+            supported12.descriptorBindingSampledImageUpdateAfterBind;
+    }
+
+    if (!bindlessSupported) {
+        std::cout << "[info] Bindless descriptor features not fully supported. Bindless disabled." << std::endl;
+    } else {
+        std::cout << "[info] Bindless descriptor indexing supported." << std::endl;
+    }
+
     // Build device
     vkb::DeviceBuilder deviceBuilder(vkbPhysDevice);
 
@@ -126,6 +150,16 @@ void VulkanContext::init(bool enableRT, bool headless, GLFWwindow* window) {
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     features12.bufferDeviceAddress = VK_TRUE;
     features12.descriptorIndexing = VK_TRUE;
+
+    // Enable bindless descriptor indexing features if supported
+    if (bindlessSupported) {
+        features12.runtimeDescriptorArray = VK_TRUE;
+        features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+        features12.descriptorBindingPartiallyBound = VK_TRUE;
+        features12.descriptorBindingVariableDescriptorCount = VK_TRUE;
+        features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    }
+
     deviceBuilder.add_pNext(&features12);
 
     // Enable RT features if supported

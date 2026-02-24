@@ -171,8 +171,9 @@ void RTRenderer::createBLAS(VulkanContext& ctx) {
     const auto& drawRanges = m_scene->getDrawRanges();
 
     // Decide whether to use multi-geometry BLAS
-    // Multi-geometry: one geometry per draw range, enabling per-geometry hit group selection
-    bool useMultiGeometry = m_multiMaterial && drawRanges.size() > 1;
+    // Multi-geometry: one geometry per draw range, enabling per-geometry hit group selection.
+    // In bindless mode, gl_GeometryIndexEXT maps to material index.
+    bool useMultiGeometry = (m_multiMaterial || m_bindlessMode) && drawRanges.size() > 1;
 
     std::vector<VkAccelerationStructureGeometryKHR> geometries;
     std::vector<VkAccelerationStructureBuildRangeInfoKHR> buildRanges;
@@ -625,6 +626,7 @@ void RTRenderer::createSBT(VulkanContext& ctx) {
     uint32_t handleSizeAligned = static_cast<uint32_t>(alignUp(handleSize, handleAlignment));
 
     // Total shader groups in the pipeline
+    // Bindless: one hit group (uber-shader), same as single-material
     uint32_t hitGroupCount = m_multiMaterial ? static_cast<uint32_t>(m_hitPermutations.size()) : 1;
     uint32_t totalGroupCount = 2 + hitGroupCount;  // rgen + miss + N hit groups
 
@@ -644,7 +646,8 @@ void RTRenderer::createSBT(VulkanContext& ctx) {
     // Hit region: one record per BLAS geometry (not per hit group!)
     // Each geometry maps to a specific hit group handle.
     // Vulkan selects: instanceSBTOffset + geometryIndex * sbt.stride
-    uint32_t hitRecordCount = m_multiMaterial ? m_geometryCount : 1;
+    // In bindless mode: N geometries all map to the same single hit group.
+    uint32_t hitRecordCount = (m_multiMaterial || m_bindlessMode) ? m_geometryCount : 1;
     VkDeviceSize hitRegionSize = alignUp(
         static_cast<VkDeviceSize>(hitRecordCount) * handleSizeAligned, baseAlignment);
     VkDeviceSize totalSbtSize = raygenRegionSize + missRegionSize + hitRegionSize;
@@ -681,7 +684,15 @@ void RTRenderer::createSBT(VulkanContext& ctx) {
     // Copy hit records
     uint8_t* hitBase = sbtData + raygenRegionSize + missRegionSize;
 
-    if (m_multiMaterial && !m_geometryToHitGroup.empty()) {
+    if (m_bindlessMode && m_geometryCount > 1) {
+        // Bindless: all geometries use the same hit group (group 2).
+        // Write N identical hit records so geometryIndex * stride lands on valid data.
+        for (uint32_t gi = 0; gi < m_geometryCount; gi++) {
+            memcpy(hitBase + gi * handleSizeAligned,
+                   handles.data() + 2 * handleSize,
+                   handleSize);
+        }
+    } else if (m_multiMaterial && !m_geometryToHitGroup.empty()) {
         // Multi-material: write one hit record per geometry, each pointing to
         // the correct permutation's hit group handle
         for (uint32_t gi = 0; gi < m_geometryCount; gi++) {
@@ -745,7 +756,11 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
     updateCameraUBO(ctx);
 
     // Create Material uniform buffer(s)
-    if (m_multiMaterial && m_scene && m_scene->hasGltfScene()) {
+    // In bindless mode, material data is in the materials SSBO, not individual UBOs.
+    // We still create a dummy single-material UBO for bindings that reference "Material"
+    // (e.g. if the shader has both bindless and a legacy Material UBO -- though typically
+    // a bindless shader won't have a Material UBO).
+    if (!m_bindlessMode && m_multiMaterial && m_scene && m_scene->hasGltfScene()) {
         // Multi-material: create one UBO per material
         const auto& materials = m_scene->getGltfScene().materials;
         size_t matCount = materials.size();
@@ -777,7 +792,7 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
         m_materialAllocation = VK_NULL_HANDLE; // owned by per-material array
 
         std::cout << "[info] Created " << matCount << " per-material UBOs" << std::endl;
-    } else {
+    } else if (!m_bindlessMode) {
         // Single-material: one Material UBO (original path)
         MaterialUBOData materialData{};
         if (m_scene && m_scene->hasGltfScene()) {
@@ -821,12 +836,20 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
     const auto& drawRanges = m_scene->getDrawRanges();
     size_t matCount = (m_scene && m_scene->hasGltfScene()) ?
         m_scene->getGltfScene().materials.size() : 1;
-    bool multiDesc = m_multiMaterial && materialSetIdx >= 0 && matCount > 1;
+    bool multiDesc = !m_bindlessMode && m_multiMaterial && materialSetIdx >= 0 && matCount > 1;
+
+    // Determine actual texture count for bindless
+    uint32_t bindlessTexCount = m_bindlessMode ? m_bindlessTextures.textureCount : 0;
+    // Must have at least 1 for valid descriptor writes
+    if (m_bindlessMode && bindlessTexCount == 0) bindlessTexCount = 1;
 
     for (auto& b : mergedBindings) {
         VkDescriptorType vkType = bindingTypeToVkDescriptorType(b.type);
 
-        if (multiDesc && b.set == materialSetIdx) {
+        if (b.type == "bindless_combined_image_sampler_array") {
+            // Pool needs enough combined image samplers for the actual texture count
+            typeCounts[VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER] += bindlessTexCount;
+        } else if (multiDesc && b.set == materialSetIdx) {
             // Need one descriptor per material for bindings in the material set
             typeCounts[vkType] += static_cast<uint32_t>(matCount);
         } else {
@@ -853,12 +876,16 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
     poolInfo.maxSets = maxSets;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
+    // Bindless requires UPDATE_AFTER_BIND on the pool
+    if (m_bindlessMode) {
+        poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+    }
 
     if (vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create RT descriptor pool");
     }
 
-    // Allocate descriptor sets for non-material sets (shared across all materials)
+    // Allocate descriptor sets
     for (auto& [setIdx, layout] : reflectedSetLayouts) {
         if (multiDesc && setIdx == materialSetIdx) continue; // allocated per-material below
 
@@ -868,14 +895,25 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
         allocSetInfo.descriptorSetCount = 1;
         allocSetInfo.pSetLayouts = &layout;
 
+        // For the bindless texture set, use variable descriptor count
+        VkDescriptorSetVariableDescriptorCountAllocateInfo variableCountInfo = {};
+        uint32_t variableDescCount = bindlessTexCount;
+
+        if (m_bindlessMode && setIdx == m_bindlessTextureSet) {
+            variableCountInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO;
+            variableCountInfo.descriptorSetCount = 1;
+            variableCountInfo.pDescriptorCounts = &variableDescCount;
+            allocSetInfo.pNext = &variableCountInfo;
+        }
+
         VkDescriptorSet set;
         if (vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &set) != VK_SUCCESS) {
-            throw std::runtime_error("Failed to allocate RT descriptor set");
+            throw std::runtime_error("Failed to allocate RT descriptor set for set " + std::to_string(setIdx));
         }
         reflectedDescSets[setIdx] = set;
     }
 
-    // Write non-material descriptor sets
+    // Write descriptor sets (non-material bindings, plus bindless-specific bindings)
     {
         struct DescWriteInfo {
             VkDescriptorBufferInfo bufferInfo;
@@ -885,9 +923,15 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
         std::vector<DescWriteInfo> writeInfos(mergedBindings.size());
         std::vector<VkWriteDescriptorSet> writes;
 
+        // For bindless texture array, we need a separate vector of image infos
+        std::vector<VkDescriptorImageInfo> bindlessImageInfos;
+
         for (size_t i = 0; i < mergedBindings.size(); i++) {
             auto& b = mergedBindings[i];
             if (multiDesc && b.set == materialSetIdx) continue; // handled per-material
+
+            // Skip bindless texture array — handled separately below
+            if (b.type == "bindless_combined_image_sampler_array") continue;
 
             auto setIt = reflectedDescSets.find(b.set);
             if (setIt == reflectedDescSets.end()) continue;
@@ -900,10 +944,13 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
 
             if (b.type == "uniform_buffer") {
                 w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-                if (b.name == "Material") {
+                if (b.name == "Material" && !m_bindlessMode) {
                     // Single-material path — write material 0
                     writeInfos[i].bufferInfo = {m_materialBuffer, 0,
                         static_cast<VkDeviceSize>(b.size > 0 ? b.size : sizeof(MaterialUBOData))};
+                } else if (b.name == "Material" && m_bindlessMode) {
+                    // Bindless mode: skip Material UBO (material data is in SSBO)
+                    continue;
                 } else {
                     writeInfos[i].bufferInfo = {cameraBuffer, 0,
                         static_cast<VkDeviceSize>(b.size > 0 ? b.size : 128)};
@@ -930,6 +977,10 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
                 else if (b.name == "normals") { buf = normalsBuffer; bufSize = normalsSize; }
                 else if (b.name == "tex_coords") { buf = texCoordsBuffer; bufSize = texCoordsSize; }
                 else if (b.name == "indices") { buf = indexStorageBuffer; bufSize = indexStorageSize; }
+                else if (b.name == "materials" && m_bindlessMode && m_bindlessMaterials.buffer != VK_NULL_HANDLE) {
+                    buf = m_bindlessMaterials.buffer;
+                    bufSize = static_cast<VkDeviceSize>(m_bindlessMaterials.materialCount) * sizeof(BindlessMaterialData);
+                }
                 if (buf == VK_NULL_HANDLE) {
                     std::cout << "[warn] Unknown storage buffer name: " << b.name << std::endl;
                     continue;
@@ -954,6 +1005,41 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
             }
 
             writes.push_back(w);
+        }
+
+        // Bindless texture array write
+        if (m_bindlessMode && m_bindlessTextureSet >= 0 && bindlessTexCount > 0) {
+            auto setIt = reflectedDescSets.find(m_bindlessTextureSet);
+            if (setIt != reflectedDescSets.end()) {
+                bindlessImageInfos.resize(bindlessTexCount);
+                for (uint32_t ti = 0; ti < bindlessTexCount; ti++) {
+                    if (ti < m_bindlessTextures.textureCount) {
+                        bindlessImageInfos[ti].sampler = m_bindlessTextures.samplers[ti];
+                        bindlessImageInfos[ti].imageView = m_bindlessTextures.imageViews[ti];
+                        bindlessImageInfos[ti].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    } else {
+                        // Pad with a valid fallback (first texture or default)
+                        if (m_bindlessTextures.textureCount > 0) {
+                            bindlessImageInfos[ti].sampler = m_bindlessTextures.samplers[0];
+                            bindlessImageInfos[ti].imageView = m_bindlessTextures.imageViews[0];
+                        } else {
+                            auto& fallback = m_scene->getTextureForBinding("base_color_tex");
+                            bindlessImageInfos[ti].sampler = fallback.sampler;
+                            bindlessImageInfos[ti].imageView = fallback.imageView;
+                        }
+                        bindlessImageInfos[ti].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    }
+                }
+
+                VkWriteDescriptorSet w = {};
+                w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w.dstSet = setIt->second;
+                w.dstBinding = static_cast<uint32_t>(m_bindlessTextureBinding);
+                w.descriptorCount = bindlessTexCount;
+                w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                w.pImageInfo = bindlessImageInfos.data();
+                writes.push_back(w);
+            }
         }
 
         if (!writes.empty()) {
@@ -1102,7 +1188,8 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
     std::cout << "[info] RT descriptor set created (reflection-driven: "
               << reflectedSetLayouts.size() << " set(s), "
               << mergedBindings.size() << " binding(s)"
-              << (multiDesc ? ", multi-material" : "") << ")" << std::endl;
+              << (m_bindlessMode ? ", bindless" : (multiDesc ? ", multi-material" : ""))
+              << ")" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -1243,14 +1330,86 @@ void RTRenderer::init(VulkanContext& ctx,
         m_scene->getGltfScene().materials.size() > 1;
     bool hasManifest = !manifest.permutations.empty();
 
-    // NOTE: Multi-material RT is disabled because Vulkan RT binds descriptor sets
-    // ONCE before traceRays — all hit shaders share the same textures/UBOs.
-    // Per-geometry material switching would require bindless textures or texture
-    // arrays indexed by gl_GeometryIndexEXT, which needs shader-level changes.
-    // For now, use single-material mode with scene-wide feature detection.
-    // TODO: Add bindless texture support for true per-geometry materials in RT.
-    if (false && hasManifest && hasMultipleMaterials) {
-        // Multi-material mode: load per-permutation rchit shaders
+    // --- Detect bindless mode ---
+    // Check if the rchit reflection JSON has bindlessEnabled AND the device supports it.
+    // Bindless uses a single uber-shader rchit with gl_GeometryIndexEXT for material lookup.
+    {
+        std::string rchitJsonPath = m_pipelineBase + ".rchit.json";
+        if (fs::exists(rchitJsonPath)) {
+            ReflectionData rchitRefl = parseReflectionJson(rchitJsonPath);
+            if (rchitRefl.bindlessEnabled && ctx.supportsBindless()) {
+                m_bindlessMode = true;
+                // Extract bindless set/binding info from the reflection data
+                for (auto& [setIdx, bindings] : rchitRefl.descriptor_sets) {
+                    for (auto& b : bindings) {
+                        if (b.type == "bindless_combined_image_sampler_array") {
+                            m_bindlessTextureSet = setIdx;
+                            m_bindlessTextureBinding = b.binding;
+                            m_bindlessMaxCount = b.max_count > 0 ?
+                                static_cast<uint32_t>(b.max_count) : 1024;
+                        }
+                        if (b.type == "storage_buffer" && b.name == "materials") {
+                            m_bindlessMaterialsSet = setIdx;
+                            m_bindlessMaterialsBinding = b.binding;
+                        }
+                    }
+                }
+                std::cout << "[info] Bindless RT mode detected (texture set=" << m_bindlessTextureSet
+                          << " binding=" << m_bindlessTextureBinding
+                          << " max=" << m_bindlessMaxCount
+                          << ", materials set=" << m_bindlessMaterialsSet
+                          << " binding=" << m_bindlessMaterialsBinding << ")" << std::endl;
+            }
+        }
+    }
+
+    if (m_bindlessMode) {
+        // --- Bindless RT mode ---
+        // Single uber-shader rchit, multi-geometry BLAS for per-material gl_GeometryIndexEXT.
+        // No permutation suffix needed for bindless shaders.
+        m_multiMaterial = false; // bindless replaces multi-material permutation mode
+
+        // Load reflection JSON for all RT stages (using base path, no permutation)
+        std::string rgenJsonPath = m_pipelineBase + ".rgen.json";
+        std::string rmissJsonPath = m_pipelineBase + ".rmiss.json";
+        std::string rchitJsonPath = m_pipelineBase + ".rchit.json";
+
+        if (fs::exists(rgenJsonPath)) {
+            std::cout << "[info] Loading reflection JSON: " << rgenJsonPath << std::endl;
+            stageReflections.push_back(parseReflectionJson(rgenJsonPath));
+        }
+        if (fs::exists(rchitJsonPath)) {
+            std::cout << "[info] Loading reflection JSON: " << rchitJsonPath << std::endl;
+            stageReflections.push_back(parseReflectionJson(rchitJsonPath));
+        }
+        if (fs::exists(rmissJsonPath)) {
+            std::cout << "[info] Loading reflection JSON: " << rmissJsonPath << std::endl;
+            stageReflections.push_back(parseReflectionJson(rmissJsonPath));
+        }
+
+        if (stageReflections.empty()) {
+            throw std::runtime_error("No reflection JSON files found for RT pipeline: " + m_pipelineBase);
+        }
+
+        // Build bindless resources from scene
+        m_bindlessTextures = m_scene->buildBindlessTextureArray(ctx);
+        m_bindlessMaterials = m_scene->buildMaterialsSSBOByGeometry(ctx, m_bindlessTextures);
+
+        // Enable multi-geometry BLAS: one geometry per draw range so that
+        // gl_GeometryIndexEXT maps directly to the material index
+        const auto& drawRanges = m_scene->getDrawRanges();
+        if (drawRanges.size() > 1) {
+            m_geometryCount = static_cast<uint32_t>(drawRanges.size());
+        }
+
+        std::cout << "[info] Bindless RT: " << m_bindlessTextures.textureCount << " textures, "
+                  << m_bindlessMaterials.materialCount << " materials, "
+                  << m_geometryCount << " geometries" << std::endl;
+
+    } else if (false && hasManifest && hasMultipleMaterials) {
+        // NOTE: Permutation-based multi-material RT is disabled.
+        // Vulkan RT binds descriptor sets ONCE before traceRays, so per-geometry
+        // material switching requires bindless textures (see bindless mode above).
         m_multiMaterial = true;
 
         auto groups = m_scene->groupMaterialsByFeatures();
@@ -1349,7 +1508,7 @@ void RTRenderer::init(VulkanContext& ctx,
                   << " permutation(s), " << totalMaterials << " material(s), "
                   << drawRanges.size() << " draw range(s)" << std::endl;
     } else {
-        // Single-material mode
+        // Single-material mode (no bindless, no multi-material)
         m_multiMaterial = false;
 
         // If manifest exists but only one material, resolve the best permutation
@@ -1400,10 +1559,11 @@ void RTRenderer::init(VulkanContext& ctx,
     rmissModule = SpvLoader::createShaderModule(ctx.device, rmissCode);
 
     if (!m_multiMaterial) {
-        // Single-material: load the rchit module passed in (may be permutation-resolved)
-        // Check if we should use a resolved permutation instead
+        // Single-material or bindless: load the rchit module.
+        // In bindless mode, use base rchit (no permutation suffix).
+        // In single-material mode, try resolving a permutation.
         std::string resolvedRchitPath = rchitSpvPath;
-        if (hasManifest && m_scene->hasGltfScene()) {
+        if (!m_bindlessMode && hasManifest && m_scene->hasGltfScene()) {
             auto sceneFeatures = m_scene->detectSceneFeatures();
             std::string suffix = findPermutationSuffix(manifest, sceneFeatures);
             if (!suffix.empty()) {
@@ -1431,7 +1591,8 @@ void RTRenderer::init(VulkanContext& ctx,
     updateCameraUBO(ctx);
 
     std::cout << "[info] RT renderer initialized successfully"
-              << (m_multiMaterial ? " (multi-material)" : "") << std::endl;
+              << (m_bindlessMode ? " (bindless)" : (m_multiMaterial ? " (multi-material)" : ""))
+              << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -1544,6 +1705,15 @@ void RTRenderer::cleanup(VulkanContext& ctx) {
     if (instanceBuffer) vmaDestroyBuffer(ctx.allocator, instanceBuffer, instanceAllocation);
     if (sbtBuffer) vmaDestroyBuffer(ctx.allocator, sbtBuffer, sbtAllocation);
     if (cameraBuffer) vmaDestroyBuffer(ctx.allocator, cameraBuffer, cameraAllocation);
+
+    // Bindless materials SSBO (owned by RT renderer, not scene manager)
+    if (m_bindlessMaterials.buffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(ctx.allocator, m_bindlessMaterials.buffer, m_bindlessMaterials.allocation);
+        m_bindlessMaterials.buffer = VK_NULL_HANDLE;
+        m_bindlessMaterials.allocation = VK_NULL_HANDLE;
+    }
+    // Bindless texture array: image views and samplers are owned by SceneManager, not freed here
+    m_bindlessTextures = {};
 
     // Per-material UBOs
     if (!m_perMaterialBuffers.empty()) {

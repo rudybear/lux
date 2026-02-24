@@ -28,6 +28,9 @@ public:
     VkFormat swapchainFormat = VK_FORMAT_B8G8R8A8_UNORM;
     VkExtent2D swapchainExtent = {0, 0};
 
+    // Bindless descriptor support
+    bool bindlessSupported = false;
+
     // Ray tracing support
     bool rtSupported = false;
 
@@ -55,6 +58,9 @@ public:
 
     // Check mesh shader support
     bool supportsMeshShader() const { return meshShaderSupported; }
+
+    // Check bindless descriptor support
+    bool supportsBindless() const { return bindlessSupported; }
 
     // Initialize Vulkan context
     void init(bool enableRT, bool headless, GLFWwindow* window = nullptr);

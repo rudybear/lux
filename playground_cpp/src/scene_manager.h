@@ -10,6 +10,21 @@
 #include <set>
 #include <map>
 #include <unordered_map>
+#include "material_ubo.h"
+
+// Bindless texture array: all unique textures from the scene for descriptor binding
+struct BindlessTextureArray {
+    std::vector<VkImageView> imageViews;
+    std::vector<VkSampler> samplers;
+    uint32_t textureCount = 0;
+};
+
+// Bindless materials SSBO: all materials packed into a single storage buffer
+struct BindlessMaterialsSSBO {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    uint32_t materialCount = 0;
+};
 
 // Shared scene management: loads scenes, uploads meshes/textures/IBL, computes auto-camera.
 // Used by both RTRenderer and RasterRenderer to avoid code duplication.
@@ -46,6 +61,11 @@ public:
     std::unordered_map<std::string, GPUTexture>& getNamedTextures() { return m_namedTextures; }
 
     void cleanup(VulkanContext& ctx);
+
+    // Bindless support: build texture array and materials SSBO from scene data
+    BindlessTextureArray buildBindlessTextureArray(VulkanContext& ctx);
+    BindlessMaterialsSSBO buildMaterialsSSBO(VulkanContext& ctx, const BindlessTextureArray& texArray);
+    BindlessMaterialsSSBO buildMaterialsSSBOByGeometry(VulkanContext& ctx, const BindlessTextureArray& texArray);
 
     // Scene feature detection for dynamic pipeline selection
     std::set<std::string> detectSceneFeatures() const;
@@ -94,6 +114,9 @@ private:
     glm::vec3 m_autoTarget = glm::vec3(0.0f);
     glm::vec3 m_autoUp = glm::vec3(0.0f, 1.0f, 0.0f);
     float m_autoFar = 100.0f;
+
+    // Bindless texture dedup map: VkImage -> index in bindless texture array
+    std::unordered_map<uint64_t, int32_t> m_bindlessTexDedup;
 
     void createDefaultTextures(VulkanContext& ctx);
     void uploadGltfTextures(VulkanContext& ctx);

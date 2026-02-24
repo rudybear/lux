@@ -7,7 +7,7 @@ from luxc.parser.ast_nodes import (
     CallExpr, ConstructorExpr, FieldAccess, SwizzleAccess, IndexAccess,
     TernaryExpr, AssignTarget,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
-    StorageImageDecl, StorageBufferDecl,
+    StorageImageDecl, StorageBufferDecl, BindlessTextureArrayDecl,
 )
 from luxc.codegen.spirv_types import TypeRegistry
 from luxc.codegen.glsl_ext import GLSL_STD_450, LUX_TO_GLSL
@@ -58,7 +58,38 @@ _RT_BUILTINS = {
     "object_to_world": ("mat4x3", "ObjectToWorldKHR", {"closest_hit", "any_hit", "intersection"}),
     "world_to_object": ("mat4x3", "WorldToObjectKHR", {"closest_hit", "any_hit", "intersection"}),
     "incoming_ray_flags": ("uint", "IncomingRayFlagsKHR", {"closest_hit", "any_hit", "miss", "intersection"}),
+    "geometry_index": ("int", "RayGeometryIndexKHR", {"closest_hit", "any_hit", "intersection"}),
 }
+
+# BindlessMaterialData struct fields: (name, lux_type)
+# Must match the GPU-side struct layout (std430)
+_BINDLESS_MATERIAL_FIELDS = [
+    ("baseColorFactor", "vec4"),
+    ("emissiveFactor", "vec3"),
+    ("metallicFactor", "scalar"),
+    ("roughnessFactor", "scalar"),
+    ("emissionStrength", "scalar"),
+    ("ior", "scalar"),
+    ("clearcoatFactor", "scalar"),
+    ("clearcoatRoughness", "scalar"),
+    ("transmissionFactor", "scalar"),
+    ("sheenRoughness", "scalar"),
+    ("_pad0", "scalar"),
+    ("sheenColorFactor", "vec3"),
+    ("_pad1", "scalar"),
+    ("base_color_tex_index", "int"),
+    ("normal_tex_index", "int"),
+    ("metallic_roughness_tex_index", "int"),
+    ("occlusion_tex_index", "int"),
+    ("emissive_tex_index", "int"),
+    ("clearcoat_tex_index", "int"),
+    ("clearcoat_roughness_tex_index", "int"),
+    ("sheen_color_tex_index", "int"),
+    ("transmission_tex_index", "int"),
+    ("material_flags", "uint"),
+    ("index_offset", "scalar"),
+    ("_pad3", "uint"),
+]
 
 
 def generate_spirv(module: Module, stage: StageBlock, debug: bool = False, source_name: str = "") -> str:
@@ -137,12 +168,20 @@ class SpvGenerator:
         if is_mesh:
             lines.append("OpCapability MeshShadingEXT")
         has_storage_buffers = bool(getattr(self.stage, 'storage_buffers', []))
+        has_bindless = bool(getattr(self.stage, 'bindless_texture_arrays', []))
+        # All OpCapability instructions must come before any OpExtension
+        if has_bindless:
+            lines.append("OpCapability RuntimeDescriptorArray")
+            lines.append("OpCapability ShaderNonUniform")
+            lines.append("OpCapability SampledImageArrayNonUniformIndexing")
         if has_storage_buffers:
             lines.append('OpExtension "SPV_KHR_storage_buffer_storage_class"')
         if is_rt:
             lines.append('OpExtension "SPV_KHR_ray_tracing"')
         if is_mesh:
             lines.append('OpExtension "SPV_EXT_mesh_shader"')
+        if has_bindless:
+            lines.append('OpExtension "SPV_EXT_descriptor_indexing"')
         lines.append(f"{self.glsl_ext_id} = OpExtInstImport \"GLSL.std.450\"")
         lines.append("OpMemoryModel Logical GLSL450")
 
@@ -317,6 +356,10 @@ class SpvGenerator:
             offsets = compute_std140_offsets(pb.fields)
             for i, offset in enumerate(offsets):
                 self.decorations.append(f"OpMemberDecorate {struct_id} {i} Offset {offset}")
+                # MatrixStride for matrix members in push constants
+                if pb.fields[i].type_name in ("mat2", "mat3", "mat4"):
+                    self.decorations.append(f"OpMemberDecorate {struct_id} {i} ColMajor")
+                    self.decorations.append(f"OpMemberDecorate {struct_id} {i} MatrixStride 16")
 
         # --- Samplers (separate sampler + texture for WebGPU compatibility) ---
         for sam in self.stage.samplers:
@@ -439,24 +482,33 @@ class SpvGenerator:
             self.interface_ids.append(var_id)
 
         # --- Storage buffer variables (runtime arrays) ---
-        for sb in getattr(self.stage, 'storage_buffers', []):
-            elem_type_id = self.reg.lux_type_to_spirv(sb.element_type)
+        # Struct element type registry for BindlessMaterialData
+        if not hasattr(self, '_ssbo_struct_fields'):
+            self._ssbo_struct_fields = {}  # buffer name -> list[(field_name, field_type)]
 
-            # Compute array stride from element type
-            _ELEM_BYTE_SIZES = {
-                "scalar": 4, "int": 4, "uint": 4, "bool": 4,
-                "vec2": 8, "vec3": 12, "vec4": 16,
-                "ivec2": 8, "ivec3": 12, "ivec4": 16,
-                "uvec2": 8, "uvec3": 12, "uvec4": 16,
-                "mat2": 32, "mat3": 48, "mat4": 64,
-            }
-            # std430 array stride: element aligned to its own size,
-            # but vec3 has stride 16 (padded to vec4 alignment in arrays)
-            _ELEM_STRIDE = dict(_ELEM_BYTE_SIZES)
-            _ELEM_STRIDE["vec3"] = 16
-            _ELEM_STRIDE["ivec3"] = 16
-            _ELEM_STRIDE["uvec3"] = 16
-            stride = _ELEM_STRIDE.get(sb.element_type, 16)
+        for sb in getattr(self.stage, 'storage_buffers', []):
+            # Check if element type is a known struct
+            if sb.element_type == "BindlessMaterialData":
+                elem_type_id, stride = self._declare_bindless_material_struct()
+                self._ssbo_struct_fields[sb.name] = _BINDLESS_MATERIAL_FIELDS
+            else:
+                elem_type_id = self.reg.lux_type_to_spirv(sb.element_type)
+
+                # Compute array stride from element type
+                _ELEM_BYTE_SIZES = {
+                    "scalar": 4, "int": 4, "uint": 4, "bool": 4,
+                    "vec2": 8, "vec3": 12, "vec4": 16,
+                    "ivec2": 8, "ivec3": 12, "ivec4": 16,
+                    "uvec2": 8, "uvec3": 12, "uvec4": 16,
+                    "mat2": 32, "mat3": 48, "mat4": 64,
+                }
+                # std430 array stride: element aligned to its own size,
+                # but vec3 has stride 16 (padded to vec4 alignment in arrays)
+                _ELEM_STRIDE = dict(_ELEM_BYTE_SIZES)
+                _ELEM_STRIDE["vec3"] = 16
+                _ELEM_STRIDE["ivec3"] = 16
+                _ELEM_STRIDE["uvec3"] = 16
+                stride = _ELEM_STRIDE.get(sb.element_type, 16)
 
             # OpTypeRuntimeArray
             rtarr_key = f"_rtarr_{sb.element_type}"
@@ -490,6 +542,23 @@ class SpvGenerator:
             self.var_map[sb.name] = var_id
             self.var_types[sb.name] = f"_rtarr_{sb.element_type}"
             self.var_storage[sb.name] = "StorageBuffer"
+            self.interface_ids.append(var_id)
+
+        # --- Bindless texture arrays (runtime array of combined image sampler) ---
+        for bta in getattr(self.stage, 'bindless_texture_arrays', []):
+            # Runtime array of combined image sampler
+            cis_type = self.reg.combined_image_sampler_type()
+            rtarr_type = self.reg.combined_image_sampler_runtime_array()
+            ptr_type = self.reg.pointer("UniformConstant", rtarr_type)
+            var_id = self.reg.next_id()
+            self.global_vars.append(f"{var_id} = OpVariable {ptr_type} UniformConstant")
+            if bta.set_number is not None:
+                self.decorations.append(f"OpDecorate {var_id} DescriptorSet {bta.set_number}")
+            if bta.binding is not None:
+                self.decorations.append(f"OpDecorate {var_id} Binding {bta.binding}")
+            self.var_map[bta.name] = var_id
+            self.var_types[bta.name] = "_bindless_texture_array"
+            self.var_storage[bta.name] = "UniformConstant"
             self.interface_ids.append(var_id)
 
         # --- RT: Built-in variables ---
@@ -607,6 +676,40 @@ class SpvGenerator:
                 self.var_types[tp.name] = tp.type_name
                 self.var_storage[tp.name] = storage
                 self.interface_ids.append(var_id)
+
+    def _declare_bindless_material_struct(self) -> tuple[str, int]:
+        """Declare the BindlessMaterialData struct type in SPIR-V.
+
+        Returns (struct_type_id, stride_in_bytes).
+        """
+        key = "BindlessMaterialData"
+        if key in self.reg._types:
+            return self.reg._types[key], 128  # cached
+
+        # Build member types
+        member_types = []
+        for fname, ftype in _BINDLESS_MATERIAL_FIELDS:
+            tid = self.reg.lux_type_to_spirv(ftype)
+            member_types.append(tid)
+
+        struct_id = self.reg.struct(key, member_types)
+
+        # Compute std430 offsets and add member decorations
+        offset = 0
+        _STD430 = {
+            "scalar": (4, 4), "int": (4, 4), "uint": (4, 4),
+            "vec2": (8, 8), "vec3": (12, 16), "vec4": (16, 16),
+            "mat4": (64, 16),
+        }
+        for i, (fname, ftype) in enumerate(_BINDLESS_MATERIAL_FIELDS):
+            size, align = _STD430.get(ftype, (4, 4))
+            offset = (offset + align - 1) & ~(align - 1)
+            self.decorations.append(f"OpMemberDecorate {struct_id} {i} Offset {offset}")
+            offset += size
+
+        # Stride = round up to largest alignment (16 for vec4)
+        stride = (offset + 15) & ~15
+        return struct_id, stride
 
     def _make_array_type(self, elem_type: str, length: int) -> str:
         length_id = self.reg.const_uint(length)
@@ -975,6 +1078,30 @@ class SpvGenerator:
             lines.append(f"{result} = {logic_op} {bool_type} {left_id} {right_id}")
             return result, lines
 
+        # Bitwise ops — operands must be integer type
+        if op in ("&", "|", "^"):
+            bitwise_ops = {"&": "OpBitwiseAnd", "|": "OpBitwiseOr", "^": "OpBitwiseXor"}
+            uint_t = self.reg.uint32()
+            # Convert float operands to uint (NumberLit defaults to float in Lux)
+            lt_resolved = resolve_alias_chain(lt)
+            rt_resolved = resolve_alias_chain(rt)
+            if lt_resolved == "scalar":
+                if isinstance(expr.left, NumberLit):
+                    left_id = self.reg.const_uint(int(float(expr.left.value)))
+                else:
+                    conv = self.reg.next_id()
+                    lines.append(f"{conv} = OpConvertFToU {uint_t} {left_id}")
+                    left_id = conv
+            if rt_resolved == "scalar":
+                if isinstance(expr.right, NumberLit):
+                    right_id = self.reg.const_uint(int(float(expr.right.value)))
+                else:
+                    conv = self.reg.next_id()
+                    lines.append(f"{conv} = OpConvertFToU {uint_t} {right_id}")
+                    right_id = conv
+            lines.append(f"{result} = {bitwise_ops[op]} {result_type} {left_id} {right_id}")
+            return result, lines
+
         # Arithmetic ops
         spv_op = self._select_arith_op(op, lt, rt)
 
@@ -1156,6 +1283,62 @@ class SpvGenerator:
                 tex_id, tex_lines = self._gen_expr(sampler_arg)
                 lines.extend(tex_lines)
                 lines.append(f"{result} = OpImageSampleExplicitLod {result_type} {tex_id} {coords_id} Lod {lod_id}")
+            return result, lines
+
+        # sample_bindless(texture_array, index, uv) — bindless implicit LOD
+        if fname == "sample_bindless":
+            arr_arg = expr.args[0]
+            idx_id, idx_lines = self._gen_expr(expr.args[1])
+            lines.extend(idx_lines)
+            uv_id, uv_lines = self._gen_expr(expr.args[2])
+            lines.extend(uv_lines)
+            result_type = self.reg.lux_type_to_spirv(expr.resolved_type)
+            result = self.reg.next_id()
+            if isinstance(arr_arg, VarRef) and self.var_types.get(arr_arg.name) == "_bindless_texture_array":
+                arr_var = self.var_map[arr_arg.name]
+                cis_type = self.reg.combined_image_sampler_type()
+                ptr_cis = self.reg.pointer("UniformConstant", cis_type)
+                # NonUniform decoration on index
+                self.decorations.append(f"OpDecorate {idx_id} NonUniform")
+                # Access chain into the runtime array
+                ac_id = self.reg.next_id()
+                lines.append(f"{ac_id} = OpAccessChain {ptr_cis} {arr_var} {idx_id}")
+                self.decorations.append(f"OpDecorate {ac_id} NonUniform")
+                # Load combined image sampler
+                loaded = self.reg.next_id()
+                lines.append(f"{loaded} = OpLoad {cis_type} {ac_id}")
+                self.decorations.append(f"OpDecorate {loaded} NonUniform")
+                # Sample
+                lines.append(f"{result} = OpImageSampleImplicitLod {result_type} {loaded} {uv_id}")
+            return result, lines
+
+        # sample_bindless_lod(texture_array, index, uv, lod) — bindless explicit LOD
+        if fname == "sample_bindless_lod":
+            arr_arg = expr.args[0]
+            idx_id, idx_lines = self._gen_expr(expr.args[1])
+            lines.extend(idx_lines)
+            uv_id, uv_lines = self._gen_expr(expr.args[2])
+            lines.extend(uv_lines)
+            lod_id, lod_lines = self._gen_expr(expr.args[3])
+            lines.extend(lod_lines)
+            result_type = self.reg.lux_type_to_spirv(expr.resolved_type)
+            result = self.reg.next_id()
+            if isinstance(arr_arg, VarRef) and self.var_types.get(arr_arg.name) == "_bindless_texture_array":
+                arr_var = self.var_map[arr_arg.name]
+                cis_type = self.reg.combined_image_sampler_type()
+                ptr_cis = self.reg.pointer("UniformConstant", cis_type)
+                # NonUniform decoration on index
+                self.decorations.append(f"OpDecorate {idx_id} NonUniform")
+                # Access chain into the runtime array
+                ac_id = self.reg.next_id()
+                lines.append(f"{ac_id} = OpAccessChain {ptr_cis} {arr_var} {idx_id}")
+                self.decorations.append(f"OpDecorate {ac_id} NonUniform")
+                # Load combined image sampler
+                loaded = self.reg.next_id()
+                lines.append(f"{loaded} = OpLoad {cis_type} {ac_id}")
+                self.decorations.append(f"OpDecorate {loaded} NonUniform")
+                # Sample with explicit LOD
+                lines.append(f"{result} = OpImageSampleExplicitLod {result_type} {loaded} {uv_id} Lod {lod_id}")
             return result, lines
 
         # Generate arguments
@@ -1551,6 +1734,50 @@ class SpvGenerator:
             return shuffle_id, lines
 
     def _gen_field_access(self, expr: FieldAccess, lines: list[str]) -> tuple[str, list[str]]:
+        # Handle field access on struct-typed storage buffer elements:
+        # materials[mat_idx].baseColorFactor -> OpAccessChain into SSBO struct
+        if (isinstance(expr.object, IndexAccess)
+            and isinstance(expr.object.object, VarRef)
+            and expr.object.object.name in getattr(self, '_ssbo_struct_fields', {})):
+            buf_name = expr.object.object.name
+            buf_var_id = self.storage_buffer_var_ids[buf_name]
+            field_name = expr.field
+            fields = self._ssbo_struct_fields[buf_name]
+
+            # Find field index and type
+            field_idx = None
+            field_type = None
+            for i, (fname, ftype) in enumerate(fields):
+                if fname == field_name:
+                    field_idx = i
+                    field_type = ftype
+                    break
+            if field_idx is None:
+                raise ValueError(f"Unknown field '{field_name}' in SSBO struct '{buf_name}'")
+
+            # Generate array index expression
+            idx_id, idx_lines = self._gen_expr(expr.object.index)
+            lines.extend(idx_lines)
+
+            # Convert float index to int if needed
+            idx_lux_type = self._resolve_expr_lux_type(expr.object.index)
+            if idx_lux_type in ("scalar", "vec2", "vec3", "vec4"):
+                conv_id = self.reg.next_id()
+                int_type = self.reg.int32()
+                lines.append(f"{conv_id} = OpConvertFToS {int_type} {idx_id}")
+                idx_id = conv_id
+
+            # OpAccessChain: buf_var -> 0 (runtime array wrapper) -> idx -> field_idx
+            type_id = self.reg.lux_type_to_spirv(field_type)
+            ptr_type = self.reg.pointer("StorageBuffer", type_id)
+            const_0 = self.reg.const_int(0, signed=True)
+            field_const = self.reg.const_int(field_idx, signed=True)
+            ac_id = self.reg.next_id()
+            lines.append(f"{ac_id} = OpAccessChain {ptr_type} {buf_var_id} {const_0} {idx_id} {field_const}")
+            result = self.reg.next_id()
+            lines.append(f"{result} = OpLoad {type_id} {ac_id}")
+            return result, lines
+
         # Handle qualified access to uniform block fields: Material.roughness_factor
         if isinstance(expr.object, VarRef) and expr.object.name in self.uniform_var_ids:
             block_name = expr.object.name

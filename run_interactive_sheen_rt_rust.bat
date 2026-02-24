@@ -11,8 +11,12 @@ if not exist playground_rust\target\release\lux-playground.exe (
 set SCENE=assets/SheenChair.glb
 set IBL=pisa
 
-REM Prefer manifest-based auto-selection, fall back to explicit sheen RT permutation
-if exist shadercache\gltf_pbr_layered.manifest.json (
+REM Prefer bindless uber-shader (multi-material via gl_GeometryIndexEXT),
+REM fall back to manifest-based permutations, then explicit sheen RT permutation
+if exist shadercache\bindless\gltf_pbr_layered.rchit.spv (
+    set PIPELINE=shadercache/bindless/gltf_pbr_layered
+    echo Using bindless PBR RT pipeline (multi-material uber-shader^)
+) else if exist shadercache\gltf_pbr_layered.manifest.json (
     set PIPELINE=shadercache/gltf_pbr_layered
     echo Using layered PBR RT pipeline (manifest auto-selection^)
 ) else if exist shadercache\gltf_pbr_layered+normal_map+sheen.rgen.spv (

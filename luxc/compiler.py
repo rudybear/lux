@@ -76,6 +76,7 @@ def compile_source(
     pipeline: str | None = None,
     features: set[str] | None = None,
     defines: dict[str, int] | None = None,
+    bindless: bool = False,
 ) -> None:
     # Clear type aliases from previous compilations
     clear_type_aliases()
@@ -95,7 +96,7 @@ def compile_source(
     # Expand surface/geometry/pipeline declarations into stage blocks
     if module.surfaces or module.pipelines or module.environments or module.procedurals:
         from luxc.expansion.surface_expander import expand_surfaces
-        expand_surfaces(module, pipeline_filter=pipeline)
+        expand_surfaces(module, pipeline_filter=pipeline, bindless=bindless)
 
     # Expand @differentiable functions into gradient functions
     from luxc.autodiff.forward_diff import autodiff_expand

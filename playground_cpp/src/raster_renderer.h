@@ -66,6 +66,13 @@ public:
 private:
     std::string m_renderPath;  // "raster", "fullscreen", "rt"
     std::string m_pipelineBase; // pipeline base path for reflection JSON lookup
+
+    // Bindless rendering mode
+    bool m_bindlessMode = false;
+
+    // Bindless resources
+    BindlessTextureArray m_bindlessTextures;
+    BindlessMaterialsSSBO m_bindlessMaterials;
     uint32_t renderWidth = 512;
     uint32_t renderHeight = 512;
 

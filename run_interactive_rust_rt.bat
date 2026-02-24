@@ -11,8 +11,11 @@ if not exist playground_rust\target\release\lux-playground.exe (
 set SCENE=assets/DamagedHelmet.glb
 set IBL=pisa
 
-REM Prefer manifest-based auto-selection, fall back to explicit permutation, then hand-written
-if exist shadercache\gltf_pbr_layered.manifest.json (
+REM Prefer bindless uber-shader, fall back to manifest-based, then explicit, then hand-written
+if exist shadercache\bindless\gltf_pbr_layered.rchit.spv (
+    set PIPELINE=shadercache/bindless/gltf_pbr_layered
+    echo Using bindless PBR RT pipeline (multi-material uber-shader^)
+) else if exist shadercache\gltf_pbr_layered.manifest.json (
     set PIPELINE=shadercache/gltf_pbr_layered
     echo Using layered PBR RT pipeline (manifest auto-selection^)
 ) else if exist shadercache\gltf_pbr_layered+emission+normal_map.rgen.spv (

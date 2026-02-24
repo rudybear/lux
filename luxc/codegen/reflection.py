@@ -15,6 +15,7 @@ import json
 from luxc.parser.ast_nodes import (
     Module, StageBlock, VarDecl, UniformBlock, PushBlock, BlockField,
     SamplerDecl, AccelDecl, StorageImageDecl, StorageBufferDecl,
+    BindlessTextureArrayDecl,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl,
     NumberLit, ConstructorExpr, UnaryOp,
 )
@@ -229,7 +230,45 @@ def generate_reflection(
             "stage_flags": [stage.stage_type],
         })
 
+    # Bindless texture arrays
+    bindless_arrays = getattr(stage, 'bindless_texture_arrays', [])
+    for bta in bindless_arrays:
+        set_key = str(bta.set_number)
+        if set_key not in descriptor_sets:
+            descriptor_sets[set_key] = []
+
+        descriptor_sets[set_key].append({
+            "binding": bta.binding,
+            "type": "bindless_combined_image_sampler_array",
+            "name": bta.name,
+            "max_count": bta.max_count,
+            "stage_flags": [stage.stage_type],
+        })
+
     result["descriptor_sets"] = descriptor_sets
+
+    # --- Bindless metadata (top-level) ---
+    if bindless_arrays:
+        # Find the materials SSBO if present
+        materials_ssbo = None
+        for sb in getattr(stage, 'storage_buffers', []):
+            if sb.name == "materials":
+                materials_ssbo = {
+                    "set": sb.set_number,
+                    "binding": sb.binding,
+                    "element_type": sb.element_type,
+                }
+                break
+        texture_array = bindless_arrays[0]
+        result["bindless"] = {
+            "enabled": True,
+            "materials_ssbo": materials_ssbo,
+            "texture_array": {
+                "set": texture_array.set_number,
+                "binding": texture_array.binding,
+                "max_count": texture_array.max_count,
+            },
+        }
 
     # --- Push constants ---
     result["push_constants"] = []

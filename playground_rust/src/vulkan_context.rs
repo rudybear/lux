@@ -24,6 +24,9 @@ pub struct VulkanContext {
     pub mesh_shader_loader: Option<ash::ext::mesh_shader::Device>,
     pub mesh_shader_properties: Option<vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>>,
 
+    // Bindless descriptor indexing support
+    pub bindless_supported: bool,
+
     // Allocator must be dropped before device — wrapped in Option so we can take() in Drop
     allocator_inner: Option<Allocator>,
     /// Public access to the allocator through a Mutex for thread safety.
@@ -246,6 +249,27 @@ impl VulkanContext {
         }
         let enable_mesh = mesh_shader_available;
 
+        // --- Query descriptor indexing features for bindless support ---
+        let bindless_supported = {
+            let mut query_vk12_features = vk::PhysicalDeviceVulkan12Features::default();
+            let mut query_features2 =
+                vk::PhysicalDeviceFeatures2::default().push_next(&mut query_vk12_features);
+            unsafe {
+                instance.get_physical_device_features2(physical_device, &mut query_features2);
+            }
+            let supported = query_vk12_features.runtime_descriptor_array == vk::TRUE
+                && query_vk12_features.shader_sampled_image_array_non_uniform_indexing == vk::TRUE
+                && query_vk12_features.descriptor_binding_partially_bound == vk::TRUE
+                && query_vk12_features.descriptor_binding_variable_descriptor_count == vk::TRUE
+                && query_vk12_features.descriptor_binding_sampled_image_update_after_bind == vk::TRUE;
+            if supported {
+                info!("Bindless descriptor indexing features supported");
+            } else {
+                warn!("Bindless descriptor indexing features NOT fully supported");
+            }
+            supported
+        };
+
         // --- Device creation ---
         let queue_priority = [1.0f32];
         let queue_create_info = vk::DeviceQueueCreateInfo::default()
@@ -269,6 +293,15 @@ impl VulkanContext {
 
         let mut vulkan_12_features =
             vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+
+        if bindless_supported {
+            vulkan_12_features = vulkan_12_features
+                .runtime_descriptor_array(true)
+                .shader_sampled_image_array_non_uniform_indexing(true)
+                .descriptor_binding_partially_bound(true)
+                .descriptor_binding_variable_descriptor_count(true)
+                .descriptor_binding_sampled_image_update_after_bind(true);
+        }
 
         let mut accel_features =
             vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
@@ -393,6 +426,7 @@ impl VulkanContext {
             mesh_shader_supported: enable_mesh,
             mesh_shader_loader,
             mesh_shader_properties,
+            bindless_supported,
             allocator_inner: Some(allocator),
             allocator: Mutex::new(Some(())),
             command_pool,
@@ -631,6 +665,27 @@ impl VulkanContext {
         let enable_rt = request_rt && rt_available;
         let enable_mesh = mesh_shader_available;
 
+        // --- Query descriptor indexing features for bindless support ---
+        let bindless_supported = {
+            let mut query_vk12_features = vk::PhysicalDeviceVulkan12Features::default();
+            let mut query_features2 =
+                vk::PhysicalDeviceFeatures2::default().push_next(&mut query_vk12_features);
+            unsafe {
+                instance.get_physical_device_features2(physical_device, &mut query_features2);
+            }
+            let supported = query_vk12_features.runtime_descriptor_array == vk::TRUE
+                && query_vk12_features.shader_sampled_image_array_non_uniform_indexing == vk::TRUE
+                && query_vk12_features.descriptor_binding_partially_bound == vk::TRUE
+                && query_vk12_features.descriptor_binding_variable_descriptor_count == vk::TRUE
+                && query_vk12_features.descriptor_binding_sampled_image_update_after_bind == vk::TRUE;
+            if supported {
+                info!("Bindless descriptor indexing features supported");
+            } else {
+                warn!("Bindless descriptor indexing features NOT fully supported");
+            }
+            supported
+        };
+
         // --- Device creation (with VK_KHR_swapchain) ---
         let queue_priority = [1.0f32];
         let queue_create_info = vk::DeviceQueueCreateInfo::default()
@@ -655,6 +710,16 @@ impl VulkanContext {
 
         let mut vulkan_12_features =
             vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+
+        if bindless_supported {
+            vulkan_12_features = vulkan_12_features
+                .runtime_descriptor_array(true)
+                .shader_sampled_image_array_non_uniform_indexing(true)
+                .descriptor_binding_partially_bound(true)
+                .descriptor_binding_variable_descriptor_count(true)
+                .descriptor_binding_sampled_image_update_after_bind(true);
+        }
+
         let mut accel_features =
             vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
                 .acceleration_structure(true);
@@ -756,6 +821,7 @@ impl VulkanContext {
             mesh_shader_supported: enable_mesh,
             mesh_shader_loader,
             mesh_shader_properties,
+            bindless_supported,
             allocator_inner: Some(allocator),
             allocator: Mutex::new(Some(())),
             command_pool,

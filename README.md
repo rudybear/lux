@@ -287,8 +287,9 @@ All three engines support reflection-driven descriptor binding, glTF loading, cu
 - **Declarative materials** — `surface`, `geometry`, `pipeline` blocks expand to full shader stages
 - **Layered surfaces** — `layers [base, normal_map, ibl, emission]` with automatic energy conservation, compiles to both raster and RT from one declaration
 - **Custom `@layer` functions** — user-defined layers via `@layer fn name(base, n, v, l, ...custom_params) -> vec3`, validated at compile time and composited in declaration order
-- **Compile-time features** — `features { has_normal_map: bool }` with `if` guards on any declaration; `--features` and `--all-permutations` for shader permutation generation
+- **Compile-time features** — `features { has_normal_map: bool }` with `if` guards on any declaration; `--features` and `--all-permutations` for shader permutation generation; per-material permutation selection via manifest across all engines
 - **Material property pipeline** — `properties` block in surface declarations abstracts runtime material data; compiler generates std140 UBO + reflection JSON with defaults; qualified `Material.field` access in layer expressions; all engines wire glTF material properties automatically
+- **Bindless rendering** — `--bindless` uber-shaders with runtime descriptor arrays, materials SSBO, `nonuniformEXT` texture indexing, and per-geometry `gl_GeometryIndexEXT` for RT; single pipeline per mode eliminates per-material descriptor switching (C++ and Rust, requires descriptor indexing)
 - **Algorithm/schedule separation** — swap BRDF variants and tonemapping without touching material code
 - **Math-first syntax** — `scalar` not `float`, `builtin_position` not `gl_Position`
 - **Auto-layout** — locations, descriptor sets, and bindings assigned by declaration order

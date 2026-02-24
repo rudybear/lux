@@ -55,6 +55,12 @@ class StorageImageType(LuxType):
 
 
 @dataclass(frozen=True)
+class BindlessTextureArrayType(LuxType):
+    """Type representing a bindless texture array (runtime array of combined image samplers)."""
+    pass
+
+
+@dataclass(frozen=True)
 class RuntimeArrayType(LuxType):
     """Type representing a runtime-sized array (storage buffer element type)."""
     element_type_name: str  # name of the element type (e.g., "vec4", "uint")
@@ -94,6 +100,7 @@ SAMPLER2D = SamplerType("sampler2d")
 SAMPLER_CUBE = SamplerType("samplerCube")
 ACCELERATION_STRUCTURE = AccelerationStructureType("acceleration_structure")
 STORAGE_IMAGE = StorageImageType("storage_image")
+BINDLESS_TEXTURE_ARRAY = BindlessTextureArrayType("_bindless_texture_array")
 
 # Lookup table: type name string -> LuxType
 TYPE_MAP: dict[str, LuxType] = {
@@ -110,6 +117,10 @@ TYPE_MAP: dict[str, LuxType] = {
     "samplerCube": SAMPLER_CUBE,
     "acceleration_structure": ACCELERATION_STRUCTURE,
     "storage_image": STORAGE_IMAGE,
+    # BindlessMaterialData is a struct type used in SSBO for bindless rendering.
+    # We treat it as a plain scalar for type-checking purposes (field access handled
+    # by codegen directly). The real field types are embedded in the SPIR-V builder.
+    "BindlessMaterialData": ScalarType("BindlessMaterialData"),
 }
 
 

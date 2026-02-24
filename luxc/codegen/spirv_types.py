@@ -82,6 +82,19 @@ class TypeRegistry:
         key = "sampled_cube_image"
         return self._ensure_type(key, f"OpTypeSampledImage {img}")
 
+    def combined_image_sampler_type(self) -> str:
+        """Combined image sampler (for bindless arrays).
+
+        Reuses the same OpTypeSampledImage as sampled_image_type() since
+        SPIR-V does not allow duplicate non-aggregate type declarations.
+        """
+        return self.sampled_image_type()
+
+    def combined_image_sampler_runtime_array(self) -> str:
+        """Runtime array of combined image samplers (bindless texture array)."""
+        cis = self.combined_image_sampler_type()
+        return self.runtime_array(cis)
+
     def acceleration_structure_type(self) -> str:
         key = "accel_struct"
         return self._ensure_type(key, "OpTypeAccelerationStructureKHR")

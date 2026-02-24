@@ -1,6 +1,7 @@
 @echo off
-REM Compile all glTF PBR variants: hand-written and layered (all permutations)
+REM Compile all glTF PBR variants: hand-written, layered (all permutations), and bindless.
 REM Uses --all-permutations to generate every feature combination automatically.
+REM Uses --bindless to generate uber-shaders with bindless descriptor arrays.
 REM Engines auto-select the correct permutation per material from the manifest.
 
 echo ============================================================
@@ -9,23 +10,38 @@ echo ============================================================
 echo.
 
 REM --- Hand-written Forward ---
-echo [1/4] Compiling hand-written Forward (gltf_pbr.lux)
+echo [1/7] Compiling hand-written Forward (gltf_pbr.lux)
 python -m luxc examples/gltf_pbr.lux -o shadercache/
 echo.
 
 REM --- Hand-written RT ---
-echo [2/4] Compiling hand-written RT (gltf_pbr_rt.lux)
+echo [2/7] Compiling hand-written RT (gltf_pbr_rt.lux)
 python -m luxc examples/gltf_pbr_rt.lux -o shadercache/
 echo.
 
 REM --- Layered Forward: all permutations ---
-echo [3/4] Compiling layered Forward (all permutations)
+echo [3/7] Compiling layered Forward (all permutations)
 python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfForward --all-permutations -o shadercache/
 echo.
 
 REM --- Layered RT: all permutations ---
-echo [4/4] Compiling layered RT (all permutations)
+echo [4/7] Compiling layered RT (all permutations)
 python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfRT --all-permutations -o shadercache/ --no-validate
+echo.
+
+REM --- Bindless Forward: single uber-shader ---
+echo [5/7] Compiling bindless Forward (uber-shader)
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfForward --bindless -o shadercache/bindless/
+echo.
+
+REM --- Bindless RT: single uber-shader ---
+echo [6/7] Compiling bindless RT (uber-shader)
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfRT --bindless -o shadercache/bindless/
+echo.
+
+REM --- Bindless Mesh: single uber-shader ---
+echo [7/7] Compiling bindless Mesh (uber-shader)
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfMesh --bindless -o shadercache/bindless/
 echo.
 
 echo ============================================================
@@ -79,6 +95,43 @@ if exist playground_rust\target\release\lux-playground.exe (
         playground_rust\target\release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/gltf_pbr_layered --mode mesh --ibl pisa --output screenshots/test_sheen_mesh_rust.png --width 512 --height 512
         playground_rust\target\release\lux-playground.exe --scene assets/ClearCoatTest.glb --pipeline shadercache/gltf_pbr_layered --ibl pisa --output screenshots/test_clearcoat_rust.png --width 512 --height 512
         playground_rust\target\release\lux-playground.exe --scene assets/TransmissionTest.glb --pipeline shadercache/gltf_pbr_layered --ibl pisa --output screenshots/test_transmission_rust.png --width 512 --height 512
+    )
+    echo.
+)
+
+REM ============================================================
+REM  Bindless rendering (C++ and Rust only — Python/wgpu lacks descriptor indexing)
+REM ============================================================
+echo.
+echo ============================================================
+echo  Bindless Rendering
+echo ============================================================
+echo.
+
+REM C++ bindless renders
+if exist playground_cpp\build\Release\lux-playground.exe (
+    echo --- C++ engine: bindless raster ---
+    playground_cpp\build\Release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/bindless/gltf_pbr_layered --ibl pisa --output screenshots/test_bindless_raster_cpp.png --width 512 --height 512
+    if exist assets\SheenChair.glb (
+        playground_cpp\build\Release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/bindless/gltf_pbr_layered --ibl pisa --output screenshots/test_bindless_sheen_raster_cpp.png --width 512 --height 512
+        echo --- C++ engine: bindless RT ---
+        playground_cpp\build\Release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/bindless/gltf_pbr_layered --mode rt --ibl pisa --output screenshots/test_bindless_sheen_rt_cpp.png --width 512 --height 512
+        echo --- C++ engine: bindless mesh ---
+        playground_cpp\build\Release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/bindless/gltf_pbr_layered --mode mesh --ibl pisa --output screenshots/test_bindless_sheen_mesh_cpp.png --width 512 --height 512
+    )
+    echo.
+)
+
+REM Rust bindless renders
+if exist playground_rust\target\release\lux-playground.exe (
+    echo --- Rust engine: bindless raster ---
+    playground_rust\target\release\lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/bindless/gltf_pbr_layered --ibl pisa --output screenshots/test_bindless_raster_rust.png --width 512 --height 512
+    if exist assets\SheenChair.glb (
+        playground_rust\target\release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/bindless/gltf_pbr_layered --ibl pisa --output screenshots/test_bindless_sheen_raster_rust.png --width 512 --height 512
+        echo --- Rust engine: bindless RT ---
+        playground_rust\target\release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/bindless/gltf_pbr_layered --mode rt --ibl pisa --output screenshots/test_bindless_sheen_rt_rust.png --width 512 --height 512
+        echo --- Rust engine: bindless mesh ---
+        playground_rust\target\release\lux-playground.exe --scene assets/SheenChair.glb --pipeline shadercache/bindless/gltf_pbr_layered --mode mesh --ibl pisa --output screenshots/test_bindless_sheen_mesh_rust.png --width 512 --height 512
     )
     echo.
 )

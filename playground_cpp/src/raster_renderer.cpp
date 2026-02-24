@@ -494,15 +494,210 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
     reflectedSetLayouts = createDescriptorSetLayoutsMultiStage(ctx.device, stages);
     auto mergedBindings = getMergedBindings(stages);
 
-    // Identify which set index contains the "Material" UBO (fragment set)
-    int fragSetIdx = -1;
-    int vertSetIdx = -1;
+    // Identify set indices
+    int vertSetIdx = 0;
+    int fragSetIdx = 1;
+    int bindlessTexSetIdx = -1;
     for (auto& b : mergedBindings) {
-        if (b.name == "Material") fragSetIdx = b.set;
         if (b.name == "MVP") vertSetIdx = b.set;
+        if (b.name == "Material" || b.name == "materials") fragSetIdx = b.set;
+        if (b.type == "bindless_combined_image_sampler_array") bindlessTexSetIdx = b.set;
     }
-    if (fragSetIdx < 0) fragSetIdx = 1;
-    if (vertSetIdx < 0) vertSetIdx = 0;
+
+    if (m_bindlessMode) {
+        // =====================================================================
+        // BINDLESS MODE: sets 0 (MVP), 1 (Light + materials SSBO + IBL), 2 (textures[])
+        // =====================================================================
+        uint32_t actualTexCount = m_bindlessTextures.textureCount;
+        if (actualTexCount == 0) actualTexCount = 1;  // need at least 1 for valid descriptor
+
+        // Count pool sizes
+        std::unordered_map<VkDescriptorType, uint32_t> typeCounts;
+        for (auto& b : mergedBindings) {
+            VkDescriptorType vkType = bindingTypeToVkDescriptorType(b.type);
+            if (b.type == "bindless_combined_image_sampler_array") {
+                typeCounts[vkType] += actualTexCount;
+            } else {
+                typeCounts[vkType]++;
+            }
+        }
+
+        std::vector<VkDescriptorPoolSize> poolSizes;
+        for (auto& [type, count] : typeCounts) {
+            poolSizes.push_back({type, count});
+        }
+
+        // Determine how many sets we need
+        int maxSetIdx = -1;
+        for (auto& [idx, _] : reflectedSetLayouts) { maxSetIdx = std::max(maxSetIdx, idx); }
+        uint32_t maxSets = static_cast<uint32_t>(maxSetIdx + 1);
+
+        VkDescriptorPoolCreateInfo poolInfo = {};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+        poolInfo.maxSets = maxSets;
+        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
+        vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &descriptorPool);
+
+        // Allocate all descriptor sets
+        for (int setIdx = 0; setIdx <= maxSetIdx; setIdx++) {
+            auto layoutIt = reflectedSetLayouts.find(setIdx);
+            if (layoutIt == reflectedSetLayouts.end()) continue;
+
+            VkDescriptorSetAllocateInfo allocSetInfo = {};
+            allocSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocSetInfo.descriptorPool = descriptorPool;
+            allocSetInfo.descriptorSetCount = 1;
+            allocSetInfo.pSetLayouts = &layoutIt->second;
+
+            // For the bindless texture set, use variable descriptor count
+            VkDescriptorSetVariableDescriptorCountAllocateInfo variableCountInfo = {};
+            uint32_t variableCount = actualTexCount;
+            if (setIdx == bindlessTexSetIdx) {
+                variableCountInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO;
+                variableCountInfo.descriptorSetCount = 1;
+                variableCountInfo.pDescriptorCounts = &variableCount;
+                allocSetInfo.pNext = &variableCountInfo;
+            }
+
+            VkDescriptorSet ds;
+            VkResult result = vkAllocateDescriptorSets(ctx.device, &allocSetInfo, &ds);
+            if (result != VK_SUCCESS) {
+                throw std::runtime_error("Failed to allocate bindless descriptor set " + std::to_string(setIdx));
+            }
+            reflectedDescSets[setIdx] = ds;
+
+            if (setIdx == vertSetIdx) m_vertexDescSet = ds;
+        }
+
+        // Write all descriptor sets
+        struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
+        std::vector<DescWriteInfo> writeInfos;
+        std::vector<VkWriteDescriptorSet> writes;
+        // Reserve space for bindless texture image infos
+        std::vector<VkDescriptorImageInfo> bindlessImageInfos;
+
+        for (auto& b : mergedBindings) {
+            auto dsIt = reflectedDescSets.find(b.set);
+            if (dsIt == reflectedDescSets.end()) continue;
+
+            if (b.type == "uniform_buffer") {
+                DescWriteInfo info = {};
+                VkWriteDescriptorSet w = {};
+                w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w.dstSet = dsIt->second;
+                w.dstBinding = static_cast<uint32_t>(b.binding);
+                w.descriptorCount = 1;
+                w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+
+                if (b.name == "MVP") {
+                    info.bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
+                } else if (b.name == "Light") {
+                    info.bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                } else {
+                    continue;
+                }
+                writeInfos.push_back(info);
+                w.pBufferInfo = &writeInfos.back().bufferInfo;
+                writes.push_back(w);
+            } else if (b.type == "storage_buffer") {
+                // Materials SSBO
+                if (m_bindlessMaterials.buffer != VK_NULL_HANDLE) {
+                    DescWriteInfo info = {};
+                    info.bufferInfo = {m_bindlessMaterials.buffer, 0, VK_WHOLE_SIZE};
+                    writeInfos.push_back(info);
+
+                    VkWriteDescriptorSet w = {};
+                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    w.dstSet = dsIt->second;
+                    w.dstBinding = static_cast<uint32_t>(b.binding);
+                    w.descriptorCount = 1;
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                    writes.push_back(w);
+                }
+            } else if (b.type == "sampler") {
+                DescWriteInfo info = {};
+                info.imageInfo = {};
+                auto& iblTextures = m_scene->getIBLTextures();
+                auto iblIt = iblTextures.find(b.name);
+                if (iblIt != iblTextures.end()) {
+                    info.imageInfo.sampler = iblIt->second.sampler;
+                } else {
+                    auto& tex = m_scene->getTextureForBinding(b.name);
+                    info.imageInfo.sampler = tex.sampler;
+                }
+                writeInfos.push_back(info);
+
+                VkWriteDescriptorSet w = {};
+                w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w.dstSet = dsIt->second;
+                w.dstBinding = static_cast<uint32_t>(b.binding);
+                w.descriptorCount = 1;
+                w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                w.pImageInfo = &writeInfos.back().imageInfo;
+                writes.push_back(w);
+            } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
+                DescWriteInfo info = {};
+                info.imageInfo = {};
+                auto& iblTextures = m_scene->getIBLTextures();
+                auto iblIt = iblTextures.find(b.name);
+                if (iblIt != iblTextures.end()) {
+                    info.imageInfo.imageView = iblIt->second.imageView;
+                    info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                } else {
+                    auto& tex = m_scene->getTextureForBinding(b.name);
+                    info.imageInfo.imageView = tex.imageView;
+                    info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                }
+                writeInfos.push_back(info);
+
+                VkWriteDescriptorSet w = {};
+                w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w.dstSet = dsIt->second;
+                w.dstBinding = static_cast<uint32_t>(b.binding);
+                w.descriptorCount = 1;
+                w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                w.pImageInfo = &writeInfos.back().imageInfo;
+                writes.push_back(w);
+            } else if (b.type == "bindless_combined_image_sampler_array") {
+                // Write ALL texture imageViews/samplers as combined image samplers
+                if (m_bindlessTextures.textureCount > 0) {
+                    bindlessImageInfos.resize(m_bindlessTextures.textureCount);
+                    for (uint32_t ti = 0; ti < m_bindlessTextures.textureCount; ti++) {
+                        bindlessImageInfos[ti] = {};
+                        bindlessImageInfos[ti].imageView = m_bindlessTextures.imageViews[ti];
+                        bindlessImageInfos[ti].sampler = m_bindlessTextures.samplers[ti];
+                        bindlessImageInfos[ti].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    }
+
+                    VkWriteDescriptorSet w = {};
+                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    w.dstSet = dsIt->second;
+                    w.dstBinding = static_cast<uint32_t>(b.binding);
+                    w.dstArrayElement = 0;
+                    w.descriptorCount = m_bindlessTextures.textureCount;
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                    w.pImageInfo = bindlessImageInfos.data();
+                    writes.push_back(w);
+                }
+            }
+        }
+
+        if (!writes.empty()) {
+            vkUpdateDescriptorSets(ctx.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
+
+        std::cout << "[info] Bindless descriptors created: " << mergedBindings.size()
+                  << " binding(s), " << m_bindlessTextures.textureCount << " texture(s), "
+                  << m_bindlessMaterials.materialCount << " material(s)" << std::endl;
+        return;
+    }
+
+    // =====================================================================
+    // NON-BINDLESS MODE: original per-material descriptor path
+    // =====================================================================
 
     size_t numMaterials = 1;
     if (m_scene && m_scene->hasGltfScene()) {
@@ -518,6 +713,7 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
         else if (b.type == "sampled_image") vkType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         else if (b.type == "sampled_cube_image") vkType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         else if (b.type == "storage_image") vkType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        else if (b.type == "storage_buffer") vkType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         else if (b.type == "acceleration_structure") vkType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         else vkType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 
@@ -907,7 +1103,48 @@ void RasterRenderer::init(VulkanContext& ctx, SceneManager& scene,
         bool hasMultipleMaterials = m_scene->hasGltfScene() &&
             m_scene->getGltfScene().materials.size() > 1;
 
-        if (!manifest.permutations.empty() && hasMultipleMaterials) {
+        // Probe for bindless shader variant: load base reflection JSON first to check
+        bool bindlessAvailable = false;
+        {
+            std::string probeFragJson = pipelineBase + ".frag.json";
+            if (fs::exists(probeFragJson)) {
+                auto probeRefl = parseReflectionJson(probeFragJson);
+                if (probeRefl.bindlessEnabled && ctx.bindlessSupported) {
+                    bindlessAvailable = true;
+                }
+            }
+        }
+
+        if (bindlessAvailable) {
+            // Bindless mode: single uber-shader pipeline for all materials
+            m_bindlessMode = true;
+            std::cout << "[info] Bindless mode enabled" << std::endl;
+
+            std::string vertPath = pipelineBase + ".vert.spv";
+            fragPath = pipelineBase + ".frag.spv";
+            auto vertCode = SpvLoader::loadSPIRV(vertPath);
+            vertModule = SpvLoader::createShaderModule(ctx.device, vertCode);
+            auto fragCode = SpvLoader::loadSPIRV(fragPath);
+            fragModule = SpvLoader::createShaderModule(ctx.device, fragCode);
+
+            std::string vertJsonPath = pipelineBase + ".vert.json";
+            std::string fragJsonPath = pipelineBase + ".frag.json";
+
+            if (fs::exists(vertJsonPath) && fs::exists(fragJsonPath)) {
+                std::cout << "[info] Loading reflection JSON: " << vertJsonPath << std::endl;
+                vertReflection = parseReflectionJson(vertJsonPath);
+                std::cout << "[info] Loading reflection JSON: " << fragJsonPath << std::endl;
+                fragReflection = parseReflectionJson(fragJsonPath);
+            }
+
+            // Build bindless texture array and materials SSBO
+            m_bindlessTextures = m_scene->buildBindlessTextureArray(ctx);
+            m_bindlessMaterials = m_scene->buildMaterialsSSBO(ctx, m_bindlessTextures);
+
+            // Use single pipeline path
+            setupReflectedDescriptors(ctx);
+            createPipelinePBR(ctx);
+        } else if (!manifest.permutations.empty() && hasMultipleMaterials) {
             // Multi-pipeline mode: create one pipeline per permutation used
             setupMultiPipeline(ctx, manifest);
         } else {
@@ -955,7 +1192,28 @@ void RasterRenderer::init(VulkanContext& ctx, SceneManager& scene,
     }
 
     // Bind scene resources to pipeline (push constants)
-    if (m_multiPipeline) {
+    if (m_bindlessMode) {
+        // Bindless push constants: model (mat4, 64 bytes) + material_index (uint, 4 bytes)
+        // The push constant block is 80 bytes (padded) per reflection
+        for (auto& pc : vertReflection.push_constants) {
+            if (pc.size <= 0) continue;
+            pushConstantSize = std::max(pushConstantSize, static_cast<uint32_t>(pc.size));
+            pushConstantStageFlags |= VK_SHADER_STAGE_VERTEX_BIT;
+        }
+        for (auto& pc : fragReflection.push_constants) {
+            if (pc.size <= 0) continue;
+            pushConstantSize = std::max(pushConstantSize, static_cast<uint32_t>(pc.size));
+            pushConstantStageFlags |= VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        pushConstantData.resize(pushConstantSize, 0);
+
+        // Set model matrix to identity initially
+        glm::mat4 identity(1.0f);
+        if (pushConstantSize >= 64) {
+            memcpy(pushConstantData.data(), &identity, sizeof(glm::mat4));
+        }
+        // material_index at offset 64 defaults to 0 (already zeroed)
+    } else if (m_multiPipeline) {
         // In multi-pipeline mode, gather push constants from the first permutation
         glm::vec3 lightDir = glm::normalize(glm::vec3(1.0f, 0.8f, 0.6f));
         if (!m_permutations.empty()) {
@@ -1004,6 +1262,7 @@ void RasterRenderer::init(VulkanContext& ctx, SceneManager& scene,
 
     std::cout << "[info] Raster renderer initialized: " << pipelineBase
               << " (path=" << renderPath
+              << (m_bindlessMode ? ", bindless" : "")
               << (m_multiPipeline ? ", multi-pipeline" : "")
               << ")" << std::endl;
 }
@@ -1448,6 +1707,57 @@ void RasterRenderer::recordDrawCommands(VkCommandBuffer cmd) {
                                0, pushConstantSize, pushConstantData.data());
         }
         vkCmdDraw(cmd, 3, 1, 0, 0);
+    } else if (m_bindlessMode) {
+        // Bindless mode: single pipeline, single set of descriptors, push material_index per draw
+        const auto& mesh = m_scene->getMesh();
+        VkDeviceSize vbOffset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &vbOffset);
+        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+
+        // Bind pipeline once
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+        // Bind all descriptor sets (0, 1, 2) once
+        int maxSet = -1;
+        for (auto& [idx, _] : reflectedDescSets) { maxSet = std::max(maxSet, idx); }
+
+        std::vector<VkDescriptorSet> allSets;
+        for (int i = 0; i <= maxSet; i++) {
+            auto it = reflectedDescSets.find(i);
+            if (it != reflectedDescSets.end()) {
+                allSets.push_back(it->second);
+            } else {
+                // Should not happen with proper reflection, but guard against it
+                allSets.push_back(VK_NULL_HANDLE);
+            }
+        }
+        if (!allSets.empty()) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    pipelineLayout, 0,
+                                    static_cast<uint32_t>(allSets.size()),
+                                    allSets.data(), 0, nullptr);
+        }
+
+        // Draw each range with push constant { model_matrix, material_index }
+        const auto& drawRanges = m_scene->getDrawRanges();
+        // Prepare push constant buffer (model mat4 at offset 0, material_index uint at offset 64)
+        std::vector<uint8_t> pcData(pushConstantSize, 0);
+        glm::mat4 modelMatrix(1.0f);  // identity - transforms already baked into vertices
+        if (pushConstantSize >= 64) {
+            memcpy(pcData.data(), &modelMatrix, sizeof(glm::mat4));
+        }
+
+        for (auto& range : drawRanges) {
+            // Set material_index at offset 64
+            if (pushConstantSize >= 68) {
+                uint32_t matIdx = static_cast<uint32_t>(range.materialIndex);
+                memcpy(pcData.data() + 64, &matIdx, sizeof(uint32_t));
+            }
+
+            vkCmdPushConstants(cmd, pipelineLayout, pushConstantStageFlags,
+                               0, pushConstantSize, pcData.data());
+            vkCmdDrawIndexed(cmd, range.indexCount, 1, range.indexOffset, 0, 0);
+        }
     } else if (m_multiPipeline) {
         // Multi-pipeline mode: switch pipeline per permutation
         const auto& mesh = m_scene->getMesh();
@@ -1796,6 +2106,14 @@ void RasterRenderer::cleanup(VulkanContext& ctx) {
     if (mvpBuffer) vmaDestroyBuffer(ctx.allocator, mvpBuffer, mvpAllocation);
     if (lightBuffer) vmaDestroyBuffer(ctx.allocator, lightBuffer, lightAllocation);
     if (m_materialBuffer) vmaDestroyBuffer(ctx.allocator, m_materialBuffer, m_materialAllocation);
+
+    // Cleanup bindless resources
+    if (m_bindlessMaterials.buffer) {
+        vmaDestroyBuffer(ctx.allocator, m_bindlessMaterials.buffer, m_bindlessMaterials.allocation);
+        m_bindlessMaterials.buffer = VK_NULL_HANDLE;
+    }
+    m_bindlessTextures = {};  // imageViews/samplers are owned by SceneManager
+    m_bindlessMode = false;
 
     for (size_t i = 0; i < m_perMaterialBuffers.size(); i++) {
         if (m_perMaterialBuffers[i]) {

@@ -897,6 +897,263 @@ void SceneManager::computeAutoCamera(const std::vector<Vertex>& vertices) {
 }
 
 // --------------------------------------------------------------------------
+// Bindless: build texture array from all scene materials
+// --------------------------------------------------------------------------
+
+BindlessTextureArray SceneManager::buildBindlessTextureArray(VulkanContext& ctx) {
+    BindlessTextureArray result;
+    m_bindlessTexDedup.clear();
+
+    if (!m_hasGltfScene || m_gltfScene.materials.empty()) return result;
+
+    // Helper: add a texture to the array if valid, return its index or -1
+    auto addTexture = [&](const GPUTexture& tex) -> int32_t {
+        if (tex.image == VK_NULL_HANDLE || tex.imageView == VK_NULL_HANDLE) return -1;
+
+        uint64_t key = reinterpret_cast<uint64_t>(tex.image);
+        auto it = m_bindlessTexDedup.find(key);
+        if (it != m_bindlessTexDedup.end()) {
+            return it->second;  // already added, return existing index
+        }
+
+        int32_t idx = static_cast<int32_t>(result.imageViews.size());
+        result.imageViews.push_back(tex.imageView);
+        result.samplers.push_back(tex.sampler);
+        m_bindlessTexDedup[key] = idx;
+        return idx;
+    };
+
+    // Iterate all materials, all texture slots
+    for (size_t mi = 0; mi < m_gltfScene.materials.size(); mi++) {
+        if (mi >= m_perMaterialTextures.size()) continue;
+        auto& texMap = m_perMaterialTextures[mi];
+
+        // Process each texture slot (order must match BindlessMaterialData fields)
+        const std::string texSlots[] = {
+            "base_color_tex", "normal_tex", "metallic_roughness_tex",
+            "occlusion_tex", "emissive_tex", "clearcoat_tex",
+            "clearcoat_roughness_tex", "sheen_color_tex", "transmission_tex"
+        };
+
+        for (auto& slot : texSlots) {
+            auto it = texMap.find(slot);
+            if (it != texMap.end() && it->second.image != VK_NULL_HANDLE) {
+                addTexture(it->second);
+            }
+        }
+    }
+
+    result.textureCount = static_cast<uint32_t>(result.imageViews.size());
+
+    std::cout << "[info] Bindless texture array: " << result.textureCount
+              << " unique texture(s) from " << m_gltfScene.materials.size()
+              << " material(s)" << std::endl;
+
+    return result;
+}
+
+// --------------------------------------------------------------------------
+// Bindless: build materials SSBO from all scene materials
+// --------------------------------------------------------------------------
+
+BindlessMaterialsSSBO SceneManager::buildMaterialsSSBO(VulkanContext& ctx,
+                                                        const BindlessTextureArray& texArray) {
+    BindlessMaterialsSSBO result;
+
+    if (!m_hasGltfScene || m_gltfScene.materials.empty()) return result;
+
+    size_t numMaterials = m_gltfScene.materials.size();
+    std::vector<BindlessMaterialData> materialData(numMaterials);
+
+    // Helper: look up a per-material texture and return its bindless index
+    auto getTexIndex = [&](size_t mi, const std::string& slot) -> int32_t {
+        if (mi >= m_perMaterialTextures.size()) return -1;
+        auto& texMap = m_perMaterialTextures[mi];
+        auto it = texMap.find(slot);
+        if (it == texMap.end() || it->second.image == VK_NULL_HANDLE) return -1;
+
+        uint64_t key = reinterpret_cast<uint64_t>(it->second.image);
+        auto dedupIt = m_bindlessTexDedup.find(key);
+        if (dedupIt != m_bindlessTexDedup.end()) return dedupIt->second;
+        return -1;
+    };
+
+    for (size_t mi = 0; mi < numMaterials; mi++) {
+        const auto& mat = m_gltfScene.materials[mi];
+        auto& bd = materialData[mi];
+
+        // PBR factors
+        bd.baseColorFactor = mat.baseColor;
+        bd.emissiveFactor = mat.emissive;
+        bd.metallicFactor = mat.metallic;
+        bd.roughnessFactor = mat.roughness;
+        bd.emissiveStrength = mat.emissiveStrength;
+        bd.ior = mat.ior;
+        bd.clearcoatFactor = mat.clearcoatFactor;
+        bd.clearcoatRoughness = mat.clearcoatRoughnessFactor;
+        bd.sheenRoughness = mat.sheenRoughnessFactor;
+        bd.transmissionFactor = mat.transmissionFactor;
+        bd.sheenColorFactor = mat.sheenColorFactor;
+
+        // Texture indices
+        bd.baseColorTexIndex = getTexIndex(mi, "base_color_tex");
+        bd.normalTexIndex = getTexIndex(mi, "normal_tex");
+        bd.metallicRoughnessTexIndex = getTexIndex(mi, "metallic_roughness_tex");
+        bd.occlusionTexIndex = getTexIndex(mi, "occlusion_tex");
+        bd.emissiveTexIndex = getTexIndex(mi, "emissive_tex");
+        bd.clearcoatTexIndex = getTexIndex(mi, "clearcoat_tex");
+        bd.clearcoatRoughnessTexIndex = getTexIndex(mi, "clearcoat_roughness_tex");
+        bd.sheenColorTexIndex = getTexIndex(mi, "sheen_color_tex");
+        bd.transmissionTexIndex = getTexIndex(mi, "transmission_tex");
+
+        // Material flags
+        bd.materialFlags = 0;
+        if (bd.normalTexIndex >= 0 || mat.normal_tex.valid())
+            bd.materialFlags |= BINDLESS_MAT_FLAG_NORMAL_MAP;
+        if (mat.hasClearcoat)
+            bd.materialFlags |= BINDLESS_MAT_FLAG_CLEARCOAT;
+        if (mat.hasSheen)
+            bd.materialFlags |= BINDLESS_MAT_FLAG_SHEEN;
+        if (mat.emissive_tex.valid() || glm::length(mat.emissive) > 0.0f)
+            bd.materialFlags |= BINDLESS_MAT_FLAG_EMISSION;
+        if (mat.hasTransmission)
+            bd.materialFlags |= BINDLESS_MAT_FLAG_TRANSMISSION;
+    }
+
+    // Upload to GPU storage buffer
+    VkDeviceSize bufSize = numMaterials * sizeof(BindlessMaterialData);
+
+    VkBufferCreateInfo bufInfo = {};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = bufSize;
+    bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    VmaAllocationCreateInfo allocInfo = {};
+    allocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+    vmaCreateBuffer(ctx.allocator, &bufInfo, &allocInfo,
+                    &result.buffer, &result.allocation, nullptr);
+
+    void* mapped;
+    vmaMapMemory(ctx.allocator, result.allocation, &mapped);
+    memcpy(mapped, materialData.data(), bufSize);
+    vmaUnmapMemory(ctx.allocator, result.allocation);
+
+    result.materialCount = static_cast<uint32_t>(numMaterials);
+
+    std::cout << "[info] Bindless materials SSBO: " << result.materialCount
+              << " material(s), " << bufSize << " bytes" << std::endl;
+
+    return result;
+}
+
+BindlessMaterialsSSBO SceneManager::buildMaterialsSSBOByGeometry(VulkanContext& ctx,
+                                                                 const BindlessTextureArray& texArray) {
+    BindlessMaterialsSSBO result;
+
+    if (!m_hasGltfScene || m_drawRanges.empty()) return result;
+
+    // Build one entry per draw range (geometry) so gl_GeometryIndexEXT indexes correctly.
+    size_t numGeometries = m_drawRanges.size();
+    std::vector<BindlessMaterialData> materialData(numGeometries);
+
+    auto getTexIndex = [&](size_t mi, const std::string& slot) -> int32_t {
+        if (mi >= m_perMaterialTextures.size()) return -1;
+        auto& texMap = m_perMaterialTextures[mi];
+        auto it = texMap.find(slot);
+        if (it == texMap.end() || it->second.image == VK_NULL_HANDLE) return -1;
+
+        uint64_t key = reinterpret_cast<uint64_t>(it->second.image);
+        auto dedupIt = m_bindlessTexDedup.find(key);
+        if (dedupIt != m_bindlessTexDedup.end()) return dedupIt->second;
+        return -1;
+    };
+
+    for (size_t gi = 0; gi < numGeometries; gi++) {
+        size_t mi = static_cast<size_t>(m_drawRanges[gi].materialIndex);
+        if (mi >= m_gltfScene.materials.size()) {
+            std::cout << "[warn] Geometry " << gi << " references material " << mi
+                      << " which is out of range (" << m_gltfScene.materials.size() << ")" << std::endl;
+            materialData[gi] = {};
+            continue;
+        }
+        const auto& mat = m_gltfScene.materials[mi];
+        auto& bd = materialData[gi];
+
+        // PBR factors
+        bd.baseColorFactor = mat.baseColor;
+        bd.emissiveFactor = mat.emissive;
+        bd.metallicFactor = mat.metallic;
+        bd.roughnessFactor = mat.roughness;
+        bd.emissiveStrength = mat.emissiveStrength;
+        bd.ior = mat.ior;
+        bd.clearcoatFactor = mat.clearcoatFactor;
+        bd.clearcoatRoughness = mat.clearcoatRoughnessFactor;
+        bd.sheenRoughness = mat.sheenRoughnessFactor;
+        bd.transmissionFactor = mat.transmissionFactor;
+        bd.sheenColorFactor = mat.sheenColorFactor;
+
+        // Texture indices
+        bd.baseColorTexIndex = getTexIndex(mi, "base_color_tex");
+        bd.normalTexIndex = getTexIndex(mi, "normal_tex");
+        bd.metallicRoughnessTexIndex = getTexIndex(mi, "metallic_roughness_tex");
+        bd.occlusionTexIndex = getTexIndex(mi, "occlusion_tex");
+        bd.emissiveTexIndex = getTexIndex(mi, "emissive_tex");
+        bd.clearcoatTexIndex = getTexIndex(mi, "clearcoat_tex");
+        bd.clearcoatRoughnessTexIndex = getTexIndex(mi, "clearcoat_roughness_tex");
+        bd.sheenColorTexIndex = getTexIndex(mi, "sheen_color_tex");
+        bd.transmissionTexIndex = getTexIndex(mi, "transmission_tex");
+
+        // Material flags
+        bd.materialFlags = 0;
+        if (bd.normalTexIndex >= 0 || mat.normal_tex.valid())
+            bd.materialFlags |= BINDLESS_MAT_FLAG_NORMAL_MAP;
+        if (mat.hasClearcoat)
+            bd.materialFlags |= BINDLESS_MAT_FLAG_CLEARCOAT;
+        if (mat.hasSheen)
+            bd.materialFlags |= BINDLESS_MAT_FLAG_SHEEN;
+        if (mat.emissive_tex.valid() || glm::length(mat.emissive) > 0.0f)
+            bd.materialFlags |= BINDLESS_MAT_FLAG_EMISSION;
+        if (mat.hasTransmission)
+            bd.materialFlags |= BINDLESS_MAT_FLAG_TRANSMISSION;
+
+        // Per-geometry index offset for RT (gl_PrimitiveID is geometry-relative)
+        bd.indexOffset = static_cast<float>(m_drawRanges[gi].indexOffset);
+
+        std::cout << "[info] Geometry " << gi << " -> material " << mi
+                  << " (flags=0x" << std::hex << bd.materialFlags << std::dec
+                  << ", base_color_tex=" << bd.baseColorTexIndex
+                  << ", index_offset=" << std::dec << m_drawRanges[gi].indexOffset << ")" << std::endl;
+    }
+
+    // Upload to GPU storage buffer
+    VkDeviceSize bufSize = numGeometries * sizeof(BindlessMaterialData);
+
+    VkBufferCreateInfo bufInfo = {};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = bufSize;
+    bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    VmaAllocationCreateInfo allocInfo = {};
+    allocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+    vmaCreateBuffer(ctx.allocator, &bufInfo, &allocInfo,
+                    &result.buffer, &result.allocation, nullptr);
+
+    void* mapped;
+    vmaMapMemory(ctx.allocator, result.allocation, &mapped);
+    memcpy(mapped, materialData.data(), bufSize);
+    vmaUnmapMemory(ctx.allocator, result.allocation);
+
+    result.materialCount = static_cast<uint32_t>(numGeometries);
+
+    std::cout << "[info] Bindless materials SSBO (by geometry): " << result.materialCount
+              << " entries, " << bufSize << " bytes" << std::endl;
+
+    return result;
+}
+
+// --------------------------------------------------------------------------
 // Scene feature detection
 // --------------------------------------------------------------------------
 
