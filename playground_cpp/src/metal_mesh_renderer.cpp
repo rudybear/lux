@@ -69,21 +69,23 @@ void MetalMeshRenderer::uploadMeshletData(MetalContext& ctx) {
 void MetalMeshRenderer::uploadVertexData(MetalContext& ctx) {
     auto& vertices = m_scene->getVertices();
 
-    // Extract SoA from interleaved vertices
-    std::vector<glm::vec3> positions(vertices.size());
-    std::vector<glm::vec3> normals(vertices.size());
+    // Extract SoA from interleaved vertices.
+    // Positions and normals must be vec4 (16-byte stride) to match the SPIR-V
+    // SSBO layout (std430 vec4 arrays). The shader reads float4 per element.
+    std::vector<glm::vec4> positions(vertices.size());
+    std::vector<glm::vec4> normals(vertices.size());
     std::vector<glm::vec2> texCoords(vertices.size());
 
     for (size_t i = 0; i < vertices.size(); i++) {
-        positions[i] = vertices[i].position;
-        normals[i] = vertices[i].normal;
+        positions[i] = glm::vec4(vertices[i].position, 1.0f);
+        normals[i] = glm::vec4(vertices[i].normal, 0.0f);
         texCoords[i] = vertices[i].uv;
     }
 
     m_positionsBuffer = ctx.newBuffer(positions.data(),
-        positions.size() * sizeof(glm::vec3), MTL::ResourceStorageModeShared);
+        positions.size() * sizeof(glm::vec4), MTL::ResourceStorageModeShared);
     m_normalsBuffer = ctx.newBuffer(normals.data(),
-        normals.size() * sizeof(glm::vec3), MTL::ResourceStorageModeShared);
+        normals.size() * sizeof(glm::vec4), MTL::ResourceStorageModeShared);
     m_texCoordsBuffer = ctx.newBuffer(texCoords.data(),
         texCoords.size() * sizeof(glm::vec2), MTL::ResourceStorageModeShared);
 
@@ -220,6 +222,7 @@ void MetalMeshRenderer::createPipeline(MetalContext& ctx) {
     if (m_pushConstantSize > 0) {
         m_pushConstantData.resize(m_pushConstantSize, 0);
     }
+
 }
 
 // --------------------------------------------------------------------------
@@ -363,8 +366,9 @@ void MetalMeshRenderer::renderToTarget(MetalContext& ctx, MTL::RenderPassDescrip
     }
 
     // Dispatch mesh threadgroups
-    uint32_t numGroups = (m_totalMeshlets + 31) / 32;
-    enc->drawMeshThreadgroups(MTL::Size(numGroups, 1, 1),
+    // One mesh threadgroup per meshlet — each threadgroup has 32 threads
+    // that cooperatively process one meshlet's vertices and triangles
+    enc->drawMeshThreadgroups(MTL::Size(m_totalMeshlets, 1, 1),
                               MTL::Size(32, 1, 1),
                               MTL::Size(32, 1, 1));
 

@@ -294,6 +294,7 @@ void ShaderTranspiler::transpileInto(TranspiledShader& result, const std::vector
               << (result.pushConstantBufferIndex != UINT32_MAX ? "has push constants" : "no push constants")
               << std::endl;
 
+
     // Destroy the compiler before creating Metal objects
     compiler.reset();
 
