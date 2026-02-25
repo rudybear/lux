@@ -178,6 +178,30 @@ fn try_load_manifest(pipeline_base: &str) -> Option<ShaderManifest> {
     None
 }
 
+/// Find the best matching permutation suffix for a set of material features.
+/// Returns "" (base) if no exact match found.
+fn find_permutation_suffix(manifest: &ShaderManifest, features: &std::collections::BTreeSet<String>) -> String {
+    let mut wanted: HashMap<String, bool> = HashMap::new();
+    for fname in &manifest.features {
+        wanted.insert(fname.clone(), features.contains(fname));
+    }
+    for perm in &manifest.permutations {
+        let mut is_match = true;
+        for fname in &manifest.features {
+            let perm_has = perm.features.get(fname).copied().unwrap_or(false);
+            let want = *wanted.get(fname).unwrap_or(&false);
+            if perm_has != want {
+                is_match = false;
+                break;
+            }
+        }
+        if is_match {
+            return perm.suffix.clone();
+        }
+    }
+    String::new()
+}
+
 // ===========================================================================
 // Multi-pipeline data structures
 // ===========================================================================
@@ -364,9 +388,44 @@ impl MeshShaderRenderer {
     ) -> Result<Self, String> {
         let device = ctx.device.clone();
 
-        // --- Phase 0: Load reflection JSON ---
-        let mesh_json_path = format!("{}.mesh.json", pipeline_base);
-        let frag_json_path = format!("{}.frag.json", pipeline_base);
+        // --- Phase 0: Load scene geometry (needed for permutation resolution) ---
+        let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
+
+        let mut gltf_scene = if is_gltf {
+            Some(crate::gltf_loader::load_gltf(Path::new(scene_source))?)
+        } else {
+            None
+        };
+
+        // Resolve single-material permutation from manifest + scene features
+        let resolved_frag_base = if let Some(ref gs) = gltf_scene {
+            if let Some(manifest) = try_load_manifest(pipeline_base) {
+                let scene_features = scene_manager::detect_scene_features(gs);
+                let suffix = find_permutation_suffix(&manifest, &scene_features);
+                if !suffix.is_empty() {
+                    let candidate = format!("{}{}", pipeline_base, suffix);
+                    if Path::new(&format!("{}.frag.spv", candidate)).exists() {
+                        info!("Resolved mesh single-material permutation: {}", suffix);
+                        candidate
+                    } else {
+                        pipeline_base.to_string()
+                    }
+                } else {
+                    pipeline_base.to_string()
+                }
+            } else {
+                pipeline_base.to_string()
+            }
+        } else {
+            pipeline_base.to_string()
+        };
+
+        // --- Phase 1: Load reflection JSON ---
+        // Both mesh and fragment shaders use resolved permutation (mesh shader
+        // varyings must match fragment shader inputs — permutation mesh outputs
+        // tangent/bitangent when normal_map is enabled)
+        let mesh_json_path = format!("{}.mesh.json", resolved_frag_base);
+        let frag_json_path = format!("{}.frag.json", resolved_frag_base);
 
         let mesh_refl = reflected_pipeline::load_reflection(Path::new(&mesh_json_path))?;
         let frag_refl = reflected_pipeline::load_reflection(Path::new(&frag_json_path))?;
@@ -387,15 +446,6 @@ impl MeshShaderRenderer {
             "Mesh output limits from reflection: max_vertices={}, max_primitives={}",
             max_verts, max_prims
         );
-
-        // --- Phase 1: Load scene geometry ---
-        let is_gltf = scene_source.ends_with(".glb") || scene_source.ends_with(".gltf");
-
-        let mut gltf_scene = if is_gltf {
-            Some(crate::gltf_loader::load_gltf(Path::new(scene_source))?)
-        } else {
-            None
-        };
 
         // --- Bindless detection: check if the fragment reflection has bindless enabled ---
         let use_bindless = frag_refl.bindless.as_ref().map_or(false, |b| b.enabled) && ctx.bindless_supported;
@@ -475,8 +525,12 @@ impl MeshShaderRenderer {
                             normal: norm.into(),
                             uv: v.uv,
                         });
-                        let tan3 = (normal_mat * glam::Vec3::from_slice(&v.tangent[..3])).normalize();
-                        tangent_data_raw.push([tan3.x, tan3.y, tan3.z, v.tangent[3]]);
+                        if mesh.has_tangents {
+                            let tan3 = (normal_mat * glam::Vec3::from_slice(&v.tangent[..3])).normalize();
+                            tangent_data_raw.push([tan3.x, tan3.y, tan3.z, v.tangent[3]]);
+                        } else {
+                            tangent_data_raw.push([1.0, 0.0, 0.0, 1.0]);
+                        }
                     }
                     for &idx in &mesh.indices {
                         all_indices.push(idx + vertex_offset);
@@ -979,8 +1033,9 @@ impl MeshShaderRenderer {
                 .map_err(|e| format!("Failed to create mesh shader framebuffer: {:?}", e))?
         };
 
-        // Load mesh shader module (shared across all permutations)
-        let mesh_path = format!("{}.mesh.spv", pipeline_base);
+        // Load mesh shader module (use resolved permutation for single-pipeline,
+        // as it must match the fragment shader's expected varyings)
+        let mesh_path = format!("{}.mesh.spv", resolved_frag_base);
         let mesh_code = spv_loader::load_spirv(Path::new(&mesh_path))?;
         let mesh_module = spv_loader::create_shader_module(&device, &mesh_code)?;
 
@@ -1721,8 +1776,8 @@ impl MeshShaderRenderer {
                 device.update_descriptor_sets(&writes, &[]);
             }
 
-            // Load fragment shader module
-            let frag_path = format!("{}.frag.spv", pipeline_base);
+            // Load fragment shader module (using resolved permutation)
+            let frag_path = format!("{}.frag.spv", resolved_frag_base);
             let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
             let frag_module = spv_loader::create_shader_module(&device, &frag_code)?;
 
@@ -1909,8 +1964,12 @@ impl MeshShaderRenderer {
                             normal: norm.into(),
                             uv: v.uv,
                         });
-                        let tan3 = (normal_mat * glam::Vec3::from_slice(&v.tangent[..3])).normalize();
-                        tangent_data_raw.push([tan3.x, tan3.y, tan3.z, v.tangent[3]]);
+                        if mesh.has_tangents {
+                            let tan3 = (normal_mat * glam::Vec3::from_slice(&v.tangent[..3])).normalize();
+                            tangent_data_raw.push([tan3.x, tan3.y, tan3.z, v.tangent[3]]);
+                        } else {
+                            tangent_data_raw.push([1.0, 0.0, 0.0, 1.0]);
+                        }
                     }
                     for &idx in &mesh.indices {
                         all_indices.push(idx + vertex_offset);

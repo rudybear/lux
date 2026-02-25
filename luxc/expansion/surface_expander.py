@@ -476,6 +476,92 @@ def _emit_custom_layer(layer, fn, result_var, body, prefix, rewrite_for_rt=False
     return out_var
 
 
+# --- Shared helper functions for code deduplication ---
+
+def _emit_barycentric_interpolation(body, index_offset_expr=None):
+    """Emit barycentric interpolation for RT closest-hit shaders.
+
+    Generates index lookups, barycentric weights, and interpolated
+    hit_pos, n (normal), and uv from storage buffers.
+
+    If index_offset_expr is given (bindless RT), base = offset + primitive_id * 3.
+    Otherwise (non-bindless RT), base = primitive_id * 3.
+    """
+    if index_offset_expr is not None:
+        body.append(LetStmt("base", "scalar",
+            BinaryOp("+",
+                BinaryOp("*", index_offset_expr, NumberLit("1.0")),
+                BinaryOp("*", VarRef("primitive_id"), NumberLit("3.0")))))
+    else:
+        body.append(LetStmt("base", "scalar",
+            BinaryOp("*", VarRef("primitive_id"), NumberLit("3.0"))))
+
+    body.append(LetStmt("i0", "uint", IndexAccess(VarRef("indices"), VarRef("base"))))
+    body.append(LetStmt("i1", "uint", IndexAccess(VarRef("indices"),
+        BinaryOp("+", VarRef("base"), NumberLit("1.0")))))
+    body.append(LetStmt("i2", "uint", IndexAccess(VarRef("indices"),
+        BinaryOp("+", VarRef("base"), NumberLit("2.0")))))
+
+    body.append(LetStmt("b", "vec2", VarRef("bary")))
+    body.append(LetStmt("bw", "scalar", BinaryOp("-",
+        BinaryOp("-", NumberLit("1.0"), SwizzleAccess(VarRef("b"), "x")),
+        SwizzleAccess(VarRef("b"), "y"))))
+
+    # Interpolate position
+    body.append(LetStmt("p0", "vec4", IndexAccess(VarRef("positions"), VarRef("i0"))))
+    body.append(LetStmt("p1", "vec4", IndexAccess(VarRef("positions"), VarRef("i1"))))
+    body.append(LetStmt("p2", "vec4", IndexAccess(VarRef("positions"), VarRef("i2"))))
+    body.append(LetStmt("hit_pos", "vec3", BinaryOp("+",
+        BinaryOp("+",
+            BinaryOp("*", SwizzleAccess(VarRef("p0"), "xyz"), VarRef("bw")),
+            BinaryOp("*", SwizzleAccess(VarRef("p1"), "xyz"),
+                SwizzleAccess(VarRef("b"), "x"))),
+        BinaryOp("*", SwizzleAccess(VarRef("p2"), "xyz"),
+            SwizzleAccess(VarRef("b"), "y")))))
+
+    # Interpolate normal
+    body.append(LetStmt("n0", "vec4", IndexAccess(VarRef("normals"), VarRef("i0"))))
+    body.append(LetStmt("n1", "vec4", IndexAccess(VarRef("normals"), VarRef("i1"))))
+    body.append(LetStmt("n2", "vec4", IndexAccess(VarRef("normals"), VarRef("i2"))))
+    body.append(LetStmt("n", "vec3", CallExpr(VarRef("normalize"), [
+        BinaryOp("+",
+            BinaryOp("+",
+                BinaryOp("*", SwizzleAccess(VarRef("n0"), "xyz"), VarRef("bw")),
+                BinaryOp("*", SwizzleAccess(VarRef("n1"), "xyz"),
+                    SwizzleAccess(VarRef("b"), "x"))),
+            BinaryOp("*", SwizzleAccess(VarRef("n2"), "xyz"),
+                SwizzleAccess(VarRef("b"), "y")))])))
+
+    # Interpolate UV
+    body.append(LetStmt("uv0", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i0"))))
+    body.append(LetStmt("uv1", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i1"))))
+    body.append(LetStmt("uv2", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i2"))))
+    body.append(LetStmt("uv", "vec2", BinaryOp("+",
+        BinaryOp("+",
+            BinaryOp("*", VarRef("uv0"), VarRef("bw")),
+            BinaryOp("*", VarRef("uv1"), SwizzleAccess(VarRef("b"), "x"))),
+        BinaryOp("*", VarRef("uv2"), SwizzleAccess(VarRef("b"), "y")))))
+
+
+def _emit_tonemap_output(body, result_var, schedule):
+    """Emit tonemap selection + sRGB conversion. Returns output variable name."""
+    tonemap_strategy = schedule.get("tonemap", "none") if schedule else "none"
+    if tonemap_strategy == "aces":
+        body.append(LetStmt("tonemapped", "vec3",
+            CallExpr(VarRef("tonemap_aces"), [VarRef(result_var)])))
+        body.append(LetStmt("final_color", "vec3",
+            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
+        return "final_color"
+    elif tonemap_strategy == "reinhard":
+        body.append(LetStmt("tonemapped", "vec3",
+            CallExpr(VarRef("tonemap_reinhard"), [VarRef(result_var)])))
+        body.append(LetStmt("final_color", "vec3",
+            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
+        return "final_color"
+    else:
+        return result_var
+
+
 def _generate_layered_main(
     surface: SurfaceDecl,
     frag_inputs: list[tuple[str, str]],
@@ -730,21 +816,7 @@ def _generate_layered_main(
         result_var = "hdr"
 
     # --- Tonemap + gamma ---
-    tonemap_strategy = schedule.get("tonemap", "none") if schedule else "none"
-    if tonemap_strategy == "aces":
-        body.append(LetStmt("tonemapped", "vec3",
-            CallExpr(VarRef("tonemap_aces"), [VarRef(result_var)])))
-        body.append(LetStmt("final_color", "vec3",
-            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
-        output_var = "final_color"
-    elif tonemap_strategy == "reinhard":
-        body.append(LetStmt("tonemapped", "vec3",
-            CallExpr(VarRef("tonemap_reinhard"), [VarRef(result_var)])))
-        body.append(LetStmt("final_color", "vec3",
-            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
-        output_var = "final_color"
-    else:
-        output_var = result_var
+    output_var = _emit_tonemap_output(body, result_var, schedule)
 
     # Output final color
     body.append(AssignStmt(
@@ -1236,57 +1308,7 @@ def _expand_layered_closest_hit(
     body = []
 
     # Barycentric interpolation preamble (matches gltf_pbr_rt.lux)
-    # let base: scalar = primitive_id * 3.0;
-    body.append(LetStmt("base", "scalar",
-        BinaryOp("*", VarRef("primitive_id"), NumberLit("3.0"))))
-
-    # Index lookups
-    body.append(LetStmt("i0", "uint", IndexAccess(VarRef("indices"), VarRef("base"))))
-    body.append(LetStmt("i1", "uint", IndexAccess(VarRef("indices"),
-        BinaryOp("+", VarRef("base"), NumberLit("1.0")))))
-    body.append(LetStmt("i2", "uint", IndexAccess(VarRef("indices"),
-        BinaryOp("+", VarRef("base"), NumberLit("2.0")))))
-
-    # Barycentric weights
-    body.append(LetStmt("b", "vec2", VarRef("bary")))
-    body.append(LetStmt("bw", "scalar", BinaryOp("-",
-        BinaryOp("-", NumberLit("1.0"), SwizzleAccess(VarRef("b"), "x")),
-        SwizzleAccess(VarRef("b"), "y"))))
-
-    # Interpolate position
-    body.append(LetStmt("p0", "vec4", IndexAccess(VarRef("positions"), VarRef("i0"))))
-    body.append(LetStmt("p1", "vec4", IndexAccess(VarRef("positions"), VarRef("i1"))))
-    body.append(LetStmt("p2", "vec4", IndexAccess(VarRef("positions"), VarRef("i2"))))
-    body.append(LetStmt("hit_pos", "vec3", BinaryOp("+",
-        BinaryOp("+",
-            BinaryOp("*", SwizzleAccess(VarRef("p0"), "xyz"), VarRef("bw")),
-            BinaryOp("*", SwizzleAccess(VarRef("p1"), "xyz"),
-                SwizzleAccess(VarRef("b"), "x"))),
-        BinaryOp("*", SwizzleAccess(VarRef("p2"), "xyz"),
-            SwizzleAccess(VarRef("b"), "y")))))
-
-    # Interpolate normal
-    body.append(LetStmt("n0", "vec4", IndexAccess(VarRef("normals"), VarRef("i0"))))
-    body.append(LetStmt("n1", "vec4", IndexAccess(VarRef("normals"), VarRef("i1"))))
-    body.append(LetStmt("n2", "vec4", IndexAccess(VarRef("normals"), VarRef("i2"))))
-    body.append(LetStmt("n", "vec3", CallExpr(VarRef("normalize"), [
-        BinaryOp("+",
-            BinaryOp("+",
-                BinaryOp("*", SwizzleAccess(VarRef("n0"), "xyz"), VarRef("bw")),
-                BinaryOp("*", SwizzleAccess(VarRef("n1"), "xyz"),
-                    SwizzleAccess(VarRef("b"), "x"))),
-            BinaryOp("*", SwizzleAccess(VarRef("n2"), "xyz"),
-                SwizzleAccess(VarRef("b"), "y")))])))
-
-    # Interpolate UV
-    body.append(LetStmt("uv0", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i0"))))
-    body.append(LetStmt("uv1", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i1"))))
-    body.append(LetStmt("uv2", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i2"))))
-    body.append(LetStmt("uv", "vec2", BinaryOp("+",
-        BinaryOp("+",
-            BinaryOp("*", VarRef("uv0"), VarRef("bw")),
-            BinaryOp("*", VarRef("uv1"), SwizzleAccess(VarRef("b"), "x"))),
-        BinaryOp("*", VarRef("uv2"), SwizzleAccess(VarRef("b"), "y")))))
+    _emit_barycentric_interpolation(body)
 
     # Index layers
     layers_by_name = {}
@@ -1499,21 +1521,7 @@ def _expand_layered_closest_hit(
         result_var = "hdr"
 
     # --- Tonemap + gamma ---
-    tonemap_strategy = schedule.get("tonemap", "none") if schedule else "none"
-    if tonemap_strategy == "aces":
-        body.append(LetStmt("tonemapped", "vec3",
-            CallExpr(VarRef("tonemap_aces"), [VarRef(result_var)])))
-        body.append(LetStmt("final_color", "vec3",
-            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
-        output_var = "final_color"
-    elif tonemap_strategy == "reinhard":
-        body.append(LetStmt("tonemapped", "vec3",
-            CallExpr(VarRef("tonemap_reinhard"), [VarRef(result_var)])))
-        body.append(LetStmt("final_color", "vec3",
-            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
-        output_var = "final_color"
-    else:
-        output_var = result_var
+    output_var = _emit_tonemap_output(body, result_var, schedule)
 
     # Write to payload
     body.append(AssignStmt(
@@ -2190,37 +2198,107 @@ def _emit_bindless_layer_body(
 
     result_var = "direct_lit"
 
-    # --- Transmission (flag check) ---
-    body.append(LetStmt("result_pre_ibl", "vec3", VarRef(result_var)))
+    # --- Initialize optional layer params (defaults = layer disabled) ---
+    body.append(LetStmt("bl_trans_factor", "scalar", NumberLit("0.0")))
+    body.append(LetStmt("bl_trans_ior", "scalar", NumberLit("1.5")))
+    body.append(LetStmt("bl_sheen_color", "vec3",
+        ConstructorExpr("vec3", [NumberLit("0.0")])))
+    body.append(LetStmt("bl_sheen_roughness", "scalar", NumberLit("0.0")))
+    body.append(LetStmt("bl_coat_factor", "scalar", NumberLit("0.0")))
+    body.append(LetStmt("bl_coat_roughness", "scalar", NumberLit("0.0")))
+    body.append(LetStmt("bl_emission", "vec3",
+        ConstructorExpr("vec3", [NumberLit("0.0")])))
+
+    # --- Transmission param loading (flag-gated) ---
     body.append(IfStmt(
         BinaryOp("!=",
             BinaryOp("&", VarRef("mat_flags"),
                 NumberLit(str(_FLAG_TRANSMISSION))),
             NumberLit("0")),
         [
-            LetStmt("trans_factor", "scalar",
+            AssignStmt(AssignTarget(VarRef("bl_trans_factor")),
                 FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
                     "transmissionFactor")),
-            LetStmt("trans_ior", "scalar",
+            AssignStmt(AssignTarget(VarRef("bl_trans_ior")),
                 FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
                     "ior")),
-            LetStmt("transmitted", "vec3", CallExpr(
-                VarRef("transmission_replace"), [
-                    VarRef("result_pre_ibl"), VarRef("layer_albedo"),
-                    VarRef("layer_roughness"),
-                    VarRef("trans_factor"), VarRef("trans_ior"),
-                    VarRef("n"), VarRef("v"), VarRef("l"),
-                    NumberLit("0.0"),
-                    ConstructorExpr("vec3", [NumberLit("1.0")]),
-                    NumberLit("1000000.0"),
-                ])),
-            AssignStmt(AssignTarget(VarRef("result_pre_ibl")), VarRef("transmitted")),
         ],
         [],
     ))
-    result_var = "result_pre_ibl"
 
-    # --- IBL ---
+    # --- Sheen param loading (flag-gated) ---
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_SHEEN))),
+            NumberLit("0")),
+        [
+            LetStmt("sheen_color_loaded", "vec3",
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "sheenColorFactor")),
+            LetStmt("sheen_tex_sample", "vec4",
+                ConstructorExpr("vec4", [NumberLit("1.0")])),
+            _sample_tex("tex_sheenColor", "sheen_tex_sample"),
+            # glTF sheen color textures are sRGB-encoded
+            AssignStmt(AssignTarget(VarRef("bl_sheen_color")),
+                BinaryOp("*", VarRef("sheen_color_loaded"),
+                    CallExpr(VarRef("srgb_to_linear"), [
+                        SwizzleAccess(VarRef("sheen_tex_sample"), "xyz")]))),
+            AssignStmt(AssignTarget(VarRef("bl_sheen_roughness")),
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "sheenRoughness")),
+        ],
+        [],
+    ))
+
+    # --- Clearcoat param loading (flag-gated) ---
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_CLEARCOAT))),
+            NumberLit("0")),
+        [
+            LetStmt("coat_factor_loaded", "scalar",
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "clearcoatFactor")),
+            LetStmt("coat_roughness_loaded", "scalar",
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "clearcoatRoughness")),
+            LetStmt("coat_tex_sample", "vec4",
+                ConstructorExpr("vec4", [NumberLit("1.0")])),
+            _sample_tex("tex_clearcoat", "coat_tex_sample"),
+            LetStmt("coat_rough_sample", "vec4",
+                ConstructorExpr("vec4", [NumberLit("1.0")])),
+            _sample_tex("tex_clearcoatRough", "coat_rough_sample"),
+            AssignStmt(AssignTarget(VarRef("bl_coat_factor")),
+                BinaryOp("*", VarRef("coat_factor_loaded"),
+                    SwizzleAccess(VarRef("coat_tex_sample"), "x"))),
+            AssignStmt(AssignTarget(VarRef("bl_coat_roughness")),
+                BinaryOp("*", VarRef("coat_roughness_loaded"),
+                    SwizzleAccess(VarRef("coat_rough_sample"), "y"))),
+        ],
+        [],
+    ))
+
+    # --- Emission param loading (flag-gated) ---
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_EMISSION))),
+            NumberLit("0")),
+        [
+            LetStmt("em_color_loaded", "vec3", BinaryOp("*",
+                VarRef("mat_emissiveFactor"), VarRef("mat_emissionStrength"))),
+            LetStmt("em_tex_sample", "vec4",
+                ConstructorExpr("vec4", [NumberLit("1.0")])),
+            _sample_tex("tex_emissive", "em_tex_sample"),
+            # glTF emissive textures are sRGB-encoded
+            AssignStmt(AssignTarget(VarRef("bl_emission")),
+                BinaryOp("*", VarRef("em_color_loaded"),
+                    CallExpr(VarRef("srgb_to_linear"), [
+                        SwizzleAccess(VarRef("em_tex_sample"), "xyz")]))),
+        ],
+        [],
+    ))
+
+    # --- IBL sampling ---
     body.append(LetStmt("r", "vec3", CallExpr(VarRef("reflect"), [
         BinaryOp("*", VarRef("v"), UnaryOp("-", NumberLit("1.0"))),
         VarRef("n"),
@@ -2266,112 +2344,32 @@ def _emit_bindless_layer_body(
             VarRef("brdf_sample"),
         ])))
 
-    body.append(LetStmt("hdr_partial", "vec3",
-        BinaryOp("+", VarRef(result_var), VarRef("ambient"))))
-    result_var = "hdr_partial"
-
-    # --- Sheen (flag check) ---
-    body.append(IfStmt(
-        BinaryOp("!=",
-            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_SHEEN))),
-            NumberLit("0")),
-        [
-            LetStmt("sheen_color_val", "vec3",
-                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
-                    "sheenColorFactor")),
-            LetStmt("sheen_roughness_val", "scalar",
-                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
-                    "sheenRoughness")),
-            LetStmt("sheen_tex_sample", "vec4",
-                ConstructorExpr("vec4", [NumberLit("1.0")])),
-            _sample_tex("tex_sheenColor", "sheen_tex_sample"),
-            # glTF sheen color textures are sRGB-encoded
-            AssignStmt(AssignTarget(VarRef("sheen_color_val")),
-                BinaryOp("*", VarRef("sheen_color_val"),
-                    CallExpr(VarRef("srgb_to_linear"), [
-                        SwizzleAccess(VarRef("sheen_tex_sample"), "xyz")]))),
-            LetStmt("sheened", "vec3", CallExpr(
-                VarRef("sheen_over"), [
-                    VarRef(result_var), VarRef("n"), VarRef("v"), VarRef("l"),
-                    VarRef("sheen_color_val"), VarRef("sheen_roughness_val"),
-                ])),
-            AssignStmt(AssignTarget(VarRef(result_var)), VarRef("sheened")),
-        ],
-        [],
-    ))
-
-    # --- Clearcoat (flag check) ---
-    body.append(IfStmt(
-        BinaryOp("!=",
-            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_CLEARCOAT))),
-            NumberLit("0")),
-        [
-            LetStmt("coat_factor", "scalar",
-                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
-                    "clearcoatFactor")),
-            LetStmt("coat_roughness", "scalar",
-                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
-                    "clearcoatRoughness")),
-            LetStmt("coat_tex_sample", "vec4",
-                ConstructorExpr("vec4", [NumberLit("1.0")])),
-            _sample_tex("tex_clearcoat", "coat_tex_sample"),
-            AssignStmt(AssignTarget(VarRef("coat_factor")),
-                BinaryOp("*", VarRef("coat_factor"),
-                    SwizzleAccess(VarRef("coat_tex_sample"), "x"))),
-            LetStmt("coat_rough_sample", "vec4",
-                ConstructorExpr("vec4", [NumberLit("1.0")])),
-            _sample_tex("tex_clearcoatRough", "coat_rough_sample"),
-            AssignStmt(AssignTarget(VarRef("coat_roughness")),
-                BinaryOp("*", VarRef("coat_roughness"),
-                    SwizzleAccess(VarRef("coat_rough_sample"), "y"))),
-            LetStmt("coated", "vec3", CallExpr(
-                VarRef("coat_over"), [
-                    VarRef(result_var), VarRef("n"), VarRef("v"), VarRef("l"),
-                    VarRef("coat_factor"), VarRef("coat_roughness"),
-                ])),
-            AssignStmt(AssignTarget(VarRef(result_var)), VarRef("coated")),
-        ],
-        [],
-    ))
-
-    # --- Emission (flag check) ---
-    body.append(IfStmt(
-        BinaryOp("!=",
-            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_EMISSION))),
-            NumberLit("0")),
-        [
-            LetStmt("em_color", "vec3", BinaryOp("*",
-                VarRef("mat_emissiveFactor"), VarRef("mat_emissionStrength"))),
-            LetStmt("em_tex_sample", "vec4",
-                ConstructorExpr("vec4", [NumberLit("1.0")])),
-            _sample_tex("tex_emissive", "em_tex_sample"),
-            # glTF emissive textures are sRGB-encoded
-            AssignStmt(AssignTarget(VarRef("em_color")),
-                BinaryOp("*", VarRef("em_color"),
-                    CallExpr(VarRef("srgb_to_linear"), [
-                        SwizzleAccess(VarRef("em_tex_sample"), "xyz")]))),
-            AssignStmt(AssignTarget(VarRef(result_var)),
-                BinaryOp("+", VarRef(result_var), VarRef("em_color"))),
-        ],
-        [],
-    ))
+    # --- Unified composition via compose_pbr_layers (stdlib) ---
+    body.append(LetStmt("composed", "vec3", CallExpr(
+        VarRef("compose_pbr_layers"), [
+            VarRef("direct_lit"),
+            VarRef("n"), VarRef("v"), VarRef("l"),
+            VarRef("layer_albedo"), VarRef("layer_roughness"),
+            # Transmission
+            VarRef("bl_trans_factor"), VarRef("bl_trans_ior"),
+            NumberLit("0.0"),
+            ConstructorExpr("vec3", [NumberLit("1.0")]),
+            NumberLit("1000000.0"),
+            # IBL
+            VarRef("ambient"),
+            # Sheen
+            VarRef("bl_sheen_color"), VarRef("bl_sheen_roughness"),
+            # Coat
+            VarRef("bl_coat_factor"), VarRef("bl_coat_roughness"),
+            # Coat IBL (not computed in bindless)
+            ConstructorExpr("vec3", [NumberLit("0.0")]),
+            # Emission
+            VarRef("bl_emission"),
+        ])))
+    result_var = "composed"
 
     # --- Tonemap + output ---
-    tonemap_strategy = schedule.get("tonemap", "none") if schedule else "none"
-    if tonemap_strategy == "aces":
-        body.append(LetStmt("tonemapped", "vec3",
-            CallExpr(VarRef("tonemap_aces"), [VarRef(result_var)])))
-        body.append(LetStmt("final_color", "vec3",
-            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
-        output_var = "final_color"
-    elif tonemap_strategy == "reinhard":
-        body.append(LetStmt("tonemapped", "vec3",
-            CallExpr(VarRef("tonemap_reinhard"), [VarRef(result_var)])))
-        body.append(LetStmt("final_color", "vec3",
-            CallExpr(VarRef("linear_to_srgb"), [VarRef("tonemapped")])))
-        output_var = "final_color"
-    else:
-        output_var = result_var
+    output_var = _emit_tonemap_output(body, result_var, schedule)
 
     return body, output_var
 
@@ -2535,55 +2533,7 @@ def _expand_bindless_closest_hit(
             "index_offset")))
 
     # Barycentric interpolation preamble — offset primitive_id by geometry's index_offset
-    body.append(LetStmt("base", "scalar",
-        BinaryOp("+",
-            BinaryOp("*", VarRef("geo_index_offset"), NumberLit("1.0")),
-            BinaryOp("*", VarRef("primitive_id"), NumberLit("3.0")))))
-    body.append(LetStmt("i0", "uint", IndexAccess(VarRef("indices"), VarRef("base"))))
-    body.append(LetStmt("i1", "uint", IndexAccess(VarRef("indices"),
-        BinaryOp("+", VarRef("base"), NumberLit("1.0")))))
-    body.append(LetStmt("i2", "uint", IndexAccess(VarRef("indices"),
-        BinaryOp("+", VarRef("base"), NumberLit("2.0")))))
-
-    body.append(LetStmt("b", "vec2", VarRef("bary")))
-    body.append(LetStmt("bw", "scalar", BinaryOp("-",
-        BinaryOp("-", NumberLit("1.0"), SwizzleAccess(VarRef("b"), "x")),
-        SwizzleAccess(VarRef("b"), "y"))))
-
-    # Interpolate position
-    body.append(LetStmt("p0", "vec4", IndexAccess(VarRef("positions"), VarRef("i0"))))
-    body.append(LetStmt("p1", "vec4", IndexAccess(VarRef("positions"), VarRef("i1"))))
-    body.append(LetStmt("p2", "vec4", IndexAccess(VarRef("positions"), VarRef("i2"))))
-    body.append(LetStmt("hit_pos", "vec3", BinaryOp("+",
-        BinaryOp("+",
-            BinaryOp("*", SwizzleAccess(VarRef("p0"), "xyz"), VarRef("bw")),
-            BinaryOp("*", SwizzleAccess(VarRef("p1"), "xyz"),
-                SwizzleAccess(VarRef("b"), "x"))),
-        BinaryOp("*", SwizzleAccess(VarRef("p2"), "xyz"),
-            SwizzleAccess(VarRef("b"), "y")))))
-
-    # Interpolate normal
-    body.append(LetStmt("n0", "vec4", IndexAccess(VarRef("normals"), VarRef("i0"))))
-    body.append(LetStmt("n1", "vec4", IndexAccess(VarRef("normals"), VarRef("i1"))))
-    body.append(LetStmt("n2", "vec4", IndexAccess(VarRef("normals"), VarRef("i2"))))
-    body.append(LetStmt("n", "vec3", CallExpr(VarRef("normalize"), [
-        BinaryOp("+",
-            BinaryOp("+",
-                BinaryOp("*", SwizzleAccess(VarRef("n0"), "xyz"), VarRef("bw")),
-                BinaryOp("*", SwizzleAccess(VarRef("n1"), "xyz"),
-                    SwizzleAccess(VarRef("b"), "x"))),
-            BinaryOp("*", SwizzleAccess(VarRef("n2"), "xyz"),
-                SwizzleAccess(VarRef("b"), "y")))])))
-
-    # Interpolate UV
-    body.append(LetStmt("uv0", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i0"))))
-    body.append(LetStmt("uv1", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i1"))))
-    body.append(LetStmt("uv2", "vec2", IndexAccess(VarRef("tex_coords"), VarRef("i2"))))
-    body.append(LetStmt("uv", "vec2", BinaryOp("+",
-        BinaryOp("+",
-            BinaryOp("*", VarRef("uv0"), VarRef("bw")),
-            BinaryOp("*", VarRef("uv1"), SwizzleAccess(VarRef("b"), "x"))),
-        BinaryOp("*", VarRef("uv2"), SwizzleAccess(VarRef("b"), "y")))))
+    _emit_barycentric_interpolation(body, VarRef("geo_index_offset"))
 
     # View and light directions (RT-specific)
     body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [

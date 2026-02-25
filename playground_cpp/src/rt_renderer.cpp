@@ -1072,7 +1072,9 @@ void RTRenderer::createDescriptorSet(VulkanContext& ctx) {
                 VkWriteDescriptorSetAccelerationStructureKHR asInfo;
             };
             std::vector<DescWriteInfo> writeInfos;
+            writeInfos.reserve(mergedBindings.size());
             std::vector<VkWriteDescriptorSet> writes;
+            writes.reserve(mergedBindings.size());
 
             for (auto& b : mergedBindings) {
                 if (b.set != materialSetIdx) continue;

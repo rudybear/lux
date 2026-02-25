@@ -424,7 +424,11 @@ impl VulkanContext {
         };
 
         // --- Debug utils device loader for RenderDoc markers ---
-        let debug_utils_device = Some(ash::ext::debug_utils::Device::new(&instance, &device));
+        let debug_utils_device = if debug_utils_loader.is_some() {
+            Some(ash::ext::debug_utils::Device::new(&instance, &device))
+        } else {
+            None
+        };
 
         info!("Vulkan context initialized successfully");
 
@@ -845,7 +849,11 @@ impl VulkanContext {
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
 
         // --- Debug utils device loader for RenderDoc markers ---
-        let debug_utils_device = Some(ash::ext::debug_utils::Device::new(&instance, &device));
+        let debug_utils_device = if debug_utils_loader.is_some() {
+            Some(ash::ext::debug_utils::Device::new(&instance, &device))
+        } else {
+            None
+        };
 
         info!("Vulkan context (with window) initialized successfully");
 

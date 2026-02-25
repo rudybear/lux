@@ -483,6 +483,7 @@ void RasterRenderer::setupPBRResources(VulkanContext& ctx) {
     vmaMapMemory(ctx.allocator, m_materialAllocation, &mapped);
     memcpy(mapped, &materialData, sizeof(MaterialUBOData));
     vmaUnmapMemory(ctx.allocator, m_materialAllocation);
+
 }
 
 // --------------------------------------------------------------------------
@@ -574,7 +575,9 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
         // Write all descriptor sets
         struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
         std::vector<DescWriteInfo> writeInfos;
+        writeInfos.reserve(mergedBindings.size());
         std::vector<VkWriteDescriptorSet> writes;
+        writes.reserve(mergedBindings.size());
         // Reserve space for bindless texture image infos
         std::vector<VkDescriptorImageInfo> bindlessImageInfos;
 
@@ -753,7 +756,9 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
     {
         struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
         std::vector<DescWriteInfo> writeInfos;
+        writeInfos.reserve(mergedBindings.size());
         std::vector<VkWriteDescriptorSet> writes;
+        writes.reserve(mergedBindings.size());
 
         for (auto& b : mergedBindings) {
             if (b.set != vertSetIdx) continue;
@@ -842,7 +847,9 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
             // Write descriptors for this material
             struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
             std::vector<DescWriteInfo> writeInfos;
+            writeInfos.reserve(mergedBindings.size());
             std::vector<VkWriteDescriptorSet> writes;
+            writes.reserve(mergedBindings.size());
 
             auto& perMatTextures = m_scene->getPerMaterialTextures();
 
@@ -1411,7 +1418,9 @@ void RasterRenderer::setupMultiPipeline(VulkanContext& ctx, const ShaderManifest
         auto mergedBindings = getMergedBindings({m_permutations[0].vertRefl});
         struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
         std::vector<DescWriteInfo> writeInfos;
+        writeInfos.reserve(mergedBindings.size());
         std::vector<VkWriteDescriptorSet> writes;
+        writes.reserve(mergedBindings.size());
 
         for (auto& b : mergedBindings) {
             if (b.set != 0) continue;
@@ -1503,7 +1512,9 @@ void RasterRenderer::setupMultiPipeline(VulkanContext& ctx, const ShaderManifest
             // Write descriptors
             struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
             std::vector<DescWriteInfo> writeInfos;
+            writeInfos.reserve(mergedBindings.size());
             std::vector<VkWriteDescriptorSet> writes;
+            writes.reserve(mergedBindings.size());
             auto& perMatTextures = m_scene->getPerMaterialTextures();
 
             for (auto& b : mergedBindings) {

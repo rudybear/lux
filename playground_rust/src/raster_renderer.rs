@@ -385,15 +385,36 @@ pub fn render_raster(
         }
         source if source.ends_with(".glb") || source.ends_with(".gltf") => {
             // glTF scene: load mesh, use PBR pipeline
-            let vert_path = format!("{}.vert.spv", pipeline_base);
-            let frag_path = format!("{}.frag.spv", pipeline_base);
+            // Resolve permutation suffix from manifest + scene features
+            let resolved_base = if let Some(manifest) = try_load_manifest(pipeline_base) {
+                let gltf_scene = crate::gltf_loader::load_gltf(Path::new(source))?;
+                let scene_features = scene_manager::detect_scene_features(&gltf_scene);
+                let suffix = find_permutation_suffix(&manifest, &scene_features);
+                if !suffix.is_empty() {
+                    let candidate = format!("{}{}", pipeline_base, suffix);
+                    if Path::new(&format!("{}.vert.spv", candidate)).exists()
+                        && Path::new(&format!("{}.frag.spv", candidate)).exists()
+                    {
+                        info!("Resolved headless permutation: {}", suffix);
+                        candidate
+                    } else {
+                        pipeline_base.to_string()
+                    }
+                } else {
+                    pipeline_base.to_string()
+                }
+            } else {
+                pipeline_base.to_string()
+            };
+            let vert_path = format!("{}.vert.spv", resolved_base);
+            let frag_path = format!("{}.frag.spv", resolved_base);
             let vert_code = spv_loader::load_spirv(Path::new(&vert_path))?;
             let frag_code = spv_loader::load_spirv(Path::new(&frag_path))?;
             let vert_module = spv_loader::create_shader_module(&ctx.device, &vert_code)?;
             let frag_module = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
 
             // For glTF, use the PBR rendering path with glTF mesh data
-            render_pbr_scene(ctx, vert_module, frag_module, pipeline_base, scene_source, width, height, output_path, ibl_name)?;
+            render_pbr_scene(ctx, vert_module, frag_module, &resolved_base, scene_source, width, height, output_path, ibl_name)?;
 
             unsafe {
                 ctx.device.destroy_shader_module(frag_module, None);

@@ -201,13 +201,16 @@ void MeshRenderer::uploadVertexData(VulkanContext& ctx) {
         size_t vertexOffset = 0;
         for (auto& item : drawItems) {
             auto& gmesh = gltfScene.meshes[item.meshIndex];
-            glm::mat3 normalMat = glm::transpose(glm::inverse(glm::mat3(item.worldTransform)));
-            for (size_t i = 0; i < gmesh.vertices.size(); i++) {
-                if (vertexOffset + i < tanVec4.size()) {
-                    glm::vec3 tan3 = glm::normalize(normalMat * glm::vec3(gmesh.vertices[i].tangent));
-                    tanVec4[vertexOffset + i] = glm::vec4(tan3, gmesh.vertices[i].tangent.w);
+            if (gmesh.hasTangents) {
+                glm::mat3 normalMat = glm::transpose(glm::inverse(glm::mat3(item.worldTransform)));
+                for (size_t i = 0; i < gmesh.vertices.size(); i++) {
+                    if (vertexOffset + i < tanVec4.size()) {
+                        glm::vec3 tan3 = glm::normalize(normalMat * glm::vec3(gmesh.vertices[i].tangent));
+                        tanVec4[vertexOffset + i] = glm::vec4(tan3, gmesh.vertices[i].tangent.w);
+                    }
                 }
             }
+            // If !hasTangents, keep default (1,0,0,1)
             vertexOffset += gmesh.vertices.size();
         }
     }
@@ -219,6 +222,7 @@ void MeshRenderer::uploadVertexData(VulkanContext& ctx) {
               << "B, normals=" << m_normalsSize << "B, texCoords=" << m_texCoordsSize
               << "B, tangents=" << m_tangentsSize
               << "B" << std::endl;
+
 }
 
 // --------------------------------------------------------------------------
@@ -983,18 +987,32 @@ void MeshRenderer::render(VulkanContext& ctx) {
         // Single-pipeline mode (original behavior)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
 
-        // Bind descriptor sets in order
+        // Set push constants if the mesh shader declares them (meshletOffset = 0)
+        if (!m_meshReflection.push_constants.empty()) {
+            uint32_t pcSize = static_cast<uint32_t>(m_meshReflection.push_constants[0].size);
+            std::vector<uint8_t> pcData(pcSize, 0);
+            vkCmdPushConstants(cmd, m_pipelineLayout,
+                               VK_SHADER_STAGE_MESH_BIT_EXT,
+                               0, pcSize, pcData.data());
+        }
+
+        // Bind all descriptor sets in a single call
         int maxSet = -1;
         for (auto& [idx, _] : m_descriptorSets) {
             maxSet = std::max(maxSet, idx);
         }
+        std::vector<VkDescriptorSet> allSets;
         for (int i = 0; i <= maxSet; i++) {
             auto it = m_descriptorSets.find(i);
             if (it != m_descriptorSets.end()) {
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                        m_pipelineLayout, static_cast<uint32_t>(i),
-                                        1, &it->second, 0, nullptr);
+                allSets.push_back(it->second);
             }
+        }
+        if (!allSets.empty()) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    m_pipelineLayout, 0,
+                                    static_cast<uint32_t>(allSets.size()),
+                                    allSets.data(), 0, nullptr);
         }
 
         // Draw mesh tasks - one workgroup per meshlet
@@ -1771,7 +1789,9 @@ void MeshRenderer::setupMeshMultiPipeline(VulkanContext& ctx, const ShaderManife
         auto mergedBindings = getMergedBindings({m_meshReflection});
         struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
         std::vector<DescWriteInfo> writeInfos;
+        writeInfos.reserve(mergedBindings.size());
         std::vector<VkWriteDescriptorSet> writes;
+        writes.reserve(mergedBindings.size());
 
         for (auto& b : mergedBindings) {
             if (b.set != 0) continue;
@@ -1875,7 +1895,9 @@ void MeshRenderer::setupMeshMultiPipeline(VulkanContext& ctx, const ShaderManife
             // Write descriptors for set 1
             struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
             std::vector<DescWriteInfo> writeInfos;
+            writeInfos.reserve(mergedBindings.size());
             std::vector<VkWriteDescriptorSet> writes;
+            writes.reserve(mergedBindings.size());
             auto& perMatTextures = m_scene->getPerMaterialTextures();
 
             for (auto& b : mergedBindings) {

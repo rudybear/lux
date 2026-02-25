@@ -99,3 +99,48 @@ fn transmission_replace(
     let atten: vec3 = volume_attenuation(thickness, atten_color, atten_dist);
     return mix(base, trans * atten, trans_factor);
 }
+
+// --- Unified PBR Layer Composition (glTF-standard order) ---
+// Chains all composition functions in the correct order.
+// Pass pre-sampled/pre-loaded values. Set factors to 0.0 or colors to
+// vec3(0.0) to disable optional layers (they become mathematical no-ops).
+
+fn compose_pbr_layers(
+    direct_lit: vec3,
+    n: vec3, v: vec3, l: vec3,
+    albedo: vec3, roughness: scalar,
+    // Transmission (factor=0.0 to disable)
+    trans_factor: scalar, trans_ior: scalar,
+    trans_thickness: scalar, trans_atten_color: vec3, trans_atten_dist: scalar,
+    // IBL (pre-computed ambient contribution)
+    ibl_ambient: vec3,
+    // Sheen (color=vec3(0.0) to disable)
+    sheen_color: vec3, sheen_roughness: scalar,
+    // Coat (factor=0.0 to disable)
+    coat_factor: scalar, coat_roughness: scalar,
+    // Coat IBL contribution (vec3(0.0) if no coat or no IBL)
+    coat_ibl_val: vec3,
+    // Emission (vec3(0.0) to disable)
+    emission: vec3
+) -> vec3 {
+    // 1. Transmission (replaces diffuse proportionally)
+    let after_trans: vec3 = transmission_replace(
+        direct_lit, albedo, roughness, trans_factor, trans_ior,
+        n, v, l, trans_thickness, trans_atten_color, trans_atten_dist);
+
+    // 2. IBL + coat IBL
+    let after_ibl: vec3 = after_trans + ibl_ambient + coat_ibl_val;
+
+    // 3. Sheen (energy-conserving additive)
+    // Clamp roughness to avoid NaN from charlie_ndf(0) when sheen is disabled
+    let safe_sheen_r: scalar = max(sheen_roughness, 0.045);
+    let after_sheen: vec3 = sheen_over(after_ibl, n, v, l, sheen_color, safe_sheen_r);
+
+    // 4. Coat (outermost, attenuates + adds specular)
+    // Clamp roughness to avoid NaN from ggx_ndf(0) when coat is disabled
+    let safe_coat_r: scalar = max(coat_roughness, 0.045);
+    let after_coat: vec3 = coat_over(after_sheen, n, v, l, coat_factor, safe_coat_r);
+
+    // 5. Emission (additive)
+    return after_coat + emission;
+}
