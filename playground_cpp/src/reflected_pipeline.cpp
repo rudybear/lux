@@ -358,6 +358,8 @@ ReflectionData parseReflectionJson(const std::string& json_path) {
     return jsonToReflection(root);
 }
 
+#ifndef LUX_METAL_BACKEND
+
 VkFormat reflectionFormatToVkFormat(const std::string& fmt) {
     if (fmt == "R32_SFLOAT") return VK_FORMAT_R32_SFLOAT;
     if (fmt == "R32G32_SFLOAT") return VK_FORMAT_R32G32_SFLOAT;
@@ -734,8 +736,10 @@ VkPipelineLayout createReflectedPipelineLayout(
     return pipelineLayout;
 }
 
+#endif // !LUX_METAL_BACKEND
+
 // ===========================================================================
-// Manifest parsing
+// Manifest parsing (shared by both Vulkan and Metal)
 // ===========================================================================
 
 ShaderManifest parseManifestJson(const std::string& manifest_path) {
@@ -829,6 +833,8 @@ std::string findPermutationSuffix(const ShaderManifest& manifest,
     return "";
 }
 
+#ifndef LUX_METAL_BACKEND
+
 ReflectedVertexInput createReflectedVertexInput(const ReflectionData& vertReflection, int overrideStride) {
     ReflectedVertexInput result;
 
@@ -853,3 +859,40 @@ ReflectedVertexInput createReflectedVertexInput(const ReflectionData& vertReflec
 
     return result;
 }
+
+#endif // !LUX_METAL_BACKEND
+
+// ===========================================================================
+// Metal format mappings (Apple platforms only)
+// ===========================================================================
+
+#if defined(__APPLE__) && defined(LUX_METAL_BACKEND)
+
+MTL::VertexFormat reflectionFormatToMTLVertexFormat(const std::string& fmt) {
+    if (fmt == "R32_SFLOAT") return MTL::VertexFormatFloat;
+    if (fmt == "R32G32_SFLOAT") return MTL::VertexFormatFloat2;
+    if (fmt == "R32G32B32_SFLOAT") return MTL::VertexFormatFloat3;
+    if (fmt == "R32G32B32A32_SFLOAT") return MTL::VertexFormatFloat4;
+    if (fmt == "R32_SINT") return MTL::VertexFormatInt;
+    if (fmt == "R32G32_SINT") return MTL::VertexFormatInt2;
+    if (fmt == "R32G32B32_SINT") return MTL::VertexFormatInt3;
+    if (fmt == "R32G32B32A32_SINT") return MTL::VertexFormatInt4;
+    if (fmt == "R32_UINT") return MTL::VertexFormatUInt;
+    if (fmt == "R32G32_UINT") return MTL::VertexFormatUInt2;
+    if (fmt == "R32G32B32_UINT") return MTL::VertexFormatUInt3;
+    if (fmt == "R32G32B32A32_UINT") return MTL::VertexFormatUInt4;
+    if (fmt == "R16G16_SFLOAT") return MTL::VertexFormatHalf2;
+    if (fmt == "R16G16B16A16_SFLOAT") return MTL::VertexFormatHalf4;
+    return MTL::VertexFormatFloat4; // fallback
+}
+
+MTL::PixelFormat reflectionFormatToMTLPixelFormat(const std::string& fmt) {
+    if (fmt == "R8G8B8A8_UNORM") return MTL::PixelFormatRGBA8Unorm;
+    if (fmt == "B8G8R8A8_UNORM") return MTL::PixelFormatBGRA8Unorm;
+    if (fmt == "R16G16B16A16_SFLOAT") return MTL::PixelFormatRGBA16Float;
+    if (fmt == "R32_SFLOAT") return MTL::PixelFormatR32Float;
+    if (fmt == "D32_SFLOAT") return MTL::PixelFormatDepth32Float;
+    return MTL::PixelFormatRGBA8Unorm; // fallback
+}
+
+#endif

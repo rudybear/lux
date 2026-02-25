@@ -4,14 +4,19 @@
  *
  * Reads .lux.json sidecar files and creates VkDescriptorSetLayout, VkPipelineLayout,
  * VkPipeline, and vertex input state automatically — no hardcoded descriptor sets needed.
+ *
+ * On Metal (LUX_METAL_BACKEND): provides format mappings and shared manifest/permutation logic.
  */
 
+#ifndef LUX_METAL_BACKEND
 #include <vulkan/vulkan.h>
+#endif
 #include <string>
 #include <vector>
 #include <set>
 #include <unordered_map>
 #include <optional>
+#include <cstdint>
 
 // Forward declaration for JSON parsing (uses minimal built-in parser)
 struct ReflectionData {
@@ -81,6 +86,8 @@ struct ReflectionData {
  * Parse a .lux.json file into a ReflectionData struct.
  */
 ReflectionData parseReflectionJson(const std::string& json_path);
+
+#ifndef LUX_METAL_BACKEND
 
 /**
  * Map a Vulkan format string from reflection metadata to VkFormat.
@@ -157,6 +164,15 @@ struct ReflectedVertexInput {
 };
 
 ReflectedVertexInput createReflectedVertexInput(const ReflectionData& vertReflection, int overrideStride = 0);
+
+#endif // !LUX_METAL_BACKEND
+
+// Metal format mappings (available on Apple platforms with Metal backend)
+#if defined(__APPLE__) && defined(LUX_METAL_BACKEND)
+#include <Metal/Metal.hpp>
+MTL::VertexFormat reflectionFormatToMTLVertexFormat(const std::string& fmt);
+MTL::PixelFormat reflectionFormatToMTLPixelFormat(const std::string& fmt);
+#endif
 
 /**
  * Shader manifest: lists all available permutations for a pipeline.

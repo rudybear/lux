@@ -22,5 +22,6 @@ screenshots/
 
 # C++/Rust build artifacts
 playground_cpp/build/
+playground_cpp/build-metal/
 playground_cpp/deps/
 playground_rust/target/
