@@ -286,6 +286,24 @@ cd playground_rust && cargo build --release
 
 All four engines support reflection-driven descriptor binding, glTF loading, cubemap textures, and IBL. The Metal backend transpiles SPIR-V to MSL via SPIRV-Cross at runtime.
 
+### Platform & Feature Matrix
+
+| Feature | Python / wgpu | C++ / Vulkan | C++ / Metal | Rust / Vulkan |
+|---------|:---:|:---:|:---:|:---:|
+| **Platforms** | Win, Linux, macOS | Win, Linux | macOS | Win, Linux |
+| **Rasterization** | yes | yes | yes | yes |
+| **Mesh shaders** | — | yes | yes (Metal 3) | yes |
+| **Ray tracing** | — | yes | — | yes |
+| **Bindless descriptors** | — | yes | — | yes |
+| **glTF 2.0 loading** | yes | yes | yes | yes |
+| **IBL (specular + irradiance)** | yes | yes | yes | yes |
+| **Multi-material permutations** | yes | yes | yes | yes |
+| **Material properties UBO** | yes | yes | yes | yes |
+| **Interactive viewer** | — | yes | yes | yes |
+| **Headless PNG output** | yes | yes | yes | yes |
+| **Shader input** | SPIR-V | SPIR-V | SPIR-V → MSL | SPIR-V |
+| **Windowing** | — | GLFW | GLFW | winit |
+
 ## Features
 
 - **Declarative materials** — `surface`, `geometry`, `pipeline` blocks expand to full shader stages
@@ -788,6 +806,43 @@ luxc gltf_pbr_layered.lux --pipeline GltfMesh --features has_emission --define m
 The approach is data-driven: at runtime the engine queries hardware capabilities (`maxMeshOutputVertices`, `maxMeshOutputPrimitives`, `maxMeshWorkGroupSize`), builds meshlets that respect those limits, and compiles the shader with matching `--define` parameters. This ensures optimal meshlet sizing across different GPU vendors without source changes.
 
 Mesh shaders require `VK_EXT_mesh_shader` and are supported in the C++ and Rust engines only -- Python/wgpu does not expose mesh shader support.
+
+### Metal / MSL Backend
+
+The Metal backend provides a native macOS renderer that runs the same Lux-compiled SPIR-V shaders as the Vulkan engines, transpiled to MSL at runtime via [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross).
+
+**Architecture:**
+
+```
+  .lux source
+    → luxc compiler → .spv (SPIR-V binary)
+    → SPIRV-Cross (CompilerMSL) → MSL source
+    → MTL::Device::newLibrary() → MTLLibrary → MTLFunction
+    → MTL::RenderPipelineState / MTL::MeshRenderPipelineState
+```
+
+The transpilation happens once at pipeline creation. SPIRV-Cross maps Vulkan descriptor bindings (set, binding) to Metal buffer/texture/sampler indices, and the transpiler records this mapping so renderers bind resources at the correct Metal indices.
+
+**Key implementation details:**
+
+| Aspect | Approach |
+|--------|----------|
+| Windowing | GLFW + ObjC++ bridge (`metal_bridge.mm`) attaches a `CAMetalLayer` to the GLFW `NSWindow` |
+| Shader transpilation | SPIRV-Cross `CompilerMSL` with MSL 3.0, discrete bindings, `force_native_arrays` |
+| Push constants | Detected via SPIR-V binary scan (OpVariable + PushConstant storage class), mapped to `[[buffer(N)]]` |
+| Vertex data | Buffer index 0 reserved for vertex stage-in; UBOs/SSBOs assigned sequentially |
+| Textures | Auto-assigned by SPIRV-Cross; combined image-samplers produce matching texture + sampler indices |
+| Depth | `MTL::PixelFormatDepth32Float`, compare less, write enabled |
+| Coordinate system | Vulkan Y-flip projection matrix reused as-is; `MTL::WindingClockwise` compensates inverted winding |
+| Mesh shaders | Metal 3 `MeshRenderPipelineDescriptor` with `[[mesh]]` + `[[fragment]]` functions; one threadgroup per meshlet |
+| SoA vertex buffers | Positions and normals uploaded as `vec4` (16-byte stride) to match std430 SSBO layout |
+
+**Requirements:**
+
+- macOS 13+ (Ventura) with Metal 3 for mesh shaders, macOS 12+ for raster-only
+- Apple Silicon or AMD GPU with Metal support
+- Metal-cpp headers vendored in `playground_cpp/deps/metal-cpp/` ([download from Apple](https://developer.apple.com/metal/cpp/))
+- SPIRV-Cross (fetched automatically by CMake via FetchContent)
 
 ### Debug Instrumentation
 
