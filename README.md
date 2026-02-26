@@ -54,24 +54,38 @@ surface GltfPBR {
     sampler2d metallic_roughness_tex,
     sampler2d occlusion_tex,
     sampler2d emissive_tex if has_emission,
-    samplerCube env_specular,
-    samplerCube env_irradiance,
-    sampler2d brdf_lut,
 
     layers [
         base(albedo: srgb_to_linear(sample(base_color_tex, uv).xyz),
              roughness: sample(metallic_roughness_tex, uv).y,
              metallic: sample(metallic_roughness_tex, uv).z),
         normal_map(map: sample(normal_tex, uv).xyz) if has_normal_map,
+        emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)) if has_emission,
+    ]
+}
+
+lighting SceneLighting {
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    properties Light {
+        light_dir: vec3 = vec3(0.0, -1.0, 0.0),
+        view_pos: vec3 = vec3(0.0, 0.0, 3.0),
+    },
+
+    layers [
+        directional(direction: Light.light_dir,
+                    color: vec3(1.0, 0.98, 0.95)),
         ibl(specular_map: env_specular, irradiance_map: env_irradiance,
             brdf_lut: brdf_lut),
-        emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)) if has_emission,
     ]
 }
 
 pipeline GltfRT {
     mode: raytrace,
     surface: GltfPBR,
+    lighting: SceneLighting,
     environment: HDRSky,
     schedule: HighQuality,
 }
@@ -307,7 +321,8 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 ## Features
 
 - **Declarative materials** — `surface`, `geometry`, `pipeline` blocks expand to full shader stages
-- **Layered surfaces** — `layers [base, normal_map, ibl, emission]` with automatic energy conservation, compiles to both raster and RT from one declaration
+- **Layered surfaces** — `layers [base, normal_map, sheen, coat, emission]` with automatic energy conservation, compiles to both raster and RT from one declaration
+- **Lighting blocks** — `lighting` declarations separate illumination (directional lights, IBL) from material response; `directional()` and `ibl()` layers with named properties; pipelines reference via `lighting: SceneLighting`
 - **Custom `@layer` functions** — user-defined layers via `@layer fn name(base, n, v, l, ...custom_params) -> vec3`, validated at compile time and composited in declaration order
 - **Compile-time features** — `features { has_normal_map: bool }` with `if` guards on any declaration; `--features` and `--all-permutations` for shader permutation generation; per-material permutation selection via manifest across all engines
 - **Material property pipeline** — `properties` block in surface declarations abstracts runtime material data; compiler generates std140 UBO + reflection JSON with defaults; qualified `Material.field` access in layer expressions; all engines wire glTF material properties automatically
@@ -556,7 +571,7 @@ pipeline PBRForward {
 
 ### Layered Surfaces
 
-For complex PBR pipelines, use `layers [...]` instead of `brdf:` — one surface generates both forward and RT shaders:
+For complex PBR pipelines, use `layers [...]` instead of `brdf:` — one surface generates both forward and RT shaders. Illumination is declared separately in a `lighting` block:
 
 ```
 import brdf;
@@ -565,33 +580,50 @@ import ibl;
 
 surface GltfPBR {
     sampler2d base_color_tex,
-    samplerCube env_specular,
-    samplerCube env_irradiance,
-    sampler2d brdf_lut,
 
     layers [
         base(albedo: srgb_to_linear(sample(base_color_tex, uv).xyz),
              roughness: sample(mr_tex, uv).y, metallic: sample(mr_tex, uv).z),
         normal_map(map: sample(normal_tex, uv).xyz),
+        emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)),
+    ]
+}
+
+lighting SceneLighting {
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    properties Light {
+        light_dir: vec3 = vec3(0.0, -1.0, 0.0),
+        view_pos: vec3 = vec3(0.0, 0.0, 3.0),
+    },
+
+    layers [
+        directional(direction: Light.light_dir,
+                    color: vec3(1.0, 0.98, 0.95)),
         ibl(specular_map: env_specular, irradiance_map: env_irradiance,
             brdf_lut: brdf_lut),
-        emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)),
     ]
 }
 
 pipeline GltfForward {
     geometry: StandardMesh,
     surface: GltfPBR,
+    lighting: SceneLighting,
     schedule: HighQuality,
 }
 
 pipeline GltfRT {
     mode: raytrace,
     surface: GltfPBR,
+    lighting: SceneLighting,
     environment: HDRSky,
     schedule: HighQuality,
 }
 ```
+
+The `lighting` block separates illumination configuration (light sources, IBL samplers) from material response (surface layers). Pipelines reference both via `surface:` and `lighting:`. Pipelines without a `lighting:` member fall back to legacy hardcoded behavior for backward compatibility.
 
 Layers are listed bottom-to-top (base first, outermost last). The compiler generates energy-conserving evaluation with `sample()` auto-rewritten to `sample_lod()` for RT.
 
@@ -626,15 +658,17 @@ Custom layers are validated at compile time (signature, return type, no name col
 
 Built-in layer types:
 
-| Layer | Purpose | Parameters |
-|-------|---------|------------|
-| `base` | PBR direct lighting | albedo, roughness, metallic |
-| `normal_map` | TBN normal perturbation | map |
-| `ibl` | Image-based lighting | specular_map, irradiance_map, brdf_lut |
-| `emission` | Additive emission | color |
-| `coat` | Clearcoat | factor, roughness |
-| `sheen` | Sheen/fuzz | color, roughness |
-| *custom* | User-defined `@layer` function | function-specific |
+| Layer | Block | Purpose | Parameters |
+|-------|-------|---------|------------|
+| `base` | surface | PBR direct lighting | albedo, roughness, metallic |
+| `normal_map` | surface | TBN normal perturbation | map |
+| `emission` | surface | Additive emission | color |
+| `coat` | surface | Clearcoat | factor, roughness |
+| `sheen` | surface | Sheen/fuzz | color, roughness |
+| `transmission` | surface | Volumetric transmission | factor, ior, thickness |
+| `directional` | lighting | Directional light source | direction, color |
+| `ibl` | lighting | Image-based lighting | specular_map, irradiance_map, brdf_lut |
+| *custom* | surface | User-defined `@layer` function | function-specific |
 
 ### Compile-Time Features
 
@@ -1179,6 +1213,7 @@ tests/
     test_gltf_extensions.py
     test_mesh_shader.py         # P13 mesh shader tests (compilation, expansion, reflection)
     test_brdf_visualization.py  # P15 BRDF visualization tests (10 tests)
+    test_lighting_block.py      # P17 lighting block tests (21 tests)
     test_debug_features.py      # P20 debug instrumentation + semantic types (22 tests)
 tools/
     generate_training_data.py
@@ -1332,7 +1367,7 @@ Output: specular cubemap (6 faces x 5 mips), irradiance cubemap, and BRDF integr
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 461 tests
+# 497 tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.

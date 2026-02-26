@@ -846,7 +846,8 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P14** | Gaussian splatting representation (splat sorting, tile-based rasterizer, SH evaluation) | Planned |
 | **P15** | BRDF & layer visualization (lobe plots, transfer function graphs, energy conservation tests) | ✅ Complete |
 | **P16** | AI features for Lux (image-to-shader, prompt-based generation, AI skills, training pipeline) | Planned |
-| **P17** | Light & shadow management (declarative lights, CSM/cubemap/perspective shadows, PCF/PCSS/VSM/MSM filtering, tiled/clustered culling, volumetric lighting, light probes, LPV) | Planned |
+| **P17.1** | Lighting block (`lighting` declarations, `directional()` + `ibl()` layers, IBL migration from surface to lighting, backward compat) | ✅ Complete |
+| **P17.2+** | Full light & shadow management (declarative lights, CSM/cubemap/perspective shadows, PCF/PCSS/VSM/MSM filtering, tiled/clustered culling, volumetric lighting, light probes, LPV, **100s light demo with shadows and cascaded lights**) | Planned |
 | **P18** | Material property pipeline (`properties` block, Material UBO, `Material.field` access, engine wiring) | ✅ Complete (18.1) |
 | **P19** | Linux support (build scripts, path handling, CI) | Planned |
 | **P20** | Validation & debugging (debug_print, assert, @[debug], semantic types, NaN analysis, OpMemberName, debug utils labels) | ✅ Complete |
@@ -1002,6 +1003,54 @@ surface GltfPBR {
 - 435 total tests passing (zero regressions)
 
 **18.2 (future): Bindless mode** — same `properties` syntax, `bindless: true` in pipeline → SSBO[material_idx] + texture arrays + push constant.
+
+---
+
+### Phase 17.1: Lighting Block + IBL Migration ✅ COMPLETE
+
+Separated illumination configuration from material response by adding a new `lighting` top-level block to the language.
+
+**New syntax:**
+```lux
+lighting SceneLighting {
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    properties Light {
+        light_dir: vec3 = vec3(0.0, -1.0, 0.0),
+        view_pos: vec3 = vec3(0.0, 0.0, 3.0),
+    },
+
+    layers [
+        directional(direction: Light.light_dir,
+                    color: vec3(1.0, 0.98, 0.95)),
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
+    ]
+}
+
+pipeline GltfForward {
+    geometry: StandardMesh,
+    surface: GltfPBR,
+    lighting: SceneLighting,
+    schedule: HighQuality,
+}
+```
+
+**Deliverables:**
+- **Grammar**: `lighting_decl` rule in `lux.lark` (reuses `surface_item`)
+- **AST**: `LightingDecl` dataclass with name, members, samplers, layers, properties
+- **Parser**: `lighting_decl()` transformer, routing in `start()`
+- **Feature evaluator**: conditional sampler/layer stripping for lighting blocks
+- **Surface expander**: lighting detection in all expansion paths (raster, RT, mesh, bindless); `directional()` layer replaces hardcoded light direction/color; `ibl()` layer migrated from surface to lighting with backward-compatible fallback
+- **IBL migration**: env_specular, env_irradiance, brdf_lut moved from surface to lighting block; engines unaffected (same sampler names in reflection JSON)
+- **Backward compatibility**: pipelines without `lighting:` member use legacy hardcoded Light UBO; `ibl()` in surface layers still works as fallback
+- **Updated `gltf_pbr_layered.lux`**: lighting SceneLighting block, all three pipelines reference it
+- **Tests**: 21 new tests (parsing, feature stripping, expansion, cross-block interaction); 497 total tests passing
+- **Zero engine changes**: Light UBO field names and IBL sampler names unchanged in reflection JSON
+
+**Future (P17.2+):** Full declarative light types, shadow mapping (CSM, cubemap, perspective), shadow filtering (PCF, PCSS, VSM, MSM), tiled/clustered light culling, volumetric lighting, light probes. **TODO: Create a 100s light demo with shadows and cascaded lights** to stress-test the lighting system.
 
 ---
 

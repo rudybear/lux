@@ -52,9 +52,6 @@ surface GltfPBR {
     sampler2d clearcoat_roughness_tex if has_clearcoat,
     sampler2d sheen_color_tex if has_sheen,
     sampler2d transmission_tex if has_transmission,
-    samplerCube env_specular,
-    samplerCube env_irradiance,
-    sampler2d brdf_lut,
 
     properties Material {
         base_color_factor: vec4 = vec4(1.0, 1.0, 1.0, 1.0),
@@ -87,8 +84,6 @@ surface GltfPBR {
         transmission(factor: sample(transmission_tex, uv).x
                              * Material.transmission_factor,
                      ior: Material.ior) if has_transmission,
-        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
-            brdf_lut: brdf_lut),
         sheen(color: srgb_to_linear(sample(sheen_color_tex, uv).xyz)
                      * Material.sheen_color_factor,
               roughness: Material.sheen_roughness_factor) if has_sheen,
@@ -99,6 +94,24 @@ surface GltfPBR {
         emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)
                         * Material.emissive_factor
                         * Material.emissive_strength) if has_emission,
+    ]
+}
+
+lighting SceneLighting {
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    properties Light {
+        light_dir: vec3 = vec3(0.0, -1.0, 0.0),
+        view_pos: vec3 = vec3(0.0, 0.0, 3.0),
+    },
+
+    layers [
+        directional(direction: Light.light_dir,
+                    color: vec3(1.0, 0.98, 0.95)),
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
     ]
 }
 
@@ -114,12 +127,14 @@ schedule HighQuality {
 pipeline GltfForward {
     geometry: StandardMesh,
     surface: GltfPBR,
+    lighting: SceneLighting,
     schedule: HighQuality,
 }
 
 pipeline GltfRT {
     mode: raytrace,
     surface: GltfPBR,
+    lighting: SceneLighting,
     environment: HDRSky,
     schedule: HighQuality,
 }
@@ -128,5 +143,6 @@ pipeline GltfMesh {
     mode: mesh_shader,
     geometry: StandardMesh,
     surface: GltfPBR,
+    lighting: SceneLighting,
     schedule: HighQuality,
 }

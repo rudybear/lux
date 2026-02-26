@@ -10,7 +10,7 @@ from luxc.parser.ast_nodes import (
     Module, FeaturesDecl, ConditionalBlock,
     FeatureRef, FeatureAnd, FeatureOr, FeatureNot,
     SurfaceDecl, GeometryDecl, PipelineDecl, ScheduleDecl,
-    EnvironmentDecl, ProceduralDecl,
+    EnvironmentDecl, LightingDecl, ProceduralDecl,
     ConstDecl, FunctionDef, StructDef, TypeAlias, ImportDecl,
     StageBlock,
 )
@@ -94,7 +94,24 @@ def strip_features(module: Module, active: set[str]) -> None:
             for layer in surface.layers:
                 layer.condition = None
 
-    # 3. Strip conditional items from geometries
+    # 3. Strip conditional items from lighting blocks
+    for lighting in module.lightings:
+        lighting.samplers = [
+            s for s in lighting.samplers
+            if s.condition is None or evaluate_feature_expr(s.condition, active)
+        ]
+        for s in lighting.samplers:
+            s.condition = None
+
+        if lighting.layers is not None:
+            lighting.layers = [
+                layer for layer in lighting.layers
+                if layer.condition is None or evaluate_feature_expr(layer.condition, active)
+            ]
+            for layer in lighting.layers:
+                layer.condition = None
+
+    # 4. Strip conditional items from geometries
     for geo in module.geometries:
         # Strip fields
         geo.fields = [
@@ -170,6 +187,8 @@ def _process_conditional_blocks(module: Module, active: set[str]) -> None:
                     module.environments.append(item)
                 elif isinstance(item, ProceduralDecl):
                     module.procedurals.append(item)
+                elif isinstance(item, LightingDecl):
+                    module.lightings.append(item)
                 elif isinstance(item, FeaturesDecl):
                     module.features_decls.append(item)
 

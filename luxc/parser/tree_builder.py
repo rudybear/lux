@@ -17,7 +17,7 @@ from luxc.parser.ast_nodes import (
     GeometryDecl, GeometryField, GeometryTransform, GeometryOutputs, OutputBinding,
     PipelineDecl, PipelineMember,
     ScheduleDecl, ScheduleMember,
-    EnvironmentDecl, ProceduralDecl, ProceduralMember,
+    EnvironmentDecl, LightingDecl, ProceduralDecl, ProceduralMember,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
     StorageImageDecl, StorageBufferDecl, MeshOutputDecl, TaskPayloadDecl,
     FeaturesDecl, ConditionalBlock, FeatureRef, FeatureAnd, FeatureOr, FeatureNot,
@@ -89,6 +89,8 @@ class LuxTransformer(Transformer):
                 mod.environments.append(item)
             elif isinstance(item, ProceduralDecl):
                 mod.procedurals.append(item)
+            elif isinstance(item, LightingDecl):
+                mod.lightings.append(item)
             elif isinstance(item, FeaturesDecl):
                 mod.features_decls.append(item)
             elif isinstance(item, ConditionalBlock):
@@ -280,6 +282,23 @@ class LuxTransformer(Transformer):
         members = [a for a in args[1:] if isinstance(a, SurfaceMember)]
         sampler_objs = [a for a in args[1:] if isinstance(a, SurfaceSampler)]
         return EnvironmentDecl(str(name), members, samplers=sampler_objs, loc=_tok_loc(name))
+
+    # --- Lighting declarations ---
+
+    def lighting_decl(self, args):
+        name = args[0]
+        members = [a for a in args[1:] if isinstance(a, SurfaceMember)]
+        sampler_objs = [a for a in args[1:] if isinstance(a, SurfaceSampler)]
+        properties = None
+        for a in args[1:]:
+            if isinstance(a, PropertiesBlock):
+                properties = a
+        layers = None
+        for a in args[1:]:
+            if isinstance(a, list) and a and isinstance(a[0], LayerCall):
+                layers = a
+        return LightingDecl(str(name), members, samplers=sampler_objs,
+                            layers=layers, properties=properties, loc=_tok_loc(name))
 
     # --- Procedural declarations ---
 

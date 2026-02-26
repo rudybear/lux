@@ -19,7 +19,7 @@ from luxc.parser.ast_nodes import (
     NumberLit, VarRef, BinaryOp, CallExpr, ConstructorExpr,
     SwizzleAccess, UnaryOp,
     AssignTarget, SurfaceDecl, SurfaceSampler, LayerCall, LayerArg,
-    GeometryDecl, PipelineDecl,
+    GeometryDecl, PipelineDecl, LightingDecl,
     ScheduleDecl, EnvironmentDecl, ProceduralDecl,
     RayPayloadDecl, HitAttributeDecl, AccelDecl, StorageImageDecl,
     StorageBufferDecl, BindlessTextureArrayDecl, IndexAccess, FieldAccess,
@@ -84,6 +84,7 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
     geometries = {g.name: g for g in module.geometries}
     environments = {e.name: e for e in module.environments}
     procedurals = {p.name: p for p in module.procedurals}
+    lightings = {l.name: l for l in module.lightings}
 
     for pipeline in module.pipelines:
         # Filter: skip pipelines that don't match the filter
@@ -93,6 +94,7 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
         surf_name = None
         schedule_name = None
         env_name = None
+        lighting_name = None
         mode = "rasterize"
         max_bounces = 1
         procedural_name = None
@@ -119,9 +121,15 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
             elif member.name == "procedural":
                 if isinstance(member.value, VarRef):
                     procedural_name = member.value.name
+            elif member.name == "lighting":
+                if isinstance(member.value, VarRef):
+                    lighting_name = member.value.name
             elif member.name == "use_task_shader":
                 if isinstance(member.value, VarRef) and member.value.name == "true":
                     use_task_shader = True
+
+        # Resolve lighting block if specified
+        lighting = lightings.get(lighting_name) if lighting_name else None
 
         # Resolve schedule if specified
         schedule = None
@@ -135,7 +143,7 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
             procedural = procedurals.get(procedural_name) if procedural_name else None
             stages = _expand_rt_pipeline(
                 surface, environment, procedural, module, schedule, max_bounces,
-                bindless=bindless,
+                bindless=bindless, lighting=lighting,
             )
             module.stages.extend(stages)
         elif mode == "mesh_shader":
@@ -144,14 +152,14 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
             geometry = geometries.get(geo_name) if geo_name else None
             stages = _expand_mesh_pipeline(
                 surface, geometry, module, schedule, pipeline, use_task_shader,
-                bindless=bindless,
+                bindless=bindless, lighting=lighting,
             )
             module.stages.extend(stages)
         elif surf_name and surf_name in surfaces:
             surface = surfaces[surf_name]
             geometry = geometries.get(geo_name) if geo_name else None
             stages = _expand_pipeline(surface, geometry, module, schedule,
-                                      bindless=bindless)
+                                      bindless=bindless, lighting=lighting)
             # Tag fragment stages with set offset so uniforms don't clash
             # with vertex uniforms when combined in a pipeline
             for s in stages:
@@ -178,6 +186,7 @@ def _expand_pipeline(
     module: Module,
     schedule: dict[str, str] | None = None,
     bindless: bool = False,
+    lighting: LightingDecl | None = None,
 ) -> list[StageBlock]:
     """Generate vertex and fragment stages from surface + geometry."""
     stages = []
@@ -187,9 +196,11 @@ def _expand_pipeline(
         stages.append(vert)
 
     if bindless and surface.layers is not None:
-        frag = _expand_bindless_fragment(surface, module, geometry, schedule)
+        frag = _expand_bindless_fragment(surface, module, geometry, schedule,
+                                         lighting=lighting)
     else:
-        frag = _expand_surface_to_fragment(surface, module, geometry, schedule)
+        frag = _expand_surface_to_fragment(surface, module, geometry, schedule,
+                                           lighting=lighting)
     stages.append(frag)
     return stages
 
@@ -248,6 +259,7 @@ def _expand_surface_to_fragment(
     module: Module,
     geometry: GeometryDecl | None = None,
     schedule: dict[str, str] | None = None,
+    lighting: LightingDecl | None = None,
 ) -> StageBlock:
     """Generate a fragment stage from a surface declaration.
 
@@ -290,11 +302,22 @@ def _expand_surface_to_fragment(
     out._is_input = False
     stage.outputs.append(out)
 
-    # Light uniform (use uniform block for wgpu compatibility)
-    stage.uniforms.append(UniformBlock("Light", [
-        BlockField("light_dir", "vec3"),
-        BlockField("view_pos", "vec3"),
-    ]))
+    # Light uniform (from lighting block or legacy hardcoded)
+    if lighting and lighting.properties:
+        props = lighting.properties
+        stage.uniforms.append(UniformBlock(props.name, [
+            BlockField(f.name, f.type_name) for f in props.fields
+        ]))
+        if not hasattr(stage, '_properties_defaults'):
+            stage._properties_defaults = {}
+        for f in props.fields:
+            if f.default is not None:
+                stage._properties_defaults[(props.name, f.name)] = f.default
+    else:
+        stage.uniforms.append(UniformBlock("Light", [
+            BlockField("light_dir", "vec3"),
+            BlockField("view_pos", "vec3"),
+        ]))
 
     # Material properties uniform (from surface properties block)
     if surface.properties:
@@ -313,9 +336,15 @@ def _expand_surface_to_fragment(
     for sam in surface.samplers:
         stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
 
+    # Add sampler declarations from the lighting block
+    if lighting:
+        for sam in lighting.samplers:
+            stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
+
     # Generate main function body - use layered path if surface has layers
     if surface.layers is not None:
-        body = _generate_layered_main(surface, frag_inputs, schedule, module=module)
+        body = _generate_layered_main(surface, frag_inputs, schedule,
+                                      module=module, lighting=lighting)
     else:
         body = _generate_surface_main(surface, frag_inputs, schedule)
     stage.functions.append(FunctionDef("main", [], None, body))
@@ -567,6 +596,7 @@ def _generate_layered_main(
     frag_inputs: list[tuple[str, str]],
     schedule: dict[str, str] | None = None,
     module: Module | None = None,
+    lighting: LightingDecl | None = None,
 ) -> list:
     """Generate main() body for a layered surface-expanded fragment shader.
 
@@ -619,8 +649,29 @@ def _generate_layered_main(
         body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
             ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("0.0"), NumberLit("1.0")]),
         ])))
-    body.append(LetStmt("l", "vec3",
-        CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+    # Light direction: from lighting block's directional layer or legacy uniform
+    if lighting and lighting.layers:
+        lighting_by_name = {layer.name: layer for layer in lighting.layers}
+        if "directional" in lighting_by_name:
+            dir_args = _get_layer_args(lighting_by_name["directional"])
+            body.append(LetStmt("l", "vec3",
+                CallExpr(VarRef("normalize"), [
+                    dir_args.get("direction", VarRef("light_dir"))])))
+            body.append(LetStmt("light_color", "vec3",
+                dir_args.get("color",
+                    ConstructorExpr("vec3", [NumberLit("1.0")]))))
+        else:
+            body.append(LetStmt("l", "vec3",
+                CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+            body.append(LetStmt("light_color", "vec3",
+                ConstructorExpr("vec3", [
+                    NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95")])))
+    else:
+        body.append(LetStmt("l", "vec3",
+            CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+        body.append(LetStmt("light_color", "vec3",
+            ConstructorExpr("vec3", [
+                NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95")])))
     body.append(LetStmt("n_dot_v", "scalar", CallExpr(VarRef("max"), [
         CallExpr(VarRef("dot"), [VarRef("n"), VarRef("v")]),
         NumberLit("0.001"),
@@ -650,10 +701,7 @@ def _generate_layered_main(
         ])))
         # Light color tint
         body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
-            VarRef("direct"),
-            ConstructorExpr("vec3", [
-                NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95"),
-            ]),
+            VarRef("direct"), VarRef("light_color"),
         )))
         result_var = "direct_lit"
 
@@ -685,9 +733,16 @@ def _generate_layered_main(
             ])))
         result_var = "transmitted"
 
-    # --- IBL layer: image-based lighting ---
-    if "ibl" in layers_by_name:
+    # --- IBL layer: image-based lighting (check lighting block first, then surface) ---
+    ibl_args = None
+    if lighting and lighting.layers:
+        _lighting_by_name = {layer.name: layer for layer in lighting.layers}
+        if "ibl" in _lighting_by_name:
+            ibl_args = _get_layer_args(_lighting_by_name["ibl"])
+    if ibl_args is None and "ibl" in layers_by_name:
         ibl_args = _get_layer_args(layers_by_name["ibl"])
+
+    if ibl_args is not None:
         specular_map = ibl_args.get("specular_map")
         irradiance_map = ibl_args.get("irradiance_map")
         brdf_lut_ref = ibl_args.get("brdf_lut")
@@ -919,6 +974,7 @@ def _expand_rt_pipeline(
     schedule: dict[str, str] | None = None,
     max_bounces: int = 1,
     bindless: bool = False,
+    lighting: LightingDecl | None = None,
 ) -> list[StageBlock]:
     """Generate ray tracing stages from pipeline declarations."""
     stages = []
@@ -930,9 +986,11 @@ def _expand_rt_pipeline(
     # 2. Closest-hit shader from surface
     if surface:
         if bindless and surface.layers is not None:
-            chit = _expand_bindless_closest_hit(surface, module, schedule)
+            chit = _expand_bindless_closest_hit(surface, module, schedule,
+                                                lighting=lighting)
         else:
-            chit = _expand_surface_to_closest_hit(surface, module, schedule)
+            chit = _expand_surface_to_closest_hit(surface, module, schedule,
+                                                  lighting=lighting)
         stages.append(chit)
 
         # 3. Any-hit shader if surface has opacity
@@ -1076,6 +1134,7 @@ def _expand_surface_to_closest_hit(
     surface: SurfaceDecl,
     module: Module,
     schedule: dict[str, str] | None = None,
+    lighting: LightingDecl | None = None,
 ) -> StageBlock:
     """Generate a closest-hit shader from a surface declaration.
 
@@ -1086,7 +1145,8 @@ def _expand_surface_to_closest_hit(
     For surfaces with `brdf:`, generates the simpler existing path.
     """
     if surface.layers is not None:
-        return _expand_layered_closest_hit(surface, module, schedule)
+        return _expand_layered_closest_hit(surface, module, schedule,
+                                           lighting=lighting)
 
     stage = StageBlock(stage_type="closest_hit")
 
@@ -1258,6 +1318,7 @@ def _expand_layered_closest_hit(
     surface: SurfaceDecl,
     module: Module,
     schedule: dict[str, str] | None = None,
+    lighting: LightingDecl | None = None,
 ) -> StageBlock:
     """Generate a closest-hit shader from a layered surface declaration.
 
@@ -1281,11 +1342,22 @@ def _expand_layered_closest_hit(
     stage.storage_buffers.append(StorageBufferDecl("tex_coords", "vec2"))
     stage.storage_buffers.append(StorageBufferDecl("indices", "uint"))
 
-    # Light uniform
-    stage.uniforms.append(UniformBlock("Light", [
-        BlockField("light_dir", "vec3"),
-        BlockField("view_pos", "vec3"),
-    ]))
+    # Light uniform (from lighting block or legacy hardcoded)
+    if lighting and lighting.properties:
+        lprops = lighting.properties
+        stage.uniforms.append(UniformBlock(lprops.name, [
+            BlockField(f.name, f.type_name) for f in lprops.fields
+        ]))
+        if not hasattr(stage, '_properties_defaults'):
+            stage._properties_defaults = {}
+        for f in lprops.fields:
+            if f.default is not None:
+                stage._properties_defaults[(lprops.name, f.name)] = f.default
+    else:
+        stage.uniforms.append(UniformBlock("Light", [
+            BlockField("light_dir", "vec3"),
+            BlockField("view_pos", "vec3"),
+        ]))
 
     # Material properties uniform (from surface properties block)
     if surface.properties:
@@ -1304,6 +1376,11 @@ def _expand_layered_closest_hit(
     for sam in surface.samplers:
         stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
 
+    # Add sampler declarations from the lighting block
+    if lighting:
+        for sam in lighting.samplers:
+            stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
+
     # --- Generate main body ---
     body = []
 
@@ -1318,8 +1395,29 @@ def _expand_layered_closest_hit(
     # --- View and light directions (RT-specific) ---
     body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
         UnaryOp("-", VarRef("world_ray_direction"))])))
-    body.append(LetStmt("l", "vec3",
-        CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+    # Light direction: from lighting block's directional layer or legacy uniform
+    if lighting and lighting.layers:
+        rt_lighting_by_name = {layer.name: layer for layer in lighting.layers}
+        if "directional" in rt_lighting_by_name:
+            dir_args = _get_layer_args(rt_lighting_by_name["directional"])
+            body.append(LetStmt("l", "vec3",
+                CallExpr(VarRef("normalize"), [
+                    dir_args.get("direction", VarRef("light_dir"))])))
+            body.append(LetStmt("light_color", "vec3",
+                dir_args.get("color",
+                    ConstructorExpr("vec3", [NumberLit("1.0")]))))
+        else:
+            body.append(LetStmt("l", "vec3",
+                CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+            body.append(LetStmt("light_color", "vec3",
+                ConstructorExpr("vec3", [
+                    NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95")])))
+    else:
+        body.append(LetStmt("l", "vec3",
+            CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+        body.append(LetStmt("light_color", "vec3",
+            ConstructorExpr("vec3", [
+                NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95")])))
     body.append(LetStmt("n_dot_v", "scalar", CallExpr(VarRef("max"), [
         CallExpr(VarRef("dot"), [VarRef("n"), VarRef("v")]),
         NumberLit("0.001"),
@@ -1350,10 +1448,7 @@ def _expand_layered_closest_hit(
             VarRef("layer_metallic"),
         ])))
         body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
-            VarRef("direct"),
-            ConstructorExpr("vec3", [
-                NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95"),
-            ]),
+            VarRef("direct"), VarRef("light_color"),
         )))
         result_var = "direct_lit"
 
@@ -1386,12 +1481,19 @@ def _expand_layered_closest_hit(
             ])))
         result_var = "transmitted"
 
-    # --- IBL layer ---
-    if "ibl" in layers_by_name:
-        ibl_args = _get_layer_args(layers_by_name["ibl"])
-        specular_map = ibl_args.get("specular_map")
-        irradiance_map = ibl_args.get("irradiance_map")
-        brdf_lut_ref = ibl_args.get("brdf_lut")
+    # --- IBL layer (check lighting block first, then surface) ---
+    rt_ibl_args = None
+    if lighting and lighting.layers:
+        _rt_lighting_by_name = {layer.name: layer for layer in lighting.layers}
+        if "ibl" in _rt_lighting_by_name:
+            rt_ibl_args = _get_layer_args(_rt_lighting_by_name["ibl"])
+    if rt_ibl_args is None and "ibl" in layers_by_name:
+        rt_ibl_args = _get_layer_args(layers_by_name["ibl"])
+
+    if rt_ibl_args is not None:
+        specular_map = rt_ibl_args.get("specular_map")
+        irradiance_map = rt_ibl_args.get("irradiance_map")
+        brdf_lut_ref = rt_ibl_args.get("brdf_lut")
 
         body.append(LetStmt("r", "vec3", CallExpr(VarRef("reflect"), [
             BinaryOp("*", VarRef("v"), UnaryOp("-", NumberLit("1.0"))),
@@ -1708,6 +1810,7 @@ def _expand_mesh_pipeline(
     pipeline: PipelineDecl | None = None,
     use_task_shader: bool = False,
     bindless: bool = False,
+    lighting: LightingDecl | None = None,
 ) -> list[StageBlock]:
     """Generate mesh + fragment stages (and optionally task) from pipeline declarations.
 
@@ -1732,9 +1835,11 @@ def _expand_mesh_pipeline(
     # 3. Fragment shader (bindless or standard)
     if surface:
         if bindless and surface.layers is not None:
-            frag = _expand_bindless_fragment(surface, module, geometry, schedule)
+            frag = _expand_bindless_fragment(surface, module, geometry, schedule,
+                                             lighting=lighting)
         else:
-            frag = _expand_surface_to_fragment(surface, module, geometry, schedule)
+            frag = _expand_surface_to_fragment(surface, module, geometry, schedule,
+                                               lighting=lighting)
         frag._descriptor_set_offset = (2 if use_task_shader else 1)
         stages.append(frag)
 
@@ -2379,6 +2484,7 @@ def _expand_bindless_fragment(
     module: Module,
     geometry: GeometryDecl | None = None,
     schedule: dict[str, str] | None = None,
+    lighting: LightingDecl | None = None,
 ) -> StageBlock:
     """Generate a bindless uber-shader fragment stage.
 
@@ -2418,20 +2524,36 @@ def _expand_bindless_fragment(
     out._is_input = False
     stage.outputs.append(out)
 
-    # --- Uniforms: Light ---
-    stage.uniforms.append(UniformBlock("Light", [
-        BlockField("light_dir", "vec3"),
-        BlockField("view_pos", "vec3"),
-    ]))
+    # --- Uniforms: Light (from lighting block or legacy hardcoded) ---
+    if lighting and lighting.properties:
+        lprops = lighting.properties
+        stage.uniforms.append(UniformBlock(lprops.name, [
+            BlockField(f.name, f.type_name) for f in lprops.fields
+        ]))
+        if not hasattr(stage, '_properties_defaults'):
+            stage._properties_defaults = {}
+        for f in lprops.fields:
+            if f.default is not None:
+                stage._properties_defaults[(lprops.name, f.name)] = f.default
+    else:
+        stage.uniforms.append(UniformBlock("Light", [
+            BlockField("light_dir", "vec3"),
+            BlockField("view_pos", "vec3"),
+        ]))
 
     # --- Materials SSBO (replaces per-material UBO) ---
     stage.storage_buffers.append(StorageBufferDecl(
         "materials", "BindlessMaterialData"))
 
     # --- IBL samplers (kept as regular samplers — scene-global, not per-material) ---
-    for sam in surface.samplers:
-        if sam.type_name == "samplerCube" or sam.name in ("brdf_lut",):
+    # Check lighting block first, then fall back to surface samplers
+    if lighting:
+        for sam in lighting.samplers:
             stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
+    else:
+        for sam in surface.samplers:
+            if sam.type_name == "samplerCube" or sam.name in ("brdf_lut",):
+                stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
 
     # --- Bindless texture array ---
     stage.bindless_texture_arrays.append(BindlessTextureArrayDecl("textures"))
@@ -2492,6 +2614,7 @@ def _expand_bindless_closest_hit(
     surface: SurfaceDecl,
     module: Module,
     schedule: dict[str, str] | None = None,
+    lighting: LightingDecl | None = None,
 ) -> StageBlock:
     """Generate a bindless uber-shader closest-hit stage.
 
@@ -2516,10 +2639,14 @@ def _expand_bindless_closest_hit(
     stage.storage_buffers.append(StorageBufferDecl(
         "materials", "BindlessMaterialData"))
 
-    # IBL samplers (scene-global)
-    for sam in surface.samplers:
-        if sam.type_name == "samplerCube" or sam.name in ("brdf_lut",):
+    # IBL samplers (scene-global) — from lighting block or surface
+    if lighting:
+        for sam in lighting.samplers:
             stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
+    else:
+        for sam in surface.samplers:
+            if sam.type_name == "samplerCube" or sam.name in ("brdf_lut",):
+                stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
 
     # Bindless texture array
     stage.bindless_texture_arrays.append(BindlessTextureArrayDecl("textures"))

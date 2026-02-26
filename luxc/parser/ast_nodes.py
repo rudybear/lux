@@ -48,6 +48,7 @@ class Module:
     schedules: list[ScheduleDecl] = field(default_factory=list)
     environments: list[EnvironmentDecl] = field(default_factory=list)
     procedurals: list[ProceduralDecl] = field(default_factory=list)
+    lightings: list[LightingDecl] = field(default_factory=list)
     features_decls: list[FeaturesDecl] = field(default_factory=list)
 
 
@@ -227,6 +228,18 @@ class EnvironmentDecl:
     name: str
     members: list[SurfaceMember]
     samplers: list[SurfaceSampler] = field(default_factory=list)
+    loc: Optional[SourceLocation] = None
+
+
+# --- Lighting declarations (illumination configuration) ---
+
+@dataclass
+class LightingDecl:
+    name: str
+    members: list[SurfaceMember]
+    samplers: list[SurfaceSampler] = field(default_factory=list)
+    layers: Optional[list[LayerCall]] = None
+    properties: Optional[PropertiesBlock] = None
     loc: Optional[SourceLocation] = None
 
 

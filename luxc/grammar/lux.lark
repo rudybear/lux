@@ -14,6 +14,7 @@ start: module_item*
             | schedule_decl
             | environment_decl
             | procedural_decl
+            | lighting_decl
             | features_decl
             | conditional_block
 
@@ -92,6 +93,10 @@ schedule_member: IDENT ":" IDENT ("if" feature_expr)?
 // --- Environment declarations (maps to miss shader in RT) ---
 
 environment_decl: "environment" IDENT "{" surface_item ("," surface_item)* ","? "}"
+
+// --- Lighting declarations (illumination configuration) ---
+
+lighting_decl: "lighting" IDENT "{" surface_item ("," surface_item)* ","? "}"
 
 // --- Procedural declarations (maps to intersection shader in RT) ---
 
