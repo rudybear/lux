@@ -313,6 +313,7 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 | **IBL (specular + irradiance)** | yes | yes | yes | yes |
 | **Multi-material permutations** | yes | yes | yes | yes |
 | **Material properties UBO** | yes | yes | yes | yes |
+| **Multi-light + shadows** | yes | yes | yes | yes |
 | **Interactive viewer** | — | yes | yes | yes |
 | **Headless PNG output** | yes | yes | yes | yes |
 | **Shader input** | SPIR-V | SPIR-V | SPIR-V → MSL | SPIR-V |
@@ -322,7 +323,7 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 
 - **Declarative materials** — `surface`, `geometry`, `pipeline` blocks expand to full shader stages
 - **Layered surfaces** — `layers [base, normal_map, sheen, coat, emission]` with automatic energy conservation, compiles to both raster and RT from one declaration
-- **Lighting blocks** — `lighting` declarations separate illumination (directional lights, IBL) from material response; `directional()` and `ibl()` layers with named properties; pipelines reference via `lighting: SceneLighting`
+- **Lighting blocks** — `lighting` declarations separate illumination from material response; `directional()`, `ibl()`, and `multi_light()` layers; `multi_light()` provides compile-time unrolled N-light evaluation with `LightData` SSBO (directional/point/spot), shadow mapping via `ShadowEntry` SSBO + `sampler2DArray`/`samplerCubeArray`, and `shadow.lux` stdlib (PCF4 filtering, cascade selection)
 - **Custom `@layer` functions** — user-defined layers via `@layer fn name(base, n, v, l, ...custom_params) -> vec3`, validated at compile time and composited in declaration order
 - **Compile-time features** — `features { has_normal_map: bool }` with `if` guards on any declaration; `--features` and `--all-permutations` for shader permutation generation; per-material permutation selection via manifest across all engines
 - **Material property pipeline** — `properties` block in surface declarations abstracts runtime material data; compiler generates std140 UBO + reflection JSON with defaults; qualified `Material.field` access in layer expressions; all engines wire glTF material properties automatically
@@ -332,7 +333,7 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 - **Algorithm/schedule separation** — swap BRDF variants and tonemapping without touching material code
 - **Math-first syntax** — `scalar` not `float`, `builtin_position` not `gl_Position`
 - **Auto-layout** — locations, descriptor sets, and bindings assigned by declaration order
-- **Standard library** — 80+ functions across 8 modules: BRDF, SDF, noise, color, colorspace, texture, IBL, lighting
+- **Standard library** — 90+ functions across 10 modules: BRDF, SDF, noise, color, colorspace, texture, IBL, lighting, shadow, toon
 - **Automatic differentiation** — `@differentiable` generates gradient functions via forward-mode autodiff
 - **Ray tracing** — `mode: raytrace` pipelines, `environment`/`procedural` declarations, RT stage blocks
 - **Mesh shaders** — `mode: mesh_shader` pipelines, `task`/`mesh` stages, meshlet-based geometry, `--define` compile-time parameters (C++ and Rust only)
@@ -501,6 +502,8 @@ Options:
 | `mat2` / `mat3` / `mat4` | `OpTypeMatrix` | Column-major |
 | `sampler2d` | `OpTypeSampledImage` | Combined image sampler |
 | `samplerCube` | `OpTypeSampledImage (Cube)` | Cubemap image sampler |
+| `sampler2DArray` | `OpTypeSampledImage (2D, Arrayed)` | 2D texture array sampler (shadow maps) |
+| `samplerCubeArray` | `OpTypeSampledImage (Cube, Arrayed)` | Cubemap array sampler (point light shadows) |
 | `acceleration_structure` | `OpTypeAccelerationStructureKHR` | RT top-level acceleration structure |
 | `type strict Foo = vec3` | Same as base type | Compile-time type safety, zero SPIR-V cost |
 
@@ -668,6 +671,7 @@ Built-in layer types:
 | `transmission` | surface | Volumetric transmission | factor, ior, thickness |
 | `directional` | lighting | Directional light source | direction, color |
 | `ibl` | lighting | Image-based lighting | specular_map, irradiance_map, brdf_lut |
+| `multi_light` | lighting | N-light evaluation with shadows | (reads from LightData + ShadowEntry SSBOs) |
 | *custom* | surface | User-defined `@layer` function | function-specific |
 
 ### Compile-Time Features
@@ -1027,6 +1031,8 @@ Import modules with `import <name>;` — functions are inlined at the call site.
 | `color` | 5 | linear-to-sRGB, sRGB-to-linear, luminance, Reinhard tonemap, ACES tonemap |
 | `colorspace` | 8 | RGB-to-HSV, HSV-to-RGB, contrast, saturation, hue shift, brightness, gamma correction |
 | `texture` | 11 | TBN normal perturbation, normal unpacking, triplanar projection (weights, UVs, blending), parallax offset, UV rotation, UV tiling |
+| `lighting` | 7 | Distance/spot attenuation, evaluate directional/point/spot lights, unified light evaluation, branchless light direction selection |
+| `shadow` | 4 | Basic shadow sampling, PCF4 shadow filtering, cascade selection, shadow UV computation |
 | `toon` | 1 | Cartoon cel-shading with quantized NdotL + rim lighting (`@layer` function) |
 | `compositing` | 2 | IBL multi-scattering (Fdez-Aguera 2019), layer compositing helpers |
 | `debug` | 5 | Normal visualization, depth grayscale, scalar heatmap, index coloring, UV checkerboard |
@@ -1135,6 +1141,7 @@ luxc/
         texture.lux          # normal maps, triplanar, UV utils
         ibl.lux              # image-based lighting + multi-scattering
         lighting.lux         # multi-light shading (directional, point, spot)
+        shadow.lux           # shadow sampling (basic, PCF4, cascade selection, UV computation)
         toon.lux             # @layer cartoon cel-shading + rim lighting
         compositing.lux      # IBL multi-scattering, layer compositing helpers
         debug.lux            # debug visualization helpers (normal, depth, heatmap, checkerboard)
@@ -1162,6 +1169,7 @@ examples/
     gltf_pbr_layered.lux     # layered surface — unified raster + RT pipeline
     cartoon_toon.lux         # @layer custom functions — cel-shading + rim lighting
     lighting_demo.lux        # multi-light PBR (directional, point, spot)
+    multi_light_demo.lux     # multi-light with shadows (N-light loop, shadow maps)
     ibl_demo.lux             # image-based lighting demo
     math_builtins_demo.lux   # built-in function visualizer
     viz_transfer_functions.lux  # BRDF transfer function graphs (2x3 grid)
@@ -1213,7 +1221,8 @@ tests/
     test_gltf_extensions.py
     test_mesh_shader.py         # P13 mesh shader tests (compilation, expansion, reflection)
     test_brdf_visualization.py  # P15 BRDF visualization tests (10 tests)
-    test_lighting_block.py      # P17 lighting block tests (21 tests)
+    test_lighting_block.py      # P17.1 lighting block tests (21 tests)
+    test_multi_light.py         # P17.2 multi-light + shadow tests (40 tests)
     test_debug_features.py      # P20 debug instrumentation + semantic types (22 tests)
 tools/
     generate_training_data.py
@@ -1243,6 +1252,7 @@ tools/
 | `gltf_pbr_layered.lux` | Layered surface: unified raster + RT + mesh shader from one surface declaration |
 | `cartoon_toon.lux` | Custom `@layer` function: cel-shading + rim lighting (raster + RT) |
 | `lighting_demo.lux` | Multi-light: directional, point, spot lights with PBR |
+| `multi_light_demo.lux` | Multi-light with shadows: N-light loop, LightData SSBO, shadow maps |
 | `ibl_demo.lux` | Image-based lighting showcase: specular + diffuse IBL |
 | `math_builtins_demo.lux` | Built-in function visualizer: sin, smoothstep, fract, etc. |
 | `viz_transfer_functions.lux` | BRDF transfer function graphs: Fresnel, NDF, geometry, diffuse curves |
@@ -1367,7 +1377,7 @@ Output: specular cubemap (6 faces x 5 mips), irradiance cubemap, and BRDF integr
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 497 tests
+# 542 tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.

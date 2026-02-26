@@ -581,6 +581,9 @@ void MeshRenderer::setupDescriptors(VulkanContext& ctx) {
             } else if (b.name == "Light") {
                 writeInfos[i].bufferInfo = {m_lightBuffer, 0,
                     static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+            } else if (b.name == "SceneLight" && m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
+                writeInfos[i].bufferInfo = {m_sceneLightUBO, 0,
+                    static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
             } else if (b.name == "Material") {
                 writeInfos[i].bufferInfo = {m_materialBuffer, 0,
                     static_cast<VkDeviceSize>(b.size > 0 ? b.size : sizeof(MaterialUBOData))};
@@ -601,6 +604,9 @@ void MeshRenderer::setupDescriptors(VulkanContext& ctx) {
             else if (b.name == "normals") { buf = m_normalsBuffer; bufSize = m_normalsSize; }
             else if (b.name == "tex_coords") { buf = m_texCoordsBuffer; bufSize = m_texCoordsSize; }
             else if (b.name == "tangents") { buf = m_tangentsBuffer; bufSize = m_tangentsSize; }
+            else if (b.name == "lights" && m_hasMultiLight && m_lightsSSBO != VK_NULL_HANDLE) {
+                buf = m_lightsSSBO; bufSize = VK_WHOLE_SIZE;
+            }
             if (buf == VK_NULL_HANDLE) {
                 std::cout << "[warn] Unknown storage buffer name: " << b.name << std::endl;
                 continue;
@@ -757,6 +763,73 @@ void MeshRenderer::init(VulkanContext& ctx, SceneManager& scene,
     vmaMapMemory(ctx.allocator, m_lightAlloc, &mapped);
     memcpy(mapped, &lightData, sizeof(LightData));
     vmaUnmapMemory(ctx.allocator, m_lightAlloc);
+
+    // Multi-light SSBO creation (when shader uses SceneLight UBO + lights SSBO)
+    // Detect from fragment reflection whether the shader uses a "lights" storage buffer
+    m_hasMultiLight = false;
+    for (auto& [setIdx, bindings] : m_fragReflection.descriptor_sets) {
+        for (auto& b : bindings) {
+            if (b.name == "lights" && b.type == "storage_buffer") {
+                m_hasMultiLight = true;
+                break;
+            }
+        }
+        if (m_hasMultiLight) break;
+    }
+
+    if (m_hasMultiLight && m_scene) {
+        // Create lights SSBO from packed scene light data
+        auto lightBuf = m_scene->packLightsBuffer();
+        if (lightBuf.empty()) {
+            // Add a dummy light to avoid empty buffer
+            lightBuf.resize(16, 0.0f);
+        }
+        VkBufferCreateInfo ssboInfo = {};
+        ssboInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        ssboInfo.size = lightBuf.size() * sizeof(float);
+        ssboInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+        VmaAllocationCreateInfo ssboAllocInfo = {};
+        ssboAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+        vmaCreateBuffer(ctx.allocator, &ssboInfo, &ssboAllocInfo,
+                        &m_lightsSSBO, &m_lightsSSBOAlloc, nullptr);
+
+        vmaMapMemory(ctx.allocator, m_lightsSSBOAlloc, &mapped);
+        memcpy(mapped, lightBuf.data(), lightBuf.size() * sizeof(float));
+        vmaUnmapMemory(ctx.allocator, m_lightsSSBOAlloc);
+
+        // Create SceneLight UBO (light_count + view_pos, std140 layout)
+        struct SceneLightUBO {
+            glm::vec3 viewPos;
+            float _pad0;
+            int32_t lightCount;
+            float _pad1[3];
+        };
+        SceneLightUBO sceneLightData;
+        sceneLightData.viewPos = viewPos;
+        sceneLightData._pad0 = 0.0f;
+        sceneLightData.lightCount = m_scene->getLightCount();
+        sceneLightData._pad1[0] = sceneLightData._pad1[1] = sceneLightData._pad1[2] = 0.0f;
+
+        VkBufferCreateInfo slBufInfo = {};
+        slBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        slBufInfo.size = sizeof(SceneLightUBO);
+        slBufInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+
+        VmaAllocationCreateInfo slAllocInfo = {};
+        slAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+        vmaCreateBuffer(ctx.allocator, &slBufInfo, &slAllocInfo,
+                        &m_sceneLightUBO, &m_sceneLightUBOAlloc, nullptr);
+
+        vmaMapMemory(ctx.allocator, m_sceneLightUBOAlloc, &mapped);
+        memcpy(mapped, &sceneLightData, sizeof(SceneLightUBO));
+        vmaUnmapMemory(ctx.allocator, m_sceneLightUBOAlloc);
+
+        std::cout << "[info] Multi-light SSBO created: " << m_scene->getLightCount()
+                  << " light(s), " << lightBuf.size() * sizeof(float) << " bytes" << std::endl;
+    }
 
     // Create Material uniform buffer (80 bytes, std140 layout)
     MaterialUBOData materialData{};
@@ -1056,6 +1129,20 @@ void MeshRenderer::updateCamera(VulkanContext& ctx, glm::vec3 eye, glm::vec3 tar
     light.viewPos = eye;
     memcpy(mapped, &light, sizeof(LightData));
     vmaUnmapMemory(ctx.allocator, m_lightAlloc);
+
+    // Update SceneLight UBO viewPos for multi-light mode
+    if (m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
+        struct SceneLightUBO {
+            glm::vec3 viewPos;
+            float _pad0;
+            int32_t lightCount;
+            float _pad1[3];
+        };
+        vmaMapMemory(ctx.allocator, m_sceneLightUBOAlloc, &mapped);
+        SceneLightUBO* sl = static_cast<SceneLightUBO*>(mapped);
+        sl->viewPos = eye;
+        vmaUnmapMemory(ctx.allocator, m_sceneLightUBOAlloc);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -1542,6 +1629,8 @@ void MeshRenderer::setupBindlessMode(VulkanContext& ctx) {
                 info.bufferInfo = {m_mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
             } else if (b.name == "Light") {
                 info.bufferInfo = {m_lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+            } else if (b.name == "SceneLight" && m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
+                info.bufferInfo = {m_sceneLightUBO, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
             } else if (b.name == "Material") {
                 info.bufferInfo = {m_materialBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : sizeof(MaterialUBOData))};
             } else {
@@ -1558,6 +1647,10 @@ void MeshRenderer::setupBindlessMode(VulkanContext& ctx) {
             if (b.name == "materials") {
                 buf = m_bindlessMaterials.buffer;
                 bufSize = static_cast<VkDeviceSize>(m_bindlessMaterials.materialCount) * sizeof(BindlessMaterialData);
+            }
+            // Multi-light SSBO
+            else if (b.name == "lights" && m_hasMultiLight && m_lightsSSBO != VK_NULL_HANDLE) {
+                buf = m_lightsSSBO; bufSize = VK_WHOLE_SIZE;
             }
             // Standard mesh shader storage buffers
             else if (b.name == "meshlet_descriptors") { buf = m_meshletDescBuffer; bufSize = m_meshletDescSize; }
@@ -1808,6 +1901,8 @@ void MeshRenderer::setupMeshMultiPipeline(VulkanContext& ctx, const ShaderManife
                     info.bufferInfo = {m_mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
                 } else if (b.name == "Light") {
                     info.bufferInfo = {m_lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                } else if (b.name == "SceneLight" && m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
+                    info.bufferInfo = {m_sceneLightUBO, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
                 } else continue;
                 writeInfos.push_back(info);
                 w.pBufferInfo = &writeInfos.back().bufferInfo;
@@ -1822,6 +1917,9 @@ void MeshRenderer::setupMeshMultiPipeline(VulkanContext& ctx, const ShaderManife
                 else if (b.name == "normals") { buf = m_normalsBuffer; bufSize = m_normalsSize; }
                 else if (b.name == "tex_coords") { buf = m_texCoordsBuffer; bufSize = m_texCoordsSize; }
                 else if (b.name == "tangents") { buf = m_tangentsBuffer; bufSize = m_tangentsSize; }
+                else if (b.name == "lights" && m_hasMultiLight && m_lightsSSBO != VK_NULL_HANDLE) {
+                    buf = m_lightsSSBO; bufSize = VK_WHOLE_SIZE;
+                }
                 if (buf == VK_NULL_HANDLE) {
                     std::cout << "[warn] Unknown storage buffer in set 0: " << b.name << std::endl;
                     continue;
@@ -1915,6 +2013,15 @@ void MeshRenderer::setupMeshMultiPipeline(VulkanContext& ctx, const ShaderManife
                         info.bufferInfo = {perm.perMaterialUBOs[i], 0, sizeof(MaterialUBOData)};
                     } else if (b.name == "Light" && m_lightBuffer != VK_NULL_HANDLE) {
                         info.bufferInfo = {m_lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                    } else if (b.name == "SceneLight" && m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
+                        info.bufferInfo = {m_sceneLightUBO, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                    } else continue;
+                    writeInfos.push_back(info);
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else if (b.type == "storage_buffer") {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    if (b.name == "lights" && m_hasMultiLight && m_lightsSSBO != VK_NULL_HANDLE) {
+                        info.bufferInfo = {m_lightsSSBO, 0, VK_WHOLE_SIZE};
                     } else continue;
                     writeInfos.push_back(info);
                     w.pBufferInfo = &writeInfos.back().bufferInfo;
@@ -2149,4 +2256,11 @@ void MeshRenderer::cleanup(VulkanContext& ctx) {
     if (m_mvpBuffer) vmaDestroyBuffer(ctx.allocator, m_mvpBuffer, m_mvpAlloc);
     if (m_lightBuffer) vmaDestroyBuffer(ctx.allocator, m_lightBuffer, m_lightAlloc);
     if (m_materialBuffer) vmaDestroyBuffer(ctx.allocator, m_materialBuffer, m_materialAllocation);
+
+    // Cleanup multi-light buffers
+    if (m_lightsSSBO) vmaDestroyBuffer(ctx.allocator, m_lightsSSBO, m_lightsSSBOAlloc);
+    if (m_sceneLightUBO) vmaDestroyBuffer(ctx.allocator, m_sceneLightUBO, m_sceneLightUBOAlloc);
+    m_lightsSSBO = VK_NULL_HANDLE;
+    m_sceneLightUBO = VK_NULL_HANDLE;
+    m_hasMultiLight = false;
 }

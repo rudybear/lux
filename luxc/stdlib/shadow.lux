@@ -1,0 +1,59 @@
+// Lux Standard Library: Shadow Sampling
+// Basic shadow map evaluation for multi-light systems.
+
+fn sample_shadow_basic(
+    shadow_depth: scalar,
+    fragment_depth: scalar,
+    bias: scalar
+) -> scalar {
+    // Basic depth comparison: 1.0 = lit, 0.0 = shadowed
+    let adjusted: scalar = fragment_depth - bias;
+    let lit: scalar = (adjusted < shadow_depth) ? 1.0 : 0.0;
+    return lit;
+}
+
+fn sample_shadow_pcf4(
+    shadow_depth_00: scalar,
+    shadow_depth_10: scalar,
+    shadow_depth_01: scalar,
+    shadow_depth_11: scalar,
+    fragment_depth: scalar,
+    bias: scalar
+) -> scalar {
+    // 4-tap PCF: manually unrolled (no loops in Lux)
+    let adjusted: scalar = fragment_depth - bias;
+    let s0: scalar = (adjusted < shadow_depth_00) ? 1.0 : 0.0;
+    let s1: scalar = (adjusted < shadow_depth_10) ? 1.0 : 0.0;
+    let s2: scalar = (adjusted < shadow_depth_01) ? 1.0 : 0.0;
+    let s3: scalar = (adjusted < shadow_depth_11) ? 1.0 : 0.0;
+    return (s0 + s1 + s2 + s3) * 0.25;
+}
+
+fn select_cascade(
+    view_depth: scalar,
+    split0: scalar,
+    split1: scalar,
+    split2: scalar,
+    split3: scalar
+) -> scalar {
+    // Select cascade index from view-space depth and split distances
+    // Returns 0..3 cascade index
+    let c0: scalar = (view_depth < split0) ? 0.0 : 1.0;
+    let c1: scalar = (view_depth < split1) ? 0.0 : 1.0;
+    let c2: scalar = (view_depth < split2) ? 0.0 : 1.0;
+    return c0 + c1 + c2;
+}
+
+fn compute_shadow_uv(
+    world_pos: vec3,
+    shadow_vp: mat4,
+    bias: scalar
+) -> vec3 {
+    // Project world position into shadow map UV space
+    let shadow_clip: vec4 = shadow_vp * vec4(world_pos, 1.0);
+    let shadow_ndc: vec3 = shadow_clip.xyz / shadow_clip.w;
+    // Map from [-1,1] to [0,1]
+    let shadow_uv: vec2 = shadow_ndc.xy * 0.5 + vec2(0.5);
+    let shadow_depth: scalar = shadow_ndc.z;
+    return vec3(shadow_uv, shadow_depth);
+}

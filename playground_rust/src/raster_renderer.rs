@@ -11,6 +11,10 @@ use log::info;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
+use gpu_allocator::vulkan::AllocationCreateDesc;
+use gpu_allocator::vulkan::AllocationScheme;
+use gpu_allocator::MemoryLocation;
+
 use crate::camera::DefaultCamera;
 use crate::reflected_pipeline;
 use crate::scene;
@@ -18,6 +22,118 @@ use crate::scene_manager::{self, GpuBuffer, GpuImage, IblAssets};
 use crate::screenshot;
 use crate::spv_loader;
 use crate::vulkan_context::VulkanContext;
+
+// ===========================================================================
+// Shadow map constants and embedded SPIR-V
+// ===========================================================================
+
+/// Maximum number of shadow-casting lights.
+const MAX_SHADOW_MAPS: usize = scene_manager::MAX_SHADOW_MAPS;
+
+/// Shadow map resolution (width and height).
+const SHADOW_MAP_RESOLUTION: u32 = scene_manager::SHADOW_MAP_RESOLUTION;
+
+/// Embedded SPIR-V for the shadow depth vertex shader.
+///
+/// This is the compiled bytecode for:
+/// ```glsl
+/// #version 450
+/// layout(push_constant) uniform PC { mat4 mvp; };
+/// layout(location = 0) in vec3 inPosition;
+/// void main() { gl_Position = mvp * vec4(inPosition, 1.0); }
+/// ```
+#[rustfmt::skip]
+const SHADOW_VERT_SPV: &[u8] = &[
+    0x03, 0x02, 0x23, 0x07, 0x00, 0x00, 0x01, 0x00, 0x0b, 0x00, 0x08, 0x00,
+    0x23, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x02, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x47, 0x4c, 0x53, 0x4c, 0x2e, 0x73, 0x74, 0x64, 0x2e, 0x34, 0x35, 0x30,
+    0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x6d, 0x61, 0x69, 0x6e, 0x00, 0x00, 0x00, 0x00,
+    0x0d, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00, 0x03, 0x00, 0x03, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0xc2, 0x01, 0x00, 0x00, 0x05, 0x00, 0x04, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x6d, 0x61, 0x69, 0x6e, 0x00, 0x00, 0x00, 0x00,
+    0x05, 0x00, 0x06, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x67, 0x6c, 0x5f, 0x50,
+    0x65, 0x72, 0x56, 0x65, 0x72, 0x74, 0x65, 0x78, 0x00, 0x00, 0x00, 0x00,
+    0x06, 0x00, 0x06, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x67, 0x6c, 0x5f, 0x50, 0x6f, 0x73, 0x69, 0x74, 0x69, 0x6f, 0x6e, 0x00,
+    0x06, 0x00, 0x07, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x67, 0x6c, 0x5f, 0x50, 0x6f, 0x69, 0x6e, 0x74, 0x53, 0x69, 0x7a, 0x65,
+    0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x07, 0x00, 0x0b, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x67, 0x6c, 0x5f, 0x43, 0x6c, 0x69, 0x70, 0x44,
+    0x69, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x00, 0x06, 0x00, 0x07, 0x00,
+    0x0b, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x67, 0x6c, 0x5f, 0x43,
+    0x75, 0x6c, 0x6c, 0x44, 0x69, 0x73, 0x74, 0x61, 0x6e, 0x63, 0x65, 0x00,
+    0x05, 0x00, 0x03, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x05, 0x00, 0x03, 0x00, 0x11, 0x00, 0x00, 0x00, 0x50, 0x43, 0x00, 0x00,
+    0x06, 0x00, 0x04, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6d, 0x76, 0x70, 0x00, 0x05, 0x00, 0x03, 0x00, 0x13, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x05, 0x00, 0x19, 0x00, 0x00, 0x00,
+    0x69, 0x6e, 0x50, 0x6f, 0x73, 0x69, 0x74, 0x69, 0x6f, 0x6e, 0x00, 0x00,
+    0x47, 0x00, 0x03, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x48, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x00, 0x05, 0x00,
+    0x0b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x48, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x48, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x0b, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x47, 0x00, 0x03, 0x00,
+    0x11, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x48, 0x00, 0x04, 0x00,
+    0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+    0x48, 0x00, 0x05, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x07, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x48, 0x00, 0x05, 0x00,
+    0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x47, 0x00, 0x04, 0x00, 0x19, 0x00, 0x00, 0x00,
+    0x1e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00, 0x02, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x21, 0x00, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x16, 0x00, 0x03, 0x00, 0x06, 0x00, 0x00, 0x00,
+    0x20, 0x00, 0x00, 0x00, 0x17, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00, 0x00,
+    0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x15, 0x00, 0x04, 0x00,
+    0x08, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2b, 0x00, 0x04, 0x00, 0x08, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x04, 0x00, 0x0a, 0x00, 0x00, 0x00,
+    0x06, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x06, 0x00,
+    0x0b, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+    0x0a, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00,
+    0x0c, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00,
+    0x3b, 0x00, 0x04, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x00, 0x15, 0x00, 0x04, 0x00, 0x0e, 0x00, 0x00, 0x00,
+    0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x04, 0x00,
+    0x0e, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x18, 0x00, 0x04, 0x00, 0x10, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x03, 0x00, 0x11, 0x00, 0x00, 0x00,
+    0x10, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00, 0x12, 0x00, 0x00, 0x00,
+    0x09, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00,
+    0x12, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x20, 0x00, 0x04, 0x00, 0x14, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x10, 0x00, 0x00, 0x00, 0x17, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x00,
+    0x06, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00,
+    0x18, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00,
+    0x3b, 0x00, 0x04, 0x00, 0x18, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00,
+    0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f, 0x20, 0x00, 0x04, 0x00,
+    0x21, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
+    0x36, 0x00, 0x05, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00,
+    0x05, 0x00, 0x00, 0x00, 0x41, 0x00, 0x05, 0x00, 0x14, 0x00, 0x00, 0x00,
+    0x15, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00,
+    0x3d, 0x00, 0x04, 0x00, 0x10, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00,
+    0x15, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x00,
+    0x1a, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00, 0x51, 0x00, 0x05, 0x00,
+    0x06, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x51, 0x00, 0x05, 0x00, 0x06, 0x00, 0x00, 0x00,
+    0x1d, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x51, 0x00, 0x05, 0x00, 0x06, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00,
+    0x1a, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x50, 0x00, 0x07, 0x00,
+    0x07, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00,
+    0x1d, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x1b, 0x00, 0x00, 0x00,
+    0x91, 0x00, 0x05, 0x00, 0x07, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+    0x16, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x41, 0x00, 0x05, 0x00,
+    0x21, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00,
+    0x0f, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x03, 0x00, 0x22, 0x00, 0x00, 0x00,
+    0x20, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x01, 0x00, 0x38, 0x00, 0x01, 0x00,
+];
 
 /// Material UBO data matching `properties Material { ... }` in gltf_pbr_layered.lux (std140 layout, 80 bytes).
 #[repr(C)]
@@ -1227,6 +1343,53 @@ fn render_pbr_scene_bindless(
     light_data[28..32].copy_from_slice(&0.0f32.to_le_bytes());
     let mut light_buffer = create_buffer_with_data(device, ctx.allocator_mut(), &light_data, vk::BufferUsageFlags::UNIFORM_BUFFER, "bindless_light")?;
 
+    // --- Multi-light SSBO (Phase E) ---
+    // Build a SceneManager and populate lights from glTF scene data.
+    let mut sm = scene_manager::SceneManager::new();
+    if let Some(ref gs) = gltf_scene {
+        sm.populate_lights_from_gltf(&gs.lights);
+    } else {
+        // Ensure at least a default directional light
+        sm.populate_lights_from_gltf(&[]);
+    }
+
+    // Check if shader uses multi-light SSBO ("lights" storage_buffer binding)
+    let has_multi_light = merged.values().any(|bindings| {
+        bindings.iter().any(|b| b.name == "lights" && b.binding_type == "storage_buffer")
+    });
+
+    let mut lights_ssbo: Option<scene_manager::GpuBuffer> = None;
+    if has_multi_light {
+        let light_floats = sm.pack_lights_buffer();
+        let data: &[u8] = if light_floats.is_empty() {
+            &[0u8; 64] // dummy light (one vec4x4 = 64 bytes)
+        } else {
+            bytemuck::cast_slice(&light_floats)
+        };
+        let buf = create_buffer_with_data(
+            device, ctx.allocator_mut(), data,
+            vk::BufferUsageFlags::STORAGE_BUFFER, "lights_ssbo",
+        )?;
+        info!("Multi-light SSBO: {} lights, {} bytes", sm.lights.len(), data.len());
+        lights_ssbo = Some(buf);
+    }
+
+    // Build SceneLight UBO data for multi-light mode (camera_pos + light_count)
+    let mut scene_light_ubo: Option<scene_manager::GpuBuffer> = None;
+    if has_multi_light {
+        let mut scene_light_data = [0u8; 32];
+        scene_light_data[0..12].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
+        scene_light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
+        let light_count = sm.lights.len() as i32;
+        scene_light_data[16..20].copy_from_slice(&light_count.to_le_bytes());
+        scene_light_data[20..32].fill(0);
+        let buf = create_buffer_with_data(
+            device, ctx.allocator_mut(), &scene_light_data,
+            vk::BufferUsageFlags::UNIFORM_BUFFER, "scene_light_ubo",
+        )?;
+        scene_light_ubo = Some(buf);
+    }
+
     // --- Textures and materials ---
     let sampler_create = vk::SamplerCreateInfo::default()
         .mag_filter(vk::Filter::LINEAR)
@@ -1390,6 +1553,18 @@ fn render_pbr_scene_bindless(
                                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                                     .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
                             );
+                        } else if binding.name == "SceneLight" {
+                            // Multi-light mode: bind the SceneLight UBO (camera_pos + light_count)
+                            if let Some(ref sl_buf) = scene_light_ubo {
+                                let idx = buf_infos.len();
+                                buf_infos.push(vk::DescriptorBufferInfo::default().buffer(sl_buf.buffer).offset(0).range(binding.size as u64));
+                                writes.push(
+                                    vk::WriteDescriptorSet::default()
+                                        .dst_set(ds1).dst_binding(binding.binding)
+                                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                        .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                );
+                            }
                         }
                     }
                     vk::DescriptorType::SAMPLER => {
@@ -1429,6 +1604,19 @@ fn render_pbr_scene_bindless(
                                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                                     .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
                             );
+                        } else if binding.name == "lights" {
+                            if let Some(ref lights_buf) = lights_ssbo {
+                                let idx = buf_infos.len();
+                                let ssbo_size = (sm.lights.len() as u64) * 64; // 16 floats * 4 bytes per light
+                                let range = if ssbo_size > 0 { ssbo_size } else { 64 };
+                                buf_infos.push(vk::DescriptorBufferInfo::default().buffer(lights_buf.buffer).offset(0).range(range));
+                                writes.push(
+                                    vk::WriteDescriptorSet::default()
+                                        .dst_set(ds1).dst_binding(binding.binding)
+                                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                        .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                );
+                            }
                         }
                     }
                     _ => {}
@@ -1629,6 +1817,12 @@ fn render_pbr_scene_bindless(
     ibl_assets.destroy(device, ctx.allocator_mut());
     mvp_buffer.destroy(device, ctx.allocator_mut());
     light_buffer.destroy(device, ctx.allocator_mut());
+    if let Some(mut buf) = lights_ssbo {
+        buf.destroy(device, ctx.allocator_mut());
+    }
+    if let Some(mut buf) = scene_light_ubo {
+        buf.destroy(device, ctx.allocator_mut());
+    }
     vbo.destroy(device, ctx.allocator_mut());
     ibo.destroy(device, ctx.allocator_mut());
 
@@ -1998,6 +2192,48 @@ fn render_pbr_scene(
         "pbr_light",
     )?;
 
+    // --- Multi-light SSBO (Phase E) ---
+    let mut sm = scene_manager::SceneManager::new();
+    if let Some(ref gs) = gltf_scene {
+        sm.populate_lights_from_gltf(&gs.lights);
+    } else {
+        sm.populate_lights_from_gltf(&[]);
+    }
+
+    let has_multi_light = merged.values().any(|bindings| {
+        bindings.iter().any(|b| b.name == "lights" && b.binding_type == "storage_buffer")
+    });
+
+    let mut lights_ssbo: Option<scene_manager::GpuBuffer> = None;
+    if has_multi_light {
+        let light_floats = sm.pack_lights_buffer();
+        let data: &[u8] = if light_floats.is_empty() {
+            &[0u8; 64]
+        } else {
+            bytemuck::cast_slice(&light_floats)
+        };
+        let buf = create_buffer_with_data(
+            device, ctx.allocator_mut(), data,
+            vk::BufferUsageFlags::STORAGE_BUFFER, "lights_ssbo",
+        )?;
+        lights_ssbo = Some(buf);
+    }
+
+    let mut scene_light_ubo: Option<scene_manager::GpuBuffer> = None;
+    if has_multi_light {
+        let mut scene_light_data = [0u8; 32];
+        scene_light_data[0..12].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
+        scene_light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
+        let light_count = sm.lights.len() as i32;
+        scene_light_data[16..20].copy_from_slice(&light_count.to_le_bytes());
+        scene_light_data[20..32].fill(0);
+        let buf = create_buffer_with_data(
+            device, ctx.allocator_mut(), &scene_light_data,
+            vk::BufferUsageFlags::UNIFORM_BUFFER, "scene_light_ubo",
+        )?;
+        scene_light_ubo = Some(buf);
+    }
+
     // Material uniform buffer (80 bytes)
     let material_data = if let Some(ref gs) = gltf_scene {
         if !gs.materials.is_empty() {
@@ -2099,7 +2335,7 @@ fn render_pbr_scene(
     // Phase 3: Write descriptor sets from reflection data
     // =====================================================================
 
-    // Write vertex set (set 0): MVP + Light only
+    // Write vertex set (set 0): MVP + Light (+ SceneLight UBO + lights SSBO if present)
     {
         let mut buf_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
         let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
@@ -2111,6 +2347,13 @@ fn render_pbr_scene(
                     let (buffer, range) = match binding.name.as_str() {
                         "MVP" => (mvp_buffer.buffer, binding.size as u64),
                         "Light" => (light_buffer.buffer, binding.size as u64),
+                        "SceneLight" => {
+                            if let Some(ref sl_buf) = scene_light_ubo {
+                                (sl_buf.buffer, binding.size as u64)
+                            } else {
+                                continue;
+                            }
+                        }
                         _ => continue,
                     };
                     let idx = buf_infos.len();
@@ -2122,6 +2365,20 @@ fn render_pbr_scene(
                             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                             .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
                     );
+                } else if vk_type == vk::DescriptorType::STORAGE_BUFFER && binding.name == "lights" {
+                    if let Some(ref lights_buf) = lights_ssbo {
+                        let idx = buf_infos.len();
+                        let ssbo_size = (sm.lights.len() as u64) * 64;
+                        let range = if ssbo_size > 0 { ssbo_size } else { 64 };
+                        buf_infos.push(vk::DescriptorBufferInfo::default().buffer(lights_buf.buffer).offset(0).range(range));
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(vert_ds)
+                                .dst_binding(binding.binding)
+                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                        );
+                    }
                 }
             }
         }
@@ -2167,6 +2424,12 @@ fn render_pbr_scene(
                             (per_material_buffers[mi].buffer, std::mem::size_of::<MaterialUboData>() as u64)
                         } else if binding.name == "Light" {
                             (light_buffer.buffer, binding.size as u64)
+                        } else if binding.name == "SceneLight" {
+                            if let Some(ref sl_buf) = scene_light_ubo {
+                                (sl_buf.buffer, binding.size as u64)
+                            } else {
+                                continue;
+                            }
                         } else {
                             continue;
                         };
@@ -2183,6 +2446,22 @@ fn render_pbr_scene(
                                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                                 .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
                         );
+                    }
+                    vk::DescriptorType::STORAGE_BUFFER => {
+                        if binding.name == "lights" {
+                            if let Some(ref lights_buf) = lights_ssbo {
+                                let idx = buf_infos.len();
+                                let ssbo_size = (sm.lights.len() as u64) * 64;
+                                let range = if ssbo_size > 0 { ssbo_size } else { 64 };
+                                buf_infos.push(vk::DescriptorBufferInfo::default().buffer(lights_buf.buffer).offset(0).range(range));
+                                writes.push(
+                                    vk::WriteDescriptorSet::default()
+                                        .dst_set(ds).dst_binding(binding.binding)
+                                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                        .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                );
+                            }
+                        }
                     }
                     vk::DescriptorType::SAMPLER => {
                         let actual_sampler = ibl_assets.sampler_for_binding(&binding.name).unwrap_or(sampler);
@@ -2539,6 +2818,12 @@ fn render_pbr_scene(
     ibl_assets.destroy(device, ctx.allocator_mut());
     mvp_buffer.destroy(device, ctx.allocator_mut());
     light_buffer.destroy(device, ctx.allocator_mut());
+    if let Some(mut buf) = lights_ssbo {
+        buf.destroy(device, ctx.allocator_mut());
+    }
+    if let Some(mut buf) = scene_light_ubo {
+        buf.destroy(device, ctx.allocator_mut());
+    }
     material_buffer.destroy(device, ctx.allocator_mut());
     for mut buf in per_material_buffers {
         buf.destroy(device, ctx.allocator_mut());
@@ -2552,6 +2837,333 @@ fn render_pbr_scene(
     ibo.destroy(device, ctx.allocator_mut());
 
     Ok(())
+}
+
+// =========================================================================
+// Shadow map infrastructure
+// =========================================================================
+
+/// Holds all shadow map GPU resources. Created when the shader
+/// requires "shadow_maps" and "shadow_matrices" bindings.
+struct ShadowResources {
+    image: vk::Image,
+    image_alloc: gpu_allocator::vulkan::Allocation,
+    array_view: vk::ImageView,
+    per_layer_views: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
+    render_pass: vk::RenderPass,
+    comparison_sampler: vk::Sampler,
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    vert_module: vk::ShaderModule,
+}
+
+/// Create all shadow map GPU resources: depth image array, views, framebuffers,
+/// render pass, comparison sampler, and shadow depth pipeline.
+fn create_shadow_resources(
+    device: &ash::Device,
+    allocator: &mut gpu_allocator::vulkan::Allocator,
+    layer_count: u32,
+    gltf_vertex_stride: u32,
+) -> Result<ShadowResources, String> {
+    let res = SHADOW_MAP_RESOLUTION;
+
+    // 1. Create 2D array depth image (D32_SFLOAT, res x res, up to 8 layers)
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(vk::Format::D32_SFLOAT)
+        .extent(vk::Extent3D { width: res, height: res, depth: 1 })
+        .mip_levels(1)
+        .array_layers(layer_count)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+        )
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+
+    let image = unsafe {
+        device
+            .create_image(&image_info, None)
+            .map_err(|e| format!("Failed to create shadow depth image: {:?}", e))?
+    };
+
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+
+    let image_alloc = allocator
+        .allocate(&AllocationCreateDesc {
+            name: "shadow_depth_array",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("Failed to allocate shadow depth image memory: {:?}", e))?;
+
+    unsafe {
+        device
+            .bind_image_memory(image, image_alloc.memory(), image_alloc.offset())
+            .map_err(|e| format!("Failed to bind shadow depth image memory: {:?}", e))?;
+    }
+
+    // 2. Create array image view (for sampler2DArray binding in main pass)
+    let array_view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
+        .format(vk::Format::D32_SFLOAT)
+        .components(vk::ComponentMapping::default())
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(layer_count),
+        );
+
+    let array_view = unsafe {
+        device
+            .create_image_view(&array_view_info, None)
+            .map_err(|e| format!("Failed to create shadow array image view: {:?}", e))?
+    };
+
+    // 3. Create per-layer views and framebuffers
+    // First create the depth-only render pass
+    let depth_attachment = vk::AttachmentDescription::default()
+        .format(vk::Format::D32_SFLOAT)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    let depth_ref = vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+    let subpass = vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .depth_stencil_attachment(&depth_ref);
+
+    let dependencies = [
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+            .src_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+        vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
+            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ),
+    ];
+
+    let render_pass = unsafe {
+        device
+            .create_render_pass(
+                &vk::RenderPassCreateInfo::default()
+                    .attachments(std::slice::from_ref(&depth_attachment))
+                    .subpasses(std::slice::from_ref(&subpass))
+                    .dependencies(&dependencies),
+                None,
+            )
+            .map_err(|e| format!("Failed to create shadow render pass: {:?}", e))?
+    };
+
+    let mut per_layer_views = Vec::with_capacity(layer_count as usize);
+    let mut framebuffers = Vec::with_capacity(layer_count as usize);
+
+    for layer in 0..layer_count {
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::D32_SFLOAT)
+            .components(vk::ComponentMapping::default())
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(layer)
+                    .layer_count(1),
+            );
+
+        let view = unsafe {
+            device
+                .create_image_view(&view_info, None)
+                .map_err(|e| format!("Failed to create shadow layer {} view: {:?}", layer, e))?
+        };
+
+        let fb_info = vk::FramebufferCreateInfo::default()
+            .render_pass(render_pass)
+            .attachments(std::slice::from_ref(&view))
+            .width(res)
+            .height(res)
+            .layers(1);
+
+        let fb = unsafe {
+            device
+                .create_framebuffer(&fb_info, None)
+                .map_err(|e| format!("Failed to create shadow layer {} framebuffer: {:?}", layer, e))?
+        };
+
+        per_layer_views.push(view);
+        framebuffers.push(fb);
+    }
+
+    // 5. Create comparison sampler (LESS_OR_EQUAL)
+    let sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+        .compare_enable(true)
+        .compare_op(vk::CompareOp::LESS_OR_EQUAL)
+        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .max_lod(1.0);
+
+    let comparison_sampler = unsafe {
+        device
+            .create_sampler(&sampler_info, None)
+            .map_err(|e| format!("Failed to create shadow comparison sampler: {:?}", e))?
+    };
+
+    // 6. Create shadow pipeline with push constants (mat4 MVP = 64 bytes)
+    // Create shader module from embedded SPIR-V
+    let spv_u32: Vec<u32> = SHADOW_VERT_SPV
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let vert_module = unsafe {
+        device
+            .create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&spv_u32),
+                None,
+            )
+            .map_err(|e| format!("Failed to create shadow vertex shader module: {:?}", e))?
+    };
+
+    // Pipeline layout: push constant mat4 (64 bytes) for vertex stage
+    let push_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(64);
+
+    let pipeline_layout = unsafe {
+        device
+            .create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .push_constant_ranges(std::slice::from_ref(&push_range)),
+                None,
+            )
+            .map_err(|e| format!("Failed to create shadow pipeline layout: {:?}", e))?
+    };
+
+    // Vertex input: only position (vec3, 12 bytes at offset 0), but stride matches the glTF VBO
+    let entry_name = c"main";
+    let shader_stages = [vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::VERTEX)
+        .module(vert_module)
+        .name(entry_name)];
+
+    // The shadow shader reads only location 0 (vec3 position) but the VBO
+    // has a stride of gltf_vertex_stride (48 for glTF with tangents, or 32).
+    let stride = if gltf_vertex_stride > 0 { gltf_vertex_stride } else { 32 };
+    let binding_desc = [vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(stride)
+        .input_rate(vk::VertexInputRate::VERTEX)];
+
+    let attr_descs = [vk::VertexInputAttributeDescription::default()
+        .binding(0)
+        .location(0)
+        .format(vk::Format::R32G32B32_SFLOAT)
+        .offset(0)];
+
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&binding_desc)
+        .vertex_attribute_descriptions(&attr_descs);
+
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+    let viewport = vk::Viewport::default()
+        .width(res as f32)
+        .height(res as f32)
+        .max_depth(1.0);
+    let scissor = vk::Rect2D::default().extent(vk::Extent2D { width: res, height: res });
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewports(std::slice::from_ref(&viewport))
+        .scissors(std::slice::from_ref(&scissor));
+
+    let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE) // No culling for shadow maps (avoids peter-panning)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0)
+        .depth_bias_enable(true)
+        .depth_bias_constant_factor(1.25)
+        .depth_bias_slope_factor(1.75);
+
+    let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+
+    // No color attachments for depth-only pass
+    let color_blending = vk::PipelineColorBlendStateCreateInfo::default();
+
+    let pipeline = unsafe {
+        device
+            .create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::GraphicsPipelineCreateInfo::default()
+                    .stages(&shader_stages)
+                    .vertex_input_state(&vertex_input)
+                    .input_assembly_state(&input_assembly)
+                    .viewport_state(&viewport_state)
+                    .rasterization_state(&rasterizer)
+                    .multisample_state(&multisampling)
+                    .depth_stencil_state(&depth_stencil)
+                    .color_blend_state(&color_blending)
+                    .layout(pipeline_layout)
+                    .render_pass(render_pass)
+                    .subpass(0)],
+                None,
+            )
+            .map_err(|e| format!("Failed to create shadow pipeline: {:?}", e))?[0]
+    };
+
+    info!(
+        "Shadow resources created: {} layers, {}x{}, D32_SFLOAT",
+        layer_count, res, res
+    );
+
+    Ok(ShadowResources {
+        image,
+        image_alloc,
+        array_view,
+        per_layer_views,
+        framebuffers,
+        render_pass,
+        comparison_sampler,
+        pipeline,
+        pipeline_layout,
+        vert_module,
+    })
 }
 
 // =========================================================================
@@ -2600,6 +3212,27 @@ pub struct PersistentRenderer {
     mvp_buffer: GpuBuffer,
     light_buffer: GpuBuffer,
     material_buffer: GpuBuffer,
+
+    // Multi-light (Phase E)
+    has_multi_light: bool,
+    lights_ssbo: Option<GpuBuffer>,
+    scene_light_ubo: Option<GpuBuffer>,
+
+    // Shadow maps (Phase F)
+    shadow_enabled: bool,
+    shadow_image: vk::Image,
+    shadow_image_alloc: Option<gpu_allocator::vulkan::Allocation>,
+    shadow_array_view: vk::ImageView,
+    shadow_per_layer_views: Vec<vk::ImageView>,
+    shadow_framebuffers: Vec<vk::Framebuffer>,
+    shadow_render_pass: vk::RenderPass,
+    shadow_sampler: vk::Sampler,
+    shadow_pipeline: vk::Pipeline,
+    shadow_pipeline_layout: vk::PipelineLayout,
+    shadow_vert_module: vk::ShaderModule,
+    shadow_matrices_ssbo: Option<GpuBuffer>,
+    shadow_count: u32,
+    scene_manager: scene_manager::SceneManager,
 
     // Push constants
     push_constant_data: Vec<u8>,
@@ -2871,6 +3504,149 @@ impl PersistentRenderer {
             &device, ctx.allocator_mut(), &light_data,
             vk::BufferUsageFlags::UNIFORM_BUFFER, "pbr_light",
         )?;
+
+        // --- Multi-light SSBO (Phase E) ---
+        let mut sm = scene_manager::SceneManager::new();
+        if let Some(ref gs) = gltf_scene {
+            sm.populate_lights_from_gltf(&gs.lights);
+        } else {
+            sm.populate_lights_from_gltf(&[]);
+        }
+
+        // Check if any shader in the merged reflection uses a "lights" SSBO
+        let has_multi_light = merged.values().any(|bindings| {
+            bindings.iter().any(|b| b.name == "lights" && b.binding_type == "storage_buffer")
+        });
+
+        let mut lights_ssbo: Option<scene_manager::GpuBuffer> = None;
+        if has_multi_light {
+            let light_floats = sm.pack_lights_buffer();
+            let data: &[u8] = if light_floats.is_empty() {
+                &[0u8; 64]
+            } else {
+                bytemuck::cast_slice(&light_floats)
+            };
+            let buf = create_buffer_with_data(
+                &device, ctx.allocator_mut(), data,
+                vk::BufferUsageFlags::STORAGE_BUFFER, "lights_ssbo",
+            )?;
+            info!("PersistentRenderer multi-light SSBO: {} lights, {} bytes", sm.lights.len(), data.len());
+            lights_ssbo = Some(buf);
+        }
+
+        let mut scene_light_ubo: Option<scene_manager::GpuBuffer> = None;
+        if has_multi_light {
+            let mut scene_light_data = [0u8; 32];
+            scene_light_data[0..12].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
+            scene_light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
+            let light_count = sm.lights.len() as i32;
+            scene_light_data[16..20].copy_from_slice(&light_count.to_le_bytes());
+            scene_light_data[20..32].fill(0);
+            let buf = create_buffer_with_data(
+                &device, ctx.allocator_mut(), &scene_light_data,
+                vk::BufferUsageFlags::UNIFORM_BUFFER, "scene_light_ubo",
+            )?;
+            scene_light_ubo = Some(buf);
+        }
+
+        // --- Shadow maps (Phase F) ---
+        // Detect from reflection: look for "shadow_maps" sampler and "shadow_matrices" storage_buffer
+        let has_shadow_maps = merged.values().any(|bindings| {
+            bindings.iter().any(|b| b.name == "shadow_maps")
+        });
+        let has_shadow_matrices = merged.values().any(|bindings| {
+            bindings.iter().any(|b| b.name == "shadow_matrices" && b.binding_type == "storage_buffer")
+        });
+        let shadow_needed = has_shadow_maps && has_shadow_matrices;
+
+        let mut shadow_enabled = false;
+        let mut shadow_image = vk::Image::null();
+        let mut shadow_image_alloc: Option<gpu_allocator::vulkan::Allocation> = None;
+        let mut shadow_array_view = vk::ImageView::null();
+        let mut shadow_per_layer_views: Vec<vk::ImageView> = Vec::new();
+        let mut shadow_framebuffers: Vec<vk::Framebuffer> = Vec::new();
+        let mut shadow_render_pass = vk::RenderPass::null();
+        let mut shadow_sampler = vk::Sampler::null();
+        let mut shadow_pipeline = vk::Pipeline::null();
+        let mut shadow_pipeline_layout = vk::PipelineLayout::null();
+        let mut shadow_vert_module = vk::ShaderModule::null();
+        let mut shadow_matrices_ssbo: Option<GpuBuffer> = None;
+        let mut shadow_count_val: u32 = 0;
+
+        if shadow_needed {
+            // Compute shadow data from camera matrices
+            let view_mat = if has_scene_bounds {
+                crate::camera::look_at(auto_eye, auto_target, auto_up)
+            } else {
+                DefaultCamera::view()
+            };
+            let proj_mat = if has_scene_bounds {
+                crate::camera::perspective(45.0f32.to_radians(), aspect, 0.1, auto_far)
+            } else {
+                DefaultCamera::projection(aspect)
+            };
+            let view_arr: [f32; 16] = *view_mat.as_ref();
+            let proj_arr: [f32; 16] = *proj_mat.as_ref();
+            let near_val = 0.1f32;
+            let far_val = if has_scene_bounds { auto_far } else { DefaultCamera::FAR };
+
+            sm.compute_shadow_data(&view_arr, &proj_arr, near_val, far_val);
+            shadow_count_val = sm.shadow_count() as u32;
+
+            if shadow_count_val > 0 {
+                let layer_count = (shadow_count_val as usize).min(MAX_SHADOW_MAPS) as u32;
+                let res = create_shadow_resources(
+                    &device,
+                    ctx.allocator_mut(),
+                    layer_count.max(1), // at least 1 layer for valid image
+                    gltf_vertex_stride,
+                )?;
+
+                shadow_enabled = true;
+                shadow_image = res.image;
+                shadow_image_alloc = Some(res.image_alloc);
+                shadow_array_view = res.array_view;
+                shadow_per_layer_views = res.per_layer_views;
+                shadow_framebuffers = res.framebuffers;
+                shadow_render_pass = res.render_pass;
+                shadow_sampler = res.comparison_sampler;
+                shadow_pipeline = res.pipeline;
+                shadow_pipeline_layout = res.pipeline_layout;
+                shadow_vert_module = res.vert_module;
+
+                // Create shadow matrices SSBO
+                let shadow_floats = sm.pack_shadow_buffer();
+                let data: &[u8] = if shadow_floats.is_empty() {
+                    &[0u8; 80] // 20 floats * 4 bytes for at least one entry
+                } else {
+                    bytemuck::cast_slice(&shadow_floats)
+                };
+                let buf = create_buffer_with_data(
+                    &device, ctx.allocator_mut(), data,
+                    vk::BufferUsageFlags::STORAGE_BUFFER, "shadow_matrices_ssbo",
+                )?;
+                info!("Shadow matrices SSBO: {} entries, {} bytes", sm.shadow_count(), data.len());
+                shadow_matrices_ssbo = Some(buf);
+
+                // Re-pack lights buffer to include updated shadow_index values
+                if let Some(ref mut lights_buf) = lights_ssbo {
+                    let light_floats = sm.pack_lights_buffer();
+                    if !light_floats.is_empty() {
+                        let light_data: &[u8] = bytemuck::cast_slice(&light_floats);
+                        if let Some(ref mut alloc) = lights_buf.allocation {
+                            if let Some(mapped) = alloc.mapped_slice_mut() {
+                                let copy_len = light_data.len().min(mapped.len());
+                                mapped[..copy_len].copy_from_slice(&light_data[..copy_len]);
+                            }
+                        }
+                    }
+                }
+
+                info!("Shadow maps enabled: {} shadow-casting light(s)", shadow_count_val);
+            } else {
+                info!("Shadow maps: no shadow-casting lights found");
+            }
+        }
 
         let material_data = if let Some(ref gs) = gltf_scene {
             if !gs.materials.is_empty() {
@@ -3181,10 +3957,11 @@ impl PersistentRenderer {
                 vk::DescriptorSet::null()
             };
 
-            // Write set 0: MVP + Light
+            // Write set 0: MVP + Light (+ SceneLight UBO + lights SSBO + shadow bindings if present)
             {
                 let set0_merged = crate::reflected_pipeline::merge_descriptor_sets(&[&vert_refl]);
                 let mut buf_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+                let mut img_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
                 let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
 
                 if let Some(bindings) = set0_merged.get(&0) {
@@ -3194,6 +3971,13 @@ impl PersistentRenderer {
                             let (buffer, range) = match binding.name.as_str() {
                                 "MVP" => (mvp_buffer.buffer, binding.size as u64),
                                 "Light" => (light_buffer.buffer, binding.size as u64),
+                                "SceneLight" => {
+                                    if let Some(ref sl_buf) = scene_light_ubo {
+                                        (sl_buf.buffer, binding.size as u64)
+                                    } else {
+                                        continue;
+                                    }
+                                }
                                 _ => continue,
                             };
                             let idx = buf_infos.len();
@@ -3205,6 +3989,64 @@ impl PersistentRenderer {
                                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                                     .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
                             );
+                        } else if vk_type == vk::DescriptorType::STORAGE_BUFFER {
+                            if binding.name == "lights" {
+                                if let Some(ref lights_buf) = lights_ssbo {
+                                    let idx = buf_infos.len();
+                                    let ssbo_size = (sm.lights.len() as u64) * 64;
+                                    let range = if ssbo_size > 0 { ssbo_size } else { 64 };
+                                    buf_infos.push(vk::DescriptorBufferInfo::default().buffer(lights_buf.buffer).offset(0).range(range));
+                                    writes.push(
+                                        vk::WriteDescriptorSet::default()
+                                            .dst_set(vert_ds)
+                                            .dst_binding(binding.binding)
+                                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                            .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                    );
+                                }
+                            } else if binding.name == "shadow_matrices" {
+                                if let Some(ref sm_buf) = shadow_matrices_ssbo {
+                                    let idx = buf_infos.len();
+                                    let ssbo_size = (shadow_count_val as u64) * 80;
+                                    let range = if ssbo_size > 0 { ssbo_size } else { 80 };
+                                    buf_infos.push(vk::DescriptorBufferInfo::default().buffer(sm_buf.buffer).offset(0).range(range));
+                                    writes.push(
+                                        vk::WriteDescriptorSet::default()
+                                            .dst_set(vert_ds)
+                                            .dst_binding(binding.binding)
+                                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                            .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                    );
+                                }
+                            }
+                        } else if vk_type == vk::DescriptorType::SAMPLED_IMAGE && binding.name == "shadow_maps" {
+                            if shadow_enabled {
+                                let idx = img_infos.len();
+                                img_infos.push(
+                                    vk::DescriptorImageInfo::default()
+                                        .image_view(shadow_array_view)
+                                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                                );
+                                writes.push(
+                                    vk::WriteDescriptorSet::default()
+                                        .dst_set(vert_ds)
+                                        .dst_binding(binding.binding)
+                                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                        .image_info(unsafe { std::slice::from_raw_parts(&img_infos[idx] as *const _, 1) }),
+                                );
+                            }
+                        } else if vk_type == vk::DescriptorType::SAMPLER && binding.name == "shadow_maps" {
+                            if shadow_enabled {
+                                let idx = img_infos.len();
+                                img_infos.push(vk::DescriptorImageInfo::default().sampler(shadow_sampler));
+                                writes.push(
+                                    vk::WriteDescriptorSet::default()
+                                        .dst_set(vert_ds)
+                                        .dst_binding(binding.binding)
+                                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                                        .image_info(unsafe { std::slice::from_raw_parts(&img_infos[idx] as *const _, 1) }),
+                                );
+                            }
                         }
                     }
                 }
@@ -3326,6 +4168,12 @@ impl PersistentRenderer {
                                             (mat_buf.buffer, std::mem::size_of::<MaterialUboData>() as u64)
                                         } else if binding.name == "Light" {
                                             (light_buffer.buffer, binding.size as u64)
+                                        } else if binding.name == "SceneLight" {
+                                            if let Some(ref sl_buf) = scene_light_ubo {
+                                                (sl_buf.buffer, binding.size as u64)
+                                            } else {
+                                                continue;
+                                            }
                                         } else {
                                             continue;
                                         };
@@ -3341,8 +4189,41 @@ impl PersistentRenderer {
                                                 .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
                                         );
                                     }
+                                    vk::DescriptorType::STORAGE_BUFFER => {
+                                        if binding.name == "lights" {
+                                            if let Some(ref lights_buf) = lights_ssbo {
+                                                let idx = buf_infos.len();
+                                                let ssbo_size = (sm.lights.len() as u64) * 64;
+                                                let range = if ssbo_size > 0 { ssbo_size } else { 64 };
+                                                buf_infos.push(vk::DescriptorBufferInfo::default().buffer(lights_buf.buffer).offset(0).range(range));
+                                                writes.push(
+                                                    vk::WriteDescriptorSet::default()
+                                                        .dst_set(ds).dst_binding(binding.binding)
+                                                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                                        .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                                );
+                                            }
+                                        } else if binding.name == "shadow_matrices" {
+                                            if let Some(ref sm_buf) = shadow_matrices_ssbo {
+                                                let idx = buf_infos.len();
+                                                let ssbo_size = (shadow_count_val as u64) * 80;
+                                                let range = if ssbo_size > 0 { ssbo_size } else { 80 };
+                                                buf_infos.push(vk::DescriptorBufferInfo::default().buffer(sm_buf.buffer).offset(0).range(range));
+                                                writes.push(
+                                                    vk::WriteDescriptorSet::default()
+                                                        .dst_set(ds).dst_binding(binding.binding)
+                                                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                                        .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                                );
+                                            }
+                                        }
+                                    }
                                     vk::DescriptorType::SAMPLER => {
-                                        let actual_sampler = ibl_assets.sampler_for_binding(&binding.name).unwrap_or(sampler);
+                                        let actual_sampler = if binding.name == "shadow_maps" && shadow_enabled {
+                                            shadow_sampler
+                                        } else {
+                                            ibl_assets.sampler_for_binding(&binding.name).unwrap_or(sampler)
+                                        };
                                         let idx = img_infos.len();
                                         img_infos.push(vk::DescriptorImageInfo::default().sampler(actual_sampler));
                                         writes.push(
@@ -3354,7 +4235,9 @@ impl PersistentRenderer {
                                     }
                                     vk::DescriptorType::SAMPLED_IMAGE => {
                                         let is_cube = crate::reflected_pipeline::is_cube_image_binding(&binding.binding_type);
-                                        let view = if is_cube || binding.name == "brdf_lut" {
+                                        let view = if binding.name == "shadow_maps" && shadow_enabled {
+                                            shadow_array_view
+                                        } else if is_cube || binding.name == "brdf_lut" {
                                             ibl_assets.view_for_binding(&binding.name).unwrap_or(default_texture.view)
                                         } else {
                                             let per_mat_view = if mi < per_material_textures.len() {
@@ -3552,6 +4435,23 @@ impl PersistentRenderer {
                 mvp_buffer,
                 light_buffer,
                 material_buffer,
+                has_multi_light,
+                lights_ssbo,
+                scene_light_ubo,
+                shadow_enabled,
+                shadow_image,
+                shadow_image_alloc,
+                shadow_array_view,
+                shadow_per_layer_views,
+                shadow_framebuffers,
+                shadow_render_pass,
+                shadow_sampler,
+                shadow_pipeline,
+                shadow_pipeline_layout,
+                shadow_vert_module,
+                shadow_matrices_ssbo,
+                shadow_count: shadow_count_val,
+                scene_manager: sm,
                 push_constant_data,
                 push_constant_stage_flags,
                 sampler,
@@ -3679,9 +4579,10 @@ impl PersistentRenderer {
                 crate::reflected_pipeline::create_pipeline_layout_from_merged(&device, &ds_layouts, &push_ranges)?
             };
 
-            // Write vertex set: MVP + Light only
+            // Write vertex set: MVP + Light (+ SceneLight UBO + lights SSBO + shadow bindings)
             {
                 let mut buf_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+                let mut img_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
                 let mut writes: Vec<vk::WriteDescriptorSet> = Vec::new();
 
                 if let Some(bindings) = merged.get(&vert_set_idx) {
@@ -3691,6 +4592,13 @@ impl PersistentRenderer {
                             let (buffer, range) = match binding.name.as_str() {
                                 "MVP" => (mvp_buffer.buffer, binding.size as u64),
                                 "Light" => (light_buffer.buffer, binding.size as u64),
+                                "SceneLight" => {
+                                    if let Some(ref sl_buf) = scene_light_ubo {
+                                        (sl_buf.buffer, binding.size as u64)
+                                    } else {
+                                        continue;
+                                    }
+                                }
                                 _ => continue,
                             };
                             let idx = buf_infos.len();
@@ -3702,6 +4610,65 @@ impl PersistentRenderer {
                                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                                     .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
                             );
+                        } else if vk_type == vk::DescriptorType::STORAGE_BUFFER {
+                            if binding.name == "lights" {
+                                if let Some(ref lights_buf) = lights_ssbo {
+                                    let idx = buf_infos.len();
+                                    let ssbo_size = (sm.lights.len() as u64) * 64;
+                                    let range = if ssbo_size > 0 { ssbo_size } else { 64 };
+                                    buf_infos.push(vk::DescriptorBufferInfo::default().buffer(lights_buf.buffer).offset(0).range(range));
+                                    writes.push(
+                                        vk::WriteDescriptorSet::default()
+                                            .dst_set(vert_ds)
+                                            .dst_binding(binding.binding)
+                                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                            .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                    );
+                                }
+                            } else if binding.name == "shadow_matrices" {
+                                if let Some(ref sm_buf) = shadow_matrices_ssbo {
+                                    let idx = buf_infos.len();
+                                    let ssbo_size = (shadow_count_val as u64) * 80;
+                                    let range = if ssbo_size > 0 { ssbo_size } else { 80 };
+                                    buf_infos.push(vk::DescriptorBufferInfo::default().buffer(sm_buf.buffer).offset(0).range(range));
+                                    writes.push(
+                                        vk::WriteDescriptorSet::default()
+                                            .dst_set(vert_ds)
+                                            .dst_binding(binding.binding)
+                                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                            .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                    );
+                                }
+                            }
+                        } else if vk_type == vk::DescriptorType::SAMPLED_IMAGE && binding.name == "shadow_maps" {
+                            if shadow_enabled {
+                                let idx = img_infos.len();
+                                img_infos.push(
+                                    vk::DescriptorImageInfo::default()
+                                        .image_view(shadow_array_view)
+                                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                                );
+                                writes.push(
+                                    vk::WriteDescriptorSet::default()
+                                        .dst_set(vert_ds)
+                                        .dst_binding(binding.binding)
+                                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                                        .image_info(unsafe { std::slice::from_raw_parts(&img_infos[idx] as *const _, 1) }),
+                                );
+                            }
+                        } else if vk_type == vk::DescriptorType::SAMPLER && binding.name == "shadow_maps" {
+                            // Combined sampler for shadow maps
+                            if shadow_enabled {
+                                let idx = img_infos.len();
+                                img_infos.push(vk::DescriptorImageInfo::default().sampler(shadow_sampler));
+                                writes.push(
+                                    vk::WriteDescriptorSet::default()
+                                        .dst_set(vert_ds)
+                                        .dst_binding(binding.binding)
+                                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                                        .image_info(unsafe { std::slice::from_raw_parts(&img_infos[idx] as *const _, 1) }),
+                                );
+                            }
                         }
                     }
                 }
@@ -3745,6 +4712,12 @@ impl PersistentRenderer {
                                     (per_material_buffers[mi].buffer, std::mem::size_of::<MaterialUboData>() as u64)
                                 } else if binding.name == "Light" {
                                     (light_buffer.buffer, binding.size as u64)
+                                } else if binding.name == "SceneLight" {
+                                    if let Some(ref sl_buf) = scene_light_ubo {
+                                        (sl_buf.buffer, binding.size as u64)
+                                    } else {
+                                        continue;
+                                    }
                                 } else {
                                     continue;
                                 };
@@ -3760,8 +4733,41 @@ impl PersistentRenderer {
                                         .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
                                 );
                             }
+                            vk::DescriptorType::STORAGE_BUFFER => {
+                                if binding.name == "lights" {
+                                    if let Some(ref lights_buf) = lights_ssbo {
+                                        let idx = buf_infos.len();
+                                        let ssbo_size = (sm.lights.len() as u64) * 64;
+                                        let range = if ssbo_size > 0 { ssbo_size } else { 64 };
+                                        buf_infos.push(vk::DescriptorBufferInfo::default().buffer(lights_buf.buffer).offset(0).range(range));
+                                        writes.push(
+                                            vk::WriteDescriptorSet::default()
+                                                .dst_set(ds).dst_binding(binding.binding)
+                                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                                .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                        );
+                                    }
+                                } else if binding.name == "shadow_matrices" {
+                                    if let Some(ref sm_buf) = shadow_matrices_ssbo {
+                                        let idx = buf_infos.len();
+                                        let ssbo_size = (shadow_count_val as u64) * 80;
+                                        let range = if ssbo_size > 0 { ssbo_size } else { 80 };
+                                        buf_infos.push(vk::DescriptorBufferInfo::default().buffer(sm_buf.buffer).offset(0).range(range));
+                                        writes.push(
+                                            vk::WriteDescriptorSet::default()
+                                                .dst_set(ds).dst_binding(binding.binding)
+                                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                                .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                        );
+                                    }
+                                }
+                            }
                             vk::DescriptorType::SAMPLER => {
-                                let actual_sampler = ibl_assets.sampler_for_binding(&binding.name).unwrap_or(sampler);
+                                let actual_sampler = if binding.name == "shadow_maps" && shadow_enabled {
+                                    shadow_sampler
+                                } else {
+                                    ibl_assets.sampler_for_binding(&binding.name).unwrap_or(sampler)
+                                };
                                 let idx = img_infos.len();
                                 img_infos.push(vk::DescriptorImageInfo::default().sampler(actual_sampler));
                                 writes.push(
@@ -3773,7 +4779,9 @@ impl PersistentRenderer {
                             }
                             vk::DescriptorType::SAMPLED_IMAGE => {
                                 let is_cube = crate::reflected_pipeline::is_cube_image_binding(&binding.binding_type);
-                                let view = if is_cube || binding.name == "brdf_lut" {
+                                let view = if binding.name == "shadow_maps" && shadow_enabled {
+                                    shadow_array_view
+                                } else if is_cube || binding.name == "brdf_lut" {
                                     ibl_assets.view_for_binding(&binding.name).unwrap_or(default_texture.view)
                                 } else {
                                     let per_mat_view = if mi < per_material_textures.len() {
@@ -3914,6 +4922,23 @@ impl PersistentRenderer {
                 mvp_buffer,
                 light_buffer,
                 material_buffer,
+                has_multi_light,
+                lights_ssbo,
+                scene_light_ubo,
+                shadow_enabled,
+                shadow_image,
+                shadow_image_alloc,
+                shadow_array_view,
+                shadow_per_layer_views,
+                shadow_framebuffers,
+                shadow_render_pass,
+                shadow_sampler,
+                shadow_pipeline,
+                shadow_pipeline_layout,
+                shadow_vert_module,
+                shadow_matrices_ssbo,
+                shadow_count: shadow_count_val,
+                scene_manager: sm,
                 push_constant_data,
                 push_constant_stage_flags,
                 sampler,
@@ -3968,6 +4993,18 @@ impl PersistentRenderer {
                 mapped[16..28].copy_from_slice(bytes);
             }
         }
+
+        // Update view_pos in SceneLight UBO (offset 0, size 12) for multi-light mode
+        if self.has_multi_light {
+            if let Some(ref mut sl_buf) = self.scene_light_ubo {
+                if let Some(ref mut alloc) = sl_buf.allocation {
+                    if let Some(mapped) = alloc.mapped_slice_mut() {
+                        let bytes = bytemuck::cast_slice::<f32, u8>(eye.as_ref());
+                        mapped[0..12].copy_from_slice(bytes);
+                    }
+                }
+            }
+        }
     }
 
     /// Record and submit rendering commands. The offscreen color_image
@@ -3995,6 +5032,63 @@ impl PersistentRenderer {
                 .map_err(|e| format!("Failed to begin command buffer: {:?}", e))?;
         }
 
+        // --- Shadow pass (before main color pass) ---
+        if self.shadow_enabled && self.shadow_count > 0 {
+            ctx.cmd_begin_label(cmd, "Shadow Pass", [0.5, 0.5, 0.0, 1.0]);
+            let shadow_clear = [vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+            }];
+
+            for layer in 0..self.shadow_count as usize {
+                if layer >= self.shadow_framebuffers.len() || layer >= self.scene_manager.shadow_entries.len() {
+                    break;
+                }
+
+                let shadow_rp_begin = vk::RenderPassBeginInfo::default()
+                    .render_pass(self.shadow_render_pass)
+                    .framebuffer(self.shadow_framebuffers[layer])
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent: vk::Extent2D {
+                            width: SHADOW_MAP_RESOLUTION,
+                            height: SHADOW_MAP_RESOLUTION,
+                        },
+                    })
+                    .clear_values(&shadow_clear);
+
+                unsafe {
+                    device.cmd_begin_render_pass(cmd, &shadow_rp_begin, vk::SubpassContents::INLINE);
+                    device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.shadow_pipeline);
+                    device.cmd_bind_vertex_buffers(cmd, 0, &[self.vbo.buffer], &[0]);
+                    device.cmd_bind_index_buffer(cmd, self.ibo.buffer, 0, vk::IndexType::UINT32);
+
+                    // Push the light's view-projection matrix as MVP (model is identity)
+                    let light_vp = &self.scene_manager.shadow_entries[layer].view_projection;
+                    let mvp_bytes: &[u8] = bytemuck::cast_slice(light_vp);
+                    device.cmd_push_constants(
+                        cmd,
+                        self.shadow_pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX,
+                        0,
+                        mvp_bytes,
+                    );
+
+                    // Draw all meshes
+                    if !self.draw_ranges.is_empty() {
+                        for range in &self.draw_ranges {
+                            device.cmd_draw_indexed(cmd, range.index_count, 1, range.index_offset, 0, 0);
+                        }
+                    } else {
+                        device.cmd_draw_indexed(cmd, self.num_indices, 1, 0, 0, 0);
+                    }
+
+                    device.cmd_end_render_pass(cmd);
+                }
+            }
+            ctx.cmd_end_label(cmd);
+        }
+
+        // --- Main color pass ---
         let clear_values = [
             vk::ClearValue {
                 color: vk::ClearColorValue { float32: [0.05, 0.05, 0.08, 1.0] },
@@ -4258,6 +5352,52 @@ impl PersistentRenderer {
         self.ibl_assets.destroy(&device, ctx.allocator_mut());
         self.mvp_buffer.destroy(&device, ctx.allocator_mut());
         self.light_buffer.destroy(&device, ctx.allocator_mut());
+        if let Some(mut buf) = self.lights_ssbo.take() {
+            buf.destroy(&device, ctx.allocator_mut());
+        }
+        if let Some(mut buf) = self.scene_light_ubo.take() {
+            buf.destroy(&device, ctx.allocator_mut());
+        }
+
+        // Clean up shadow resources
+        if self.shadow_enabled {
+            unsafe {
+                if self.shadow_pipeline != vk::Pipeline::null() {
+                    device.destroy_pipeline(self.shadow_pipeline, None);
+                }
+                if self.shadow_pipeline_layout != vk::PipelineLayout::null() {
+                    device.destroy_pipeline_layout(self.shadow_pipeline_layout, None);
+                }
+                if self.shadow_vert_module != vk::ShaderModule::null() {
+                    device.destroy_shader_module(self.shadow_vert_module, None);
+                }
+                for fb in self.shadow_framebuffers.drain(..) {
+                    device.destroy_framebuffer(fb, None);
+                }
+                for view in self.shadow_per_layer_views.drain(..) {
+                    device.destroy_image_view(view, None);
+                }
+                if self.shadow_array_view != vk::ImageView::null() {
+                    device.destroy_image_view(self.shadow_array_view, None);
+                }
+                if self.shadow_render_pass != vk::RenderPass::null() {
+                    device.destroy_render_pass(self.shadow_render_pass, None);
+                }
+                if self.shadow_sampler != vk::Sampler::null() {
+                    device.destroy_sampler(self.shadow_sampler, None);
+                }
+            }
+            if let Some(alloc) = self.shadow_image_alloc.take() {
+                let _ = ctx.allocator_mut().free(alloc);
+            }
+            if self.shadow_image != vk::Image::null() {
+                unsafe { device.destroy_image(self.shadow_image, None); }
+            }
+            if let Some(mut buf) = self.shadow_matrices_ssbo.take() {
+                buf.destroy(&device, ctx.allocator_mut());
+            }
+        }
+
         self.material_buffer.destroy(&device, ctx.allocator_mut());
         for mut buf in self.per_material_buffers.drain(..) {
             buf.destroy(&device, ctx.allocator_mut());

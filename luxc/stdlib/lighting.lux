@@ -103,3 +103,15 @@ fn evaluate_light(
 
     return dir_contrib * is_dir + point_contrib * is_point + spot_contrib * is_spot;
 }
+
+fn evaluate_light_direction(
+    light_type: scalar,
+    light_pos: vec3,
+    light_dir: vec3,
+    surface_pos: vec3
+) -> vec3 {
+    let dir_l: vec3 = normalize(light_dir);
+    let point_l: vec3 = normalize(light_pos - surface_pos);
+    let is_dir: scalar = (light_type < 0.5) ? 1.0 : 0.0;
+    return dir_l * is_dir + point_l * (1.0 - is_dir);
+}

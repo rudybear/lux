@@ -92,6 +92,32 @@ _BINDLESS_MATERIAL_FIELDS = [
     ("_pad3", "uint"),
 ]
 
+# LightData struct fields: (name, lux_type)
+# Must match the GPU-side struct layout (std430)
+# 64 bytes per light: 4 vec4s
+_LIGHT_DATA_FIELDS = [
+    ("light_type", "scalar"),   # 0=dir, 1=point, 2=spot
+    ("intensity", "scalar"),
+    ("range", "scalar"),
+    ("inner_cone", "scalar"),
+    ("position", "vec3"),
+    ("outer_cone", "scalar"),
+    ("direction", "vec3"),
+    ("shadow_index", "scalar"), # -1.0 = no shadow
+    ("color", "vec3"),
+    ("_pad", "scalar"),
+]
+
+# ShadowEntry struct fields for shadow matrix data
+# 80 bytes per entry (std430)
+_SHADOW_ENTRY_FIELDS = [
+    ("view_projection", "mat4"),   # 64 bytes
+    ("bias", "scalar"),            # 4 bytes
+    ("normal_bias", "scalar"),     # 4 bytes
+    ("resolution", "scalar"),      # 4 bytes
+    ("_pad", "scalar"),            # 4 bytes
+]
+
 
 def generate_spirv(module: Module, stage: StageBlock, debug: bool = False, source_name: str = "") -> str:
     gen = SpvGenerator(module, stage, debug=debug, source_name=source_name)
@@ -433,9 +459,16 @@ class SpvGenerator:
             self.decorations.append(f"OpDecorate {sampler_var} Binding {sam.binding}")
             self.interface_ids.append(sampler_var)
 
-            # Texture image variable (2D or Cube depending on sampler type)
-            is_cube = getattr(sam, 'type_name', 'sampler2d') == 'samplerCube'
-            image_type = self.reg.cube_image_type() if is_cube else self.reg.image_type()
+            # Texture image variable (2D, Cube, 2DArray, or CubeArray depending on sampler type)
+            sam_type_name = getattr(sam, 'type_name', 'sampler2d')
+            if sam_type_name == 'samplerCube':
+                image_type = self.reg.cube_image_type()
+            elif sam_type_name == 'sampler2DArray':
+                image_type = self.reg.image_2d_array_type()
+            elif sam_type_name == 'samplerCubeArray':
+                image_type = self.reg.image_cube_array_type()
+            else:
+                image_type = self.reg.image_type()
             image_ptr = self.reg.pointer("UniformConstant", image_type)
             texture_var = self.reg.next_id()
             self.global_vars.append(f"{texture_var} = OpVariable {image_ptr} UniformConstant")
@@ -446,7 +479,6 @@ class SpvGenerator:
             # Store both var IDs for use in sample() codegen
             self.var_map[sam.name + ".__sampler"] = sampler_var
             self.var_map[sam.name + ".__texture"] = texture_var
-            sam_type_name = getattr(sam, 'type_name', 'sampler2d')
             self.var_types[sam.name] = sam_type_name
             self.var_storage[sam.name] = "UniformConstant"
 
@@ -552,6 +584,12 @@ class SpvGenerator:
             if sb.element_type == "BindlessMaterialData":
                 elem_type_id, stride = self._declare_bindless_material_struct()
                 self._ssbo_struct_fields[sb.name] = _BINDLESS_MATERIAL_FIELDS
+            elif sb.element_type == "LightData":
+                elem_type_id, stride = self._declare_light_data_struct()
+                self._ssbo_struct_fields[sb.name] = _LIGHT_DATA_FIELDS
+            elif sb.element_type == "ShadowEntry":
+                elem_type_id, stride = self._declare_shadow_entry_struct()
+                self._ssbo_struct_fields[sb.name] = _SHADOW_ENTRY_FIELDS
             else:
                 elem_type_id = self.reg.lux_type_to_spirv(sb.element_type)
 
@@ -593,6 +631,8 @@ class SpvGenerator:
             # Decorations
             self.decorations.append(f"OpDecorate {struct_id} Block")
             self.decorations.append(f"OpMemberDecorate {struct_id} 0 Offset 0")
+            self.decorations.append(f"OpMemberDecorate {struct_id} 0 NonWritable")
+            self.decorations.append(f"OpDecorate {var_id} NonWritable")
             if sb.set_number is not None:
                 self.decorations.append(f"OpDecorate {var_id} DescriptorSet {sb.set_number}")
             if sb.binding is not None:
@@ -769,6 +809,72 @@ class SpvGenerator:
             offset += size
 
         # Stride = round up to largest alignment (16 for vec4)
+        stride = (offset + 15) & ~15
+        return struct_id, stride
+
+    def _declare_light_data_struct(self) -> tuple[str, int]:
+        """Declare the LightData struct type in SPIR-V.
+        Returns (struct_type_id, stride_in_bytes).
+        """
+        key = "LightData"
+        if key in self.reg._types:
+            return self.reg._types[key], 64  # cached
+
+        member_types = []
+        for fname, ftype in _LIGHT_DATA_FIELDS:
+            tid = self.reg.lux_type_to_spirv(ftype)
+            member_types.append(tid)
+
+        struct_id = self.reg.struct(key, member_types)
+
+        offset = 0
+        _STD430 = {
+            "scalar": (4, 4), "int": (4, 4), "uint": (4, 4),
+            "vec2": (8, 8), "vec3": (12, 16), "vec4": (16, 16),
+            "mat4": (64, 16),
+        }
+        for i, (fname, ftype) in enumerate(_LIGHT_DATA_FIELDS):
+            size, align = _STD430.get(ftype, (4, 4))
+            offset = (offset + align - 1) & ~(align - 1)
+            self.decorations.append(f"OpMemberDecorate {struct_id} {i} Offset {offset}")
+            if ftype == "mat4":
+                self.decorations.append(f"OpMemberDecorate {struct_id} {i} ColMajor")
+                self.decorations.append(f"OpMemberDecorate {struct_id} {i} MatrixStride 16")
+            offset += size
+
+        stride = (offset + 15) & ~15
+        return struct_id, stride
+
+    def _declare_shadow_entry_struct(self) -> tuple[str, int]:
+        """Declare the ShadowEntry struct type in SPIR-V.
+        Returns (struct_type_id, stride_in_bytes).
+        """
+        key = "ShadowEntry"
+        if key in self.reg._types:
+            return self.reg._types[key], 80  # cached
+
+        member_types = []
+        for fname, ftype in _SHADOW_ENTRY_FIELDS:
+            tid = self.reg.lux_type_to_spirv(ftype)
+            member_types.append(tid)
+
+        struct_id = self.reg.struct(key, member_types)
+
+        offset = 0
+        _STD430 = {
+            "scalar": (4, 4), "int": (4, 4), "uint": (4, 4),
+            "vec2": (8, 8), "vec3": (12, 16), "vec4": (16, 16),
+            "mat4": (64, 16),
+        }
+        for i, (fname, ftype) in enumerate(_SHADOW_ENTRY_FIELDS):
+            size, align = _STD430.get(ftype, (4, 4))
+            offset = (offset + align - 1) & ~(align - 1)
+            self.decorations.append(f"OpMemberDecorate {struct_id} {i} Offset {offset}")
+            if ftype == "mat4":
+                self.decorations.append(f"OpMemberDecorate {struct_id} {i} ColMajor")
+                self.decorations.append(f"OpMemberDecorate {struct_id} {i} MatrixStride 16")
+            offset += size
+
         stride = (offset + 15) & ~15
         return struct_id, stride
 
@@ -1364,6 +1470,17 @@ class SpvGenerator:
             lines.append(f"{result} = OpLogicalNot {result_type} {operand_id}")
         return result, lines
 
+    def _resolve_sampler_types(self, sam_type: str) -> tuple[str, str]:
+        """Return (image_type, sampled_image_type) for a given sampler type name."""
+        if sam_type == "samplerCube":
+            return self.reg.cube_image_type(), self.reg.sampled_cube_image_type()
+        elif sam_type == "sampler2DArray":
+            return self.reg.image_2d_array_type(), self.reg.sampled_image_2d_array_type()
+        elif sam_type == "samplerCubeArray":
+            return self.reg.image_cube_array_type(), self.reg.sampled_cube_array_type()
+        else:
+            return self.reg.image_type(), self.reg.sampled_image_type()
+
     def _gen_call(self, expr: CallExpr, lines: list[str]) -> tuple[str, list[str]]:
         if not isinstance(expr.func, VarRef):
             raise ValueError("Non-simple function calls not supported")
@@ -1381,10 +1498,10 @@ class SpvGenerator:
             result = self.reg.next_id()
             if isinstance(sampler_arg, VarRef) and sampler_arg.name + ".__sampler" in self.var_map:
                 sam_name = sampler_arg.name
-                # Determine if this is a cube or 2D sampler
-                is_cube = self.var_types.get(sam_name) == "samplerCube"
+                # Determine sampler type and resolve image/sampled-image types
+                sam_type = self.var_types.get(sam_name, "sampler2d")
+                img_type, sampled_img_type = self._resolve_sampler_types(sam_type)
                 # Load the texture image
-                img_type = self.reg.cube_image_type() if is_cube else self.reg.image_type()
                 tex_loaded = self.reg.next_id()
                 lines.append(f"{tex_loaded} = OpLoad {img_type} {self.var_map[sam_name + '.__texture']}")
                 # Load the sampler
@@ -1392,7 +1509,6 @@ class SpvGenerator:
                 samp_loaded = self.reg.next_id()
                 lines.append(f"{samp_loaded} = OpLoad {samp_type} {self.var_map[sam_name + '.__sampler']}")
                 # Combine into sampled image
-                sampled_img_type = self.reg.sampled_cube_image_type() if is_cube else self.reg.sampled_image_type()
                 combined = self.reg.next_id()
                 lines.append(f"{combined} = OpSampledImage {sampled_img_type} {tex_loaded} {samp_loaded}")
                 # Sample
@@ -1416,14 +1532,13 @@ class SpvGenerator:
             result = self.reg.next_id()
             if isinstance(sampler_arg, VarRef) and sampler_arg.name + ".__sampler" in self.var_map:
                 sam_name = sampler_arg.name
-                is_cube = self.var_types.get(sam_name) == "samplerCube"
-                img_type = self.reg.cube_image_type() if is_cube else self.reg.image_type()
+                sam_type = self.var_types.get(sam_name, "sampler2d")
+                img_type, sampled_img_type = self._resolve_sampler_types(sam_type)
                 tex_loaded = self.reg.next_id()
                 lines.append(f"{tex_loaded} = OpLoad {img_type} {self.var_map[sam_name + '.__texture']}")
                 samp_type = self.reg.sampler_type()
                 samp_loaded = self.reg.next_id()
                 lines.append(f"{samp_loaded} = OpLoad {samp_type} {self.var_map[sam_name + '.__sampler']}")
-                sampled_img_type = self.reg.sampled_cube_image_type() if is_cube else self.reg.sampled_image_type()
                 combined = self.reg.next_id()
                 lines.append(f"{combined} = OpSampledImage {sampled_img_type} {tex_loaded} {samp_loaded}")
                 lines.append(f"{result} = OpImageSampleExplicitLod {result_type} {combined} {coords_id} Lod {lod_id}")

@@ -56,7 +56,7 @@ surface_decl: "surface" IDENT "{" surface_item ("," surface_item)* ","? "}"
 
 ?surface_item: surface_sampler | surface_member | surface_layers | surface_properties
 surface_sampler: SAMPLER_KW IDENT ("if" feature_expr)?
-SAMPLER_KW: "sampler2d" | "samplerCube"
+SAMPLER_KW: "sampler2d" | "samplerCube" | "sampler2DArray" | "samplerCubeArray"
 surface_member: IDENT ":" expr
 surface_layers: "layers" "[" layer_call ("," layer_call)* ","? "]"
 layer_call: IDENT "(" layer_arg ("," layer_arg)* ","? ")" ("if" feature_expr)?
@@ -133,7 +133,7 @@ push_block: "push" IDENT "{" block_field ("," block_field)* ","? "}"
 block_field: IDENT ":" type
 
 sampler_decl: SAMPLER_TYPE IDENT ";"
-SAMPLER_TYPE: "sampler2d" | "samplerCube"
+SAMPLER_TYPE: "sampler2d" | "samplerCube" | "sampler2DArray" | "samplerCubeArray"
 
 // RT-specific stage items
 ray_payload_decl: "ray_payload" IDENT ":" type ";"
@@ -195,7 +195,7 @@ TYPE_NAME: "scalar" | "int" | "uint" | "bool"
          | "ivec2" | "ivec3" | "ivec4"
          | "uvec2" | "uvec3" | "uvec4"
          | "mat2" | "mat3" | "mat4"
-         | "sampler2d" | "samplerCube" | "void"
+         | "sampler2d" | "samplerCube" | "sampler2DArray" | "samplerCubeArray" | "void"
          | "acceleration_structure"
          | IDENT
 

@@ -111,6 +111,31 @@ private:
     VkBuffer m_materialBuffer = VK_NULL_HANDLE;
     VmaAllocation m_materialAllocation = VK_NULL_HANDLE;
 
+    // Multi-light SSBO (when shader uses SceneLight UBO + lights SSBO)
+    VkBuffer m_lightsSSBO = VK_NULL_HANDLE;
+    VmaAllocation m_lightsSSBOAlloc = VK_NULL_HANDLE;
+    VkBuffer m_sceneLightUBO = VK_NULL_HANDLE;
+    VmaAllocation m_sceneLightUBOAlloc = VK_NULL_HANDLE;
+    bool m_hasMultiLight = false;
+
+    // Shadow map resources
+    static constexpr uint32_t SHADOW_MAP_SIZE = 1024;
+    static constexpr uint32_t MAX_SHADOW_MAPS = 8;
+    VkImage m_shadowImage = VK_NULL_HANDLE;
+    VmaAllocation m_shadowImageAlloc = VK_NULL_HANDLE;
+    VkImageView m_shadowImageView = VK_NULL_HANDLE;   // array view for shader sampling
+    std::vector<VkImageView> m_shadowLayerViews;       // per-layer views for framebuffers
+    std::vector<VkFramebuffer> m_shadowFramebuffers;
+    VkRenderPass m_shadowRenderPass = VK_NULL_HANDLE;
+    VkSampler m_shadowSampler = VK_NULL_HANDLE;        // comparison sampler
+    VkPipelineLayout m_shadowPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
+    VkShaderModule m_shadowVertModule = VK_NULL_HANDLE;
+    VkBuffer m_shadowMatricesSSBO = VK_NULL_HANDLE;
+    VmaAllocation m_shadowMatricesSSBOAlloc = VK_NULL_HANDLE;
+    bool m_hasShadows = false;
+    int m_numShadowMaps = 0;
+
     // Per-material descriptor sets and buffers (single-pipeline fallback)
     std::vector<VkDescriptorSet> m_perMaterialDescSets;
     std::vector<VkBuffer> m_perMaterialBuffers;
@@ -150,6 +175,12 @@ private:
     void createPipelineFullscreen(VulkanContext& ctx);
     void createPipelinePBR(VulkanContext& ctx);
     void setupPBRResources(VulkanContext& ctx);
+    void setupMultiLightResources(VulkanContext& ctx);
+
+    // Shadow map infrastructure
+    void setupShadowMaps(VulkanContext& ctx);
+    void renderShadowMaps(VulkanContext& ctx, VkCommandBuffer cmd);
+    void cleanupShadowMaps(VulkanContext& ctx);
 
     // Reflection-driven descriptor setup (single pipeline)
     void setupReflectedDescriptors(VulkanContext& ctx);

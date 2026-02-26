@@ -49,6 +49,19 @@ _BINDLESS_MATERIAL_FIELD_TYPES = {
     "material_flags": "uint",
 }
 
+# Field types for LightData struct (SSBO) — multi-light evaluation
+_LIGHT_DATA_FIELD_TYPES = {
+    "light_type": "scalar",
+    "intensity": "scalar",
+    "range": "scalar",
+    "inner_cone": "scalar",
+    "position": "vec3",
+    "outer_cone": "scalar",
+    "direction": "vec3",
+    "shadow_index": "scalar",
+    "color": "vec3",
+}
+
 
 def type_check(module: Module) -> None:
     checker = TypeChecker(module)
@@ -383,6 +396,15 @@ class TypeChecker:
             # SSBO struct field access (e.g. materials[idx].baseColorFactor)
             if obj_type.name == "BindlessMaterialData":
                 field_types = _BINDLESS_MATERIAL_FIELD_TYPES.get(expr.field)
+                if field_types is not None:
+                    result = resolve_type(field_types)
+                    if result is None:
+                        result = SCALAR
+                    expr.resolved_type = result.name
+                    return result
+                # Unknown field — fallback to scalar
+            if obj_type.name == "LightData":
+                field_types = _LIGHT_DATA_FIELD_TYPES.get(expr.field)
                 if field_types is not None:
                     result = resolve_type(field_types)
                     if result is None:

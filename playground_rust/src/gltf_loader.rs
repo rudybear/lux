@@ -249,6 +249,25 @@ pub fn flatten_scene(scene: &mut GltfScene) -> Vec<DrawItem> {
         }
     }
 
+    // Extract light positions/directions from node world transforms.
+    // We iterate by index to avoid simultaneous borrows of nodes and lights.
+    for ni in 0..scene.nodes.len() {
+        let light_index = scene.nodes[ni].light_index;
+        if light_index >= 0 && (light_index as usize) < scene.lights.len() {
+            let world = scene.nodes[ni].world_transform;
+            let li = light_index as usize;
+            // Position from column 3 (w_axis) of world transform
+            scene.lights[li].position = Vec3::new(
+                world.w_axis.x,
+                world.w_axis.y,
+                world.w_axis.z,
+            );
+            // Direction: transform -Z through the rotation part of the world matrix
+            let dir = world.transform_vector3(Vec3::new(0.0, 0.0, -1.0));
+            scene.lights[li].direction = dir.normalize_or_zero();
+        }
+    }
+
     items.sort_by_key(|d| d.material_index);
     items
 }
@@ -613,13 +632,16 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
         let mesh_index = node.mesh().map(|m| m.index() as i32).unwrap_or(-1);
         let camera_index = node.camera().map(|c| c.index() as i32).unwrap_or(-1);
 
+        // Set light index from node extension (KHR_lights_punctual)
+        let light_index = node.light().map(|l| l.index() as i32).unwrap_or(-1);
+
         scene.nodes.push(GltfNode {
             name: node.name().unwrap_or("unnamed").to_string(),
             local_transform,
             world_transform: Mat4::IDENTITY,
             mesh_index,
             camera_index,
-            light_index: -1,
+            light_index,
             children,
             parent: -1,
         });

@@ -11,14 +11,18 @@ if not exist playground_cpp\build\Release\lux-playground.exe (
 set SCENE=assets/DamagedHelmet.glb
 set IBL=pisa
 
-REM Check for compiled mesh shader pipeline
-if not exist shadercache\gltf_pbr_layered+emission.mesh.spv (
+REM Prefer manifest-based auto-selection, fall back to explicit permutation
+if exist shadercache\gltf_pbr_layered.manifest.json (
+    set PIPELINE=shadercache/gltf_pbr_layered
+    echo Using layered PBR mesh pipeline (manifest auto-selection^)
+) else if exist shadercache\gltf_pbr_layered+emission.mesh.spv (
+    set PIPELINE=shadercache/gltf_pbr_layered+emission
+    echo Using layered PBR mesh pipeline (emission permutation^)
+) else (
     echo No compiled mesh shaders found. Compile first with:
-    echo   compile_mesh.bat
+    echo   compile_all.bat
     exit /b 1
 )
-
-set PIPELINE=shadercache/gltf_pbr_layered+emission
 
 echo === Interactive C++ Mesh Shader Viewer ===
 echo   Scene:    %SCENE%

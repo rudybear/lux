@@ -277,6 +277,13 @@ def load_gltf(path: Path) -> GltfScene:
                 camera_index=node.camera if node.camera is not None else -1,
                 children=list(node.children) if node.children else [],
             )
+            # Check for light extension on node
+            if hasattr(node, 'extensions') and node.extensions:
+                light_ext = node.extensions.get("KHR_lights_punctual", {}) if isinstance(node.extensions, dict) else {}
+                if not isinstance(light_ext, dict) and hasattr(light_ext, '__dict__'):
+                    light_ext = vars(light_ext)
+                if "light" in light_ext:
+                    gnode.light_index = light_ext["light"]
             scene.nodes.append(gnode)
 
         # Set parent indices

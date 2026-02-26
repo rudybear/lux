@@ -391,3 +391,34 @@ procedural MetaBalls {
 | Mesh shader pipeline material wiring | Medium | glTF properties in mesh path | ✅ |
 | 10 new tests (435 total pass, SPIR-V validates) | Small | Regression safety | ✅ |
 | Screenshots verified across RT/raster/mesh for C++ and Rust engines | — | Visual correctness | ✅ |
+
+---
+
+### ✅ COMPLETE — P17.2: Multi-Light + Shadows
+
+**Problem**: The P17.1 `directional()` lighting layer supported only a single hardcoded light. Real scenes require multiple dynamic lights (directional, point, spot) with shadow mapping, all driven by runtime data rather than compile-time constants.
+
+**Solution**: Added a `multi_light()` lighting layer that performs compile-time unrolled N-light evaluation (default 16 iterations). Each iteration reads light parameters from a `LightData` SSBO (64 bytes/light, std430) and evaluates the surface BRDF using branchless light direction selection. Shadow mapping is supported via `ShadowEntry` SSBOs and `sampler2DArray`/`samplerCubeArray` texture arrays, gated by the `has_shadows` compile-time feature.
+
+**Architecture**: The `_emit_multi_light_loop()` helper in the surface expander is shared across all 6 expansion paths (raster, RT, mesh x non-bindless, bindless), ensuring consistent behavior. Engines auto-detect multi-light and shadow support from shader reflection JSON and bind the appropriate SSBOs and texture arrays. Light data is extracted from glTF `KHR_lights_punctual` at load time with world-space transforms applied.
+
+**Implementation**: Changes span the full stack -- grammar (sampler2DArray/samplerCubeArray types), SPIR-V codegen (arrayed image types), stdlib (shadow.lux, evaluate_light_direction), surface expander (multi_light loop emission), and all 3 engines (light extraction, buffer packing, shadow map infrastructure).
+
+| Item | Effort | Impact | Status |
+|---|---|---|---|
+| `multi_light()` lighting layer with compile-time unrolled loop | Large | Runtime N-light evaluation | ✅ |
+| `_emit_multi_light_loop()` shared helper (6 paths) | Medium | Consistent expansion across all pipelines | ✅ |
+| `LightData` SSBO struct (64 bytes/light) | Medium | GPU light data layout | ✅ |
+| `ShadowEntry` SSBO struct (80 bytes) | Medium | Shadow matrix + bias data | ✅ |
+| `sampler2DArray` + `samplerCubeArray` type support | Medium | Arrayed sampler types in grammar + SPIR-V | ✅ |
+| `evaluate_light_direction()` stdlib function | Small | Branchless directional/point/spot selection | ✅ |
+| `shadow.lux` stdlib (4 functions) | Medium | Shadow sampling + cascade selection | ✅ |
+| `SceneLight` struct + glTF light extraction (C++, Rust, Python) | Large | KHR_lights_punctual with world transforms | ✅ |
+| Light buffer packing (std430, 64 bytes/light) | Small | GPU buffer layout | ✅ |
+| Shadow map infrastructure (1024x1024 depth arrays, comparison samplers) | Large | Depth-only render passes | ✅ |
+| Shadow matrix computation (ortho for directional, perspective for spot) | Medium | Light-space transforms | ✅ |
+| Reflection-driven detection in engines | Small | Auto-detect multi-light/shadow from JSON | ✅ |
+| `multi_light_demo.lux` example | Small | Standalone demo | ✅ |
+| Updated `gltf_pbr_layered.lux` with multi_light + has_shadows | Small | Reference shader update | ✅ |
+| 40 new tests (542 total pass, SPIR-V validates) | Medium | Regression safety | ✅ |
+| Backward compatible: `directional()` layer still works | — | No breaking changes | ✅ |

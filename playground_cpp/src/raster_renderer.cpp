@@ -14,6 +14,87 @@
 #include <filesystem>
 
 // --------------------------------------------------------------------------
+// Embedded shadow depth vertex shader SPIR-V
+// --------------------------------------------------------------------------
+// Minimal vertex shader:
+//   #version 450
+//   layout(push_constant) uniform PC { mat4 mvp; };
+//   layout(location = 0) in vec3 inPosition;
+//   void main() { gl_Position = mvp * vec4(inPosition, 1.0); }
+//
+// Compiled with: glslangValidator -V -e main shadow.vert -o shadow.vert.spv
+// Then xxd -i to get C array. This is the pre-compiled SPIR-V binary.
+static const uint32_t shadow_vert_spv[] = {
+    0x07230203, 0x00010000, 0x0008000b, 0x00000023,
+    0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0007000f, 0x00000000, 0x00000004, 0x6e69616d,
+    0x00000000, 0x0000000d, 0x00000019, 0x00030003,
+    0x00000002, 0x000001c2, 0x00040005, 0x00000004,
+    0x6e69616d, 0x00000000, 0x00060005, 0x0000000b,
+    0x505f6c67, 0x65567265, 0x78657472, 0x00000000,
+    0x00060006, 0x0000000b, 0x00000000, 0x505f6c67,
+    0x7469736f, 0x006e6f69, 0x00070006, 0x0000000b,
+    0x00000001, 0x505f6c67, 0x746e696f, 0x657a6953,
+    0x00000000, 0x00070006, 0x0000000b, 0x00000002,
+    0x435f6c67, 0x4470696c, 0x61747369, 0x0065636e,
+    0x00070006, 0x0000000b, 0x00000003, 0x435f6c67,
+    0x446c6c75, 0x61747369, 0x0065636e, 0x00030005,
+    0x0000000d, 0x00000000, 0x00030005, 0x00000011,
+    0x00004350, 0x00040006, 0x00000011, 0x00000000,
+    0x0070766d, 0x00030005, 0x00000013, 0x00000000,
+    0x00050005, 0x00000019, 0x6f506e69, 0x69746973,
+    0x00006e6f, 0x00030047, 0x0000000b, 0x00000002,
+    0x00050048, 0x0000000b, 0x00000000, 0x0000000b,
+    0x00000000, 0x00050048, 0x0000000b, 0x00000001,
+    0x0000000b, 0x00000001, 0x00050048, 0x0000000b,
+    0x00000002, 0x0000000b, 0x00000003, 0x00050048,
+    0x0000000b, 0x00000003, 0x0000000b, 0x00000004,
+    0x00030047, 0x00000011, 0x00000002, 0x00040048,
+    0x00000011, 0x00000000, 0x00000005, 0x00050048,
+    0x00000011, 0x00000000, 0x00000007, 0x00000010,
+    0x00050048, 0x00000011, 0x00000000, 0x00000023,
+    0x00000000, 0x00040047, 0x00000019, 0x0000001e,
+    0x00000000, 0x00020013, 0x00000002, 0x00030021,
+    0x00000003, 0x00000002, 0x00030016, 0x00000006,
+    0x00000020, 0x00040017, 0x00000007, 0x00000006,
+    0x00000004, 0x00040015, 0x00000008, 0x00000020,
+    0x00000000, 0x0004002b, 0x00000008, 0x00000009,
+    0x00000001, 0x0004001c, 0x0000000a, 0x00000006,
+    0x00000009, 0x0006001e, 0x0000000b, 0x00000007,
+    0x00000006, 0x0000000a, 0x0000000a, 0x00040020,
+    0x0000000c, 0x00000003, 0x0000000b, 0x0004003b,
+    0x0000000c, 0x0000000d, 0x00000003, 0x00040015,
+    0x0000000e, 0x00000020, 0x00000001, 0x0004002b,
+    0x0000000e, 0x0000000f, 0x00000000, 0x00040018,
+    0x00000010, 0x00000007, 0x00000004, 0x0003001e,
+    0x00000011, 0x00000010, 0x00040020, 0x00000012,
+    0x00000009, 0x00000011, 0x0004003b, 0x00000012,
+    0x00000013, 0x00000009, 0x00040020, 0x00000014,
+    0x00000009, 0x00000010, 0x00040017, 0x00000017,
+    0x00000006, 0x00000003, 0x00040020, 0x00000018,
+    0x00000001, 0x00000017, 0x0004003b, 0x00000018,
+    0x00000019, 0x00000001, 0x0004002b, 0x00000006,
+    0x0000001b, 0x3f800000, 0x00040020, 0x00000021,
+    0x00000003, 0x00000007, 0x00050036, 0x00000002,
+    0x00000004, 0x00000000, 0x00000003, 0x000200f8,
+    0x00000005, 0x00050041, 0x00000014, 0x00000015,
+    0x00000013, 0x0000000f, 0x0004003d, 0x00000010,
+    0x00000016, 0x00000015, 0x0004003d, 0x00000017,
+    0x0000001a, 0x00000019, 0x00050051, 0x00000006,
+    0x0000001c, 0x0000001a, 0x00000000, 0x00050051,
+    0x00000006, 0x0000001d, 0x0000001a, 0x00000001,
+    0x00050051, 0x00000006, 0x0000001e, 0x0000001a,
+    0x00000002, 0x00070050, 0x00000007, 0x0000001f,
+    0x0000001c, 0x0000001d, 0x0000001e, 0x0000001b,
+    0x00050091, 0x00000007, 0x00000020, 0x00000016,
+    0x0000001f, 0x00050041, 0x00000021, 0x00000022,
+    0x0000000d, 0x0000000f, 0x0003003e, 0x00000022,
+    0x00000020, 0x000100fd, 0x00010038
+};
+
+// --------------------------------------------------------------------------
 // Offscreen render target creation
 // --------------------------------------------------------------------------
 
@@ -487,6 +568,511 @@ void RasterRenderer::setupPBRResources(VulkanContext& ctx) {
 }
 
 // --------------------------------------------------------------------------
+// Multi-light resource setup (called AFTER fragReflection is loaded)
+// --------------------------------------------------------------------------
+
+void RasterRenderer::setupMultiLightResources(VulkanContext& ctx) {
+    // Detect from fragment reflection whether the shader uses a "lights" storage buffer
+    m_hasMultiLight = false;
+    for (auto& [setIdx, bindings] : fragReflection.descriptor_sets) {
+        for (auto& b : bindings) {
+            if (b.name == "lights" && b.type == "storage_buffer") {
+                m_hasMultiLight = true;
+                break;
+            }
+        }
+        if (m_hasMultiLight) break;
+    }
+
+    if (m_hasMultiLight && m_scene) {
+        // Create lights SSBO from packed scene light data
+        auto lightBuf = m_scene->packLightsBuffer();
+        if (lightBuf.empty()) {
+            // Add a dummy light to avoid empty buffer
+            lightBuf.resize(16, 0.0f);
+        }
+        VkBufferCreateInfo ssboInfo = {};
+        ssboInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        ssboInfo.size = lightBuf.size() * sizeof(float);
+        ssboInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+        VmaAllocationCreateInfo ssboAllocInfo = {};
+        ssboAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+        vmaCreateBuffer(ctx.allocator, &ssboInfo, &ssboAllocInfo,
+                        &m_lightsSSBO, &m_lightsSSBOAlloc, nullptr);
+
+        void* mapped;
+        vmaMapMemory(ctx.allocator, m_lightsSSBOAlloc, &mapped);
+        memcpy(mapped, lightBuf.data(), lightBuf.size() * sizeof(float));
+        vmaUnmapMemory(ctx.allocator, m_lightsSSBOAlloc);
+
+        // Create SceneLight UBO (light_count + view_pos, std140 layout)
+        struct SceneLightUBO {
+            glm::vec3 viewPos;
+            float _pad0;
+            int32_t lightCount;
+            float _pad1[3];
+        };
+        glm::vec3 viewPos = m_scene->hasSceneBounds() ? m_scene->getAutoEye() : Camera::DEFAULT_EYE;
+        SceneLightUBO sceneLightData;
+        sceneLightData.viewPos = viewPos;
+        sceneLightData._pad0 = 0.0f;
+        sceneLightData.lightCount = m_scene->getLightCount();
+        sceneLightData._pad1[0] = sceneLightData._pad1[1] = sceneLightData._pad1[2] = 0.0f;
+
+        VkBufferCreateInfo slBufInfo = {};
+        slBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        slBufInfo.size = sizeof(SceneLightUBO);
+        slBufInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+
+        VmaAllocationCreateInfo slAllocInfo = {};
+        slAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+        vmaCreateBuffer(ctx.allocator, &slBufInfo, &slAllocInfo,
+                        &m_sceneLightUBO, &m_sceneLightUBOAlloc, nullptr);
+
+        vmaMapMemory(ctx.allocator, m_sceneLightUBOAlloc, &mapped);
+        memcpy(mapped, &sceneLightData, sizeof(SceneLightUBO));
+        vmaUnmapMemory(ctx.allocator, m_sceneLightUBOAlloc);
+
+        std::cout << "[info] Multi-light SSBO created: " << m_scene->getLightCount()
+                  << " light(s), " << lightBuf.size() * sizeof(float) << " bytes" << std::endl;
+    }
+}
+
+// --------------------------------------------------------------------------
+// Shadow map infrastructure setup
+// --------------------------------------------------------------------------
+
+void RasterRenderer::setupShadowMaps(VulkanContext& ctx) {
+    // 1. Create 2D array depth image (MAX_SHADOW_MAPS layers)
+    VkImageCreateInfo imageInfo = {};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = VK_FORMAT_D32_SFLOAT;
+    imageInfo.extent = {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = MAX_SHADOW_MAPS;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo allocInfo = {};
+    allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+    VkResult res = vmaCreateImage(ctx.allocator, &imageInfo, &allocInfo,
+                                   &m_shadowImage, &m_shadowImageAlloc, nullptr);
+    if (res != VK_SUCCESS) {
+        std::cerr << "[warn] Failed to create shadow map image, disabling shadows" << std::endl;
+        m_hasShadows = false;
+        return;
+    }
+
+    // 2. Create array image view (for binding as sampler2DArray in main pass)
+    VkImageViewCreateInfo arrayViewInfo = {};
+    arrayViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    arrayViewInfo.image = m_shadowImage;
+    arrayViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    arrayViewInfo.format = VK_FORMAT_D32_SFLOAT;
+    arrayViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    arrayViewInfo.subresourceRange.baseMipLevel = 0;
+    arrayViewInfo.subresourceRange.levelCount = 1;
+    arrayViewInfo.subresourceRange.baseArrayLayer = 0;
+    arrayViewInfo.subresourceRange.layerCount = MAX_SHADOW_MAPS;
+    vkCreateImageView(ctx.device, &arrayViewInfo, nullptr, &m_shadowImageView);
+
+    // 3. Create per-layer image views (for framebuffer attachments)
+    m_shadowLayerViews.resize(MAX_SHADOW_MAPS);
+    for (uint32_t i = 0; i < MAX_SHADOW_MAPS; i++) {
+        VkImageViewCreateInfo layerViewInfo = {};
+        layerViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        layerViewInfo.image = m_shadowImage;
+        layerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        layerViewInfo.format = VK_FORMAT_D32_SFLOAT;
+        layerViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        layerViewInfo.subresourceRange.baseMipLevel = 0;
+        layerViewInfo.subresourceRange.levelCount = 1;
+        layerViewInfo.subresourceRange.baseArrayLayer = i;
+        layerViewInfo.subresourceRange.layerCount = 1;
+        vkCreateImageView(ctx.device, &layerViewInfo, nullptr, &m_shadowLayerViews[i]);
+    }
+
+    // 4. Create depth-only render pass
+    VkAttachmentDescription depthAtt = {};
+    depthAtt.format = VK_FORMAT_D32_SFLOAT;
+    depthAtt.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAtt.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAtt.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAtt.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthAtt.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+    VkAttachmentReference depthRef = {};
+    depthRef.attachment = 0;
+    depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 0;
+    subpass.pColorAttachments = nullptr;
+    subpass.pDepthStencilAttachment = &depthRef;
+
+    VkSubpassDependency dependencies[2] = {};
+    // EXTERNAL -> 0: ensure prior reads complete before depth writes
+    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[0].dstSubpass = 0;
+    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependencies[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+
+    // 0 -> EXTERNAL: ensure depth writes complete before shader reads
+    dependencies[1].srcSubpass = 0;
+    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+
+    VkRenderPassCreateInfo rpInfo = {};
+    rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpInfo.attachmentCount = 1;
+    rpInfo.pAttachments = &depthAtt;
+    rpInfo.subpassCount = 1;
+    rpInfo.pSubpasses = &subpass;
+    rpInfo.dependencyCount = 2;
+    rpInfo.pDependencies = dependencies;
+
+    if (vkCreateRenderPass(ctx.device, &rpInfo, nullptr, &m_shadowRenderPass) != VK_SUCCESS) {
+        std::cerr << "[warn] Failed to create shadow render pass" << std::endl;
+        return;
+    }
+
+    // 5. Create per-layer framebuffers
+    m_shadowFramebuffers.resize(MAX_SHADOW_MAPS);
+    for (uint32_t i = 0; i < MAX_SHADOW_MAPS; i++) {
+        VkFramebufferCreateInfo fbInfo = {};
+        fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbInfo.renderPass = m_shadowRenderPass;
+        fbInfo.attachmentCount = 1;
+        fbInfo.pAttachments = &m_shadowLayerViews[i];
+        fbInfo.width = SHADOW_MAP_SIZE;
+        fbInfo.height = SHADOW_MAP_SIZE;
+        fbInfo.layers = 1;
+        vkCreateFramebuffer(ctx.device, &fbInfo, nullptr, &m_shadowFramebuffers[i]);
+    }
+
+    // 6. Create comparison sampler (for shadow sampling with PCF)
+    VkSamplerCreateInfo samplerInfo = {};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    samplerInfo.compareEnable = VK_TRUE;
+    samplerInfo.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 1.0f;
+    vkCreateSampler(ctx.device, &samplerInfo, nullptr, &m_shadowSampler);
+
+    // 7. Create shadow pipeline layout (push constant: mat4 lightVP = 64 bytes)
+    VkPushConstantRange pushRange = {};
+    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushRange.offset = 0;
+    pushRange.size = sizeof(glm::mat4);  // 64 bytes for the MVP
+
+    VkPipelineLayoutCreateInfo layoutInfo = {};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = 0;
+    layoutInfo.pSetLayouts = nullptr;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pushRange;
+    vkCreatePipelineLayout(ctx.device, &layoutInfo, nullptr, &m_shadowPipelineLayout);
+
+    // Create shadow vertex shader module from embedded SPIR-V
+    VkShaderModuleCreateInfo shaderInfo = {};
+    shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shaderInfo.codeSize = sizeof(shadow_vert_spv);
+    shaderInfo.pCode = shadow_vert_spv;
+    vkCreateShaderModule(ctx.device, &shaderInfo, nullptr, &m_shadowVertModule);
+
+    // Create shadow pipeline (depth-only, vertex-only for shadow pass)
+    VkPipelineShaderStageCreateInfo shaderStage = {};
+    shaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    shaderStage.module = m_shadowVertModule;
+    shaderStage.pName = "main";
+
+    // Vertex input: only position at location 0 (vec3, offset 0)
+    // The vertex buffer stride depends on the scene format (32 or 48 bytes)
+    int vbStride = (m_scene && m_scene->hasGltfScene()) ? 48 : 32;
+
+    VkVertexInputBindingDescription binding = {};
+    binding.binding = 0;
+    binding.stride = static_cast<uint32_t>(vbStride);
+    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription posAttr = {};
+    posAttr.location = 0;
+    posAttr.binding = 0;
+    posAttr.format = VK_FORMAT_R32G32B32_SFLOAT;
+    posAttr.offset = 0;
+
+    VkPipelineVertexInputStateCreateInfo vertexInput = {};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInput.vertexBindingDescriptionCount = 1;
+    vertexInput.pVertexBindingDescriptions = &binding;
+    vertexInput.vertexAttributeDescriptionCount = 1;
+    vertexInput.pVertexAttributeDescriptions = &posAttr;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport viewport = {0, 0, (float)SHADOW_MAP_SIZE, (float)SHADOW_MAP_SIZE, 0, 1};
+    VkRect2D scissor = {{0, 0}, {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE}};
+    VkPipelineViewportStateCreateInfo viewportState = {};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.pViewports = &viewport;
+    viewportState.scissorCount = 1;
+    viewportState.pScissors = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer = {};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth = 1.0f;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.depthBiasEnable = VK_TRUE;
+    rasterizer.depthBiasConstantFactor = 1.25f;
+    rasterizer.depthBiasSlopeFactor = 1.75f;
+
+    VkPipelineMultisampleStateCreateInfo multisampling = {};
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil = {};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    // No color blend state needed (depth-only)
+    VkPipelineColorBlendStateCreateInfo colorBlending = {};
+    colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlending.attachmentCount = 0;
+
+    VkGraphicsPipelineCreateInfo pipeInfo = {};
+    pipeInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipeInfo.stageCount = 1;  // vertex only
+    pipeInfo.pStages = &shaderStage;
+    pipeInfo.pVertexInputState = &vertexInput;
+    pipeInfo.pInputAssemblyState = &inputAssembly;
+    pipeInfo.pViewportState = &viewportState;
+    pipeInfo.pRasterizationState = &rasterizer;
+    pipeInfo.pMultisampleState = &multisampling;
+    pipeInfo.pDepthStencilState = &depthStencil;
+    pipeInfo.pColorBlendState = &colorBlending;
+    pipeInfo.layout = m_shadowPipelineLayout;
+    pipeInfo.renderPass = m_shadowRenderPass;
+    pipeInfo.subpass = 0;
+
+    if (vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeInfo,
+                                  nullptr, &m_shadowPipeline) != VK_SUCCESS) {
+        std::cerr << "[warn] Failed to create shadow pipeline" << std::endl;
+        return;
+    }
+
+    // 8. Allocate shadow matrices SSBO (80 bytes per entry * MAX_SHADOW_MAPS)
+    VkBufferCreateInfo ssboBufInfo = {};
+    ssboBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    ssboBufInfo.size = MAX_SHADOW_MAPS * 80;  // 80 bytes per ShadowEntry
+    ssboBufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+    VmaAllocationCreateInfo ssboAllocInfo = {};
+    ssboAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+
+    vmaCreateBuffer(ctx.allocator, &ssboBufInfo, &ssboAllocInfo,
+                    &m_shadowMatricesSSBO, &m_shadowMatricesSSBOAlloc, nullptr);
+
+    // Transition shadow image to shader read initially (all layers)
+    VkCommandBuffer initCmd = ctx.beginSingleTimeCommands();
+    VkImageMemoryBarrier initBarrier = {};
+    initBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    initBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    initBarrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    initBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    initBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    initBarrier.image = m_shadowImage;
+    initBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    initBarrier.subresourceRange.baseMipLevel = 0;
+    initBarrier.subresourceRange.levelCount = 1;
+    initBarrier.subresourceRange.baseArrayLayer = 0;
+    initBarrier.subresourceRange.layerCount = MAX_SHADOW_MAPS;
+    initBarrier.srcAccessMask = 0;
+    initBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(initCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &initBarrier);
+    ctx.endSingleTimeCommands(initCmd);
+
+    m_hasShadows = true;
+    std::cout << "[info] Shadow map infrastructure created: " << MAX_SHADOW_MAPS
+              << " layers at " << SHADOW_MAP_SIZE << "x" << SHADOW_MAP_SIZE << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Render shadow maps for all shadow-casting lights
+// --------------------------------------------------------------------------
+
+void RasterRenderer::renderShadowMaps(VulkanContext& ctx, VkCommandBuffer cmd) {
+    if (!m_hasShadows || !m_scene) return;
+
+    // Compute shadow data using current camera parameters
+    // Read back current MVP to extract view/proj
+    struct MVPData { glm::mat4 model, view, projection; };
+    MVPData mvp;
+    void* mapped;
+    vmaMapMemory(ctx.allocator, mvpAllocation, &mapped);
+    memcpy(&mvp, mapped, sizeof(MVPData));
+    vmaUnmapMemory(ctx.allocator, mvpAllocation);
+
+    float nearClip = 0.1f;
+    float farClip = m_scene->hasSceneBounds() ? m_scene->getAutoFar() : 100.0f;
+    m_scene->computeShadowData(mvp.view, mvp.projection, nearClip, farClip);
+
+    m_numShadowMaps = m_scene->getShadowMapCount();
+    if (m_numShadowMaps == 0) return;
+
+    const auto& shadowEntries = m_scene->getShadowEntries();
+    const auto& mesh = m_scene->getMesh();
+    if (mesh.vertexBuffer == VK_NULL_HANDLE) return;
+
+    ctx.cmdBeginLabel(cmd, "Shadow Pass", 0.5f, 0.3f, 0.1f, 1.0f);
+
+    for (int i = 0; i < m_numShadowMaps && i < static_cast<int>(MAX_SHADOW_MAPS); i++) {
+        // Begin shadow render pass for this layer
+        VkClearValue depthClear = {};
+        depthClear.depthStencil = {1.0f, 0};
+
+        VkRenderPassBeginInfo rpBeginInfo = {};
+        rpBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rpBeginInfo.renderPass = m_shadowRenderPass;
+        rpBeginInfo.framebuffer = m_shadowFramebuffers[i];
+        rpBeginInfo.renderArea.offset = {0, 0};
+        rpBeginInfo.renderArea.extent = {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE};
+        rpBeginInfo.clearValueCount = 1;
+        rpBeginInfo.pClearValues = &depthClear;
+
+        vkCmdBeginRenderPass(cmd, &rpBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+        // Bind shadow pipeline
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_shadowPipeline);
+
+        // Bind vertex/index buffers
+        VkDeviceSize vbOffset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &vbOffset);
+        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+
+        // Draw all meshes with lightVP as push constant
+        // lightVP = shadow_entry.viewProjection (model is identity since transforms are baked)
+        glm::mat4 lightMVP = shadowEntries[i].viewProjection;
+
+        const auto& drawRanges = m_scene->getDrawRanges();
+        if (!drawRanges.empty()) {
+            for (auto& range : drawRanges) {
+                vkCmdPushConstants(cmd, m_shadowPipelineLayout,
+                                   VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                   sizeof(glm::mat4), &lightMVP);
+                vkCmdDrawIndexed(cmd, range.indexCount, 1, range.indexOffset, 0, 0);
+            }
+        } else {
+            vkCmdPushConstants(cmd, m_shadowPipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT, 0,
+                               sizeof(glm::mat4), &lightMVP);
+            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+        }
+
+        vkCmdEndRenderPass(cmd);
+    }
+
+    ctx.cmdEndLabel(cmd);
+
+    // Update shadow matrices SSBO
+    auto shadowBuf = m_scene->packShadowBuffer();
+    if (!shadowBuf.empty()) {
+        vmaMapMemory(ctx.allocator, m_shadowMatricesSSBOAlloc, &mapped);
+        size_t copySize = std::min(shadowBuf.size() * sizeof(float),
+                                    static_cast<size_t>(MAX_SHADOW_MAPS * 80));
+        memcpy(mapped, shadowBuf.data(), copySize);
+        vmaUnmapMemory(ctx.allocator, m_shadowMatricesSSBOAlloc);
+    }
+
+    // Update light buffer with shadow indices (repack lights with updated shadow indices)
+    if (m_hasMultiLight && m_lightsSSBO != VK_NULL_HANDLE) {
+        auto lightBuf = m_scene->packLightsBuffer();
+        if (!lightBuf.empty()) {
+            vmaMapMemory(ctx.allocator, m_lightsSSBOAlloc, &mapped);
+            memcpy(mapped, lightBuf.data(), lightBuf.size() * sizeof(float));
+            vmaUnmapMemory(ctx.allocator, m_lightsSSBOAlloc);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Shadow map cleanup
+// --------------------------------------------------------------------------
+
+void RasterRenderer::cleanupShadowMaps(VulkanContext& ctx) {
+    if (m_shadowPipeline) vkDestroyPipeline(ctx.device, m_shadowPipeline, nullptr);
+    m_shadowPipeline = VK_NULL_HANDLE;
+
+    if (m_shadowPipelineLayout) vkDestroyPipelineLayout(ctx.device, m_shadowPipelineLayout, nullptr);
+    m_shadowPipelineLayout = VK_NULL_HANDLE;
+
+    if (m_shadowVertModule) vkDestroyShaderModule(ctx.device, m_shadowVertModule, nullptr);
+    m_shadowVertModule = VK_NULL_HANDLE;
+
+    for (auto fb : m_shadowFramebuffers) {
+        if (fb) vkDestroyFramebuffer(ctx.device, fb, nullptr);
+    }
+    m_shadowFramebuffers.clear();
+
+    if (m_shadowRenderPass) vkDestroyRenderPass(ctx.device, m_shadowRenderPass, nullptr);
+    m_shadowRenderPass = VK_NULL_HANDLE;
+
+    if (m_shadowSampler) vkDestroySampler(ctx.device, m_shadowSampler, nullptr);
+    m_shadowSampler = VK_NULL_HANDLE;
+
+    for (auto view : m_shadowLayerViews) {
+        if (view) vkDestroyImageView(ctx.device, view, nullptr);
+    }
+    m_shadowLayerViews.clear();
+
+    if (m_shadowImageView) vkDestroyImageView(ctx.device, m_shadowImageView, nullptr);
+    m_shadowImageView = VK_NULL_HANDLE;
+
+    if (m_shadowImage) vmaDestroyImage(ctx.allocator, m_shadowImage, m_shadowImageAlloc);
+    m_shadowImage = VK_NULL_HANDLE;
+    m_shadowImageAlloc = VK_NULL_HANDLE;
+
+    if (m_shadowMatricesSSBO) vmaDestroyBuffer(ctx.allocator, m_shadowMatricesSSBO, m_shadowMatricesSSBOAlloc);
+    m_shadowMatricesSSBO = VK_NULL_HANDLE;
+    m_shadowMatricesSSBOAlloc = VK_NULL_HANDLE;
+
+    m_hasShadows = false;
+    m_numShadowMaps = 0;
+}
+
+// --------------------------------------------------------------------------
 // Reflection-driven descriptor set creation
 // --------------------------------------------------------------------------
 
@@ -598,6 +1184,8 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
                     info.bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
                 } else if (b.name == "Light") {
                     info.bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                } else if (b.name == "SceneLight" && m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
+                    info.bufferInfo = {m_sceneLightUBO, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
                 } else {
                     continue;
                 }
@@ -605,10 +1193,40 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
                 w.pBufferInfo = &writeInfos.back().bufferInfo;
                 writes.push_back(w);
             } else if (b.type == "storage_buffer") {
+                // Multi-light SSBO
+                if (b.name == "lights" && m_hasMultiLight && m_lightsSSBO != VK_NULL_HANDLE) {
+                    DescWriteInfo info = {};
+                    info.bufferInfo = {m_lightsSSBO, 0, VK_WHOLE_SIZE};
+                    writeInfos.push_back(info);
+
+                    VkWriteDescriptorSet w = {};
+                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    w.dstSet = dsIt->second;
+                    w.dstBinding = static_cast<uint32_t>(b.binding);
+                    w.descriptorCount = 1;
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                    writes.push_back(w);
+                }
                 // Materials SSBO
-                if (m_bindlessMaterials.buffer != VK_NULL_HANDLE) {
+                else if (b.name == "materials" && m_bindlessMaterials.buffer != VK_NULL_HANDLE) {
                     DescWriteInfo info = {};
                     info.bufferInfo = {m_bindlessMaterials.buffer, 0, VK_WHOLE_SIZE};
+                    writeInfos.push_back(info);
+
+                    VkWriteDescriptorSet w = {};
+                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    w.dstSet = dsIt->second;
+                    w.dstBinding = static_cast<uint32_t>(b.binding);
+                    w.descriptorCount = 1;
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                    writes.push_back(w);
+                }
+                // Shadow matrices SSBO
+                else if (b.name == "shadow_matrices" && m_hasShadows && m_shadowMatricesSSBO != VK_NULL_HANDLE) {
+                    DescWriteInfo info = {};
+                    info.bufferInfo = {m_shadowMatricesSSBO, 0, VK_WHOLE_SIZE};
                     writeInfos.push_back(info);
 
                     VkWriteDescriptorSet w = {};
@@ -623,6 +1241,10 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
             } else if (b.type == "sampler") {
                 DescWriteInfo info = {};
                 info.imageInfo = {};
+                // Shadow sampler
+                if (b.name == "shadow_maps" && m_hasShadows && m_shadowSampler != VK_NULL_HANDLE) {
+                    info.imageInfo.sampler = m_shadowSampler;
+                } else {
                 auto& iblTextures = m_scene->getIBLTextures();
                 auto iblIt = iblTextures.find(b.name);
                 if (iblIt != iblTextures.end()) {
@@ -630,6 +1252,7 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
                 } else {
                     auto& tex = m_scene->getTextureForBinding(b.name);
                     info.imageInfo.sampler = tex.sampler;
+                }
                 }
                 writeInfos.push_back(info);
 
@@ -644,6 +1267,11 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
             } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
                 DescWriteInfo info = {};
                 info.imageInfo = {};
+                // Shadow maps array texture
+                if (b.name == "shadow_maps" && m_hasShadows && m_shadowImageView != VK_NULL_HANDLE) {
+                    info.imageInfo.imageView = m_shadowImageView;
+                    info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                } else {
                 auto& iblTextures = m_scene->getIBLTextures();
                 auto iblIt = iblTextures.find(b.name);
                 if (iblIt != iblTextures.end()) {
@@ -653,6 +1281,7 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
                     auto& tex = m_scene->getTextureForBinding(b.name);
                     info.imageInfo.imageView = tex.imageView;
                     info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                }
                 }
                 writeInfos.push_back(info);
 
@@ -752,7 +1381,7 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
         }
     }
 
-    // Write vertex set (set 0): MVP + Light
+    // Write vertex set (set 0): MVP + Light (or SceneLight for multi-light)
     {
         struct DescWriteInfo { VkDescriptorBufferInfo bufferInfo; VkDescriptorImageInfo imageInfo; };
         std::vector<DescWriteInfo> writeInfos;
@@ -775,11 +1404,40 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
                     info.bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
                 } else if (b.name == "Light") {
                     info.bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                } else if (b.name == "SceneLight" && m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
+                    info.bufferInfo = {m_sceneLightUBO, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
                 } else {
                     continue;
                 }
                 writeInfos.push_back(info);
                 w.pBufferInfo = &writeInfos.back().bufferInfo;
+            } else if (b.type == "storage_buffer") {
+                if (b.name == "lights" && m_hasMultiLight && m_lightsSSBO != VK_NULL_HANDLE) {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    info.bufferInfo = {m_lightsSSBO, 0, VK_WHOLE_SIZE};
+                    writeInfos.push_back(info);
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else if (b.name == "shadow_matrices" && m_hasShadows && m_shadowMatricesSSBO != VK_NULL_HANDLE) {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    info.bufferInfo = {m_shadowMatricesSSBO, 0, VK_WHOLE_SIZE};
+                    writeInfos.push_back(info);
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else {
+                    continue;
+                }
+            } else if (b.type == "sampled_image" && b.name == "shadow_maps" && m_hasShadows && m_shadowImageView != VK_NULL_HANDLE) {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                info.imageInfo = {};
+                info.imageInfo.imageView = m_shadowImageView;
+                info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                writeInfos.push_back(info);
+                w.pImageInfo = &writeInfos.back().imageInfo;
+            } else if (b.type == "sampler" && b.name == "shadow_maps" && m_hasShadows && m_shadowSampler != VK_NULL_HANDLE) {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                info.imageInfo = {};
+                info.imageInfo.sampler = m_shadowSampler;
+                writeInfos.push_back(info);
+                w.pImageInfo = &writeInfos.back().imageInfo;
             } else {
                 continue;
             }
@@ -868,13 +1526,33 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
                         info.bufferInfo = {m_perMaterialBuffers[mi], 0, sizeof(MaterialUBOData)};
                     } else if (b.name == "Light" && lightBuffer != VK_NULL_HANDLE) {
                         info.bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                    } else if (b.name == "SceneLight" && m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
+                        info.bufferInfo = {m_sceneLightUBO, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
                     } else {
                         continue;
                     }
                     writeInfos.push_back(info);
                     w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else if (b.type == "storage_buffer") {
+                    if (b.name == "lights" && m_hasMultiLight && m_lightsSSBO != VK_NULL_HANDLE) {
+                        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        info.bufferInfo = {m_lightsSSBO, 0, VK_WHOLE_SIZE};
+                        writeInfos.push_back(info);
+                        w.pBufferInfo = &writeInfos.back().bufferInfo;
+                    } else if (b.name == "shadow_matrices" && m_hasShadows && m_shadowMatricesSSBO != VK_NULL_HANDLE) {
+                        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        info.bufferInfo = {m_shadowMatricesSSBO, 0, VK_WHOLE_SIZE};
+                        writeInfos.push_back(info);
+                        w.pBufferInfo = &writeInfos.back().bufferInfo;
+                    } else {
+                        continue;
+                    }
                 } else if (b.type == "sampler") {
                     w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                    if (b.name == "shadow_maps" && m_hasShadows && m_shadowSampler != VK_NULL_HANDLE) {
+                        info.imageInfo = {};
+                        info.imageInfo.sampler = m_shadowSampler;
+                    } else {
                     auto& iblTextures = m_scene->getIBLTextures();
                     auto iblIt = iblTextures.find(b.name);
                     if (iblIt != iblTextures.end()) {
@@ -885,10 +1563,17 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
                         info.imageInfo = {};
                         info.imageInfo.sampler = tex.sampler;
                     }
+                    }
                     writeInfos.push_back(info);
                     w.pImageInfo = &writeInfos.back().imageInfo;
                 } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
                     w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                    // Shadow maps array texture
+                    if (b.name == "shadow_maps" && m_hasShadows && m_shadowImageView != VK_NULL_HANDLE) {
+                        info.imageInfo = {};
+                        info.imageInfo.imageView = m_shadowImageView;
+                        info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                    } else {
                     // Check IBL first
                     auto& iblTextures = m_scene->getIBLTextures();
                     auto iblIt = iblTextures.find(b.name);
@@ -917,6 +1602,7 @@ void RasterRenderer::setupReflectedDescriptors(VulkanContext& ctx) {
                             info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                         }
                     }
+                    } // end shadow_maps else
                     writeInfos.push_back(info);
                     w.pImageInfo = &writeInfos.back().imageInfo;
                 } else {
@@ -1148,6 +1834,57 @@ void RasterRenderer::init(VulkanContext& ctx, SceneManager& scene,
             m_bindlessTextures = m_scene->buildBindlessTextureArray(ctx);
             m_bindlessMaterials = m_scene->buildMaterialsSSBO(ctx, m_bindlessTextures);
 
+            // Detect multi-light from fragment reflection (must run before shadow setup
+            // because shadow re-pack depends on m_hasMultiLight and m_lightsSSBO)
+            setupMultiLightResources(ctx);
+
+            // Detect shadow support from reflection and set up shadow maps
+            {
+                bool hasShadowMaps = false, hasShadowMatrices = false;
+                for (auto& [setIdx, bindings] : fragReflection.descriptor_sets) {
+                    for (auto& b : bindings) {
+                        if (b.name == "shadow_maps") hasShadowMaps = true;
+                        if (b.name == "shadow_matrices" && b.type == "storage_buffer") hasShadowMatrices = true;
+                    }
+                }
+                if (hasShadowMaps && hasShadowMatrices) {
+                    std::cout << "[info] Shader requests shadow maps, setting up shadow infrastructure" << std::endl;
+                    auto& lights = const_cast<std::vector<SceneLight>&>(m_scene->getLights());
+                    for (auto& l : lights) {
+                        if (l.type == SceneLight::Directional || l.type == SceneLight::Spot)
+                            l.castsShadow = true;
+                    }
+                    setupShadowMaps(ctx);
+                    // Re-pack lights SSBO with updated shadow indices
+                    if (m_hasMultiLight && m_lightsSSBO != VK_NULL_HANDLE && m_hasShadows) {
+                        float nearClip = 0.1f;
+                        float farClip = m_scene->hasSceneBounds() ? m_scene->getAutoFar() : 100.0f;
+                        float aspect = static_cast<float>(renderWidth) / static_cast<float>(renderHeight);
+                        glm::mat4 view = m_scene->hasSceneBounds()
+                            ? glm::lookAt(m_scene->getAutoEye(), m_scene->getAutoTarget(), m_scene->getAutoUp())
+                            : Camera::lookAt(Camera::DEFAULT_EYE, Camera::DEFAULT_TARGET, Camera::DEFAULT_UP);
+                        glm::mat4 proj = m_scene->hasSceneBounds()
+                            ? glm::perspective(glm::radians(45.0f), aspect, nearClip, farClip)
+                            : Camera::perspective(Camera::DEFAULT_FOV, aspect, nearClip, farClip);
+                        m_scene->computeShadowData(view, proj, nearClip, farClip);
+                        auto lightBuf = m_scene->packLightsBuffer();
+                        if (!lightBuf.empty()) {
+                            void* mapped;
+                            vmaMapMemory(ctx.allocator, m_lightsSSBOAlloc, &mapped);
+                            memcpy(mapped, lightBuf.data(), lightBuf.size() * sizeof(float));
+                            vmaUnmapMemory(ctx.allocator, m_lightsSSBOAlloc);
+                        }
+                        auto shadowBuf = m_scene->packShadowBuffer();
+                        if (!shadowBuf.empty()) {
+                            void* mapped;
+                            vmaMapMemory(ctx.allocator, m_shadowMatricesSSBOAlloc, &mapped);
+                            memcpy(mapped, shadowBuf.data(), shadowBuf.size() * sizeof(float));
+                            vmaUnmapMemory(ctx.allocator, m_shadowMatricesSSBOAlloc);
+                        }
+                    }
+                }
+            }
+
             // Use single pipeline path
             setupReflectedDescriptors(ctx);
             createPipelinePBR(ctx);
@@ -1190,6 +1927,26 @@ void RasterRenderer::init(VulkanContext& ctx, SceneManager& scene,
             if (sceneSource == "triangle") {
                 createPipelineTriangle(ctx);
             } else {
+                // Detect shadow support from reflection and set up shadow maps
+                {
+                    bool hasShadowMaps = false, hasShadowMatrices = false;
+                    for (auto& [setIdx, bindings] : fragReflection.descriptor_sets) {
+                        for (auto& b : bindings) {
+                            if (b.name == "shadow_maps") hasShadowMaps = true;
+                            if (b.name == "shadow_matrices" && b.type == "storage_buffer") hasShadowMatrices = true;
+                        }
+                    }
+                    if (hasShadowMaps && hasShadowMatrices) {
+                        std::cout << "[info] Shader requests shadow maps, setting up shadow infrastructure" << std::endl;
+                        auto& lights = const_cast<std::vector<SceneLight>&>(m_scene->getLights());
+                        for (auto& l : lights) {
+                            if (l.type == SceneLight::Directional || l.type == SceneLight::Spot)
+                                l.castsShadow = true;
+                        }
+                        setupShadowMaps(ctx);
+                    }
+                }
+                setupMultiLightResources(ctx);
                 setupReflectedDescriptors(ctx);
                 createPipelinePBR(ctx);
             }
@@ -1337,6 +2094,32 @@ void RasterRenderer::setupMultiPipeline(VulkanContext& ctx, const ShaderManifest
                   << " (" << materialIndices.size() << " material(s))" << std::endl;
     }
 
+    // Detect multi-light from first permutation's fragment reflection and create buffers
+    if (!m_permutations.empty()) {
+        fragReflection = m_permutations[0].fragRefl;
+        setupMultiLightResources(ctx);
+    }
+
+    // Detect shadow support from first permutation's fragment reflection
+    if (!m_permutations.empty()) {
+        bool hasShadowMaps = false, hasShadowMatrices = false;
+        for (auto& [setIdx, bindings] : m_permutations[0].fragRefl.descriptor_sets) {
+            for (auto& b : bindings) {
+                if (b.name == "shadow_maps") hasShadowMaps = true;
+                if (b.name == "shadow_matrices" && b.type == "storage_buffer") hasShadowMatrices = true;
+            }
+        }
+        if (hasShadowMaps && hasShadowMatrices) {
+            std::cout << "[info] Shader requests shadow maps, setting up shadow infrastructure" << std::endl;
+            auto& lights = const_cast<std::vector<SceneLight>&>(m_scene->getLights());
+            for (auto& l : lights) {
+                if (l.type == SceneLight::Directional || l.type == SceneLight::Spot)
+                    l.castsShadow = true;
+            }
+            setupShadowMaps(ctx);
+        }
+    }
+
     // Create shared set 0 layout (MVP + Light) from first permutation's vertex reflection
     // All permutations share the same set 0 layout
     {
@@ -1437,9 +2220,36 @@ void RasterRenderer::setupMultiPipeline(VulkanContext& ctx, const ShaderManifest
                     info.bufferInfo = {mvpBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 192)};
                 } else if (b.name == "Light") {
                     info.bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                } else if (b.name == "SceneLight" && m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
+                    info.bufferInfo = {m_sceneLightUBO, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
                 } else continue;
                 writeInfos.push_back(info);
                 w.pBufferInfo = &writeInfos.back().bufferInfo;
+            } else if (b.type == "storage_buffer") {
+                if (b.name == "lights" && m_hasMultiLight && m_lightsSSBO != VK_NULL_HANDLE) {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    info.bufferInfo = {m_lightsSSBO, 0, VK_WHOLE_SIZE};
+                    writeInfos.push_back(info);
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else if (b.name == "shadow_matrices" && m_hasShadows && m_shadowMatricesSSBO != VK_NULL_HANDLE) {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    info.bufferInfo = {m_shadowMatricesSSBO, 0, VK_WHOLE_SIZE};
+                    writeInfos.push_back(info);
+                    w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else continue;
+            } else if (b.type == "sampled_image" && b.name == "shadow_maps" && m_hasShadows && m_shadowImageView != VK_NULL_HANDLE) {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                info.imageInfo = {};
+                info.imageInfo.imageView = m_shadowImageView;
+                info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                writeInfos.push_back(info);
+                w.pImageInfo = &writeInfos.back().imageInfo;
+            } else if (b.type == "sampler" && b.name == "shadow_maps" && m_hasShadows && m_shadowSampler != VK_NULL_HANDLE) {
+                w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                info.imageInfo = {};
+                info.imageInfo.sampler = m_shadowSampler;
+                writeInfos.push_back(info);
+                w.pImageInfo = &writeInfos.back().imageInfo;
             } else continue;
             writes.push_back(w);
         }
@@ -1532,11 +2342,28 @@ void RasterRenderer::setupMultiPipeline(VulkanContext& ctx, const ShaderManifest
                         info.bufferInfo = {perm.perMaterialUBOs[i], 0, sizeof(MaterialUBOData)};
                     } else if (b.name == "Light" && lightBuffer != VK_NULL_HANDLE) {
                         info.bufferInfo = {lightBuffer, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
+                    } else if (b.name == "SceneLight" && m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
+                        info.bufferInfo = {m_sceneLightUBO, 0, static_cast<VkDeviceSize>(b.size > 0 ? b.size : 32)};
                     } else continue;
                     writeInfos.push_back(info);
                     w.pBufferInfo = &writeInfos.back().bufferInfo;
+                } else if (b.type == "storage_buffer") {
+                    if (b.name == "lights" && m_hasMultiLight && m_lightsSSBO != VK_NULL_HANDLE) {
+                        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        info.bufferInfo = {m_lightsSSBO, 0, VK_WHOLE_SIZE};
+                        writeInfos.push_back(info);
+                        w.pBufferInfo = &writeInfos.back().bufferInfo;
+                    } else if (b.name == "shadow_matrices" && m_hasShadows && m_shadowMatricesSSBO != VK_NULL_HANDLE) {
+                        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        info.bufferInfo = {m_shadowMatricesSSBO, 0, VK_WHOLE_SIZE};
+                        writeInfos.push_back(info);
+                        w.pBufferInfo = &writeInfos.back().bufferInfo;
+                    } else continue;
                 } else if (b.type == "sampler") {
                     w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                    if (b.name == "shadow_maps" && m_hasShadows && m_shadowSampler != VK_NULL_HANDLE) {
+                        info.imageInfo = {}; info.imageInfo.sampler = m_shadowSampler;
+                    } else {
                     auto& iblTextures = m_scene->getIBLTextures();
                     auto iblIt = iblTextures.find(b.name);
                     if (iblIt != iblTextures.end()) {
@@ -1545,10 +2372,16 @@ void RasterRenderer::setupMultiPipeline(VulkanContext& ctx, const ShaderManifest
                         auto& tex = m_scene->getTextureForBinding(b.name);
                         info.imageInfo = {}; info.imageInfo.sampler = tex.sampler;
                     }
+                    }
                     writeInfos.push_back(info);
                     w.pImageInfo = &writeInfos.back().imageInfo;
                 } else if (b.type == "sampled_image" || b.type == "sampled_cube_image") {
                     w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                    if (b.name == "shadow_maps" && m_hasShadows && m_shadowImageView != VK_NULL_HANDLE) {
+                        info.imageInfo = {};
+                        info.imageInfo.imageView = m_shadowImageView;
+                        info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                    } else {
                     auto& iblTextures = m_scene->getIBLTextures();
                     auto iblIt = iblTextures.find(b.name);
                     if (iblIt != iblTextures.end()) {
@@ -1573,6 +2406,7 @@ void RasterRenderer::setupMultiPipeline(VulkanContext& ctx, const ShaderManifest
                             info.imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                         }
                     }
+                    } // end shadow_maps else
                     writeInfos.push_back(info);
                     w.pImageInfo = &writeInfos.back().imageInfo;
                 } else continue;
@@ -1876,6 +2710,11 @@ void RasterRenderer::recordDrawCommands(VkCommandBuffer cmd) {
 void RasterRenderer::render(VulkanContext& ctx) {
     VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
 
+    // Shadow pass: render depth maps before main color pass
+    if (m_hasShadows) {
+        renderShadowMaps(ctx, cmd);
+    }
+
     std::vector<VkClearValue> clearValues;
     VkClearValue colorClear = {};
     if (m_needsDepth) {
@@ -1992,6 +2831,11 @@ void RasterRenderer::renderToSwapchain(VulkanContext& ctx,
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
+    // Shadow pass: render depth maps before main color pass
+    if (m_hasShadows) {
+        renderShadowMaps(ctx, cmd);
+    }
+
     std::vector<VkClearValue> clearValues;
     VkClearValue colorClear = {};
     if (m_needsDepth) {
@@ -2073,6 +2917,20 @@ void RasterRenderer::updateCamera(VulkanContext& ctx, glm::vec3 eye, glm::vec3 t
     light.viewPos = eye;
     memcpy(mapped, &light, sizeof(LightData));
     vmaUnmapMemory(ctx.allocator, lightAllocation);
+
+    // Update SceneLight UBO viewPos for multi-light mode
+    if (m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
+        struct SceneLightUBO {
+            glm::vec3 viewPos;
+            float _pad0;
+            int32_t lightCount;
+            float _pad1[3];
+        };
+        vmaMapMemory(ctx.allocator, m_sceneLightUBOAlloc, &mapped);
+        SceneLightUBO* sl = static_cast<SceneLightUBO*>(mapped);
+        sl->viewPos = eye;
+        vmaUnmapMemory(ctx.allocator, m_sceneLightUBOAlloc);
+    }
 }
 
 
@@ -2121,6 +2979,16 @@ void RasterRenderer::cleanup(VulkanContext& ctx) {
     if (mvpBuffer) vmaDestroyBuffer(ctx.allocator, mvpBuffer, mvpAllocation);
     if (lightBuffer) vmaDestroyBuffer(ctx.allocator, lightBuffer, lightAllocation);
     if (m_materialBuffer) vmaDestroyBuffer(ctx.allocator, m_materialBuffer, m_materialAllocation);
+
+    // Cleanup multi-light buffers
+    if (m_lightsSSBO) vmaDestroyBuffer(ctx.allocator, m_lightsSSBO, m_lightsSSBOAlloc);
+    if (m_sceneLightUBO) vmaDestroyBuffer(ctx.allocator, m_sceneLightUBO, m_sceneLightUBOAlloc);
+    m_lightsSSBO = VK_NULL_HANDLE;
+    m_sceneLightUBO = VK_NULL_HANDLE;
+    m_hasMultiLight = false;
+
+    // Cleanup shadow map resources
+    cleanupShadowMaps(ctx);
 
     // Cleanup bindless resources
     if (m_bindlessMaterials.buffer) {

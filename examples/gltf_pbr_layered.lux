@@ -12,6 +12,7 @@ import brdf;
 import color;
 import compositing;
 import ibl;
+import lighting;
 import texture;
 
 features {
@@ -20,6 +21,7 @@ features {
     has_sheen: bool,
     has_emission: bool,
     has_transmission: bool,
+    has_shadows: bool,
 }
 
 geometry StandardMesh {
@@ -98,18 +100,22 @@ surface GltfPBR {
 }
 
 lighting SceneLighting {
+    sampler2DArray shadow_maps if has_shadows,
     samplerCube env_specular,
     samplerCube env_irradiance,
     sampler2d brdf_lut,
 
-    properties Light {
-        light_dir: vec3 = vec3(0.0, -1.0, 0.0),
+    properties SceneLight {
         view_pos: vec3 = vec3(0.0, 0.0, 3.0),
+        light_count: int = 0,
     },
 
     layers [
-        directional(direction: Light.light_dir,
-                    color: vec3(1.0, 0.98, 0.95)),
+        multi_light(count: SceneLight.light_count,
+                    shadow_map: shadow_maps,
+                    max_lights: 16) if has_shadows,
+        multi_light(count: SceneLight.light_count,
+                    max_lights: 16) if !has_shadows,
         ibl(specular_map: env_specular, irradiance_map: env_irradiance,
             brdf_lut: brdf_lut),
     ]

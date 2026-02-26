@@ -347,6 +347,16 @@ GltfScene loadGltf(const std::string& path) {
         gnode.meshIndex = node.mesh ? static_cast<int>(cgltf_mesh_index(data, node.mesh)) : -1;
         gnode.cameraIndex = node.camera ? static_cast<int>(cgltf_camera_index(data, node.camera)) : -1;
 
+        if (node.light) {
+            // Find light index by matching pointer into data->lights array
+            for (size_t li = 0; li < data->lights_count; li++) {
+                if (&data->lights[li] == node.light) {
+                    gnode.lightIndex = static_cast<int>(li);
+                    break;
+                }
+            }
+        }
+
         for (size_t ci = 0; ci < node.children_count; ci++) {
             gnode.children.push_back(static_cast<int>(cgltf_node_index(data, node.children[ci])));
         }
@@ -427,6 +437,16 @@ std::vector<DrawItem> flattenScene(GltfScene& scene) {
                 item.meshIndex = node.meshIndex;
                 item.materialIndex = scene.meshes[node.meshIndex].materialIndex;
                 items.push_back(item);
+            }
+
+            // Extract world-space position and direction for lights attached to this node
+            if (node.lightIndex >= 0 && node.lightIndex < static_cast<int>(scene.lights.size())) {
+                auto& light = scene.lights[node.lightIndex];
+                // Extract position from world transform column 3
+                light.position = glm::vec3(node.worldTransform[3]);
+                // Extract forward direction (-Z in local space, transformed)
+                light.direction = glm::normalize(glm::vec3(
+                    node.worldTransform * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f)));
             }
 
             for (int child : node.children) {

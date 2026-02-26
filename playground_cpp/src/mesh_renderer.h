@@ -137,6 +137,13 @@ private:
     VkBuffer m_materialBuffer = VK_NULL_HANDLE;
     VmaAllocation m_materialAllocation = VK_NULL_HANDLE;
 
+    // Multi-light SSBO (when shader uses SceneLight UBO + lights SSBO)
+    VkBuffer m_lightsSSBO = VK_NULL_HANDLE;
+    VmaAllocation m_lightsSSBOAlloc = VK_NULL_HANDLE;
+    VkBuffer m_sceneLightUBO = VK_NULL_HANDLE;
+    VmaAllocation m_sceneLightUBOAlloc = VK_NULL_HANDLE;
+    bool m_hasMultiLight = false;
+
     // Shader modules
     VkShaderModule m_meshModule = VK_NULL_HANDLE;
     VkShaderModule m_fragModule = VK_NULL_HANDLE;

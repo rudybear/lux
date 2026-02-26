@@ -298,6 +298,11 @@ pub struct MeshShaderRenderer {
     shared_set0: vk::DescriptorSet,
     meshlet_groups: Vec<MeshletGroup>,
 
+    // Multi-light support (P17.2)
+    has_multi_light: bool,
+    lights_ssbo: Option<GpuBuffer>,
+    scene_light_ubo: Option<GpuBuffer>,
+
     // Bindless mode (single pipeline, materials SSBO + texture array)
     bindless_mode: bool,
     bindless_materials_ssbo: Option<scene_manager::BindlessMaterialsSSBO>,
@@ -792,6 +797,51 @@ impl MeshShaderRenderer {
             "mesh_light",
         )?;
 
+        // --- Multi-light detection and buffer creation (P17.2) ---
+        // Scan the FRAGMENT reflection for a "lights" storage_buffer binding
+        let frag_merged_for_detect = reflected_pipeline::merge_descriptor_sets(&[&frag_refl]);
+        let has_multi_light = frag_merged_for_detect.values().any(|bindings| {
+            bindings.iter().any(|b| b.name == "lights" && b.binding_type == "storage_buffer")
+        });
+
+        let mut sm = scene_manager::SceneManager::new();
+        if let Some(ref gs) = gltf_scene {
+            sm.populate_lights_from_gltf(&gs.lights);
+        } else {
+            sm.populate_lights_from_gltf(&[]);
+        }
+
+        let mut lights_ssbo: Option<GpuBuffer> = None;
+        if has_multi_light {
+            let light_floats = sm.pack_lights_buffer();
+            let data: &[u8] = if light_floats.is_empty() {
+                &[0u8; 64]
+            } else {
+                bytemuck::cast_slice(&light_floats)
+            };
+            let buf = create_buffer_with_data(
+                &device, ctx.allocator_mut(), data,
+                vk::BufferUsageFlags::STORAGE_BUFFER, "mesh_lights_ssbo",
+            )?;
+            info!("Mesh multi-light SSBO: {} lights, {} bytes", sm.lights.len(), data.len());
+            lights_ssbo = Some(buf);
+        }
+
+        let mut scene_light_ubo: Option<GpuBuffer> = None;
+        if has_multi_light {
+            let mut scene_light_data = [0u8; 32];
+            scene_light_data[0..12].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
+            scene_light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
+            let light_count = sm.lights.len() as i32;
+            scene_light_data[16..20].copy_from_slice(&light_count.to_le_bytes());
+            scene_light_data[20..32].fill(0);
+            let buf = create_buffer_with_data(
+                &device, ctx.allocator_mut(), &scene_light_data,
+                vk::BufferUsageFlags::UNIFORM_BUFFER, "mesh_scene_light_ubo",
+            )?;
+            scene_light_ubo = Some(buf);
+        }
+
         // Material uniform buffer
         let material_data = if let Some(ref gs) = gltf_scene {
             if !gs.materials.is_empty() {
@@ -1186,6 +1236,13 @@ impl MeshShaderRenderer {
                                 let (buffer, range) = match binding.name.as_str() {
                                     "MVP" => (mvp_buffer.buffer, binding.size as u64),
                                     "Light" => (light_buffer.buffer, binding.size as u64),
+                                    "SceneLight" => {
+                                        if let Some(ref sl_buf) = scene_light_ubo {
+                                            (sl_buf.buffer, binding.size as u64)
+                                        } else {
+                                            continue;
+                                        }
+                                    }
                                     _ => continue,
                                 };
                                 let idx = buf_infos.len();
@@ -1199,22 +1256,35 @@ impl MeshShaderRenderer {
                                 );
                             }
                             vk::DescriptorType::STORAGE_BUFFER => {
-                                let (buffer, size) = match ssbo_map.get(binding.name.as_str()) {
-                                    Some(&(buf, sz)) => (buf, sz),
-                                    None => {
-                                        info!("Unknown SSBO '{}' in set 0, skipping", binding.name);
-                                        continue;
+                                // Check known SSBOs first, then multi-light
+                                if let Some(&(buffer, size)) = ssbo_map.get(binding.name.as_str()) {
+                                    let idx = buf_infos.len();
+                                    buf_infos.push(vk::DescriptorBufferInfo::default().buffer(buffer).offset(0).range(size));
+                                    writes.push(
+                                        vk::WriteDescriptorSet::default()
+                                            .dst_set(shared_set0)
+                                            .dst_binding(binding.binding)
+                                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                            .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                    );
+                                } else if binding.name == "lights" {
+                                    if let Some(ref lights_buf) = lights_ssbo {
+                                        let idx = buf_infos.len();
+                                        let ssbo_size = (sm.lights.len() as u64) * 64;
+                                        let range = if ssbo_size > 0 { ssbo_size } else { 64 };
+                                        buf_infos.push(vk::DescriptorBufferInfo::default().buffer(lights_buf.buffer).offset(0).range(range));
+                                        writes.push(
+                                            vk::WriteDescriptorSet::default()
+                                                .dst_set(shared_set0)
+                                                .dst_binding(binding.binding)
+                                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                                .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                        );
                                     }
-                                };
-                                let idx = buf_infos.len();
-                                buf_infos.push(vk::DescriptorBufferInfo::default().buffer(buffer).offset(0).range(size));
-                                writes.push(
-                                    vk::WriteDescriptorSet::default()
-                                        .dst_set(shared_set0)
-                                        .dst_binding(binding.binding)
-                                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                                        .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
-                                );
+                                } else {
+                                    info!("Unknown SSBO '{}' in set 0, skipping", binding.name);
+                                    continue;
+                                }
                             }
                             _ => continue,
                         }
@@ -1297,6 +1367,12 @@ impl MeshShaderRenderer {
                                             (mat_buf.buffer, std::mem::size_of::<MaterialUboData>() as u64)
                                         } else if binding.name == "Light" {
                                             (light_buffer.buffer, binding.size as u64)
+                                        } else if binding.name == "SceneLight" {
+                                            if let Some(ref sl_buf) = scene_light_ubo {
+                                                (sl_buf.buffer, binding.size as u64)
+                                            } else {
+                                                continue;
+                                            }
                                         } else {
                                             continue;
                                         };
@@ -1311,6 +1387,22 @@ impl MeshShaderRenderer {
                                                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                                                 .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
                                         );
+                                    }
+                                    vk::DescriptorType::STORAGE_BUFFER => {
+                                        if binding.name == "lights" {
+                                            if let Some(ref lights_buf) = lights_ssbo {
+                                                let idx = buf_infos.len();
+                                                let ssbo_size = (sm.lights.len() as u64) * 64;
+                                                let range = if ssbo_size > 0 { ssbo_size } else { 64 };
+                                                buf_infos.push(vk::DescriptorBufferInfo::default().buffer(lights_buf.buffer).offset(0).range(range));
+                                                writes.push(
+                                                    vk::WriteDescriptorSet::default()
+                                                        .dst_set(ds).dst_binding(binding.binding)
+                                                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                                        .buffer_info(unsafe { std::slice::from_raw_parts(&buf_infos[idx] as *const _, 1) }),
+                                                );
+                                            }
+                                        }
                                     }
                                     vk::DescriptorType::SAMPLER => {
                                         let actual_sampler = ibl_assets.sampler_for_binding(&binding.name).unwrap_or(sampler);
@@ -1534,6 +1626,9 @@ impl MeshShaderRenderer {
                 texture_images,
                 per_material_textures,
                 ibl_assets,
+                has_multi_light,
+                lights_ssbo,
+                scene_light_ubo,
                 multi_pipeline: true,
                 mesh_permutations,
                 material_to_permutation,
@@ -1648,6 +1743,13 @@ impl MeshShaderRenderer {
                                 "MVP" => (mvp_buffer.buffer, binding.size as u64),
                                 "Light" => (light_buffer.buffer, binding.size as u64),
                                 "Material" => (material_buffer.buffer, std::mem::size_of::<MaterialUboData>() as u64),
+                                "SceneLight" => {
+                                    if let Some(ref sl_buf) = scene_light_ubo {
+                                        (sl_buf.buffer, binding.size as u64)
+                                    } else {
+                                        continue;
+                                    }
+                                }
                                 _ => continue,
                             };
                             let idx = buffer_infos.len();
@@ -1671,35 +1773,58 @@ impl MeshShaderRenderer {
                             );
                         }
                         vk::DescriptorType::STORAGE_BUFFER => {
-                            let (buffer, size) = match ssbo_map.get(&binding.name) {
-                                Some(&(buf, sz)) => (buf, sz),
-                                None => {
-                                    info!(
-                                        "Unknown SSBO name '{}' at set={} binding={}, skipping",
-                                        binding.name, set_idx, binding.binding
+                            // Check known geometry SSBOs first, then multi-light
+                            if let Some(&(buf, sz)) = ssbo_map.get(&binding.name) {
+                                let idx = buffer_infos.len();
+                                buffer_infos.push(
+                                    vk::DescriptorBufferInfo::default()
+                                        .buffer(buf)
+                                        .offset(0)
+                                        .range(sz),
+                                );
+                                writes.push(
+                                    vk::WriteDescriptorSet::default()
+                                        .dst_set(ds)
+                                        .dst_binding(binding.binding)
+                                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                        .buffer_info(unsafe {
+                                            std::slice::from_raw_parts(
+                                                &buffer_infos[idx] as *const _,
+                                                1,
+                                            )
+                                        }),
+                                );
+                            } else if binding.name == "lights" {
+                                if let Some(ref lights_buf) = lights_ssbo {
+                                    let idx = buffer_infos.len();
+                                    let ssbo_size = (sm.lights.len() as u64) * 64;
+                                    let range = if ssbo_size > 0 { ssbo_size } else { 64 };
+                                    buffer_infos.push(
+                                        vk::DescriptorBufferInfo::default()
+                                            .buffer(lights_buf.buffer)
+                                            .offset(0)
+                                            .range(range),
                                     );
-                                    continue;
+                                    writes.push(
+                                        vk::WriteDescriptorSet::default()
+                                            .dst_set(ds)
+                                            .dst_binding(binding.binding)
+                                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                            .buffer_info(unsafe {
+                                                std::slice::from_raw_parts(
+                                                    &buffer_infos[idx] as *const _,
+                                                    1,
+                                                )
+                                            }),
+                                    );
                                 }
-                            };
-                            let idx = buffer_infos.len();
-                            buffer_infos.push(
-                                vk::DescriptorBufferInfo::default()
-                                    .buffer(buffer)
-                                    .offset(0)
-                                    .range(size),
-                            );
-                            writes.push(
-                                vk::WriteDescriptorSet::default()
-                                    .dst_set(ds)
-                                    .dst_binding(binding.binding)
-                                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                                    .buffer_info(unsafe {
-                                        std::slice::from_raw_parts(
-                                            &buffer_infos[idx] as *const _,
-                                            1,
-                                        )
-                                    }),
-                            );
+                            } else {
+                                info!(
+                                    "Unknown SSBO name '{}' at set={} binding={}, skipping",
+                                    binding.name, set_idx, binding.binding
+                                );
+                                continue;
+                            }
                         }
                         vk::DescriptorType::SAMPLER => {
                             let actual_sampler = ibl_assets
@@ -1883,6 +2008,9 @@ impl MeshShaderRenderer {
                 texture_images,
                 per_material_textures,
                 ibl_assets,
+                has_multi_light,
+                lights_ssbo,
+                scene_light_ubo,
                 multi_pipeline: false,
                 mesh_permutations: Vec::new(),
                 material_to_permutation: Vec::new(),
@@ -2109,6 +2237,50 @@ impl MeshShaderRenderer {
         light_data[28..32].copy_from_slice(&0.0f32.to_le_bytes());
 
         let light_buffer = create_buffer_with_data(&device, ctx.allocator_mut(), &light_data, vk::BufferUsageFlags::UNIFORM_BUFFER, "mesh_bl_light")?;
+
+        // --- Multi-light detection and buffer creation (P17.2) ---
+        let frag_merged_for_detect = reflected_pipeline::merge_descriptor_sets(&[&frag_refl]);
+        let has_multi_light = frag_merged_for_detect.values().any(|bindings| {
+            bindings.iter().any(|b| b.name == "lights" && b.binding_type == "storage_buffer")
+        });
+
+        let mut sm = scene_manager::SceneManager::new();
+        if let Some(ref gs) = gltf_scene {
+            sm.populate_lights_from_gltf(&gs.lights);
+        } else {
+            sm.populate_lights_from_gltf(&[]);
+        }
+
+        let mut lights_ssbo: Option<GpuBuffer> = None;
+        if has_multi_light {
+            let light_floats = sm.pack_lights_buffer();
+            let data: &[u8] = if light_floats.is_empty() {
+                &[0u8; 64]
+            } else {
+                bytemuck::cast_slice(&light_floats)
+            };
+            let buf = create_buffer_with_data(
+                &device, ctx.allocator_mut(), data,
+                vk::BufferUsageFlags::STORAGE_BUFFER, "mesh_bl_lights_ssbo",
+            )?;
+            info!("Mesh bindless multi-light SSBO: {} lights, {} bytes", sm.lights.len(), data.len());
+            lights_ssbo = Some(buf);
+        }
+
+        let mut scene_light_ubo: Option<GpuBuffer> = None;
+        if has_multi_light {
+            let mut scene_light_data = [0u8; 32];
+            scene_light_data[0..12].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
+            scene_light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
+            let light_count = sm.lights.len() as i32;
+            scene_light_data[16..20].copy_from_slice(&light_count.to_le_bytes());
+            scene_light_data[20..32].fill(0);
+            let buf = create_buffer_with_data(
+                &device, ctx.allocator_mut(), &scene_light_data,
+                vk::BufferUsageFlags::UNIFORM_BUFFER, "mesh_bl_scene_light_ubo",
+            )?;
+            scene_light_ubo = Some(buf);
+        }
 
         // Material UBO (for legacy single-material fallback fields)
         let material_data = if let Some(ref gs) = gltf_scene {
@@ -2372,6 +2544,13 @@ impl MeshShaderRenderer {
                                 "MVP" => (mvp_buffer.buffer, binding.size as u64),
                                 "Light" => (light_buffer.buffer, binding.size as u64),
                                 "Material" => (material_buffer.buffer, std::mem::size_of::<MaterialUboData>() as u64),
+                                "SceneLight" => {
+                                    if let Some(ref sl_buf) = scene_light_ubo {
+                                        (sl_buf.buffer, binding.size as u64)
+                                    } else {
+                                        continue;
+                                    }
+                                }
                                 _ => continue,
                             };
                             let idx = buffer_infos.len();
@@ -2383,17 +2562,27 @@ impl MeshShaderRenderer {
                             );
                         }
                         vk::DescriptorType::STORAGE_BUFFER => {
-                            let (buffer, size) = match ssbo_map.get(binding.name.as_str()) {
-                                Some(&(buf, sz)) => (buf, sz),
-                                None => continue,
-                            };
-                            let idx = buffer_infos.len();
-                            buffer_infos.push(vk::DescriptorBufferInfo::default().buffer(buffer).offset(0).range(size));
-                            writes.push(
-                                vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(binding.binding)
-                                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                                    .buffer_info(unsafe { std::slice::from_raw_parts(&buffer_infos[idx] as *const _, 1) }),
-                            );
+                            if let Some(&(buf, sz)) = ssbo_map.get(binding.name.as_str()) {
+                                let idx = buffer_infos.len();
+                                buffer_infos.push(vk::DescriptorBufferInfo::default().buffer(buf).offset(0).range(sz));
+                                writes.push(
+                                    vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(binding.binding)
+                                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                        .buffer_info(unsafe { std::slice::from_raw_parts(&buffer_infos[idx] as *const _, 1) }),
+                                );
+                            } else if binding.name == "lights" {
+                                if let Some(ref lights_buf) = lights_ssbo {
+                                    let idx = buffer_infos.len();
+                                    let ssbo_size = (sm.lights.len() as u64) * 64;
+                                    let range = if ssbo_size > 0 { ssbo_size } else { 64 };
+                                    buffer_infos.push(vk::DescriptorBufferInfo::default().buffer(lights_buf.buffer).offset(0).range(range));
+                                    writes.push(
+                                        vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(binding.binding)
+                                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                            .buffer_info(unsafe { std::slice::from_raw_parts(&buffer_infos[idx] as *const _, 1) }),
+                                    );
+                                }
+                            }
                         }
                         vk::DescriptorType::SAMPLER => {
                             let actual_sampler = ibl_assets.sampler_for_binding(&binding.name).unwrap_or(sampler);
@@ -2542,6 +2731,9 @@ impl MeshShaderRenderer {
             texture_images,
             per_material_textures,
             ibl_assets,
+            has_multi_light,
+            lights_ssbo,
+            scene_light_ubo,
             multi_pipeline: false, // not multi-pipeline mode
             mesh_permutations: Vec::new(),
             material_to_permutation: Vec::new(),
@@ -2590,6 +2782,18 @@ impl MeshShaderRenderer {
             if let Some(mapped) = alloc.mapped_slice_mut() {
                 let bytes = bytemuck::cast_slice::<f32, u8>(eye.as_ref());
                 mapped[16..28].copy_from_slice(bytes);
+            }
+        }
+
+        // Update view_pos in SceneLight UBO (offset 0, size 12) for multi-light mode
+        if self.has_multi_light {
+            if let Some(ref mut sl_buf) = self.scene_light_ubo {
+                if let Some(ref mut alloc) = sl_buf.allocation {
+                    if let Some(mapped) = alloc.mapped_slice_mut() {
+                        let bytes = bytemuck::cast_slice::<f32, u8>(eye.as_ref());
+                        mapped[0..12].copy_from_slice(bytes);
+                    }
+                }
             }
         }
     }
@@ -2944,6 +3148,12 @@ impl MeshShaderRenderer {
         self.ibl_assets.destroy(&device, ctx.allocator_mut());
         self.mvp_buffer.destroy(&device, ctx.allocator_mut());
         self.light_buffer.destroy(&device, ctx.allocator_mut());
+        if let Some(mut buf) = self.lights_ssbo.take() {
+            buf.destroy(&device, ctx.allocator_mut());
+        }
+        if let Some(mut buf) = self.scene_light_ubo.take() {
+            buf.destroy(&device, ctx.allocator_mut());
+        }
         self.material_buffer.destroy(&device, ctx.allocator_mut());
         self.meshlet_desc_buffer
             .destroy(&device, ctx.allocator_mut());

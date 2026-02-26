@@ -1,0 +1,84 @@
+// Multi-Light Demo — demonstrates multi-light support with unrolled evaluation
+// Simple PBR surface with SceneLight properties for dynamic light count.
+
+import brdf;
+import color;
+import compositing;
+import ibl;
+import texture;
+import lighting;
+
+features {
+    has_normal_map: bool,
+}
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    uv: vec2,
+    tangent: vec4 if has_normal_map,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        world_tangent: normalize((model * vec4(tangent.xyz, 0.0)).xyz) if has_normal_map,
+        world_bitangent: cross(world_normal, world_tangent) * tangent.w if has_normal_map,
+        frag_uv: uv,
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+surface MultiLightPBR {
+    sampler2d base_color_tex,
+    sampler2d normal_tex if has_normal_map,
+    sampler2d metallic_roughness_tex,
+
+    properties Material {
+        base_color_factor: vec4 = vec4(1.0, 1.0, 1.0, 1.0),
+        metallic_factor: scalar = 1.0,
+        roughness_factor: scalar = 1.0,
+    },
+
+    layers [
+        base(albedo: srgb_to_linear(sample(base_color_tex, uv).xyz)
+                     * Material.base_color_factor.xyz,
+             roughness: sample(metallic_roughness_tex, uv).y
+                        * Material.roughness_factor,
+             metallic: sample(metallic_roughness_tex, uv).z
+                        * Material.metallic_factor),
+        normal_map(map: sample(normal_tex, uv).xyz) if has_normal_map,
+    ]
+}
+
+lighting MultiLighting {
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    properties SceneLight {
+        view_pos: vec3 = vec3(0.0, 0.0, 3.0),
+        light_count: int = 0,
+    },
+
+    layers [
+        multi_light(count: SceneLight.light_count,
+                    max_lights: 16),
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
+    ]
+}
+
+schedule HighQuality {
+    tonemap: aces,
+}
+
+pipeline MultiLightForward {
+    geometry: StandardMesh,
+    surface: MultiLightPBR,
+    lighting: MultiLighting,
+    schedule: HighQuality,
+}

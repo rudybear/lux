@@ -12,9 +12,369 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use glam::Vec3;
+
 use crate::camera::DefaultCamera;
 use crate::screenshot;
 use crate::vulkan_context::VulkanContext;
+
+// ===========================================================================
+// Scene light management
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+pub struct SceneLight {
+    pub light_type: u32, // 0=directional, 1=point, 2=spot
+    pub position: Vec3,
+    pub direction: Vec3,
+    pub color: Vec3,
+    pub intensity: f32,
+    pub range: f32,
+    pub inner_cone_angle: f32,
+    pub outer_cone_angle: f32,
+    pub casts_shadow: bool,
+    pub shadow_index: i32,
+}
+
+impl Default for SceneLight {
+    fn default() -> Self {
+        Self {
+            light_type: 0,
+            position: Vec3::ZERO,
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            color: Vec3::ONE,
+            intensity: 1.0,
+            range: 0.0,
+            inner_cone_angle: 0.0,
+            outer_cone_angle: std::f32::consts::FRAC_PI_4,
+            casts_shadow: false,
+            shadow_index: -1,
+        }
+    }
+}
+
+/// Shadow map entry: stores the view-projection matrix and bias parameters
+/// for a single shadow-casting light.
+#[derive(Debug, Clone)]
+pub struct ShadowEntry {
+    pub view_projection: [f32; 16], // mat4 in column-major
+    pub bias: f32,
+    pub normal_bias: f32,
+    pub resolution: f32,
+    pub _pad: f32,
+}
+
+impl Default for ShadowEntry {
+    fn default() -> Self {
+        Self {
+            view_projection: [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            bias: 0.005,
+            normal_bias: 0.02,
+            resolution: 1024.0,
+            _pad: 0.0,
+        }
+    }
+}
+
+/// Maximum number of shadow-casting lights supported.
+pub const MAX_SHADOW_MAPS: usize = 8;
+
+/// Shadow map resolution (width and height).
+pub const SHADOW_MAP_RESOLUTION: u32 = 1024;
+
+/// Central scene manager: holds lights and provides buffer packing for GPU upload.
+pub struct SceneManager {
+    pub lights: Vec<SceneLight>,
+    pub shadow_entries: Vec<ShadowEntry>,
+}
+
+impl SceneManager {
+    pub fn new() -> Self {
+        Self {
+            lights: Vec::new(),
+            shadow_entries: Vec::new(),
+        }
+    }
+
+    /// Pack all lights into a flat f32 buffer for GPU SSBO upload.
+    ///
+    /// Each light occupies 4 vec4s (16 floats = 64 bytes):
+    ///   vec4: (light_type, intensity, range, inner_cone)
+    ///   vec4: (position.xyz, outer_cone)
+    ///   vec4: (direction.xyz, shadow_index)
+    ///   vec4: (color.xyz, pad)
+    pub fn pack_lights_buffer(&self) -> Vec<f32> {
+        let mut buf = Vec::new();
+        for l in &self.lights {
+            // vec4: (light_type, intensity, range, inner_cone)
+            buf.push(l.light_type as f32);
+            buf.push(l.intensity);
+            buf.push(l.range);
+            buf.push(l.inner_cone_angle);
+            // vec4: (position.xyz, outer_cone)
+            buf.push(l.position.x);
+            buf.push(l.position.y);
+            buf.push(l.position.z);
+            buf.push(l.outer_cone_angle);
+            // vec4: (direction.xyz, shadow_index)
+            buf.push(l.direction.x);
+            buf.push(l.direction.y);
+            buf.push(l.direction.z);
+            buf.push(l.shadow_index as f32);
+            // vec4: (color.xyz, pad)
+            buf.push(l.color.x);
+            buf.push(l.color.y);
+            buf.push(l.color.z);
+            buf.push(0.0); // pad
+        }
+        buf
+    }
+
+    /// Populate lights from a glTF scene's extracted light data.
+    ///
+    /// If the scene has no lights, a default directional light is added.
+    pub fn populate_lights_from_gltf(&mut self, gltf_lights: &[crate::gltf_loader::GltfLight]) {
+        self.lights.clear();
+        for gl in gltf_lights {
+            let light_type = match gl.light_type.as_str() {
+                "directional" => 0,
+                "point" => 1,
+                "spot" => 2,
+                _ => 0,
+            };
+            self.lights.push(SceneLight {
+                light_type,
+                position: gl.position,
+                direction: gl.direction,
+                color: Vec3::new(gl.color[0], gl.color[1], gl.color[2]),
+                intensity: gl.intensity,
+                range: gl.range,
+                inner_cone_angle: gl.inner_cone_angle,
+                outer_cone_angle: gl.outer_cone_angle,
+                ..Default::default()
+            });
+        }
+        // Add default directional light if scene has none
+        if self.lights.is_empty() {
+            self.lights.push(SceneLight {
+                light_type: 0,
+                direction: Vec3::new(1.0, 0.8, 0.6).normalize(),
+                color: Vec3::new(1.0, 0.98, 0.95),
+                intensity: 1.0,
+                ..Default::default()
+            });
+        }
+        info!(
+            "SceneManager: {} light(s) populated",
+            self.lights.len()
+        );
+    }
+
+    /// Compute shadow view-projection matrices for all shadow-capable lights.
+    ///
+    /// For directional lights: builds an orthographic projection sized to the
+    /// camera frustum. For spot lights: builds a perspective projection from the
+    /// light's position using its cone angle and range.
+    ///
+    /// Assigns `shadow_index` on each light (-1 if no shadow).
+    /// Stores results in `self.shadow_entries`.
+    pub fn compute_shadow_data(
+        &mut self,
+        camera_view: &[f32; 16],
+        camera_proj: &[f32; 16],
+        _near: f32,
+        _far: f32,
+    ) {
+        use glam::{Mat4, Vec3, Vec4};
+
+        self.shadow_entries.clear();
+        let mut shadow_idx: i32 = 0;
+
+        // Parse camera matrices (column-major)
+        let cam_view = Mat4::from_cols_array(camera_view);
+        let cam_proj = Mat4::from_cols_array(camera_proj);
+        let cam_inv_vp = (cam_proj * cam_view).inverse();
+
+        // Compute camera frustum corners in world space (NDC cube corners)
+        let ndc_corners: [[f32; 3]; 8] = [
+            [-1.0, -1.0, 0.0], [ 1.0, -1.0, 0.0], [-1.0,  1.0, 0.0], [ 1.0,  1.0, 0.0],
+            [-1.0, -1.0, 1.0], [ 1.0, -1.0, 1.0], [-1.0,  1.0, 1.0], [ 1.0,  1.0, 1.0],
+        ];
+        let mut frustum_ws: Vec<Vec3> = Vec::with_capacity(8);
+        for ndc in &ndc_corners {
+            let clip = cam_inv_vp * Vec4::new(ndc[0], ndc[1], ndc[2], 1.0);
+            if clip.w.abs() > 1e-8 {
+                frustum_ws.push(Vec3::new(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w));
+            }
+        }
+
+        // Compute frustum center and radius for directional light sizing
+        let frustum_center = if !frustum_ws.is_empty() {
+            let sum: Vec3 = frustum_ws.iter().copied().sum();
+            sum / frustum_ws.len() as f32
+        } else {
+            Vec3::ZERO
+        };
+
+        let frustum_radius = frustum_ws.iter()
+            .map(|p| (*p - frustum_center).length())
+            .fold(0.0f32, f32::max);
+
+        for light in self.lights.iter_mut() {
+            if shadow_idx as usize >= MAX_SHADOW_MAPS {
+                light.shadow_index = -1;
+                continue;
+            }
+
+            // Only directional and spot lights cast shadows
+            match light.light_type {
+                0 => {
+                    // Directional light: orthographic projection
+                    let light_dir = light.direction.normalize();
+                    // Build a stable up vector
+                    let up = if light_dir.y.abs() > 0.99 {
+                        Vec3::new(0.0, 0.0, 1.0)
+                    } else {
+                        Vec3::new(0.0, 1.0, 0.0)
+                    };
+                    let light_right = light_dir.cross(up).normalize();
+                    let light_up = light_right.cross(light_dir).normalize();
+
+                    // Light view: looking along light_dir from behind the frustum
+                    let light_pos = frustum_center - light_dir * frustum_radius * 2.0;
+
+                    let light_view = Mat4::from_cols(
+                        Vec4::new(light_right.x, light_up.x, -light_dir.x, 0.0),
+                        Vec4::new(light_right.y, light_up.y, -light_dir.y, 0.0),
+                        Vec4::new(light_right.z, light_up.z, -light_dir.z, 0.0),
+                        Vec4::new(
+                            -light_right.dot(light_pos),
+                            -light_up.dot(light_pos),
+                            light_dir.dot(light_pos),
+                            1.0,
+                        ),
+                    );
+
+                    // Ortho projection sized to frustum
+                    let extent = frustum_radius.max(1.0);
+                    let ortho_near = 0.0f32;
+                    let ortho_far = frustum_radius * 4.0;
+
+                    // Column-major orthographic projection (Vulkan depth [0,1])
+                    let light_proj = Mat4::from_cols(
+                        Vec4::new(1.0 / extent, 0.0, 0.0, 0.0),
+                        Vec4::new(0.0, -1.0 / extent, 0.0, 0.0), // Y-flip for Vulkan
+                        Vec4::new(0.0, 0.0, 1.0 / (ortho_far - ortho_near), 0.0),
+                        Vec4::new(0.0, 0.0, -ortho_near / (ortho_far - ortho_near), 1.0),
+                    );
+
+                    let vp = light_proj * light_view;
+                    light.shadow_index = shadow_idx;
+                    light.casts_shadow = true;
+
+                    self.shadow_entries.push(ShadowEntry {
+                        view_projection: vp.to_cols_array(),
+                        bias: 0.005,
+                        normal_bias: 0.02,
+                        resolution: SHADOW_MAP_RESOLUTION as f32,
+                        _pad: 0.0,
+                    });
+                    shadow_idx += 1;
+                }
+                2 => {
+                    // Spot light: perspective projection from light position
+                    let light_dir = light.direction.normalize();
+                    let up = if light_dir.y.abs() > 0.99 {
+                        Vec3::new(0.0, 0.0, 1.0)
+                    } else {
+                        Vec3::new(0.0, 1.0, 0.0)
+                    };
+                    let light_right = light_dir.cross(up).normalize();
+                    let light_up = light_right.cross(light_dir).normalize();
+
+                    let light_view = Mat4::from_cols(
+                        Vec4::new(light_right.x, light_up.x, -light_dir.x, 0.0),
+                        Vec4::new(light_right.y, light_up.y, -light_dir.y, 0.0),
+                        Vec4::new(light_right.z, light_up.z, -light_dir.z, 0.0),
+                        Vec4::new(
+                            -light_right.dot(light.position),
+                            -light_up.dot(light.position),
+                            light_dir.dot(light.position),
+                            1.0,
+                        ),
+                    );
+
+                    // Use the outer cone angle for the FOV
+                    let fov = light.outer_cone_angle * 2.0;
+                    let fov = fov.max(0.1); // Clamp to avoid degenerate
+                    let spot_near = 0.1f32;
+                    let spot_far = if light.range > 0.0 { light.range } else { 100.0 };
+                    let f_val = 1.0 / (fov / 2.0).tan();
+
+                    // Vulkan perspective (Y-flip, depth [0,1])
+                    let light_proj = Mat4::from_cols(
+                        Vec4::new(f_val, 0.0, 0.0, 0.0),
+                        Vec4::new(0.0, -f_val, 0.0, 0.0), // Y-flip
+                        Vec4::new(0.0, 0.0, spot_far / (spot_near - spot_far), -1.0),
+                        Vec4::new(0.0, 0.0, (spot_near * spot_far) / (spot_near - spot_far), 0.0),
+                    );
+
+                    let vp = light_proj * light_view;
+                    light.shadow_index = shadow_idx;
+                    light.casts_shadow = true;
+
+                    self.shadow_entries.push(ShadowEntry {
+                        view_projection: vp.to_cols_array(),
+                        bias: 0.005,
+                        normal_bias: 0.02,
+                        resolution: SHADOW_MAP_RESOLUTION as f32,
+                        _pad: 0.0,
+                    });
+                    shadow_idx += 1;
+                }
+                _ => {
+                    // Point lights don't cast shadows in this implementation
+                    light.shadow_index = -1;
+                }
+            }
+        }
+
+        info!(
+            "SceneManager: computed {} shadow map(s) for {} light(s)",
+            self.shadow_entries.len(),
+            self.lights.len()
+        );
+    }
+
+    /// Pack all shadow entries into a flat f32 buffer for GPU SSBO upload.
+    ///
+    /// Each entry occupies 20 floats (80 bytes):
+    ///   16 floats: mat4 viewProjection (column-major)
+    ///   4 floats: bias, normalBias, resolution, pad
+    pub fn pack_shadow_buffer(&self) -> Vec<f32> {
+        let mut buf = Vec::with_capacity(self.shadow_entries.len() * 20);
+        for entry in &self.shadow_entries {
+            // 16 floats for mat4
+            buf.extend_from_slice(&entry.view_projection);
+            // 4 floats: bias, normal_bias, resolution, pad
+            buf.push(entry.bias);
+            buf.push(entry.normal_bias);
+            buf.push(entry.resolution);
+            buf.push(entry._pad);
+        }
+        buf
+    }
+
+    /// Number of active shadow maps.
+    pub fn shadow_count(&self) -> usize {
+        self.shadow_entries.len()
+    }
+}
 
 // ===========================================================================
 // Shared GPU resource types

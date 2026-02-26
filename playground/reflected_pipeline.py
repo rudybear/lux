@@ -195,6 +195,13 @@ class ReflectedPipeline:
                         resource=wgpu.BufferBinding(buffer=buf, size=size),
                     ))
 
+                elif btype == "storage_buffer":
+                    buf = resource
+                    entries.append(wgpu.BindGroupEntry(
+                        binding=binding_num,
+                        resource=wgpu.BufferBinding(buffer=buf, size=buf.size),
+                    ))
+
                 elif btype == "sampler":
                     # Expect (sampler, texture_view) tuple
                     if isinstance(resource, tuple):
@@ -272,6 +279,8 @@ class ReflectedPipeline:
             if visibility == 0:
                 visibility = wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT
 
+        name = binding_data.get("name", "")
+
         if btype == "uniform_buffer":
             return wgpu.BindGroupLayoutEntry(
                 binding=binding_num,
@@ -279,12 +288,30 @@ class ReflectedPipeline:
                 buffer=wgpu.BufferBindingLayout(type=wgpu.BufferBindingType.uniform),
             )
         elif btype == "sampler":
+            # Shadow map comparison sampler vs regular filtering sampler
+            if name == "shadow_maps":
+                return wgpu.BindGroupLayoutEntry(
+                    binding=binding_num,
+                    visibility=visibility,
+                    sampler=wgpu.SamplerBindingLayout(
+                        type=wgpu.SamplerBindingType.comparison),
+                )
             return wgpu.BindGroupLayoutEntry(
                 binding=binding_num,
                 visibility=visibility,
                 sampler=wgpu.SamplerBindingLayout(type=wgpu.SamplerBindingType.filtering),
             )
         elif btype == "sampled_image":
+            # Shadow map depth texture array vs regular 2D texture
+            if name == "shadow_maps":
+                return wgpu.BindGroupLayoutEntry(
+                    binding=binding_num,
+                    visibility=visibility,
+                    texture=wgpu.TextureBindingLayout(
+                        sample_type=wgpu.TextureSampleType.depth,
+                        view_dimension=wgpu.TextureViewDimension.d2_array,
+                    ),
+                )
             return wgpu.BindGroupLayoutEntry(
                 binding=binding_num,
                 visibility=visibility,
@@ -301,6 +328,12 @@ class ReflectedPipeline:
                     sample_type=wgpu.TextureSampleType.float,
                     view_dimension=wgpu.TextureViewDimension.cube,
                 ),
+            )
+        elif btype == "storage_buffer":
+            return wgpu.BindGroupLayoutEntry(
+                binding=binding_num,
+                visibility=visibility,
+                buffer=wgpu.BufferBindingLayout(type=wgpu.BufferBindingType.read_only_storage),
             )
         elif btype == "storage_image":
             return wgpu.BindGroupLayoutEntry(

@@ -341,6 +341,14 @@ def _expand_surface_to_fragment(
         for sam in lighting.samplers:
             stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
 
+    # If multi_light layer present, add lights SSBO
+    if lighting and lighting.layers:
+        for layer in lighting.layers:
+            if layer.name == "multi_light":
+                stage.storage_buffers.append(
+                    StorageBufferDecl("lights", "LightData"))
+                break
+
     # Generate main function body - use layered path if surface has layers
     if surface.layers is not None:
         body = _generate_layered_main(surface, frag_inputs, schedule,
@@ -505,6 +513,107 @@ def _emit_custom_layer(layer, fn, result_var, body, prefix, rewrite_for_rt=False
     return out_var
 
 
+# --- Multi-light unrolling helper ---
+
+def _emit_multi_light_loop(
+    body: list,
+    max_lights: int,
+    pos_var: str,      # "world_pos" or "hit_pos"
+    normal_var: str,   # "n"
+    view_var: str,     # "v"
+    albedo_var: str,   # "layer_albedo"
+    roughness_var: str, # "layer_roughness"
+    metallic_var: str,  # "layer_metallic"
+    light_count_var: str = "_ml_light_count",
+    has_shadows: bool = False,
+) -> str:
+    """Emit unrolled multi-light evaluation.
+
+    Generates max_lights iterations, each guarded by if (i < light_count).
+    Each iteration:
+    1. Loads light data from SSBO: lights[i].field
+    2. Calls evaluate_light_direction() -> l_i
+    3. Calls gltf_pbr(n, v, l_i, albedo, roughness, metallic) -> brdf_i
+    4. Calls evaluate_light() -> radiance_i
+    5. Accumulates: total_direct += brdf_i * radiance_i
+
+    Returns the result variable name ("total_direct").
+    """
+    # Initialize accumulator
+    body.append(LetStmt("total_direct", "vec3",
+        ConstructorExpr("vec3", [NumberLit("0.0")])))
+
+    for i in range(max_lights):
+        idx = str(i)
+        sfx = f"_{i}"
+        guard_body = []
+
+        # Load light fields from SSBO: lights[i].field_name
+        # Uses FieldAccess(IndexAccess(VarRef("lights"), NumberLit(i)), field)
+        def _light_ref(field, _idx=idx):
+            return FieldAccess(
+                IndexAccess(VarRef("lights"), NumberLit(_idx)),
+                field
+            )
+
+        guard_body.append(LetStmt(f"lt{sfx}", "scalar", _light_ref("light_type")))
+        guard_body.append(LetStmt(f"li{sfx}", "scalar", _light_ref("intensity")))
+        guard_body.append(LetStmt(f"lr{sfx}", "scalar", _light_ref("range")))
+        guard_body.append(LetStmt(f"lic{sfx}", "scalar", _light_ref("inner_cone")))
+        guard_body.append(LetStmt(f"lp{sfx}", "vec3", _light_ref("position")))
+        guard_body.append(LetStmt(f"loc{sfx}", "scalar", _light_ref("outer_cone")))
+        guard_body.append(LetStmt(f"ld{sfx}", "vec3", _light_ref("direction")))
+        guard_body.append(LetStmt(f"lsi{sfx}", "scalar", _light_ref("shadow_index")))
+        guard_body.append(LetStmt(f"lc{sfx}", "vec3", _light_ref("color")))
+
+        # Compute light direction using stdlib helper
+        guard_body.append(LetStmt(f"l{sfx}", "vec3",
+            CallExpr(VarRef("evaluate_light_direction"), [
+                VarRef(f"lt{sfx}"),
+                VarRef(f"lp{sfx}"),
+                VarRef(f"ld{sfx}"),
+                VarRef(pos_var),
+            ])))
+
+        # Evaluate BRDF
+        guard_body.append(LetStmt(f"brdf{sfx}", "vec3",
+            CallExpr(VarRef("gltf_pbr"), [
+                VarRef(normal_var), VarRef(view_var), VarRef(f"l{sfx}"),
+                VarRef(albedo_var), VarRef(roughness_var),
+                VarRef(metallic_var),
+            ])))
+
+        # Evaluate light radiance (attenuation etc.)
+        guard_body.append(LetStmt(f"radiance{sfx}", "vec3",
+            CallExpr(VarRef("evaluate_light"), [
+                VarRef(f"lt{sfx}"),
+                VarRef(f"lp{sfx}"),
+                VarRef(f"ld{sfx}"),
+                VarRef(f"lc{sfx}"),
+                VarRef(f"li{sfx}"),
+                VarRef(f"lr{sfx}"),
+                VarRef(f"lic{sfx}"),
+                VarRef(f"loc{sfx}"),
+                VarRef(pos_var),
+                VarRef(normal_var),
+            ])))
+
+        # Accumulate: total_direct = total_direct + brdf_i * radiance_i
+        guard_body.append(AssignStmt(
+            AssignTarget(VarRef("total_direct")),
+            BinaryOp("+", VarRef("total_direct"),
+                BinaryOp("*", VarRef(f"brdf{sfx}"), VarRef(f"radiance{sfx}"))),
+        ))
+
+        # Guard: if (i < light_count)
+        body.append(IfStmt(
+            BinaryOp("<", NumberLit(f"{i}.0"),
+                      BinaryOp("+", VarRef(light_count_var), NumberLit("0.0"))),
+            guard_body, []))
+
+    return "total_direct"
+
+
 # --- Shared helper functions for code deduplication ---
 
 def _emit_barycentric_interpolation(body, index_offset_expr=None):
@@ -649,9 +758,20 @@ def _generate_layered_main(
         body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
             ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("0.0"), NumberLit("1.0")]),
         ])))
-    # Light direction: from lighting block's directional layer or legacy uniform
+    # Detect multi_light vs directional lighting mode
+    _has_multi_light = False
     if lighting and lighting.layers:
         lighting_by_name = {layer.name: layer for layer in lighting.layers}
+        _has_multi_light = "multi_light" in lighting_by_name
+
+    # Light direction: from lighting block (directional/multi_light) or legacy uniform
+    if _has_multi_light:
+        # Multi-light path: l will be computed per-light inside unrolled loop.
+        # We still need a dummy `l` for layers that reference it (coat, sheen, etc.)
+        # It will be overwritten per-iteration, but downstream layers use the last value.
+        body.append(LetStmt("l", "vec3",
+            ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("1.0"), NumberLit("0.0")])))
+    elif lighting and lighting.layers:
         if "directional" in lighting_by_name:
             dir_args = _get_layer_args(lighting_by_name["directional"])
             body.append(LetStmt("l", "vec3",
@@ -693,17 +813,37 @@ def _generate_layered_main(
         body.append(LetStmt("layer_roughness", "scalar", roughness_expr))
         body.append(LetStmt("layer_metallic", "scalar", metallic_expr))
 
-        # Direct lighting via gltf_pbr (includes N·L)
-        body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
-            VarRef("n"), VarRef("v"), VarRef("l"),
-            VarRef("layer_albedo"), VarRef("layer_roughness"),
-            VarRef("layer_metallic"),
-        ])))
-        # Light color tint
-        body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
-            VarRef("direct"), VarRef("light_color"),
-        )))
-        result_var = "direct_lit"
+        if _has_multi_light:
+            # Multi-light path: unroll N iterations from SSBO
+            ml_args = _get_layer_args(lighting_by_name["multi_light"])
+            max_lights = 16  # default
+            if "max_lights" in ml_args and isinstance(ml_args["max_lights"], NumberLit):
+                max_lights = int(float(ml_args["max_lights"].value))
+            # Emit light_count from count arg (e.g. SceneLight.light_count)
+            count_expr = ml_args.get("count", NumberLit(str(max_lights)))
+            # Multiply by 1.0 to ensure float type (count may come from int uniform).
+            # Use _ml_ prefix to avoid clashing with uniform field names.
+            body.append(LetStmt("_ml_light_count", "scalar",
+                BinaryOp("*", count_expr, NumberLit("1.0"))))
+            result_var = _emit_multi_light_loop(
+                body, max_lights,
+                pos_var=pos_var, normal_var="n", view_var="v",
+                albedo_var="layer_albedo", roughness_var="layer_roughness",
+                metallic_var="layer_metallic",
+            )
+        else:
+            # Single directional light path
+            # Direct lighting via gltf_pbr (includes N-dot-L)
+            body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
+                VarRef("n"), VarRef("v"), VarRef("l"),
+                VarRef("layer_albedo"), VarRef("layer_roughness"),
+                VarRef("layer_metallic"),
+            ])))
+            # Light color tint
+            body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
+                VarRef("direct"), VarRef("light_color"),
+            )))
+            result_var = "direct_lit"
 
     # --- Transmission layer (replaces diffuse proportionally) ---
     if "transmission" in layers_by_name:
@@ -1381,6 +1521,14 @@ def _expand_layered_closest_hit(
         for sam in lighting.samplers:
             stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
 
+    # If multi_light layer present, add lights SSBO
+    if lighting and lighting.layers:
+        for layer in lighting.layers:
+            if layer.name == "multi_light":
+                stage.storage_buffers.append(
+                    StorageBufferDecl("lights", "LightData"))
+                break
+
     # --- Generate main body ---
     body = []
 
@@ -1395,9 +1543,20 @@ def _expand_layered_closest_hit(
     # --- View and light directions (RT-specific) ---
     body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
         UnaryOp("-", VarRef("world_ray_direction"))])))
-    # Light direction: from lighting block's directional layer or legacy uniform
+
+    # Detect multi_light vs directional lighting mode
+    _rt_has_multi_light = False
     if lighting and lighting.layers:
         rt_lighting_by_name = {layer.name: layer for layer in lighting.layers}
+        _rt_has_multi_light = "multi_light" in rt_lighting_by_name
+
+    # Light direction: from lighting block (directional/multi_light) or legacy uniform
+    if _rt_has_multi_light:
+        # Multi-light path: l will be computed per-light inside unrolled loop.
+        # Dummy l for downstream layers (coat, sheen, etc.)
+        body.append(LetStmt("l", "vec3",
+            ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("1.0"), NumberLit("0.0")])))
+    elif lighting and lighting.layers:
         if "directional" in rt_lighting_by_name:
             dir_args = _get_layer_args(rt_lighting_by_name["directional"])
             body.append(LetStmt("l", "vec3",
@@ -1424,7 +1583,7 @@ def _expand_layered_closest_hit(
     ])))
 
     # --- Base layer: direct lighting ---
-    # Rewrite sample→sample_lod for all layer expressions in RT
+    # Rewrite sample->sample_lod for all layer expressions in RT
     result_var = "result_zero"
     body.append(LetStmt(result_var, "vec3",
         ConstructorExpr("vec3", [NumberLit("0.0")])))
@@ -1442,15 +1601,35 @@ def _expand_layered_closest_hit(
         body.append(LetStmt("layer_roughness", "scalar", roughness_expr))
         body.append(LetStmt("layer_metallic", "scalar", metallic_expr))
 
-        body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
-            VarRef("n"), VarRef("v"), VarRef("l"),
-            VarRef("layer_albedo"), VarRef("layer_roughness"),
-            VarRef("layer_metallic"),
-        ])))
-        body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
-            VarRef("direct"), VarRef("light_color"),
-        )))
-        result_var = "direct_lit"
+        if _rt_has_multi_light:
+            # Multi-light path: unroll N iterations from SSBO
+            ml_args = _get_layer_args(rt_lighting_by_name["multi_light"])
+            max_lights = 16  # default
+            if "max_lights" in ml_args and isinstance(ml_args["max_lights"], NumberLit):
+                max_lights = int(float(ml_args["max_lights"].value))
+            # Emit light_count from count arg (e.g. SceneLight.light_count)
+            count_expr = ml_args.get("count", NumberLit(str(max_lights)))
+            # Multiply by 1.0 to ensure float type (count may come from int uniform).
+            # Use _ml_ prefix to avoid clashing with uniform field names.
+            body.append(LetStmt("_ml_light_count", "scalar",
+                BinaryOp("*", count_expr, NumberLit("1.0"))))
+            result_var = _emit_multi_light_loop(
+                body, max_lights,
+                pos_var="hit_pos", normal_var="n", view_var="v",
+                albedo_var="layer_albedo", roughness_var="layer_roughness",
+                metallic_var="layer_metallic",
+            )
+        else:
+            # Single directional light path
+            body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
+                VarRef("n"), VarRef("v"), VarRef("l"),
+                VarRef("layer_albedo"), VarRef("layer_roughness"),
+                VarRef("layer_metallic"),
+            ])))
+            body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
+                VarRef("direct"), VarRef("light_color"),
+            )))
+            result_var = "direct_lit"
 
     # --- Transmission layer (replaces diffuse proportionally) ---
     if "transmission" in layers_by_name:
@@ -2188,6 +2367,8 @@ def _emit_bindless_layer_body(
     mat_idx_expr,
     schedule: dict[str, str] | None = None,
     is_rt: bool = False,
+    lighting: LightingDecl | None = None,
+    pos_var: str = "world_pos",
 ) -> tuple[list, str]:
     """Generate shared uber-shader body for bindless mode.
 
@@ -2289,19 +2470,45 @@ def _emit_bindless_layer_body(
     ))
 
     # --- Direct lighting ---
-    body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
-        VarRef("n"), VarRef("v"), VarRef("l"),
-        VarRef("layer_albedo"), VarRef("layer_roughness"),
-        VarRef("layer_metallic"),
-    ])))
-    body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
-        VarRef("direct"),
-        ConstructorExpr("vec3", [
-            NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95"),
-        ]),
-    )))
+    # Check if lighting has multi_light layer
+    _bl_has_multi_light = False
+    if lighting and lighting.layers:
+        for _bl_layer in lighting.layers:
+            if _bl_layer.name == "multi_light":
+                _bl_has_multi_light = True
+                break
 
-    result_var = "direct_lit"
+    if _bl_has_multi_light:
+        # Multi-light path: unroll N iterations from SSBO
+        ml_args = _get_layer_args(
+            next(la for la in lighting.layers if la.name == "multi_light"))
+        max_lights = 16  # default
+        if "max_lights" in ml_args and isinstance(ml_args["max_lights"], NumberLit):
+            max_lights = int(float(ml_args["max_lights"].value))
+        count_expr = ml_args.get("count", NumberLit(str(max_lights)))
+        # Multiply by 1.0 to ensure float type (count may come from int uniform).
+        # Use _ml_ prefix to avoid clashing with uniform field names.
+        body.append(LetStmt("_ml_light_count", "scalar",
+            BinaryOp("*", count_expr, NumberLit("1.0"))))
+        result_var = _emit_multi_light_loop(
+            body, max_lights,
+            pos_var=pos_var, normal_var="n", view_var="v",
+            albedo_var="layer_albedo", roughness_var="layer_roughness",
+            metallic_var="layer_metallic",
+        )
+    else:
+        body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
+            VarRef("n"), VarRef("v"), VarRef("l"),
+            VarRef("layer_albedo"), VarRef("layer_roughness"),
+            VarRef("layer_metallic"),
+        ])))
+        body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
+            VarRef("direct"),
+            ConstructorExpr("vec3", [
+                NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95"),
+            ]),
+        )))
+        result_var = "direct_lit"
 
     # --- Initialize optional layer params (defaults = layer disabled) ---
     body.append(LetStmt("bl_trans_factor", "scalar", NumberLit("0.0")))
@@ -2452,7 +2659,7 @@ def _emit_bindless_layer_body(
     # --- Unified composition via compose_pbr_layers (stdlib) ---
     body.append(LetStmt("composed", "vec3", CallExpr(
         VarRef("compose_pbr_layers"), [
-            VarRef("direct_lit"),
+            VarRef(result_var),
             VarRef("n"), VarRef("v"), VarRef("l"),
             VarRef("layer_albedo"), VarRef("layer_roughness"),
             # Transmission
@@ -2545,6 +2752,14 @@ def _expand_bindless_fragment(
     stage.storage_buffers.append(StorageBufferDecl(
         "materials", "BindlessMaterialData"))
 
+    # If multi_light layer present, add lights SSBO
+    if lighting and lighting.layers:
+        for layer in lighting.layers:
+            if layer.name == "multi_light":
+                stage.storage_buffers.append(
+                    StorageBufferDecl("lights", "LightData"))
+                break
+
     # --- IBL samplers (kept as regular samplers — scene-global, not per-material) ---
     # Check lighting block first, then fall back to surface samplers
     if lighting:
@@ -2581,6 +2796,14 @@ def _expand_bindless_fragment(
         "frag_normal",
     )
 
+    # Detect multi_light mode for bindless raster
+    _bl_raster_has_multi_light = False
+    if lighting and lighting.layers:
+        for _bl_rl in lighting.layers:
+            if _bl_rl.name == "multi_light":
+                _bl_raster_has_multi_light = True
+                break
+
     # n, v, l setup
     body.append(LetStmt("n", "vec3", CallExpr(VarRef("normalize"), [VarRef(normal_var)])))
     if has_pos:
@@ -2589,7 +2812,12 @@ def _expand_bindless_fragment(
     else:
         body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
             ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("0.0"), NumberLit("1.0")])])))
-    body.append(LetStmt("l", "vec3", CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+    if _bl_raster_has_multi_light:
+        # Multi-light: dummy l for downstream layers (coat, sheen, etc.)
+        body.append(LetStmt("l", "vec3",
+            ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("1.0"), NumberLit("0.0")])))
+    else:
+        body.append(LetStmt("l", "vec3", CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
     body.append(LetStmt("n_dot_v", "scalar", CallExpr(VarRef("max"), [
         CallExpr(VarRef("dot"), [VarRef("n"), VarRef("v")]),
         NumberLit("0.001"),
@@ -2597,7 +2825,8 @@ def _expand_bindless_fragment(
 
     # Bindless uber-shader body (material_index from push constant)
     uber_body, output_var = _emit_bindless_layer_body(
-        surface, VarRef("material_index"), schedule, is_rt=False)
+        surface, VarRef("material_index"), schedule, is_rt=False,
+        lighting=lighting, pos_var=pos_var)
     body.extend(uber_body)
 
     # Output final color
@@ -2635,9 +2864,29 @@ def _expand_bindless_closest_hit(
     stage.storage_buffers.append(StorageBufferDecl("tex_coords", "vec2"))
     stage.storage_buffers.append(StorageBufferDecl("indices", "uint"))
 
+    # Light properties uniform (from lighting block — needed for multi_light count)
+    if lighting and lighting.properties:
+        lprops = lighting.properties
+        stage.uniforms.append(UniformBlock(lprops.name, [
+            BlockField(f.name, f.type_name) for f in lprops.fields
+        ]))
+        if not hasattr(stage, '_properties_defaults'):
+            stage._properties_defaults = {}
+        for f in lprops.fields:
+            if f.default is not None:
+                stage._properties_defaults[(lprops.name, f.name)] = f.default
+
     # Materials SSBO
     stage.storage_buffers.append(StorageBufferDecl(
         "materials", "BindlessMaterialData"))
+
+    # If multi_light layer present, add lights SSBO
+    if lighting and lighting.layers:
+        for layer in lighting.layers:
+            if layer.name == "multi_light":
+                stage.storage_buffers.append(
+                    StorageBufferDecl("lights", "LightData"))
+                break
 
     # IBL samplers (scene-global) — from lighting block or surface
     if lighting:
@@ -2662,13 +2911,26 @@ def _expand_bindless_closest_hit(
     # Barycentric interpolation preamble — offset primitive_id by geometry's index_offset
     _emit_barycentric_interpolation(body, VarRef("geo_index_offset"))
 
+    # Detect multi_light mode for bindless RT
+    _bl_rt_has_multi_light = False
+    if lighting and lighting.layers:
+        for _bl_rtl in lighting.layers:
+            if _bl_rtl.name == "multi_light":
+                _bl_rt_has_multi_light = True
+                break
+
     # View and light directions (RT-specific)
     body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
         UnaryOp("-", VarRef("world_ray_direction"))])))
-    body.append(LetStmt("l", "vec3",
-        CallExpr(VarRef("normalize"), [
-            ConstructorExpr("vec3", [
-                NumberLit("1.0"), NumberLit("0.8"), NumberLit("0.6")])])))
+    if _bl_rt_has_multi_light:
+        # Multi-light: dummy l for downstream layers (coat, sheen, etc.)
+        body.append(LetStmt("l", "vec3",
+            ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("1.0"), NumberLit("0.0")])))
+    else:
+        body.append(LetStmt("l", "vec3",
+            CallExpr(VarRef("normalize"), [
+                ConstructorExpr("vec3", [
+                    NumberLit("1.0"), NumberLit("0.8"), NumberLit("0.6")])])))
     body.append(LetStmt("n_dot_v", "scalar", CallExpr(VarRef("max"), [
         CallExpr(VarRef("dot"), [VarRef("n"), VarRef("v")]),
         NumberLit("0.001"),
@@ -2676,7 +2938,8 @@ def _expand_bindless_closest_hit(
 
     # Bindless uber-shader body (material index from gl_GeometryIndexEXT)
     uber_body, output_var = _emit_bindless_layer_body(
-        surface, VarRef("geometry_index"), schedule, is_rt=True)
+        surface, VarRef("geometry_index"), schedule, is_rt=True,
+        lighting=lighting, pos_var="hit_pos")
     body.extend(uber_body)
 
     # Write to payload

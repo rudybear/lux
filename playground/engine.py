@@ -87,6 +87,21 @@ class LightData:
     position: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
     color: tuple = (1.0, 1.0, 1.0)
     intensity: float = 1.0
+    type: str = "directional"       # "directional", "point", "spot"
+    range: float = 0.0              # 0 = infinite
+    inner_cone_angle: float = 0.0   # spot only
+    outer_cone_angle: float = 0.7854  # spot only (~pi/4)
+    shadow_index: float = -1.0
+
+
+@dataclass
+class ShadowEntry:
+    """Shadow map data for a single shadow-casting light."""
+    view_projection: list = field(default_factory=lambda: [
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])  # 4x4 column-major flat
+    bias: float = 0.005
+    normal_bias: float = 0.02
+    resolution: float = 1024.0
 
 
 @dataclass
@@ -116,9 +131,23 @@ class GPUScene:
     index_buffers: list = field(default_factory=list)    # list of (GPUBuffer, num_indices)
     textures: dict = field(default_factory=dict)         # name -> (sampler, texture_view)
     uniform_buffers: dict = field(default_factory=dict)  # name -> GPUBuffer
+    storage_buffers: dict = field(default_factory=dict)  # name -> GPUBuffer (SSBOs)
     per_material_textures: list = field(default_factory=list)  # list of dict: name -> (sampler, view)
     per_material_ubos: list = field(default_factory=list)      # list of GPUBuffer
     draw_ranges: list = field(default_factory=list)            # list of DrawRange
+    reflection_data: dict = field(default_factory=dict)        # stage -> reflection dict
+    # Shadow map resources
+    shadow_texture: object = None
+    shadow_sampler: object = None
+    shadow_array_view: object = None
+    shadow_layer_views: list = field(default_factory=list)
+    shadow_matrices_buffer: object = None
+    shadow_depth_pipeline: object = None
+    shadow_depth_bind_layout: object = None
+    shadow_depth_pipeline_layout: object = None
+    shadow_mvp_buffers: list = field(default_factory=list)
+    has_shadows: bool = False
+    num_shadow_maps: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +402,24 @@ def _load_gltf_scene(path: str, camera_elevation: float = 5.0) -> SceneData:
             position=light.position.copy(),
             color=light.color,
             intensity=light.intensity,
+            type=getattr(light, 'type', 'directional'),
+            range=getattr(light, 'range', 0.0),
+            inner_cone_angle=getattr(light, 'inner_cone_angle', 0.0),
+            outer_cone_angle=getattr(light, 'outer_cone_angle', 0.7854),
         ))
+
+    # Extract light positions/directions from node world transforms
+    for node in gltf_scene.nodes:
+        if node.light_index >= 0 and node.light_index < len(scene.lights):
+            light = scene.lights[node.light_index]
+            # Position from row 3 of world transform (row-vector convention: translation in last row)
+            light.position = node.world_transform[3, :3].copy()
+            # Direction: transform local -Z through rotation
+            rot = node.world_transform[:3, :3]
+            light.direction = (rot @ np.array([0, 0, -1], dtype=np.float32))
+            norm = np.linalg.norm(light.direction)
+            if norm > 1e-6:
+                light.direction /= norm
 
     if not scene.lights:
         scene.lights.append(LightData())
@@ -728,10 +774,493 @@ def _pack_material_ubo(mat: MaterialData) -> bytes:
     return bytes(buf)
 
 
+def _pack_lights_buffer(scene: SceneData) -> bytes:
+    """Pack scene lights into GPU buffer (std430 layout: 64 bytes per light)."""
+    lights = scene.lights if scene.lights else []
+
+    buf = bytearray()
+    for light in lights:
+        light_type = {"directional": 0.0, "point": 1.0, "spot": 2.0}.get(
+            getattr(light, 'type', 'directional'), 0.0)
+        intensity = getattr(light, 'intensity', 1.0)
+        range_val = getattr(light, 'range', 0.0)
+        inner_cone = getattr(light, 'inner_cone_angle', 0.0)
+        pos = getattr(light, 'position', np.zeros(3))
+        outer_cone = getattr(light, 'outer_cone_angle', 0.7854)
+        direction = getattr(light, 'direction', np.array([0, -1, 0]))
+        shadow_idx = getattr(light, 'shadow_index', -1.0)
+        color = getattr(light, 'color', (1.0, 1.0, 1.0))
+
+        # vec4: (light_type, intensity, range, inner_cone)
+        buf += struct.pack("4f", light_type, intensity, range_val, inner_cone)
+        # vec4: (position.xyz, outer_cone)
+        buf += struct.pack("3f", float(pos[0]), float(pos[1]), float(pos[2]))
+        buf += struct.pack("f", outer_cone)
+        # vec4: (direction.xyz, shadow_index)
+        buf += struct.pack("3f", float(direction[0]), float(direction[1]), float(direction[2]))
+        buf += struct.pack("f", float(shadow_idx))
+        # vec4: (color.xyz, pad)
+        buf += struct.pack("3f", float(color[0]), float(color[1]), float(color[2]))
+        buf += struct.pack("f", 0.0)
+
+    if not buf:
+        # Dummy light (directional, white, pointing down)
+        # Layout: vec4(type,intensity,range,inner_cone), vec4(pos.xyz,outer_cone),
+        #         vec4(dir.xyz,shadow_idx), vec4(color.xyz,pad)
+        buf = bytearray(64)
+        struct.pack_into("f", buf, 0, 0.0)       # type: directional
+        struct.pack_into("f", buf, 4, 1.0)       # intensity
+        struct.pack_into("f", buf, 28, 0.7854)   # outer_cone
+        struct.pack_into("f", buf, 32, 0.0)      # dir.x
+        struct.pack_into("f", buf, 36, -1.0)     # dir.y
+        struct.pack_into("f", buf, 40, 0.0)      # dir.z
+        struct.pack_into("f", buf, 48, 1.0)      # color.r
+        struct.pack_into("f", buf, 52, 1.0)      # color.g
+        struct.pack_into("f", buf, 56, 1.0)      # color.b
+
+    return bytes(buf)
+
+
+# ---------------------------------------------------------------------------
+# Shadow map helpers (Phase F)
+# ---------------------------------------------------------------------------
+
+_SHADOW_MAP_RESOLUTION = 1024
+_MAX_SHADOW_MAPS = 8
+
+
+def _look_at_shadow(eye, target, up) -> list:
+    """Compute a column-major 4x4 look-at view matrix (16 floats).
+
+    Follows the same conventions as scene_utils.look_at but returns a flat
+    list instead of a numpy array so it can be used without numpy dependency
+    in pure-Python shadow math.
+    """
+    import math as _m
+    # forward
+    fx = target[0] - eye[0]
+    fy = target[1] - eye[1]
+    fz = target[2] - eye[2]
+    fl = _m.sqrt(fx * fx + fy * fy + fz * fz)
+    if fl < 1e-12:
+        fl = 1e-12
+    fx /= fl; fy /= fl; fz /= fl
+    # side = cross(f, up)
+    sx = fy * up[2] - fz * up[1]
+    sy = fz * up[0] - fx * up[2]
+    sz = fx * up[1] - fy * up[0]
+    sl = _m.sqrt(sx * sx + sy * sy + sz * sz)
+    if sl < 1e-12:
+        # Degenerate: pick a different up vector
+        alt_up = (1.0, 0.0, 0.0) if abs(fx) < 0.9 else (0.0, 1.0, 0.0)
+        sx = fy * alt_up[2] - fz * alt_up[1]
+        sy = fz * alt_up[0] - fx * alt_up[2]
+        sz = fx * alt_up[1] - fy * alt_up[0]
+        sl = _m.sqrt(sx * sx + sy * sy + sz * sz)
+    sx /= sl; sy /= sl; sz /= sl
+    # up = cross(s, f)
+    ux = sy * fz - sz * fy
+    uy = sz * fx - sx * fz
+    uz = sx * fy - sy * fx
+    # dot products
+    ds = -(sx * eye[0] + sy * eye[1] + sz * eye[2])
+    du = -(ux * eye[0] + uy * eye[1] + uz * eye[2])
+    df = fx * eye[0] + fy * eye[1] + fz * eye[2]
+    # Column-major 4x4: m[col][row]
+    # col 0: (s.x, u.x, -f.x, 0)
+    # col 1: (s.y, u.y, -f.y, 0)
+    # col 2: (s.z, u.z, -f.z, 0)
+    # col 3: (ds,  du,   df,  1)
+    return [
+        sx,  ux,  -fx, 0.0,
+        sy,  uy,  -fy, 0.0,
+        sz,  uz,  -fz, 0.0,
+        ds,  du,   df, 1.0,
+    ]
+
+
+def _ortho_shadow(left, right, bottom, top, near, far) -> list:
+    """Compute a column-major 4x4 orthographic projection (16 floats).
+
+    Maps to Vulkan/wgpu clip space: y-down not flipped (caller handles),
+    z in [0, 1].
+    """
+    rl = right - left
+    tb = top - bottom
+    fn = far - near
+    if abs(rl) < 1e-12:
+        rl = 1e-12
+    if abs(tb) < 1e-12:
+        tb = 1e-12
+    if abs(fn) < 1e-12:
+        fn = 1e-12
+    # Column-major
+    return [
+        2.0 / rl,               0.0,                    0.0,            0.0,
+        0.0,                    2.0 / tb,                0.0,            0.0,
+        0.0,                    0.0,                   -1.0 / fn,        0.0,
+       -(right + left) / rl,  -(top + bottom) / tb,    -near / fn,      1.0,
+    ]
+
+
+def _perspective_shadow(fovy, aspect, near, far) -> list:
+    """Compute a column-major 4x4 perspective projection (16 floats).
+
+    Maps to Vulkan/wgpu clip space: y-down, z in [0, 1].
+    """
+    import math as _m
+    f = 1.0 / _m.tan(fovy / 2.0)
+    fn = far - near
+    if abs(fn) < 1e-12:
+        fn = 1e-12
+    return [
+        f / aspect, 0.0,  0.0,                     0.0,
+        0.0,       -f,    0.0,                     0.0,
+        0.0,        0.0,  far / (near - far),      -1.0,
+        0.0,        0.0,  (near * far) / (near - far), 0.0,
+    ]
+
+
+def _mat4_multiply(a, b) -> list:
+    """Multiply two column-major 4x4 matrices (each 16 floats). Returns 16 floats."""
+    result = [0.0] * 16
+    for col in range(4):
+        for row in range(4):
+            s = 0.0
+            for k in range(4):
+                s += a[k * 4 + row] * b[col * 4 + k]
+            result[col * 4 + row] = s
+    return result
+
+
+def _compute_shadow_data(lights: list, camera_view=None,
+                          camera_proj=None, near=0.1, far=100.0) -> list:
+    """Compute shadow matrices for shadow-casting lights.
+
+    Returns a list of ShadowEntry (one per shadow-casting light, up to
+    _MAX_SHADOW_MAPS).  Also updates each light's shadow_index to reference
+    the correct shadow entry.
+    """
+    entries = []
+    shadow_idx = 0
+
+    for light in lights:
+        if shadow_idx >= _MAX_SHADOW_MAPS:
+            break
+
+        light_type = getattr(light, 'type', 'directional')
+
+        if light_type == "directional":
+            d = light.direction
+            d_len = math.sqrt(d[0]**2 + d[1]**2 + d[2]**2)
+            if d_len < 1e-8:
+                d = np.array([0.0, -1.0, 0.0])
+                d_len = 1.0
+            dn = [d[0] / d_len, d[1] / d_len, d[2] / d_len]
+
+            # Place light "eye" far along the incoming direction
+            dist = far * 0.5
+            eye = [-dn[0] * dist, -dn[1] * dist, -dn[2] * dist]
+            target = [0.0, 0.0, 0.0]
+            up = [0.0, 1.0, 0.0]
+            if abs(dn[1]) > 0.95:
+                up = [0.0, 0.0, 1.0]
+
+            view_mat = _look_at_shadow(eye, target, up)
+            # Ortho projection enclosing the scene
+            ortho_extent = far * 0.5
+            proj_mat = _ortho_shadow(
+                -ortho_extent, ortho_extent,
+                -ortho_extent, ortho_extent,
+                near, far,
+            )
+            vp = _mat4_multiply(proj_mat, view_mat)
+
+            entry = ShadowEntry(view_projection=vp, bias=0.005, normal_bias=0.02)
+            entries.append(entry)
+            light.shadow_index = float(shadow_idx)
+            shadow_idx += 1
+
+        elif light_type == "spot":
+            pos = light.position
+            d = light.direction
+            d_len = math.sqrt(d[0]**2 + d[1]**2 + d[2]**2)
+            if d_len < 1e-8:
+                d = np.array([0.0, -1.0, 0.0])
+                d_len = 1.0
+            dn = [d[0] / d_len, d[1] / d_len, d[2] / d_len]
+
+            eye = [float(pos[0]), float(pos[1]), float(pos[2])]
+            target = [eye[0] + dn[0], eye[1] + dn[1], eye[2] + dn[2]]
+            up = [0.0, 1.0, 0.0]
+            if abs(dn[1]) > 0.95:
+                up = [0.0, 0.0, 1.0]
+
+            view_mat = _look_at_shadow(eye, target, up)
+            outer_angle = getattr(light, 'outer_cone_angle', 0.7854)
+            fovy = outer_angle * 2.0
+            if fovy < 0.01:
+                fovy = 0.01
+            spot_far = getattr(light, 'range', 0.0)
+            if spot_far <= 0.0:
+                spot_far = far
+            proj_mat = _perspective_shadow(fovy, 1.0, near, spot_far)
+            vp = _mat4_multiply(proj_mat, view_mat)
+
+            entry = ShadowEntry(view_projection=vp, bias=0.005, normal_bias=0.02)
+            entries.append(entry)
+            light.shadow_index = float(shadow_idx)
+            shadow_idx += 1
+
+        elif light_type == "point":
+            # Point lights could use cubemap shadows; for now skip
+            light.shadow_index = -1.0
+
+        else:
+            light.shadow_index = -1.0
+
+    return entries
+
+
+def _pack_shadow_buffer(entries: list) -> bytes:
+    """Pack shadow entries into GPU buffer (std430: 80 bytes per entry).
+
+    Layout per entry:
+        16 floats — mat4 view_projection (64 bytes)
+        4 floats  — (bias, normalBias, resolution, pad) (16 bytes)
+    Total: 80 bytes per entry.
+    """
+    buf = bytearray()
+    for entry in entries:
+        vp = entry.view_projection
+        for i in range(16):
+            buf += struct.pack("f", float(vp[i]))
+        buf += struct.pack("4f", entry.bias, entry.normal_bias,
+                           entry.resolution, 0.0)
+    # Ensure at least one entry (dummy) if empty
+    if not buf:
+        buf = bytearray(80)
+    return bytes(buf)
+
+
+# Shadow depth shader (WGSL) — position-only vertex transform
+_SHADOW_DEPTH_WGSL = """
+struct ShadowUniforms {
+    mvp: mat4x4<f32>,
+};
+@group(0) @binding(0) var<uniform> shadow_uniforms: ShadowUniforms;
+
+@vertex
+fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+    return shadow_uniforms.mvp * vec4<f32>(position, 1.0);
+}
+"""
+
+
+def _setup_shadow_maps(device, scene, gpu_scene, reflection_data):
+    """Create shadow map textures, sampler, and depth pipeline if shadows are needed.
+
+    Detects shadow support from reflection data by looking for "shadow_maps"
+    (sampler binding) and/or "shadow_matrices" (storage_buffer binding).
+
+    Updates gpu_scene in place with shadow resources.
+    """
+    # Check reflection for shadow bindings
+    has_shadow_maps = False
+    has_shadow_matrices = False
+    for _stage_key, stage_ref in reflection_data.items():
+        for _set_key, bindings in stage_ref.get("descriptor_sets", {}).items():
+            for binding in bindings:
+                name = binding.get("name", "")
+                btype = binding.get("type", "")
+                if name == "shadow_maps" and btype in ("sampler", "sampled_image"):
+                    has_shadow_maps = True
+                elif name == "shadow_matrices" and btype == "storage_buffer":
+                    has_shadow_matrices = True
+
+    if not has_shadow_maps and not has_shadow_matrices:
+        return  # shader doesn't use shadows
+
+    # Compute shadow data for each shadow-casting light
+    cam = scene.camera
+    shadow_entries = _compute_shadow_data(
+        scene.lights, near=cam.near, far=cam.far,
+    )
+
+    num_shadows = len(shadow_entries)
+    if num_shadows == 0:
+        # No shadow-casting lights; create a dummy so bindings are valid
+        shadow_entries = [ShadowEntry()]
+        num_shadows = 1
+
+    gpu_scene.num_shadow_maps = num_shadows
+    gpu_scene.has_shadows = True
+
+    # 1. Create depth texture array
+    gpu_scene.shadow_texture = device.create_texture(
+        size=(_SHADOW_MAP_RESOLUTION, _SHADOW_MAP_RESOLUTION, num_shadows),
+        format=wgpu.TextureFormat.depth32float,
+        usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.TEXTURE_BINDING,
+    )
+
+    # 2. Create comparison sampler
+    gpu_scene.shadow_sampler = device.create_sampler(
+        compare=wgpu.CompareFunction.less_equal,
+        mag_filter=wgpu.FilterMode.linear,
+        min_filter=wgpu.FilterMode.linear,
+    )
+
+    # 3. Create per-layer views for rendering into individual layers
+    gpu_scene.shadow_layer_views = [
+        gpu_scene.shadow_texture.create_view(
+            dimension=wgpu.TextureViewDimension.d2,
+            base_array_layer=i,
+            array_layer_count=1,
+        )
+        for i in range(num_shadows)
+    ]
+
+    # 4. Create array view for shader binding
+    gpu_scene.shadow_array_view = gpu_scene.shadow_texture.create_view(
+        dimension=wgpu.TextureViewDimension.d2_array,
+    )
+
+    # 5. Pack and upload shadow matrices SSBO
+    shadow_data = _pack_shadow_buffer(shadow_entries)
+    gpu_scene.shadow_matrices_buffer = device.create_buffer_with_data(
+        data=shadow_data,
+        usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
+    )
+    gpu_scene.storage_buffers["shadow_matrices"] = gpu_scene.shadow_matrices_buffer
+
+    # 6. Create shadow depth pipeline (WGSL, position-only)
+    shadow_module = device.create_shader_module(code=_SHADOW_DEPTH_WGSL)
+
+    # Bind group layout: one uniform buffer for the shadow MVP
+    shadow_bind_layout = device.create_bind_group_layout(entries=[
+        wgpu.BindGroupLayoutEntry(
+            binding=0,
+            visibility=wgpu.ShaderStage.VERTEX,
+            buffer=wgpu.BufferBindingLayout(type=wgpu.BufferBindingType.uniform),
+        ),
+    ])
+    gpu_scene.shadow_depth_bind_layout = shadow_bind_layout
+
+    shadow_pipeline_layout = device.create_pipeline_layout(
+        bind_group_layouts=[shadow_bind_layout],
+    )
+    gpu_scene.shadow_depth_pipeline_layout = shadow_pipeline_layout
+
+    # Determine vertex stride from the scene's first mesh (position at offset 0)
+    vertex_stride = 32  # default: pos(3) + normal(3) + uv(2) = 32
+    if scene.meshes:
+        vertex_stride = scene.meshes[0].vertex_stride
+    # Also check GPU-side vertex buffers (may have been padded)
+    if gpu_scene.vertex_buffers:
+        _, uploaded_stride, _ = gpu_scene.vertex_buffers[0]
+        vertex_stride = max(vertex_stride, uploaded_stride)
+
+    gpu_scene.shadow_depth_pipeline = device.create_render_pipeline(
+        layout=shadow_pipeline_layout,
+        vertex=wgpu.VertexState(
+            module=shadow_module,
+            entry_point="vs_main",
+            buffers=[wgpu.VertexBufferLayout(
+                array_stride=vertex_stride,
+                step_mode=wgpu.VertexStepMode.vertex,
+                attributes=[wgpu.VertexAttribute(
+                    format=wgpu.VertexFormat.float32x3,
+                    offset=0,
+                    shader_location=0,
+                )],
+            )],
+        ),
+        primitive=wgpu.PrimitiveState(
+            topology=wgpu.PrimitiveTopology.triangle_list,
+            cull_mode=wgpu.CullMode.back,
+            front_face=wgpu.FrontFace.cw,
+        ),
+        depth_stencil=wgpu.DepthStencilState(
+            format=wgpu.TextureFormat.depth32float,
+            depth_write_enabled=True,
+            depth_compare=wgpu.CompareFunction.less,
+            depth_bias=2,
+            depth_bias_slope_scale=1.5,
+        ),
+        multisample=wgpu.MultisampleState(count=1, mask=0xFFFFFFFF),
+    )
+
+    # 7. Create per-shadow-map MVP uniform buffers and bind groups
+    gpu_scene.shadow_mvp_buffers = []
+    for entry in shadow_entries:
+        # MVP for shadow = light VP * model (model is identity for now)
+        mvp_data = struct.pack(f"{16}f", *entry.view_projection)
+        mvp_buf = device.create_buffer_with_data(
+            data=mvp_data,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+        gpu_scene.shadow_mvp_buffers.append(mvp_buf)
+
+    print(f"[info] Shadow maps: {num_shadows} shadow caster(s) at "
+          f"{_SHADOW_MAP_RESOLUTION}x{_SHADOW_MAP_RESOLUTION}")
+
+
+def _render_shadow_pass(device, encoder, gpu_scene):
+    """Execute all shadow depth render passes."""
+    if not gpu_scene.has_shadows or gpu_scene.shadow_depth_pipeline is None:
+        return
+
+    for layer_idx in range(gpu_scene.num_shadow_maps):
+        if layer_idx >= len(gpu_scene.shadow_layer_views):
+            break
+        if layer_idx >= len(gpu_scene.shadow_mvp_buffers):
+            break
+
+        layer_view = gpu_scene.shadow_layer_views[layer_idx]
+        mvp_buf = gpu_scene.shadow_mvp_buffers[layer_idx]
+
+        # Create bind group for this shadow map's MVP
+        bind_group = device.create_bind_group(
+            layout=gpu_scene.shadow_depth_bind_layout,
+            entries=[wgpu.BindGroupEntry(
+                binding=0,
+                resource=wgpu.BufferBinding(buffer=mvp_buf, size=64),
+            )],
+        )
+
+        # Begin depth-only render pass for this layer
+        shadow_pass = encoder.begin_render_pass(
+            color_attachments=[],
+            depth_stencil_attachment=wgpu.RenderPassDepthStencilAttachment(
+                view=layer_view,
+                depth_load_op=wgpu.LoadOp.clear,
+                depth_store_op=wgpu.StoreOp.store,
+                depth_clear_value=1.0,
+            ),
+        )
+        shadow_pass.set_pipeline(gpu_scene.shadow_depth_pipeline)
+        shadow_pass.set_bind_group(0, bind_group)
+
+        # Draw all scene meshes
+        for i, (vbo, stride, num_verts) in enumerate(gpu_scene.vertex_buffers):
+            ibo, num_indices = gpu_scene.index_buffers[i]
+            if vbo:
+                shadow_pass.set_vertex_buffer(0, vbo)
+            if ibo and num_indices > 0:
+                shadow_pass.set_index_buffer(ibo, wgpu.IndexFormat.uint32)
+                shadow_pass.draw_indexed(num_indices)
+            elif vbo:
+                shadow_pass.draw(num_verts)
+
+        shadow_pass.end()
+
+
 def upload_scene(device: wgpu.GPUDevice, scene: SceneData, width: int, height: int,
-                 pipeline_stride: int = 0) -> GPUScene:
+                 pipeline_stride: int = 0, reflection_data: dict = None) -> GPUScene:
     """Upload scene resources to GPU. Independent of any pipeline."""
     gpu = GPUScene()
+    if reflection_data:
+        gpu.reflection_data = reflection_data
 
     # Upload meshes (with optional vertex padding)
     for mesh in scene.meshes:
@@ -809,6 +1338,36 @@ def upload_scene(device: wgpu.GPUDevice, scene: SceneData, width: int, height: i
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
         gpu.uniform_buffers["Lighting"] = gpu.uniform_buffers["Light"]
+
+    # Setup shadow maps BEFORE packing lights so shadow_index is populated
+    if reflection_data:
+        _setup_shadow_maps(device, scene, gpu, reflection_data)
+
+    # Multi-light SSBO creation (when shader uses "lights" SSBO)
+    # Detect from reflection data if "lights" storage buffer is expected
+    has_multi_light = False
+    for stage_ref in gpu.reflection_data.values():
+        for _set_key, bindings in stage_ref.get("descriptor_sets", {}).items():
+            for binding in bindings:
+                if binding.get("name") == "lights" and binding.get("type") == "storage_buffer":
+                    has_multi_light = True
+                    break
+
+    if has_multi_light:
+        light_data = _pack_lights_buffer(scene)
+        gpu.storage_buffers["lights"] = device.create_buffer_with_data(
+            data=light_data,
+            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
+        )
+
+        # SceneLight UBO (view_pos + light_count)
+        light_count = len(scene.lights) if scene.lights else 1
+        scene_light_data = struct.pack("3f", *cam.eye) + struct.pack("f", 0.0)
+        scene_light_data += struct.pack("i", light_count) + struct.pack("3f", 0.0, 0.0, 0.0)
+        gpu.uniform_buffers["SceneLight"] = device.create_buffer_with_data(
+            data=scene_light_data,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
 
     # Create Material properties UBO (fixed std140 layout) — for single-pipeline compat
     if scene.materials:
@@ -1123,6 +1682,34 @@ fn main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 # Bind scene to pipeline (Phase 3)
 # ---------------------------------------------------------------------------
 
+def _bind_shadow_resources(gpu_scene, resources, reflected):
+    """Add shadow map resources to the resource map if the shader expects them.
+
+    Checks reflected binding info for "shadow_maps" (sampler + texture) and
+    "shadow_matrices" (storage buffer) names and maps the gpu_scene's shadow
+    resources accordingly.
+    """
+    if not gpu_scene.has_shadows:
+        return
+
+    for _set_idx, bindings in reflected._binding_info.items():
+        for b in bindings:
+            name = b["name"]
+            btype = b["type"]
+
+            if name == "shadow_maps":
+                if btype == "sampler" and gpu_scene.shadow_sampler is not None:
+                    resources["shadow_maps"] = (gpu_scene.shadow_sampler,
+                                                 gpu_scene.shadow_array_view)
+                elif btype == "sampled_image" and gpu_scene.shadow_array_view is not None:
+                    resources["shadow_maps"] = (gpu_scene.shadow_sampler,
+                                                 gpu_scene.shadow_array_view)
+
+            elif name == "shadow_matrices" and btype == "storage_buffer":
+                if gpu_scene.shadow_matrices_buffer is not None:
+                    resources["shadow_matrices"] = gpu_scene.shadow_matrices_buffer
+
+
 def bind_scene_to_pipeline(
     device: wgpu.GPUDevice,
     gpu_scene: GPUScene,
@@ -1139,8 +1726,13 @@ def bind_scene_to_pipeline(
     resources = {}
     for name, buf in gpu_scene.uniform_buffers.items():
         resources[name] = buf
+    for name, buf in gpu_scene.storage_buffers.items():
+        resources[name] = buf
     for name, (sampler, view) in gpu_scene.textures.items():
         resources[name] = (sampler, view)
+
+    # Bind shadow resources if available
+    _bind_shadow_resources(gpu_scene, resources, reflected)
 
     # Identify which names need cube textures
     cube_names = set()
@@ -1195,6 +1787,12 @@ def bind_scene_to_pipeline(
                     data=bytes(size),
                     usage=wgpu.BufferUsage.UNIFORM,
                 )
+            elif b["type"] == "storage_buffer" and b["name"] not in resources:
+                size = b.get("size", 64)
+                resources[b["name"]] = device.create_buffer_with_data(
+                    data=bytes(max(size, 64)),
+                    usage=wgpu.BufferUsage.STORAGE,
+                )
 
     return reflected.create_bind_groups(device, resources)
 
@@ -1233,6 +1831,10 @@ def _build_per_material_resources(
         if name != "Material":  # Material is per-material, not shared
             resources[name] = buf
 
+    # Shared storage buffers (lights SSBO, etc.)
+    for name, buf in gpu_scene.storage_buffers.items():
+        resources[name] = buf
+
     # Per-material UBO
     if material_index < len(gpu_scene.per_material_ubos):
         resources["Material"] = gpu_scene.per_material_ubos[material_index]
@@ -1245,6 +1847,9 @@ def _build_per_material_resources(
     if material_index < len(gpu_scene.per_material_textures):
         for name, tex_pair in gpu_scene.per_material_textures[material_index].items():
             resources[name] = tex_pair
+
+    # Bind shadow resources if available
+    _bind_shadow_resources(gpu_scene, resources, reflected)
 
     # Identify which names need cube textures
     cube_names = set()
@@ -1292,6 +1897,12 @@ def _build_per_material_resources(
                 resources[b["name"]] = device.create_buffer_with_data(
                     data=bytes(size),
                     usage=wgpu.BufferUsage.UNIFORM,
+                )
+            elif b["type"] == "storage_buffer" and b["name"] not in resources:
+                size = b.get("size", 64)
+                resources[b["name"]] = device.create_buffer_with_data(
+                    data=bytes(max(size, 64)),
+                    usage=wgpu.BufferUsage.STORAGE,
                 )
 
     return resources
@@ -1472,9 +2083,19 @@ def render(
                 vert_refl = _json.load(f)
             pipeline_stride = vert_refl.get("vertex_stride", 0)
 
+    # Pre-load reflection data for SSBO detection (multi-light, materials, etc.)
+    reflection_data = {}
+    resolve_base = effective_base if not use_multi_pipeline else pipeline_base
+    for stage_suffix in [".vert.json", ".frag.json"]:
+        rpath = Path(resolve_base + stage_suffix)
+        if rpath.exists():
+            with open(rpath, encoding="utf-8") as f:
+                reflection_data[stage_suffix] = _json.load(f)
+
     # Phase 1: Upload scene to GPU (with correct stride for padding)
     print(f"Uploading scene '{scene_source}' to GPU...")
-    gpu_scene = upload_scene(device, scene, width, height, pipeline_stride=pipeline_stride)
+    gpu_scene = upload_scene(device, scene, width, height, pipeline_stride=pipeline_stride,
+                             reflection_data=reflection_data)
 
     # Load IBL assets if available
     if ibl_name:
@@ -1550,6 +2171,9 @@ def _execute_render(
     texture_view = texture.create_view()
 
     encoder = device.create_command_encoder()
+
+    # Render shadow maps before the main color pass
+    _render_shadow_pass(device, encoder, gpu_scene)
 
     if render_path == "fullscreen":
         render_pass = encoder.begin_render_pass(
@@ -1659,6 +2283,9 @@ def _execute_render_multi_pipeline(
     depth_view = depth_texture.create_view()
 
     encoder = device.create_command_encoder()
+
+    # Render shadow maps before the main color pass
+    _render_shadow_pass(device, encoder, gpu_scene)
 
     render_pass = encoder.begin_render_pass(
         color_attachments=[wgpu.RenderPassColorAttachment(

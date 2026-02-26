@@ -127,6 +127,9 @@ TYPE_MAP: dict[str, LuxType] = {
     # We treat it as a plain scalar for type-checking purposes (field access handled
     # by codegen directly). The real field types are embedded in the SPIR-V builder.
     "BindlessMaterialData": ScalarType("BindlessMaterialData"),
+    # LightData is a struct type used in SSBO for multi-light evaluation.
+    # Same treatment as BindlessMaterialData — codegen handles field access.
+    "LightData": ScalarType("LightData"),
 }
 
 

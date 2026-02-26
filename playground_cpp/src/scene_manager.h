@@ -11,6 +11,37 @@
 #include <map>
 #include <unordered_map>
 #include "material_ubo.h"
+#include <glm/glm.hpp>
+
+// GPU-compatible scene light representation (64 bytes per light, std430 layout)
+struct SceneLight {
+    enum Type { Directional = 0, Point = 1, Spot = 2 };
+    Type type = Directional;
+    glm::vec3 position{0.0f};
+    glm::vec3 direction{0.0f, -1.0f, 0.0f};
+    glm::vec3 color{1.0f};
+    float intensity = 1.0f;
+    float range = 0.0f;          // 0 = infinite
+    float innerConeAngle = 0.0f;
+    float outerConeAngle = 0.7854f; // pi/4
+    bool castsShadow = false;
+    int shadowIndex = -1;
+};
+
+// Shadow cascade data for directional light CSM
+struct ShadowCascade {
+    glm::mat4 viewProjection;
+    float splitDepth;
+};
+
+// Shadow map entry: packed for GPU (std430 layout, 80 bytes)
+struct ShadowEntry {
+    glm::mat4 viewProjection{1.0f};
+    float bias = 0.005f;
+    float normalBias = 0.02f;
+    float resolution = 1024.0f;
+    float _pad = 0.0f;
+};
 
 // Bindless texture array: all unique textures from the scene for descriptor binding
 struct BindlessTextureArray {
@@ -51,6 +82,74 @@ public:
     const GltfScene& getGltfScene() const { return m_gltfScene; }
     bool hasGltfScene() const { return m_hasGltfScene; }
     const std::string& getSceneSource() const { return m_sceneSource; }
+
+    // Light management
+    void addLight(const SceneLight& light) { m_lights.push_back(light); }
+    const std::vector<SceneLight>& getLights() const { return m_lights; }
+    int getLightCount() const { return static_cast<int>(m_lights.size()); }
+
+    // Convert glTF lights to SceneLights (called after scene load)
+    void populateLightsFromGltf(const GltfScene& gltfScene) {
+        m_lights.clear();
+        for (const auto& gl : gltfScene.lights) {
+            SceneLight sl;
+            if (gl.type == "directional") sl.type = SceneLight::Directional;
+            else if (gl.type == "point") sl.type = SceneLight::Point;
+            else if (gl.type == "spot") sl.type = SceneLight::Spot;
+            sl.position = gl.position;
+            sl.direction = gl.direction;
+            sl.color = gl.color;
+            sl.intensity = gl.intensity;
+            sl.range = gl.range;
+            sl.innerConeAngle = gl.innerConeAngle;
+            sl.outerConeAngle = gl.outerConeAngle;
+            m_lights.push_back(sl);
+        }
+        // Add a default directional light if scene has none
+        if (m_lights.empty()) {
+            SceneLight defaultLight;
+            defaultLight.type = SceneLight::Directional;
+            defaultLight.direction = glm::normalize(glm::vec3(1.0f, 0.8f, 0.6f));
+            defaultLight.color = glm::vec3(1.0f, 0.98f, 0.95f);
+            defaultLight.intensity = 1.0f;
+            m_lights.push_back(defaultLight);
+        }
+    }
+
+    // Pack lights into GPU buffer (std430 layout: 64 bytes per light)
+    std::vector<float> packLightsBuffer() const {
+        std::vector<float> buf;
+        for (const auto& l : m_lights) {
+            // vec4: (light_type, intensity, range, inner_cone)
+            buf.push_back(static_cast<float>(l.type));
+            buf.push_back(l.intensity);
+            buf.push_back(l.range);
+            buf.push_back(l.innerConeAngle);
+            // vec4: (position.xyz, outer_cone)
+            buf.push_back(l.position.x);
+            buf.push_back(l.position.y);
+            buf.push_back(l.position.z);
+            buf.push_back(l.outerConeAngle);
+            // vec4: (direction.xyz, shadow_index)
+            buf.push_back(l.direction.x);
+            buf.push_back(l.direction.y);
+            buf.push_back(l.direction.z);
+            buf.push_back(static_cast<float>(l.shadowIndex));
+            // vec4: (color.xyz, pad)
+            buf.push_back(l.color.x);
+            buf.push_back(l.color.y);
+            buf.push_back(l.color.z);
+            buf.push_back(0.0f); // pad
+        }
+        return buf;
+    }
+
+    // Shadow map support
+    void computeShadowData(const glm::mat4& cameraView, const glm::mat4& cameraProj,
+                           float nearClip, float farClip);
+    std::vector<float> packShadowBuffer() const;
+    const std::vector<ShadowEntry>& getShadowEntries() const { return m_shadowEntries; }
+    int getShadowMapCount() const { return static_cast<int>(m_shadowEntries.size()); }
 
     // Per-material draw ranges and textures for multi-material rendering
     const std::vector<DrawRange>& getDrawRanges() const { return m_drawRanges; }
@@ -94,6 +193,12 @@ private:
     // glTF scene data
     GltfScene m_gltfScene;
     bool m_hasGltfScene = false;
+
+    // Scene lights (populated from glTF or added manually)
+    std::vector<SceneLight> m_lights;
+
+    // Shadow map entries (populated by computeShadowData)
+    std::vector<ShadowEntry> m_shadowEntries;
 
     // Textures
     std::unordered_map<std::string, GPUTexture> m_namedTextures;

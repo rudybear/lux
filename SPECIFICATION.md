@@ -91,10 +91,10 @@ The following identifiers are reserved as keywords and may not be used as user-d
 | Declarations | `fn`, `let`, `const`, `type`, `struct`, `import` |
 | Control flow | `return`, `if`, `else` |
 | Stage types | `vertex`, `fragment`, `raygen`, `closest_hit`, `any_hit`, `miss`, `intersection`, `callable`, `mesh`, `task` |
-| Stage items | `in`, `out`, `uniform`, `push`, `sampler2d`, `samplerCube` |
+| Stage items | `in`, `out`, `uniform`, `push`, `sampler2d`, `samplerCube`, `sampler2DArray`, `samplerCubeArray` |
 | RT items | `ray_payload`, `hit_attribute`, `callable_data`, `acceleration_structure` |
 | Mesh items | `mesh_output`, `task_payload` |
-| Declarative | `surface`, `geometry`, `pipeline`, `schedule`, `environment`, `procedural`, `layers`, `properties` |
+| Declarative | `surface`, `geometry`, `pipeline`, `schedule`, `environment`, `procedural`, `lighting`, `layers`, `properties` |
 | Boolean | `true`, `false` |
 
 ### 2.6 Literals
@@ -230,6 +230,8 @@ All matrices are column-major. Matrices use `ColMajor` layout with a `MatrixStri
 |---|---|---|
 | `sampler2d` | 2D texture sampler | `OpTypeSampledImage` (split into `OpTypeSampler` + `OpTypeImage` for codegen) |
 | `samplerCube` | Cube map texture sampler | `OpTypeSampledImage` with `Cube` dimensionality (split into `OpTypeSampler` + `OpTypeImage Cube` for codegen) |
+| `sampler2DArray` | 2D texture array sampler | `OpTypeSampledImage` with `2D` dimensionality and `Arrayed` flag (used for shadow map arrays) |
+| `samplerCubeArray` | Cube map array sampler | `OpTypeSampledImage` with `Cube` dimensionality and `Arrayed` flag (used for point light shadow maps) |
 | `acceleration_structure` | RT top-level acceleration structure | `OpTypeAccelerationStructureKHR` |
 
 ### 3.5 Type Aliases
@@ -1350,6 +1352,31 @@ Custom `@layer` functions for non-photorealistic rendering.
 |---|---|---|
 | `cartoon` | `(base: vec3, n: vec3, v: vec3, l: vec3, bands: scalar, rim_power: scalar, rim_color: vec3) -> vec3` | Cel-shading with quantized NdotL lighting bands and Fresnel rim lighting. Annotated with `@layer` for use in `layers [...]` blocks. |
 
+### 11.8 Module: lighting
+
+Multi-light shading functions for evaluating directional, point, and spot lights.
+
+| Function | Signature | Description |
+|---|---|---|
+| `distance_attenuation` | `(dist: scalar, range: scalar) -> scalar` | Inverse-square distance attenuation with range cutoff |
+| `spot_attenuation` | `(cos_angle: scalar, inner_cone: scalar, outer_cone: scalar) -> scalar` | Smooth spot light cone falloff |
+| `evaluate_directional_light` | `(n: vec3, l: vec3, v: vec3, albedo: vec3, roughness: scalar, metallic: scalar, color: vec3, intensity: scalar) -> vec3` | Evaluate a directional light contribution |
+| `evaluate_point_light` | `(n: vec3, world_pos: vec3, v: vec3, albedo: vec3, roughness: scalar, metallic: scalar, light_pos: vec3, color: vec3, intensity: scalar, range: scalar) -> vec3` | Evaluate a point light contribution with distance attenuation |
+| `evaluate_spot_light` | `(n: vec3, world_pos: vec3, v: vec3, albedo: vec3, roughness: scalar, metallic: scalar, light_pos: vec3, light_dir: vec3, color: vec3, intensity: scalar, range: scalar, inner_cone: scalar, outer_cone: scalar) -> vec3` | Evaluate a spot light contribution with distance and cone attenuation |
+| `evaluate_light` | `(n: vec3, world_pos: vec3, v: vec3, albedo: vec3, roughness: scalar, metallic: scalar, light_type: int, light_pos: vec3, light_dir: vec3, color: vec3, intensity: scalar, range: scalar, inner_cone: scalar, outer_cone: scalar) -> vec3` | Unified light evaluation that dispatches by light_type (0=directional, 1=point, 2=spot) |
+| `evaluate_light_direction` | `(light_type: int, light_pos: vec3, light_dir: vec3, world_pos: vec3) -> vec3` | Branchless light direction selection for directional/point/spot lights |
+
+### 11.9 Module: shadow
+
+Shadow map sampling and cascade selection functions.
+
+| Function | Signature | Description |
+|---|---|---|
+| `sample_shadow_basic` | `(shadow_maps: sampler2DArray, shadow_uv: vec3, compare_depth: scalar) -> scalar` | Single-sample shadow map comparison. Returns 1.0 (lit) or 0.0 (shadowed). |
+| `sample_shadow_pcf4` | `(shadow_maps: sampler2DArray, shadow_uv: vec3, compare_depth: scalar, texel_size: scalar) -> scalar` | 4-tap percentage-closer filtering. Samples a 2x2 pattern around the center for soft shadow edges. |
+| `select_cascade` | `(view_depth: scalar, cascade_splits: vec4) -> int` | Select the appropriate shadow cascade index based on view-space depth and cascade split distances. |
+| `compute_shadow_uv` | `(world_pos: vec4, shadow_matrix: mat4) -> vec3` | Transform a world-space position into shadow map UV coordinates via the shadow view-projection matrix. |
+
 ---
 
 ## 12. Declarative Syntax
@@ -1463,6 +1490,14 @@ surface Name {
 | `ibl(specular_map, irradiance_map, brdf_lut)` | `specular_map: samplerCube`, `irradiance_map: samplerCube`, `brdf_lut: sampler2d` | Image-based lighting with multi-scattering energy compensation. Samples the irradiance map for diffuse IBL and the pre-filtered specular map at a roughness-dependent mip level for specular IBL. Applies the split-sum approximation using the BRDF LUT and adds multi-scattering energy compensation. |
 | `emission(color)` | `color: vec3` | Additive emissive contribution. Adds the given color directly to the final output, unaffected by lighting. |
 
+When used inside a `lighting` block (see [Section 12.7](#127-lighting-block)), the following additional layers are available:
+
+| Layer | Arguments | Description |
+|---|---|---|
+| `directional(direction, color)` | `direction: vec3`, `color: vec3` | Directional light source. Evaluates the surface BRDF with the given light direction and color. |
+| `ibl(specular_map, irradiance_map, brdf_lut)` | `specular_map: samplerCube`, `irradiance_map: samplerCube`, `brdf_lut: sampler2d` | Image-based lighting with multi-scattering energy compensation. |
+| `multi_light()` | *(no arguments -- reads from SSBOs)* | Compile-time unrolled N-light evaluation loop (default 16 iterations). Each iteration is guarded by `if (i < light_count)` and reads light parameters from a `LightData` SSBO (64 bytes/light: light_type, intensity, range, inner_cone, position, outer_cone, direction, shadow_index, color, _pad). Supports directional, point, and spot lights with branchless direction selection via `evaluate_light_direction()`. When shadows are enabled (`has_shadows` feature), also reads from a `ShadowEntry` SSBO (80 bytes: mat4 viewProjection, bias, normalBias, resolution, _pad) and samples a `sampler2DArray` for directional/spot shadow maps or `samplerCubeArray` for point light shadow maps. Shadow sampling uses `sample_shadow_pcf4()` from `shadow.lux` for filtered results. The `_emit_multi_light_loop()` helper is shared across all 6 expansion paths (raster, RT, mesh x non-bindless, bindless). |
+
 **Example**:
 
 ```
@@ -1515,7 +1550,7 @@ surface ToonSurface {
 }
 ```
 
-Custom layers are validated at compile time: the function must have ≥4 parameters with the correct types, must return `vec3`, and must not collide with a built-in layer name (`base`, `normal_map`, `ibl`, `emission`, `coat`, `sheen`, `transmission`). Custom layers are inserted in declaration order after all built-in layers and before `emission`. In RT mode, any `sample()` calls within custom layer arguments are automatically rewritten to `sample_lod()`.
+Custom layers are validated at compile time: the function must have ≥4 parameters with the correct types, must return `vec3`, and must not collide with a built-in layer name (`base`, `normal_map`, `ibl`, `emission`, `coat`, `sheen`, `transmission`, `directional`, `multi_light`). Custom layers are inserted in declaration order after all built-in layers and before `emission`. In RT mode, any `sample()` calls within custom layer arguments are automatically rewritten to `sample_lod()`.
 
 #### 12.2.3 RT Unification
 
@@ -1638,12 +1673,13 @@ The `sdf` member specifies the signed distance function expression.
 
 ### 12.6 Pipeline Block
 
-A pipeline block ties together geometry, surface, schedule, and environment declarations.
+A pipeline block ties together geometry, surface, lighting, schedule, and environment declarations.
 
 ```
 pipeline Name {
     geometry: GeometryName,
     surface: SurfaceName,
+    lighting: LightingName,
     schedule: ScheduleName,
     environment: EnvironmentName,
     procedural: ProceduralName,
@@ -1658,6 +1694,7 @@ All members are optional except `surface`. Members reference declarations by nam
 |---|---|---|
 | `geometry` | No | Vertex layout and transform (rasterization only) |
 | `surface` | Yes | Material definition |
+| `lighting` | No | Illumination configuration (light sources, IBL, shadows) |
 | `schedule` | No | Algorithm variant selection |
 | `environment` | No | Background for RT miss shader |
 | `procedural` | No | SDF for RT intersection shader |
@@ -1679,6 +1716,74 @@ All members are optional except `surface`. Members reference declarations by nam
 - `fragment` stage from the surface (identical to rasterization fragment output)
 
 The mesh shader mode replaces the traditional vertex pipeline with GPU-driven meshlet processing. The surface declaration is unchanged -- only the geometry processing stage changes. Compile-time parameters (`--define max_vertices=N`, `--define max_primitives=N`, `--define workgroup_size=N`) control the mesh shader output limits and workgroup dimensions to match hardware capabilities.
+
+### 12.7 Lighting Block
+
+A `lighting` block separates illumination configuration (light sources, IBL) from material response (surface layers). It is a top-level declaration that pipelines reference via a `lighting:` member.
+
+```
+lighting Name {
+    samplerCube cubemap_name,
+    sampler2d texture_name,
+
+    properties BlockName {
+        field: type = default,
+        ...
+    },
+
+    layers [
+        layer_name(arg: expr, ...),
+        ...
+    ]
+}
+```
+
+**Grammar**: The `lighting_decl` rule in the grammar reuses `surface_item`, so lighting blocks support the same sampler declarations, `properties` blocks, and `layers [...]` syntax as surface declarations.
+
+**AST**: `LightingDecl` dataclass with `name`, `members`, `samplers`, `layers`, and `properties` fields.
+
+**Lighting layers**: Inside a `lighting` block, the following layer types are available:
+
+- `directional(direction, color)` -- single directional light evaluation against the surface BRDF.
+- `ibl(specular_map, irradiance_map, brdf_lut)` -- image-based lighting with diffuse irradiance + pre-filtered specular + multi-scattering energy compensation.
+- `multi_light()` -- compile-time unrolled N-light evaluation. Reads `LightData` from an SSBO (64 bytes/light), supports directional, point, and spot lights. Optionally reads `ShadowEntry` SSBO and shadow map texture arrays when the `has_shadows` compile-time feature is enabled.
+
+**Pipeline reference**: Pipelines include a `lighting:` member to reference a lighting block:
+
+```
+pipeline GltfForward {
+    geometry: StandardMesh,
+    surface: GltfPBR,
+    lighting: SceneLighting,
+    schedule: HighQuality,
+}
+```
+
+**Backward compatibility**: Pipelines without a `lighting:` member use legacy hardcoded Light UBO behavior. The `ibl()` layer in a surface `layers` block still works as a fallback path.
+
+**Surface expander integration**: The surface expander detects `lighting:` in the pipeline and merges lighting samplers, properties, and layer code into the generated fragment/closest-hit/mesh shader. The `multi_light()` layer emits a compile-time unrolled loop via the shared `_emit_multi_light_loop()` helper, which is used identically across all 6 expansion paths (raster, RT, mesh x non-bindless, bindless).
+
+**Example with multi-light and shadows**:
+
+```
+features {
+    has_shadows: bool,
+}
+
+lighting SceneLighting {
+    sampler2DArray shadow_maps if has_shadows,
+
+    properties Light {
+        view_pos: vec3 = vec3(0.0, 0.0, 3.0),
+    },
+
+    layers [
+        multi_light(),
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
+    ]
+}
+```
 
 ---
 

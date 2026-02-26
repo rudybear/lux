@@ -82,6 +82,26 @@ class TypeRegistry:
         key = "sampled_cube_image"
         return self._ensure_type(key, f"OpTypeSampledImage {img}")
 
+    def image_2d_array_type(self) -> str:
+        f32 = self.float32()
+        key = "image2d_array"
+        return self._ensure_type(key, f"OpTypeImage {f32} 2D 0 1 0 1 Unknown")
+
+    def sampled_image_2d_array_type(self) -> str:
+        img = self.image_2d_array_type()
+        key = "sampled_image_2d_array"
+        return self._ensure_type(key, f"OpTypeSampledImage {img}")
+
+    def image_cube_array_type(self) -> str:
+        f32 = self.float32()
+        key = "image_cube_array"
+        return self._ensure_type(key, f"OpTypeImage {f32} Cube 0 1 0 1 Unknown")
+
+    def sampled_cube_array_type(self) -> str:
+        img = self.image_cube_array_type()
+        key = "sampled_cube_array"
+        return self._ensure_type(key, f"OpTypeSampledImage {img}")
+
     def combined_image_sampler_type(self) -> str:
         """Combined image sampler (for bindless arrays).
 
@@ -204,6 +224,8 @@ class TypeRegistry:
             "mat4x3": lambda: self.mat_cols_rows(4, 3),
             "sampler2d": self.sampled_image_type,
             "samplerCube": self.sampled_cube_image_type,
+            "sampler2DArray": self.sampled_image_2d_array_type,
+            "samplerCubeArray": self.sampled_cube_array_type,
             "acceleration_structure": self.acceleration_structure_type,
             "storage_image": self._storage_image_type,
         }

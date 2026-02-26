@@ -27,9 +27,9 @@ echo [4/6] Compiling layered RT (all permutations)
 python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfRT --all-permutations -o shadercache/
 echo.
 
-REM --- Mesh Shader Pipeline (from layered) ---
-echo [5/6] Compiling Mesh Shader (GltfMesh from gltf_pbr_layered.lux)
-python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfMesh --features has_emission -o shadercache/ --define max_vertices=64 --define max_primitives=124 --define workgroup_size=32
+REM --- Mesh Shader Pipeline (from layered): all permutations ---
+echo [5/6] Compiling Mesh Shader (GltfMesh, all permutations)
+python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfMesh --all-permutations -o shadercache/ --define max_vertices=64 --define max_primitives=124 --define workgroup_size=32
 echo.
 
 REM --- Cartoon Shader (Vertex) ---

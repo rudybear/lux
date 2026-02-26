@@ -61,6 +61,10 @@ void SceneManager::loadScene(VulkanContext& ctx, const std::string& sceneSource)
             std::cout << "[warn] glTF has no meshes, falling back to sphere" << std::endl;
             Scene::generateSphere(32, 32, m_vertices, m_indices);
         }
+
+        // Populate SceneLights from glTF lights (after flattenScene extracted world transforms)
+        populateLightsFromGltf(m_gltfScene);
+        std::cout << "[info] Scene lights: " << m_lights.size() << std::endl;
     } else if (sceneSource == "sphere" || sceneSource == "triangle" ||
                sceneSource == "fullscreen") {
         // For sphere, generate geometry; for triangle/fullscreen, vertices may be empty
@@ -1151,6 +1155,124 @@ BindlessMaterialsSSBO SceneManager::buildMaterialsSSBOByGeometry(VulkanContext& 
               << " entries, " << bufSize << " bytes" << std::endl;
 
     return result;
+}
+
+// --------------------------------------------------------------------------
+// Shadow data computation
+// --------------------------------------------------------------------------
+
+void SceneManager::computeShadowData(const glm::mat4& cameraView, const glm::mat4& cameraProj,
+                                      float nearClip, float farClip) {
+    m_shadowEntries.clear();
+    int shadowIdx = 0;
+    const int MAX_SHADOW_MAPS = 8;
+
+    for (auto& light : m_lights) {
+        light.shadowIndex = -1;  // Reset
+        if (!light.castsShadow) continue;
+        if (shadowIdx >= MAX_SHADOW_MAPS) break;
+
+        ShadowEntry entry;
+
+        if (light.type == SceneLight::Directional) {
+            // Compute orthographic shadow projection that encompasses the camera frustum
+            glm::mat4 invCam = glm::inverse(cameraProj * cameraView);
+
+            // NDC corners of the camera frustum
+            glm::vec3 frustumCorners[8] = {
+                {-1, -1, 0}, { 1, -1, 0}, { 1,  1, 0}, {-1,  1, 0},  // near
+                {-1, -1, 1}, { 1, -1, 1}, { 1,  1, 1}, {-1,  1, 1}   // far
+            };
+
+            // Transform to world space
+            glm::vec3 center(0.0f);
+            for (int i = 0; i < 8; i++) {
+                glm::vec4 ws = invCam * glm::vec4(frustumCorners[i], 1.0f);
+                frustumCorners[i] = glm::vec3(ws) / ws.w;
+                center += frustumCorners[i];
+            }
+            center /= 8.0f;
+
+            // Build light view matrix looking along the light direction
+            glm::vec3 lightDir = glm::normalize(light.direction);
+            glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f);
+            if (std::abs(glm::dot(lightDir, up)) > 0.99f) {
+                up = glm::vec3(0.0f, 0.0f, 1.0f);
+            }
+            glm::mat4 lightView = glm::lookAt(center - lightDir, center, up);
+
+            // Find bounding box in light space
+            float minX =  FLT_MAX, maxX = -FLT_MAX;
+            float minY =  FLT_MAX, maxY = -FLT_MAX;
+            float minZ =  FLT_MAX, maxZ = -FLT_MAX;
+            for (int i = 0; i < 8; i++) {
+                glm::vec4 ls = lightView * glm::vec4(frustumCorners[i], 1.0f);
+                minX = std::min(minX, ls.x); maxX = std::max(maxX, ls.x);
+                minY = std::min(minY, ls.y); maxY = std::max(maxY, ls.y);
+                minZ = std::min(minZ, ls.z); maxZ = std::max(maxZ, ls.z);
+            }
+
+            // Extend depth range to catch shadow casters behind the camera
+            float zRange = maxZ - minZ;
+            minZ -= zRange * 0.5f;
+            maxZ += zRange * 0.5f;
+
+            glm::mat4 lightProj = glm::ortho(minX, maxX, minY, maxY, minZ, maxZ);
+            entry.viewProjection = lightProj * lightView;
+        } else if (light.type == SceneLight::Spot) {
+            // Perspective shadow projection for spot lights
+            float outerAngle = light.outerConeAngle;
+            float fov = outerAngle * 2.0f;
+            float range = (light.range > 0.0f) ? light.range : 100.0f;
+
+            glm::vec3 lightDir = glm::normalize(light.direction);
+            glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f);
+            if (std::abs(glm::dot(lightDir, up)) > 0.99f) {
+                up = glm::vec3(0.0f, 0.0f, 1.0f);
+            }
+
+            glm::mat4 lightView = glm::lookAt(light.position,
+                                                light.position + lightDir, up);
+            glm::mat4 lightProj = glm::perspective(fov, 1.0f, 0.1f, range);
+
+            entry.viewProjection = lightProj * lightView;
+        } else {
+            // Point lights: skip shadows for now (would need cube maps)
+            continue;
+        }
+
+        entry.bias = 0.005f;
+        entry.normalBias = 0.02f;
+        entry.resolution = 1024.0f;
+        entry._pad = 0.0f;
+
+        light.shadowIndex = shadowIdx;
+        m_shadowEntries.push_back(entry);
+        shadowIdx++;
+    }
+
+    if (!m_shadowEntries.empty()) {
+        std::cout << "[info] Computed shadow data: " << m_shadowEntries.size()
+                  << " shadow map(s)" << std::endl;
+    }
+}
+
+std::vector<float> SceneManager::packShadowBuffer() const {
+    // 80 bytes per entry: mat4 (64) + 4 floats (16) = 20 floats
+    std::vector<float> buf;
+    for (const auto& entry : m_shadowEntries) {
+        // mat4 viewProjection (column-major, 16 floats)
+        const float* mat = &entry.viewProjection[0][0];
+        for (int i = 0; i < 16; i++) {
+            buf.push_back(mat[i]);
+        }
+        // bias, normalBias, resolution, _pad
+        buf.push_back(entry.bias);
+        buf.push_back(entry.normalBias);
+        buf.push_back(entry.resolution);
+        buf.push_back(entry._pad);
+    }
+    return buf;
 }
 
 // --------------------------------------------------------------------------
