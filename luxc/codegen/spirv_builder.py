@@ -115,7 +115,7 @@ _SHADOW_ENTRY_FIELDS = [
     ("bias", "scalar"),            # 4 bytes
     ("normal_bias", "scalar"),     # 4 bytes
     ("resolution", "scalar"),      # 4 bytes
-    ("_pad", "scalar"),            # 4 bytes
+    ("light_size", "scalar"),      # 4 bytes — PCSS light source size
 ]
 
 
@@ -1546,6 +1546,60 @@ class SpvGenerator:
                 tex_id, tex_lines = self._gen_expr(sampler_arg)
                 lines.extend(tex_lines)
                 lines.append(f"{result} = OpImageSampleExplicitLod {result_type} {tex_id} {coords_id} Lod {lod_id}")
+            return result, lines
+
+        # sample_compare(shadow_tex, vec3(uv, layer), depth_ref) → scalar
+        if fname == "sample_compare":
+            sampler_arg = expr.args[0]
+            coords_id, coords_lines = self._gen_expr(expr.args[1])  # vec3(u, v, layer)
+            lines.extend(coords_lines)
+            dref_id, dref_lines = self._gen_expr(expr.args[2])  # depth reference
+            lines.extend(dref_lines)
+            result_type = self.reg.float32()  # returns scalar
+            result = self.reg.next_id()
+            if isinstance(sampler_arg, VarRef) and sampler_arg.name + ".__sampler" in self.var_map:
+                sam_name = sampler_arg.name
+                sam_type = self.var_types.get(sam_name, "sampler2DArray")
+                img_type, sampled_img_type = self._resolve_sampler_types(sam_type)
+                tex_loaded = self.reg.next_id()
+                lines.append(f"{tex_loaded} = OpLoad {img_type} {self.var_map[sam_name + '.__texture']}")
+                samp_loaded = self.reg.next_id()
+                lines.append(f"{samp_loaded} = OpLoad {self.reg.sampler_type()} {self.var_map[sam_name + '.__sampler']}")
+                combined = self.reg.next_id()
+                lines.append(f"{combined} = OpSampledImage {sampled_img_type} {tex_loaded} {samp_loaded}")
+                lod_zero = self.reg.const_float(0.0)
+                lines.append(f"{result} = OpImageSampleDrefExplicitLod {result_type} {combined} {coords_id} {dref_id} Lod {lod_zero}")
+            return result, lines
+
+        # sample_array(tex, uv, layer) → vec4
+        if fname == "sample_array":
+            sampler_arg = expr.args[0]
+            uv_id, uv_lines = self._gen_expr(expr.args[1])   # vec2
+            lines.extend(uv_lines)
+            layer_id, layer_lines = self._gen_expr(expr.args[2])  # scalar (layer index)
+            lines.extend(layer_lines)
+            # Build vec3(uv.x, uv.y, layer) coordinate
+            float_type = self.reg.float32()
+            uv_x = self.reg.next_id()
+            lines.append(f"{uv_x} = OpCompositeExtract {float_type} {uv_id} 0")
+            uv_y = self.reg.next_id()
+            lines.append(f"{uv_y} = OpCompositeExtract {float_type} {uv_id} 1")
+            coord3 = self.reg.next_id()
+            lines.append(f"{coord3} = OpCompositeConstruct {self.reg.vec(3)} {uv_x} {uv_y} {layer_id}")
+            result_type = self.reg.lux_type_to_spirv(expr.resolved_type)
+            result = self.reg.next_id()
+            if isinstance(sampler_arg, VarRef) and sampler_arg.name + ".__sampler" in self.var_map:
+                sam_name = sampler_arg.name
+                sam_type = self.var_types.get(sam_name, "sampler2DArray")
+                img_type, sampled_img_type = self._resolve_sampler_types(sam_type)
+                tex_loaded = self.reg.next_id()
+                lines.append(f"{tex_loaded} = OpLoad {img_type} {self.var_map[sam_name + '.__texture']}")
+                samp_loaded = self.reg.next_id()
+                lines.append(f"{samp_loaded} = OpLoad {self.reg.sampler_type()} {self.var_map[sam_name + '.__sampler']}")
+                combined = self.reg.next_id()
+                lines.append(f"{combined} = OpSampledImage {sampled_img_type} {tex_loaded} {samp_loaded}")
+                lod_zero = self.reg.const_float(0.0)
+                lines.append(f"{result} = OpImageSampleExplicitLod {result_type} {combined} {coord3} Lod {lod_zero}")
             return result, lines
 
         # sample_bindless(texture_array, index, uv) — bindless implicit LOD

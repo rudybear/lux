@@ -540,7 +540,7 @@ impl RTRenderer {
             // Single-material: resolve best permutation from scene-wide features
             let mut resolved_base = shader_base.to_string();
             if let (Some(ref mf), Some(ref gs)) = (&manifest, &gltf_scene_opt) {
-                let scene_features = scene_manager::detect_scene_features(gs);
+                let scene_features = scene_manager::detect_scene_features(gs, &[]);
                 let suffix = find_permutation_suffix(mf, &scene_features);
                 if !suffix.is_empty() {
                     let candidate = format!("{}{}", shader_base, suffix);

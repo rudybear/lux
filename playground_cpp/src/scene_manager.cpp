@@ -1244,7 +1244,7 @@ void SceneManager::computeShadowData(const glm::mat4& cameraView, const glm::mat
         entry.bias = 0.005f;
         entry.normalBias = 0.02f;
         entry.resolution = 1024.0f;
-        entry._pad = 0.0f;
+        entry.light_size = 0.02f;
 
         light.shadowIndex = shadowIdx;
         m_shadowEntries.push_back(entry);
@@ -1266,11 +1266,11 @@ std::vector<float> SceneManager::packShadowBuffer() const {
         for (int i = 0; i < 16; i++) {
             buf.push_back(mat[i]);
         }
-        // bias, normalBias, resolution, _pad
+        // bias, normalBias, resolution, light_size
         buf.push_back(entry.bias);
         buf.push_back(entry.normalBias);
         buf.push_back(entry.resolution);
-        buf.push_back(entry._pad);
+        buf.push_back(entry.light_size);
     }
     return buf;
 }
@@ -1292,8 +1292,16 @@ std::set<std::string> SceneManager::detectSceneFeatures() const {
         if (mat.hasTransmission) features.insert("has_transmission");
     }
 
+    // Detect shadow support: if any light casts shadows, enable has_shadows
+    for (auto& l : m_lights) {
+        if (l.castsShadow) {
+            features.insert("has_shadows");
+            break;
+        }
+    }
+
     if (!features.empty()) {
-        std::cout << "[info] Detected material features:";
+        std::cout << "[info] Detected scene features:";
         for (auto& f : features) std::cout << " " << f;
         std::cout << std::endl;
     }
@@ -1312,6 +1320,14 @@ std::set<std::string> SceneManager::detectMaterialFeatures(int materialIndex) co
     if (mat.hasClearcoat) features.insert("has_clearcoat");
     if (mat.hasSheen) features.insert("has_sheen");
     if (mat.hasTransmission) features.insert("has_transmission");
+
+    // Detect shadow support for per-material permutation selection
+    for (auto& l : m_lights) {
+        if (l.castsShadow) {
+            features.insert("has_shadows");
+            break;
+        }
+    }
 
     return features;
 }

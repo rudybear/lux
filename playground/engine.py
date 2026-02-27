@@ -102,6 +102,7 @@ class ShadowEntry:
     bias: float = 0.005
     normal_bias: float = 0.02
     resolution: float = 1024.0
+    light_size: float = 0.02
 
 
 @dataclass
@@ -437,6 +438,9 @@ def _load_gltf_scene(path: str, camera_elevation: float = 5.0) -> SceneData:
                 scene.scene_features.add("has_sheen")
             if 'transmission' in mat.extensions:
                 scene.scene_features.add("has_transmission")
+    # Detect shadow support: if any light has shadow capability, enable has_shadows
+    if scene.lights:
+        scene.scene_features.add("has_shadows")
     if scene.scene_features:
         print(f"[info] Detected material features: {scene.scene_features}")
 
@@ -460,6 +464,9 @@ def detect_scene_features(scene_source: str, scene: SceneData, gltf_scene) -> se
                 features.add("has_sheen")
             if 'transmission' in mat.extensions:
                 features.add("has_transmission")
+    # Detect shadow support
+    if scene.lights:
+        features.add("has_shadows")
     return features
 
 
@@ -1027,7 +1034,7 @@ def _pack_shadow_buffer(entries: list) -> bytes:
 
     Layout per entry:
         16 floats — mat4 view_projection (64 bytes)
-        4 floats  — (bias, normalBias, resolution, pad) (16 bytes)
+        4 floats  — (bias, normalBias, resolution, light_size) (16 bytes)
     Total: 80 bytes per entry.
     """
     buf = bytearray()
@@ -1036,7 +1043,7 @@ def _pack_shadow_buffer(entries: list) -> bytes:
         for i in range(16):
             buf += struct.pack("f", float(vp[i]))
         buf += struct.pack("4f", entry.bias, entry.normal_bias,
-                           entry.resolution, 0.0)
+                           entry.resolution, entry.light_size)
     # Ensure at least one entry (dummy) if empty
     if not buf:
         buf = bytearray(80)
@@ -1360,10 +1367,9 @@ def upload_scene(device: wgpu.GPUDevice, scene: SceneData, width: int, height: i
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
         )
 
-        # SceneLight UBO (view_pos + light_count)
+        # SceneLight UBO: vec3 view_pos at offset 0, int light_count at offset 12 (16 bytes total)
         light_count = len(scene.lights) if scene.lights else 1
-        scene_light_data = struct.pack("3f", *cam.eye) + struct.pack("f", 0.0)
-        scene_light_data += struct.pack("i", light_count) + struct.pack("3f", 0.0, 0.0, 0.0)
+        scene_light_data = struct.pack("3fi", *cam.eye, light_count)
         gpu.uniform_buffers["SceneLight"] = device.create_buffer_with_data(
             data=scene_light_data,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,

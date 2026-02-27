@@ -799,18 +799,15 @@ void MeshRenderer::init(VulkanContext& ctx, SceneManager& scene,
         memcpy(mapped, lightBuf.data(), lightBuf.size() * sizeof(float));
         vmaUnmapMemory(ctx.allocator, m_lightsSSBOAlloc);
 
-        // Create SceneLight UBO (light_count + view_pos, std140 layout)
+        // Create SceneLight UBO: vec3 view_pos at offset 0, int light_count at offset 12
+        // Must match SPIR-V layout (16 bytes total, no padding between fields)
         struct SceneLightUBO {
-            glm::vec3 viewPos;
-            float _pad0;
-            int32_t lightCount;
-            float _pad1[3];
+            glm::vec3 viewPos;      // offset 0, size 12
+            int32_t lightCount;     // offset 12, size 4
         };
         SceneLightUBO sceneLightData;
         sceneLightData.viewPos = viewPos;
-        sceneLightData._pad0 = 0.0f;
         sceneLightData.lightCount = m_scene->getLightCount();
-        sceneLightData._pad1[0] = sceneLightData._pad1[1] = sceneLightData._pad1[2] = 0.0f;
 
         VkBufferCreateInfo slBufInfo = {};
         slBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -1133,10 +1130,8 @@ void MeshRenderer::updateCamera(VulkanContext& ctx, glm::vec3 eye, glm::vec3 tar
     // Update SceneLight UBO viewPos for multi-light mode
     if (m_hasMultiLight && m_sceneLightUBO != VK_NULL_HANDLE) {
         struct SceneLightUBO {
-            glm::vec3 viewPos;
-            float _pad0;
-            int32_t lightCount;
-            float _pad1[3];
+            glm::vec3 viewPos;      // offset 0, size 12
+            int32_t lightCount;     // offset 12, size 4
         };
         vmaMapMemory(ctx.allocator, m_sceneLightUBOAlloc, &mapped);
         SceneLightUBO* sl = static_cast<SceneLightUBO*>(mapped);

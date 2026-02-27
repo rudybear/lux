@@ -104,6 +104,7 @@ struct CLIOptions {
     bool interactive = false;
     bool headless = true;
     bool forceValidation = false;
+    bool demoLights = false;
 };
 
 static void printUsage(const char* program) {
@@ -123,6 +124,7 @@ static void printUsage(const char* program) {
               << "  --interactive          Open GLFW preview window\n"
               << "  --headless             Offscreen render only (default)\n"
               << "  --validation           Enable Vulkan validation layers (even in release)\n"
+              << "  --demo-lights          Add 3 demo lights (directional + point + spot) with shadows\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -170,6 +172,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.interactive = false;
         } else if (arg == "--validation") {
             opts.forceValidation = true;
+        } else if (arg == "--demo-lights") {
+            opts.demoLights = true;
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -210,6 +214,49 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
     }
 
     return opts;
+}
+
+// --------------------------------------------------------------------------
+// Demo lights setup
+// --------------------------------------------------------------------------
+
+static void setupDemoLights(SceneManager& scene) {
+    // Clear any existing lights
+    scene.clearLights();
+
+    // Light 1: warm directional (sun-like), casts shadow
+    SceneLight sun;
+    sun.type = SceneLight::Directional;
+    sun.direction = glm::normalize(glm::vec3(0.6f, -0.8f, 0.4f));
+    sun.color = glm::vec3(1.0f, 0.95f, 0.85f);
+    sun.intensity = 1.2f;
+    sun.castsShadow = true;
+    scene.addLight(sun);
+
+    // Light 2: blue point light (left side)
+    SceneLight blue;
+    blue.type = SceneLight::Point;
+    blue.position = glm::vec3(-2.0f, 1.0f, 1.0f);
+    blue.color = glm::vec3(0.3f, 0.5f, 1.0f);
+    blue.intensity = 3.0f;
+    blue.range = 10.0f;
+    scene.addLight(blue);
+
+    // Light 3: red spot light (right side), casts shadow
+    SceneLight spot;
+    spot.type = SceneLight::Spot;
+    spot.position = glm::vec3(2.5f, 2.0f, 1.5f);
+    spot.direction = glm::normalize(glm::vec3(-1.0f, -1.0f, -0.5f));
+    spot.color = glm::vec3(1.0f, 0.3f, 0.2f);
+    spot.intensity = 5.0f;
+    spot.range = 15.0f;
+    spot.innerConeAngle = 0.2f;
+    spot.outerConeAngle = 0.5f;
+    spot.castsShadow = true;
+    scene.addLight(spot);
+
+    std::cout << "[info] Demo lights: 3 lights (directional+shadow, point, spot+shadow)"
+              << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -279,6 +326,11 @@ static int runHeadless(const CLIOptions& opts) {
         // Shared scene setup
         SceneManager scene;
         scene.loadScene(ctx, opts.sceneSource);
+
+        // Set up demo lights if requested (before GPU upload so light count is known)
+        if (opts.demoLights) {
+            setupDemoLights(scene);
+        }
 
         // Always use 48-byte stride for glTF scenes so that flattenScene()
         // is called (which generates draw ranges and applies world transforms).
@@ -454,6 +506,11 @@ static int runInteractive(CLIOptions opts) {
 
     try {
         scene.loadScene(ctx, opts.sceneSource);
+
+        // Set up demo lights if requested
+        if (opts.demoLights) {
+            setupDemoLights(scene);
+        }
 
         // Always use 48-byte stride for glTF raster scenes so that flattenScene()
         // is called (which generates draw ranges and applies world transforms).

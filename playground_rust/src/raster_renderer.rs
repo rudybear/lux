@@ -477,6 +477,7 @@ pub fn render_raster(
     height: u32,
     output_path: &Path,
     ibl_name: &str,
+    demo_lights: bool,
 ) -> Result<(), String> {
     info!(
         "Raster render: scene='{}', pipeline='{}', {}x{}",
@@ -504,7 +505,8 @@ pub fn render_raster(
             // Resolve permutation suffix from manifest + scene features
             let resolved_base = if let Some(manifest) = try_load_manifest(pipeline_base) {
                 let gltf_scene = crate::gltf_loader::load_gltf(Path::new(source))?;
-                let scene_features = scene_manager::detect_scene_features(&gltf_scene);
+                let demo_light_vec = if demo_lights { crate::setup_demo_lights() } else { vec![] };
+                let scene_features = scene_manager::detect_scene_features(&gltf_scene, &demo_light_vec);
                 let suffix = find_permutation_suffix(&manifest, &scene_features);
                 if !suffix.is_empty() {
                     let candidate = format!("{}{}", pipeline_base, suffix);
@@ -530,7 +532,7 @@ pub fn render_raster(
             let frag_module = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
 
             // For glTF, use the PBR rendering path with glTF mesh data
-            render_pbr_scene(ctx, vert_module, frag_module, &resolved_base, scene_source, width, height, output_path, ibl_name)?;
+            render_pbr_scene(ctx, vert_module, frag_module, &resolved_base, scene_source, width, height, output_path, ibl_name, demo_lights)?;
 
             unsafe {
                 ctx.device.destroy_shader_module(frag_module, None);
@@ -546,7 +548,7 @@ pub fn render_raster(
             let vert_module = spv_loader::create_shader_module(&ctx.device, &vert_code)?;
             let frag_module = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
 
-            render_pbr_scene(ctx, vert_module, frag_module, pipeline_base, scene_source, width, height, output_path, ibl_name)?;
+            render_pbr_scene(ctx, vert_module, frag_module, pipeline_base, scene_source, width, height, output_path, ibl_name, demo_lights)?;
 
             unsafe {
                 ctx.device.destroy_shader_module(frag_module, None);
@@ -1191,6 +1193,7 @@ fn render_pbr_scene_bindless(
     ibl_name: &str,
     vert_refl: reflected_pipeline::ReflectionData,
     frag_refl: reflected_pipeline::ReflectionData,
+    demo_lights: bool,
 ) -> Result<(), String> {
     let device_owned = ctx.device.clone();
     let device = &device_owned;
@@ -1346,7 +1349,9 @@ fn render_pbr_scene_bindless(
     // --- Multi-light SSBO (Phase E) ---
     // Build a SceneManager and populate lights from glTF scene data.
     let mut sm = scene_manager::SceneManager::new();
-    if let Some(ref gs) = gltf_scene {
+    if demo_lights {
+        sm.override_lights(crate::setup_demo_lights());
+    } else if let Some(ref gs) = gltf_scene {
         sm.populate_lights_from_gltf(&gs.lights);
     } else {
         // Ensure at least a default directional light
@@ -1374,15 +1379,13 @@ fn render_pbr_scene_bindless(
         lights_ssbo = Some(buf);
     }
 
-    // Build SceneLight UBO data for multi-light mode (camera_pos + light_count)
+    // Build SceneLight UBO: vec3 view_pos at offset 0, int light_count at offset 12 (16 bytes total)
     let mut scene_light_ubo: Option<scene_manager::GpuBuffer> = None;
     if has_multi_light {
-        let mut scene_light_data = [0u8; 32];
+        let mut scene_light_data = [0u8; 16];
         scene_light_data[0..12].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
-        scene_light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
         let light_count = sm.lights.len() as i32;
-        scene_light_data[16..20].copy_from_slice(&light_count.to_le_bytes());
-        scene_light_data[20..32].fill(0);
+        scene_light_data[12..16].copy_from_slice(&light_count.to_le_bytes());
         let buf = create_buffer_with_data(
             device, ctx.allocator_mut(), &scene_light_data,
             vk::BufferUsageFlags::UNIFORM_BUFFER, "scene_light_ubo",
@@ -1839,6 +1842,7 @@ fn render_pbr_scene(
     height: u32,
     output_path: &Path,
     ibl_name: &str,
+    demo_lights: bool,
 ) -> Result<(), String> {
     let device_owned = ctx.device.clone();
     let device = &device_owned;
@@ -1868,6 +1872,7 @@ fn render_pbr_scene(
         return render_pbr_scene_bindless(
             ctx, vert_module, frag_module, pipeline_base, scene_source,
             width, height, output_path, ibl_name, vert_refl, frag_refl,
+            demo_lights,
         );
     }
 
@@ -2194,7 +2199,9 @@ fn render_pbr_scene(
 
     // --- Multi-light SSBO (Phase E) ---
     let mut sm = scene_manager::SceneManager::new();
-    if let Some(ref gs) = gltf_scene {
+    if demo_lights {
+        sm.override_lights(crate::setup_demo_lights());
+    } else if let Some(ref gs) = gltf_scene {
         sm.populate_lights_from_gltf(&gs.lights);
     } else {
         sm.populate_lights_from_gltf(&[]);
@@ -2219,14 +2226,13 @@ fn render_pbr_scene(
         lights_ssbo = Some(buf);
     }
 
+    // SceneLight UBO: vec3 view_pos at offset 0, int light_count at offset 12 (16 bytes total)
     let mut scene_light_ubo: Option<scene_manager::GpuBuffer> = None;
     if has_multi_light {
-        let mut scene_light_data = [0u8; 32];
+        let mut scene_light_data = [0u8; 16];
         scene_light_data[0..12].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
-        scene_light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
         let light_count = sm.lights.len() as i32;
-        scene_light_data[16..20].copy_from_slice(&light_count.to_le_bytes());
-        scene_light_data[20..32].fill(0);
+        scene_light_data[12..16].copy_from_slice(&light_count.to_le_bytes());
         let buf = create_buffer_with_data(
             device, ctx.allocator_mut(), &scene_light_data,
             vk::BufferUsageFlags::UNIFORM_BUFFER, "scene_light_ubo",
@@ -3272,6 +3278,7 @@ impl PersistentRenderer {
         width: u32,
         height: u32,
         ibl_name: &str,
+        demo_lights: bool,
     ) -> Result<Self, String> {
         let device = ctx.device.clone();
 
@@ -3299,7 +3306,8 @@ impl PersistentRenderer {
         let resolved_base = if !use_multi_pipeline {
             if let Some(ref mf) = manifest {
                 if let Some(ref gs) = gltf_scene {
-                    let scene_features = scene_manager::detect_scene_features(gs);
+                    let demo_light_vec = if demo_lights { crate::setup_demo_lights() } else { vec![] };
+                    let scene_features = scene_manager::detect_scene_features(gs, &demo_light_vec);
                     let suffix = find_permutation_suffix(mf, &scene_features);
                     if !suffix.is_empty() {
                         let candidate = format!("{}{}", pipeline_base, suffix);
@@ -3507,7 +3515,9 @@ impl PersistentRenderer {
 
         // --- Multi-light SSBO (Phase E) ---
         let mut sm = scene_manager::SceneManager::new();
-        if let Some(ref gs) = gltf_scene {
+        if demo_lights {
+            sm.override_lights(crate::setup_demo_lights());
+        } else if let Some(ref gs) = gltf_scene {
             sm.populate_lights_from_gltf(&gs.lights);
         } else {
             sm.populate_lights_from_gltf(&[]);
@@ -3534,14 +3544,13 @@ impl PersistentRenderer {
             lights_ssbo = Some(buf);
         }
 
+        // SceneLight UBO: vec3 view_pos at offset 0, int light_count at offset 12 (16 bytes total)
         let mut scene_light_ubo: Option<scene_manager::GpuBuffer> = None;
         if has_multi_light {
-            let mut scene_light_data = [0u8; 32];
+            let mut scene_light_data = [0u8; 16];
             scene_light_data[0..12].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
-            scene_light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
             let light_count = sm.lights.len() as i32;
-            scene_light_data[16..20].copy_from_slice(&light_count.to_le_bytes());
-            scene_light_data[20..32].fill(0);
+            scene_light_data[12..16].copy_from_slice(&light_count.to_le_bytes());
             let buf = create_buffer_with_data(
                 &device, ctx.allocator_mut(), &scene_light_data,
                 vk::BufferUsageFlags::UNIFORM_BUFFER, "scene_light_ubo",

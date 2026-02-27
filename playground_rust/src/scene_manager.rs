@@ -61,7 +61,7 @@ pub struct ShadowEntry {
     pub bias: f32,
     pub normal_bias: f32,
     pub resolution: f32,
-    pub _pad: f32,
+    pub light_size: f32,
 }
 
 impl Default for ShadowEntry {
@@ -76,7 +76,7 @@ impl Default for ShadowEntry {
             bias: 0.005,
             normal_bias: 0.02,
             resolution: 1024.0,
-            _pad: 0.0,
+            light_size: 0.02,
         }
     }
 }
@@ -171,6 +171,15 @@ impl SceneManager {
         }
         info!(
             "SceneManager: {} light(s) populated",
+            self.lights.len()
+        );
+    }
+
+    /// Replace current lights with the given demo lights.
+    pub fn override_lights(&mut self, demo_lights: Vec<SceneLight>) {
+        self.lights = demo_lights;
+        info!(
+            "SceneManager: overridden with {} demo light(s)",
             self.lights.len()
         );
     }
@@ -282,7 +291,7 @@ impl SceneManager {
                         bias: 0.005,
                         normal_bias: 0.02,
                         resolution: SHADOW_MAP_RESOLUTION as f32,
-                        _pad: 0.0,
+                        light_size: 0.02,
                     });
                     shadow_idx += 1;
                 }
@@ -333,7 +342,7 @@ impl SceneManager {
                         bias: 0.005,
                         normal_bias: 0.02,
                         resolution: SHADOW_MAP_RESOLUTION as f32,
-                        _pad: 0.0,
+                        light_size: 0.02,
                     });
                     shadow_idx += 1;
                 }
@@ -355,17 +364,17 @@ impl SceneManager {
     ///
     /// Each entry occupies 20 floats (80 bytes):
     ///   16 floats: mat4 viewProjection (column-major)
-    ///   4 floats: bias, normalBias, resolution, pad
+    ///   4 floats: bias, normalBias, resolution, light_size
     pub fn pack_shadow_buffer(&self) -> Vec<f32> {
         let mut buf = Vec::with_capacity(self.shadow_entries.len() * 20);
         for entry in &self.shadow_entries {
             // 16 floats for mat4
             buf.extend_from_slice(&entry.view_projection);
-            // 4 floats: bias, normal_bias, resolution, pad
+            // 4 floats: bias, normal_bias, resolution, light_size
             buf.push(entry.bias);
             buf.push(entry.normal_bias);
             buf.push(entry.resolution);
-            buf.push(entry._pad);
+            buf.push(entry.light_size);
         }
         buf
     }
@@ -647,7 +656,7 @@ pub fn is_gltf_file(scene_source: &str) -> bool {
 }
 
 /// Detect which material features are used across the scene.
-pub fn detect_scene_features(scene: &crate::gltf_loader::GltfScene) -> std::collections::BTreeSet<String> {
+pub fn detect_scene_features(scene: &crate::gltf_loader::GltfScene, lights: &[SceneLight]) -> std::collections::BTreeSet<String> {
     let mut features = std::collections::BTreeSet::new();
     for mat in &scene.materials {
         if mat.normal_image.is_some() {
@@ -665,6 +674,10 @@ pub fn detect_scene_features(scene: &crate::gltf_loader::GltfScene) -> std::coll
         if mat.has_transmission {
             features.insert("has_transmission".to_string());
         }
+    }
+    // Detect shadow support
+    if lights.iter().any(|l| l.casts_shadow) {
+        features.insert("has_shadows".to_string());
     }
     if !features.is_empty() {
         info!("Detected material features: {:?}", features);

@@ -67,6 +67,10 @@ struct Args {
     /// Enable Vulkan validation layers even in release builds.
     #[arg(long)]
     validation: bool,
+
+    /// Add 3 demo lights (directional + point + spot) with shadows.
+    #[arg(long)]
+    demo_lights: bool,
 }
 
 fn main() {
@@ -179,12 +183,56 @@ fn run(args: Args) -> Result<(), String> {
         } else {
             (args.width, args.height)
         };
-        run_interactive(&pipeline_base, &scene_source, render_path, iw, ih, ibl_name, args.validation)?;
+        run_interactive(&pipeline_base, &scene_source, render_path, iw, ih, ibl_name, args.validation, args.demo_lights)?;
     } else {
-        run_headless(&pipeline_base, &scene_source, render_path, args.width, args.height, &args.output, ibl_name, args.validation)?;
+        run_headless(&pipeline_base, &scene_source, render_path, args.width, args.height, &args.output, ibl_name, args.validation, args.demo_lights)?;
     }
 
     Ok(())
+}
+
+fn setup_demo_lights() -> Vec<scene_manager::SceneLight> {
+    vec![
+        // Light 1: warm directional (sun-like), casts shadow
+        scene_manager::SceneLight {
+            light_type: 0, // Directional
+            position: glam::Vec3::ZERO,
+            direction: glam::Vec3::new(0.6, -0.8, 0.4).normalize(),
+            color: glam::Vec3::new(1.0, 0.95, 0.85),
+            intensity: 1.2,
+            range: 0.0,
+            inner_cone_angle: 0.0,
+            outer_cone_angle: 0.7854,
+            casts_shadow: true,
+            shadow_index: -1,
+        },
+        // Light 2: blue point light (left side)
+        scene_manager::SceneLight {
+            light_type: 1, // Point
+            position: glam::Vec3::new(-2.0, 1.0, 1.0),
+            direction: glam::Vec3::new(0.0, -1.0, 0.0),
+            color: glam::Vec3::new(0.3, 0.5, 1.0),
+            intensity: 3.0,
+            range: 10.0,
+            inner_cone_angle: 0.0,
+            outer_cone_angle: 0.7854,
+            casts_shadow: false,
+            shadow_index: -1,
+        },
+        // Light 3: red spot light (right side), casts shadow
+        scene_manager::SceneLight {
+            light_type: 2, // Spot
+            position: glam::Vec3::new(2.5, 2.0, 1.5),
+            direction: glam::Vec3::new(-1.0, -1.0, -0.5).normalize(),
+            color: glam::Vec3::new(1.0, 0.3, 0.2),
+            intensity: 5.0,
+            range: 15.0,
+            inner_cone_angle: 0.2,
+            outer_cone_angle: 0.5,
+            casts_shadow: true,
+            shadow_index: -1,
+        },
+    ]
 }
 
 /// Run in headless mode: create context, render offscreen, save PNG.
@@ -197,6 +245,7 @@ fn run_headless(
     output: &str,
     ibl_name: &str,
     force_validation: bool,
+    demo_lights: bool,
 ) -> Result<(), String> {
     let enable_rt = render_path == "rt";
 
@@ -216,6 +265,7 @@ fn run_headless(
                 height,
                 output_path,
                 ibl_name,
+                demo_lights,
             )
         }
         "fullscreen" => {
@@ -250,7 +300,7 @@ fn run_headless(
                 );
             }
             info!("Rendering mesh shader scene '{}' with pipeline '{}'...", scene_source, pipeline_base);
-            render_mesh_headless(&mut ctx, pipeline_base, scene_source, width, height, output_path, ibl_name)
+            render_mesh_headless(&mut ctx, pipeline_base, scene_source, width, height, output_path, ibl_name, demo_lights)
         }
         _ => Err(format!("Unknown render path: {}", render_path)),
     };
@@ -279,6 +329,7 @@ fn render_mesh_headless(
     height: u32,
     output_path: &Path,
     ibl_name: &str,
+    demo_lights: bool,
 ) -> Result<(), String> {
     use scene_manager::Renderer;
 
@@ -289,6 +340,7 @@ fn render_mesh_headless(
         width,
         height,
         ibl_name,
+        demo_lights,
     )?;
 
     // Render frame
@@ -424,6 +476,7 @@ fn run_interactive(
     height: u32,
     ibl_name: &str,
     force_validation: bool,
+    demo_lights: bool,
 ) -> Result<(), String> {
     use ash::vk;
     use scene_manager::Renderer;
@@ -446,6 +499,7 @@ fn run_interactive(
         use_mesh: bool,
         ibl_name: String,
         force_validation: bool,
+        demo_lights: bool,
         // Vulkan state (initialized after window creation)
         ctx: Option<vulkan_context::VulkanContext>,
         renderer: Option<Box<dyn Renderer>>,
@@ -511,6 +565,7 @@ fn run_interactive(
                         self.width,
                         self.height,
                         &self.ibl_name,
+                        self.demo_lights,
                     ).map(|r| Box::new(r) as Box<dyn Renderer>)
                 }
             } else {
@@ -522,6 +577,7 @@ fn run_interactive(
                     self.width,
                     self.height,
                     &self.ibl_name,
+                    self.demo_lights,
                 ).map(|r| Box::new(r) as Box<dyn Renderer>)
             };
 
@@ -784,6 +840,7 @@ fn run_interactive(
         use_mesh,
         ibl_name: ibl_name.to_string(),
         force_validation,
+        demo_lights,
         ctx: None,
         renderer: None,
         orbit: OrbitCamera::new(),

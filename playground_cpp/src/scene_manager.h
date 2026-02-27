@@ -40,7 +40,7 @@ struct ShadowEntry {
     float bias = 0.005f;
     float normalBias = 0.02f;
     float resolution = 1024.0f;
-    float _pad = 0.0f;
+    float light_size = 0.02f;
 };
 
 // Bindless texture array: all unique textures from the scene for descriptor binding
@@ -85,6 +85,7 @@ public:
 
     // Light management
     void addLight(const SceneLight& light) { m_lights.push_back(light); }
+    void clearLights() { m_lights.clear(); }
     const std::vector<SceneLight>& getLights() const { return m_lights; }
     int getLightCount() const { return static_cast<int>(m_lights.size()); }
 

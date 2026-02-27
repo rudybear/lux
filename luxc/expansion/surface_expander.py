@@ -341,12 +341,16 @@ def _expand_surface_to_fragment(
         for sam in lighting.samplers:
             stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
 
-    # If multi_light layer present, add lights SSBO
+    # If multi_light layer present, add lights SSBO (and shadow_matrices if shadow_map arg)
     if lighting and lighting.layers:
         for layer in lighting.layers:
             if layer.name == "multi_light":
                 stage.storage_buffers.append(
                     StorageBufferDecl("lights", "LightData"))
+                _ml_arg_names = [a.name for a in layer.args]
+                if "shadow_map" in _ml_arg_names:
+                    stage.storage_buffers.append(
+                        StorageBufferDecl("shadow_matrices", "ShadowEntry"))
                 break
 
     # Generate main function body - use layered path if surface has layers
@@ -513,6 +517,126 @@ def _emit_custom_layer(layer, fn, result_var, body, prefix, rewrite_for_rt=False
     return out_var
 
 
+# --- Poisson disk offsets for shadow filtering ---
+_POISSON_DISK_16 = [
+    (-0.94201624, -0.39906216), (0.94558609, -0.76890725),
+    (-0.09418410, -0.92938870), (0.34495938, 0.29387760),
+    (-0.91588581, 0.45771432), (-0.81544232, -0.87912464),
+    (-0.38277543, 0.27676845), (0.97484398, 0.75648379),
+    (0.44323325, -0.97511554), (0.53742981, -0.47373420),
+    (-0.26496911, -0.41893023), (0.79197514, 0.19090188),
+    (-0.24188840, 0.99706507), (-0.81409955, 0.91437590),
+    (0.19984126, 0.78641367), (0.14383161, -0.14100790),
+]
+
+
+def _emit_hard_shadow(body, sfx):
+    """Emit single comparison sample — binary hard shadow."""
+    body.append(LetStmt(f"sf{sfx}", "scalar",
+        CallExpr(VarRef("sample_compare"), [
+            VarRef("shadow_maps"),
+            ConstructorExpr("vec3", [
+                SwizzleAccess(VarRef(f"suv{sfx}"), "x"),
+                SwizzleAccess(VarRef(f"suv{sfx}"), "y"),
+                VarRef(f"lsi{sfx}")]),
+            SwizzleAccess(VarRef(f"suv{sfx}"), "z")])))
+
+
+def _emit_pcf_shadow(body, sfx):
+    """Emit 4-tap PCF shadow: 4 comparison samples at +-0.5 texel offsets, averaged."""
+    # texel_size = 1.0 / resolution
+    body.append(LetStmt(f"stxsz{sfx}", "scalar",
+        BinaryOp("/", NumberLit("1.0"), VarRef(f"sres{sfx}"))))
+    offsets = [(-0.5, -0.5), (0.5, -0.5), (-0.5, 0.5), (0.5, 0.5)]
+    for tap_i, (ox, oy) in enumerate(offsets):
+        body.append(LetStmt(f"spc{tap_i}{sfx}", "scalar",
+            CallExpr(VarRef("sample_compare"), [
+                VarRef("shadow_maps"),
+                ConstructorExpr("vec3", [
+                    BinaryOp("+", SwizzleAccess(VarRef(f"suv{sfx}"), "x"),
+                        BinaryOp("*", NumberLit(str(ox)), VarRef(f"stxsz{sfx}"))),
+                    BinaryOp("+", SwizzleAccess(VarRef(f"suv{sfx}"), "y"),
+                        BinaryOp("*", NumberLit(str(oy)), VarRef(f"stxsz{sfx}"))),
+                    VarRef(f"lsi{sfx}")]),
+                SwizzleAccess(VarRef(f"suv{sfx}"), "z")])))
+    # Average the 4 samples using pcf_shadow_4 stdlib function
+    body.append(LetStmt(f"sf{sfx}", "scalar",
+        CallExpr(VarRef("pcf_shadow_4"), [
+            VarRef(f"spc0{sfx}"), VarRef(f"spc1{sfx}"),
+            VarRef(f"spc2{sfx}"), VarRef(f"spc3{sfx}")])))
+
+
+def _emit_pcss_shadow(body, sfx):
+    """Emit PCSS shadow: 16-sample blocker search + 16-sample variable-kernel PCF."""
+    # texel_size = 1.0 / resolution
+    body.append(LetStmt(f"stxsz{sfx}", "scalar",
+        BinaryOp("/", NumberLit("1.0"), VarRef(f"sres{sfx}"))))
+
+    # Search radius for blocker search (light_size * receiver_depth / resolution)
+    body.append(LetStmt(f"ssrad{sfx}", "scalar",
+        BinaryOp("*", VarRef(f"slsz{sfx}"),
+            BinaryOp("*", SwizzleAccess(VarRef(f"suv{sfx}"), "z"),
+                BinaryOp("/", NumberLit("1.0"), VarRef(f"sres{sfx}"))))))
+
+    # --- Blocker search: 16 raw depth samples ---
+    for tap_i, (ox, oy) in enumerate(_POISSON_DISK_16):
+        body.append(LetStmt(f"sbd{tap_i}{sfx}", "vec4",
+            CallExpr(VarRef("sample_array"), [
+                VarRef("shadow_maps"),
+                ConstructorExpr("vec2", [
+                    BinaryOp("+", SwizzleAccess(VarRef(f"suv{sfx}"), "x"),
+                        BinaryOp("*", NumberLit(str(ox)), VarRef(f"ssrad{sfx}"))),
+                    BinaryOp("+", SwizzleAccess(VarRef(f"suv{sfx}"), "y"),
+                        BinaryOp("*", NumberLit(str(oy)), VarRef(f"ssrad{sfx}")))]),
+                VarRef(f"lsi{sfx}")])))
+
+    # Average blockers using stdlib (16-sample version)
+    body.append(LetStmt(f"sbavg{sfx}", "vec2",
+        CallExpr(VarRef("pcss_average_blockers_16"), [
+            *[SwizzleAccess(VarRef(f"sbd{j}{sfx}"), "x") for j in range(16)],
+            SwizzleAccess(VarRef(f"suv{sfx}"), "z")])))
+
+    # Penumbra size
+    body.append(LetStmt(f"spen{sfx}", "scalar",
+        CallExpr(VarRef("pcss_penumbra_size"), [
+            SwizzleAccess(VarRef(f"sbavg{sfx}"), "x"),
+            SwizzleAccess(VarRef(f"suv{sfx}"), "z"),
+            VarRef(f"slsz{sfx}")])))
+
+    # Filter radius = max(penumbra, 1 texel) / resolution
+    body.append(LetStmt(f"sfrad{sfx}", "scalar",
+        CallExpr(VarRef("max"), [
+            VarRef(f"spen{sfx}"),
+            VarRef(f"stxsz{sfx}")])))
+
+    # --- Variable-kernel PCF: 16 comparison samples ---
+    for tap_i, (ox, oy) in enumerate(_POISSON_DISK_16):
+        body.append(LetStmt(f"spcs{tap_i}{sfx}", "scalar",
+            CallExpr(VarRef("sample_compare"), [
+                VarRef("shadow_maps"),
+                ConstructorExpr("vec3", [
+                    BinaryOp("+", SwizzleAccess(VarRef(f"suv{sfx}"), "x"),
+                        BinaryOp("*", NumberLit(str(ox)), VarRef(f"sfrad{sfx}"))),
+                    BinaryOp("+", SwizzleAccess(VarRef(f"suv{sfx}"), "y"),
+                        BinaryOp("*", NumberLit(str(oy)), VarRef(f"sfrad{sfx}"))),
+                    VarRef(f"lsi{sfx}")]),
+                SwizzleAccess(VarRef(f"suv{sfx}"), "z")])))
+
+    # Average the 16 PCF taps
+    body.append(LetStmt(f"spcss_raw{sfx}", "scalar",
+        CallExpr(VarRef("pcf_shadow_16"), [
+            *[VarRef(f"spcs{j}{sfx}") for j in range(16)]])))
+
+    # If no blockers found (blocker count == 0), fully lit
+    body.append(LetStmt(f"sf{sfx}", "scalar",
+        BinaryOp("+",
+            BinaryOp("*", VarRef(f"spcss_raw{sfx}"),
+                SwizzleAccess(VarRef(f"sbavg{sfx}"), "y")),
+            BinaryOp("*", NumberLit("1.0"),
+                BinaryOp("-", NumberLit("1.0"),
+                    SwizzleAccess(VarRef(f"sbavg{sfx}"), "y"))))))
+
+
 # --- Multi-light unrolling helper ---
 
 def _emit_multi_light_loop(
@@ -526,6 +650,7 @@ def _emit_multi_light_loop(
     metallic_var: str,  # "layer_metallic"
     light_count_var: str = "_ml_light_count",
     has_shadows: bool = False,
+    shadow_filter: str = "pcf",
 ) -> str:
     """Emit unrolled multi-light evaluation.
 
@@ -598,12 +723,71 @@ def _emit_multi_light_loop(
                 VarRef(normal_var),
             ])))
 
-        # Accumulate: total_direct = total_direct + brdf_i * radiance_i
-        guard_body.append(AssignStmt(
-            AssignTarget(VarRef("total_direct")),
-            BinaryOp("+", VarRef("total_direct"),
-                BinaryOp("*", VarRef(f"brdf{sfx}"), VarRef(f"radiance{sfx}"))),
-        ))
+        if has_shadows:
+            # 1. Init shadow factor to 1.0 (fully lit)
+            guard_body.append(LetStmt(f"shadow{sfx}", "scalar", NumberLit("1.0")))
+
+            # 2. Build shadow evaluation body (guarded by shadow_index >= 0)
+            shadow_body = []
+            # Load ShadowEntry fields from SSBO
+            def _shadow_field(field, _idx=idx):
+                return FieldAccess(
+                    IndexAccess(VarRef("shadow_matrices"),
+                                VarRef(f"lsi{sfx}")),
+                    field)
+            shadow_body.append(LetStmt(f"svp{sfx}", "mat4", _shadow_field("view_projection")))
+            shadow_body.append(LetStmt(f"sbias{sfx}", "scalar", _shadow_field("bias")))
+            shadow_body.append(LetStmt(f"snbias{sfx}", "scalar", _shadow_field("normal_bias")))
+            shadow_body.append(LetStmt(f"sres{sfx}", "scalar", _shadow_field("resolution")))
+            shadow_body.append(LetStmt(f"slsz{sfx}", "scalar", _shadow_field("light_size")))
+
+            # Normal-offset bias
+            shadow_body.append(LetStmt(f"soffpos{sfx}", "vec3",
+                CallExpr(VarRef("normal_offset_world"), [
+                    VarRef(pos_var), VarRef(normal_var),
+                    VarRef(f"snbias{sfx}"),
+                    CallExpr(VarRef("max"), [
+                        CallExpr(VarRef("dot"), [VarRef(normal_var), VarRef(f"l{sfx}")]),
+                        NumberLit("0.0")])])))
+
+            # Project to shadow UV space
+            shadow_body.append(LetStmt(f"suv{sfx}", "vec3",
+                CallExpr(VarRef("compute_shadow_uv"), [
+                    VarRef(f"soffpos{sfx}"), VarRef(f"svp{sfx}"),
+                    VarRef(f"sbias{sfx}")])))
+
+            # Emit filter-specific sampling code
+            if shadow_filter == "hard":
+                _emit_hard_shadow(shadow_body, sfx)
+            elif shadow_filter == "pcf":
+                _emit_pcf_shadow(shadow_body, sfx)
+            elif shadow_filter == "pcss":
+                _emit_pcss_shadow(shadow_body, sfx)
+            else:
+                _emit_pcf_shadow(shadow_body, sfx)  # default to PCF
+
+            shadow_body.append(AssignStmt(
+                AssignTarget(VarRef(f"shadow{sfx}")), VarRef(f"sf{sfx}")))
+
+            # 3. Guard: if (shadow_index >= 0.0) { evaluate shadow }
+            guard_body.append(IfStmt(
+                BinaryOp(">=", VarRef(f"lsi{sfx}"), NumberLit("0.0")),
+                shadow_body, []))
+
+            # 4. Accumulate with shadow factor
+            guard_body.append(AssignStmt(
+                AssignTarget(VarRef("total_direct")),
+                BinaryOp("+", VarRef("total_direct"),
+                    BinaryOp("*",
+                        BinaryOp("*", VarRef(f"brdf{sfx}"), VarRef(f"radiance{sfx}")),
+                        VarRef(f"shadow{sfx}")))))
+        else:
+            # Original: no shadow attenuation
+            guard_body.append(AssignStmt(
+                AssignTarget(VarRef("total_direct")),
+                BinaryOp("+", VarRef("total_direct"),
+                    BinaryOp("*", VarRef(f"brdf{sfx}"), VarRef(f"radiance{sfx}"))),
+            ))
 
         # Guard: if (i < light_count)
         body.append(IfStmt(
@@ -819,6 +1003,12 @@ def _generate_layered_main(
             max_lights = 16  # default
             if "max_lights" in ml_args and isinstance(ml_args["max_lights"], NumberLit):
                 max_lights = int(float(ml_args["max_lights"].value))
+            _has_shadow_map = "shadow_map" in ml_args
+            _shadow_filter = "pcf"  # default
+            if "shadow_filter" in ml_args:
+                sf_val = ml_args["shadow_filter"]
+                if isinstance(sf_val, VarRef):
+                    _shadow_filter = sf_val.name
             # Emit light_count from count arg (e.g. SceneLight.light_count)
             count_expr = ml_args.get("count", NumberLit(str(max_lights)))
             # Multiply by 1.0 to ensure float type (count may come from int uniform).
@@ -830,6 +1020,8 @@ def _generate_layered_main(
                 pos_var=pos_var, normal_var="n", view_var="v",
                 albedo_var="layer_albedo", roughness_var="layer_roughness",
                 metallic_var="layer_metallic",
+                has_shadows=_has_shadow_map,
+                shadow_filter=_shadow_filter,
             )
         else:
             # Single directional light path
@@ -1521,12 +1713,16 @@ def _expand_layered_closest_hit(
         for sam in lighting.samplers:
             stage.samplers.append(SamplerDecl(sam.name, type_name=sam.type_name))
 
-    # If multi_light layer present, add lights SSBO
+    # If multi_light layer present, add lights SSBO (and shadow_matrices if shadow_map arg)
     if lighting and lighting.layers:
         for layer in lighting.layers:
             if layer.name == "multi_light":
                 stage.storage_buffers.append(
                     StorageBufferDecl("lights", "LightData"))
+                _ml_arg_names = [a.name for a in layer.args]
+                if "shadow_map" in _ml_arg_names:
+                    stage.storage_buffers.append(
+                        StorageBufferDecl("shadow_matrices", "ShadowEntry"))
                 break
 
     # --- Generate main body ---
@@ -1607,6 +1803,12 @@ def _expand_layered_closest_hit(
             max_lights = 16  # default
             if "max_lights" in ml_args and isinstance(ml_args["max_lights"], NumberLit):
                 max_lights = int(float(ml_args["max_lights"].value))
+            _has_shadow_map = "shadow_map" in ml_args
+            _shadow_filter = "pcf"  # default
+            if "shadow_filter" in ml_args:
+                sf_val = ml_args["shadow_filter"]
+                if isinstance(sf_val, VarRef):
+                    _shadow_filter = sf_val.name
             # Emit light_count from count arg (e.g. SceneLight.light_count)
             count_expr = ml_args.get("count", NumberLit(str(max_lights)))
             # Multiply by 1.0 to ensure float type (count may come from int uniform).
@@ -1618,6 +1820,8 @@ def _expand_layered_closest_hit(
                 pos_var="hit_pos", normal_var="n", view_var="v",
                 albedo_var="layer_albedo", roughness_var="layer_roughness",
                 metallic_var="layer_metallic",
+                has_shadows=_has_shadow_map,
+                shadow_filter=_shadow_filter,
             )
         else:
             # Single directional light path
@@ -2485,6 +2689,12 @@ def _emit_bindless_layer_body(
         max_lights = 16  # default
         if "max_lights" in ml_args and isinstance(ml_args["max_lights"], NumberLit):
             max_lights = int(float(ml_args["max_lights"].value))
+        _has_shadow_map = "shadow_map" in ml_args
+        _shadow_filter = "pcf"  # default
+        if "shadow_filter" in ml_args:
+            sf_val = ml_args["shadow_filter"]
+            if isinstance(sf_val, VarRef):
+                _shadow_filter = sf_val.name
         count_expr = ml_args.get("count", NumberLit(str(max_lights)))
         # Multiply by 1.0 to ensure float type (count may come from int uniform).
         # Use _ml_ prefix to avoid clashing with uniform field names.
@@ -2495,6 +2705,8 @@ def _emit_bindless_layer_body(
             pos_var=pos_var, normal_var="n", view_var="v",
             albedo_var="layer_albedo", roughness_var="layer_roughness",
             metallic_var="layer_metallic",
+            has_shadows=_has_shadow_map,
+            shadow_filter=_shadow_filter,
         )
     else:
         body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
@@ -2752,12 +2964,16 @@ def _expand_bindless_fragment(
     stage.storage_buffers.append(StorageBufferDecl(
         "materials", "BindlessMaterialData"))
 
-    # If multi_light layer present, add lights SSBO
+    # If multi_light layer present, add lights SSBO (and shadow_matrices if shadow_map arg)
     if lighting and lighting.layers:
         for layer in lighting.layers:
             if layer.name == "multi_light":
                 stage.storage_buffers.append(
                     StorageBufferDecl("lights", "LightData"))
+                _ml_arg_names = [a.name for a in layer.args]
+                if "shadow_map" in _ml_arg_names:
+                    stage.storage_buffers.append(
+                        StorageBufferDecl("shadow_matrices", "ShadowEntry"))
                 break
 
     # --- IBL samplers (kept as regular samplers — scene-global, not per-material) ---
@@ -2880,12 +3096,16 @@ def _expand_bindless_closest_hit(
     stage.storage_buffers.append(StorageBufferDecl(
         "materials", "BindlessMaterialData"))
 
-    # If multi_light layer present, add lights SSBO
+    # If multi_light layer present, add lights SSBO (and shadow_matrices if shadow_map arg)
     if lighting and lighting.layers:
         for layer in lighting.layers:
             if layer.name == "multi_light":
                 stage.storage_buffers.append(
                     StorageBufferDecl("lights", "LightData"))
+                _ml_arg_names = [a.name for a in layer.args]
+                if "shadow_map" in _ml_arg_names:
+                    stage.storage_buffers.append(
+                        StorageBufferDecl("shadow_matrices", "ShadowEntry"))
                 break
 
     # IBL samplers (scene-global) — from lighting block or surface

@@ -62,6 +62,15 @@ _LIGHT_DATA_FIELD_TYPES = {
     "color": "vec3",
 }
 
+# Field types for ShadowEntry struct (SSBO) — shadow map evaluation
+_SHADOW_ENTRY_FIELD_TYPES = {
+    "view_projection": "mat4",
+    "bias": "scalar",
+    "normal_bias": "scalar",
+    "resolution": "scalar",
+    "light_size": "scalar",
+}
+
 
 def type_check(module: Module) -> None:
     checker = TypeChecker(module)
@@ -146,9 +155,13 @@ class TypeChecker:
 
         # Register samplers
         for sam in stage.samplers:
-            from luxc.builtins.types import SAMPLER2D, SAMPLER_CUBE
+            from luxc.builtins.types import SAMPLER2D, SAMPLER_CUBE, SAMPLER_2D_ARRAY, SAMPLER_CUBE_ARRAY
             sam_type_name = getattr(sam, 'type_name', 'sampler2d')
-            sam_type = SAMPLER_CUBE if sam_type_name == "samplerCube" else SAMPLER2D
+            _SAMPLER_TYPE_MAP = {
+                "sampler2d": SAMPLER2D, "samplerCube": SAMPLER_CUBE,
+                "sampler2DArray": SAMPLER_2D_ARRAY, "samplerCubeArray": SAMPLER_CUBE_ARRAY,
+            }
+            sam_type = _SAMPLER_TYPE_MAP.get(sam_type_name, SAMPLER2D)
             scope.define(Symbol(sam.name, sam_type, "sampler"))
 
         # Register RT-specific variables
@@ -405,6 +418,15 @@ class TypeChecker:
                 # Unknown field — fallback to scalar
             if obj_type.name == "LightData":
                 field_types = _LIGHT_DATA_FIELD_TYPES.get(expr.field)
+                if field_types is not None:
+                    result = resolve_type(field_types)
+                    if result is None:
+                        result = SCALAR
+                    expr.resolved_type = result.name
+                    return result
+                # Unknown field — fallback to scalar
+            if obj_type.name == "ShadowEntry":
+                field_types = _SHADOW_ENTRY_FIELD_TYPES.get(expr.field)
                 if field_types is not None:
                     result = resolve_type(field_types)
                     if result is None:

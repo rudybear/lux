@@ -104,6 +104,8 @@ MAT4X3 = MatrixType("mat4x3", 4, 3)
 
 SAMPLER2D = SamplerType("sampler2d")
 SAMPLER_CUBE = SamplerType("samplerCube")
+SAMPLER_2D_ARRAY = SamplerType("sampler2DArray")
+SAMPLER_CUBE_ARRAY = SamplerType("samplerCubeArray")
 ACCELERATION_STRUCTURE = AccelerationStructureType("acceleration_structure")
 STORAGE_IMAGE = StorageImageType("storage_image")
 BINDLESS_TEXTURE_ARRAY = BindlessTextureArrayType("_bindless_texture_array")
@@ -121,6 +123,8 @@ TYPE_MAP: dict[str, LuxType] = {
     "mat2": MAT2, "mat3": MAT3, "mat4": MAT4, "mat4x3": MAT4X3,
     "sampler2d": SAMPLER2D,
     "samplerCube": SAMPLER_CUBE,
+    "sampler2DArray": SAMPLER_2D_ARRAY,
+    "samplerCubeArray": SAMPLER_CUBE_ARRAY,
     "acceleration_structure": ACCELERATION_STRUCTURE,
     "storage_image": STORAGE_IMAGE,
     # BindlessMaterialData is a struct type used in SSBO for bindless rendering.
@@ -130,6 +134,7 @@ TYPE_MAP: dict[str, LuxType] = {
     # LightData is a struct type used in SSBO for multi-light evaluation.
     # Same treatment as BindlessMaterialData — codegen handles field access.
     "LightData": ScalarType("LightData"),
+    "ShadowEntry": ScalarType("ShadowEntry"),
 }
 
 

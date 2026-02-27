@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from luxc.builtins.types import (
     LuxType, SCALAR, INT, UINT, BOOL, VOID,
     VEC2, VEC3, VEC4, MAT2, MAT3, MAT4, SAMPLER2D, SAMPLER_CUBE,
+    SAMPLER_2D_ARRAY, SAMPLER_CUBE_ARRAY,
     ACCELERATION_STRUCTURE, STORAGE_IMAGE, BINDLESS_TEXTURE_ARRAY, IVEC2, UVEC2,
     VectorType, MatrixType, ScalarType,
 )
@@ -133,6 +134,12 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     add([FuncSig("sample_bindless_lod", (BINDLESS_TEXTURE_ARRAY, INT, VEC2, SCALAR), VEC4)])
     add([FuncSig("sample_bindless_lod", (BINDLESS_TEXTURE_ARRAY, UINT, VEC2, SCALAR), VEC4)])
     add([FuncSig("sample_bindless_lod", (BINDLESS_TEXTURE_ARRAY, SCALAR, VEC2, SCALAR), VEC4)])
+
+    # Shadow comparison sampling: sample_compare(shadow_tex, vec3(uv, layer), depth_ref) -> scalar
+    add([FuncSig("sample_compare", (SAMPLER_2D_ARRAY, VEC3, SCALAR), SCALAR)])
+
+    # Array texture sampling (raw depth fetch): sample_array(tex, uv, layer) -> vec4
+    add([FuncSig("sample_array", (SAMPLER_2D_ARRAY, VEC2, SCALAR), VEC4)])
 
     # --- RT instructions ---
     # trace_ray(accel, ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,

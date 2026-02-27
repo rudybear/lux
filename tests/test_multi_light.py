@@ -18,6 +18,7 @@ from luxc.parser.tree_builder import parse_lux
 from luxc.parser.ast_nodes import (
     LightingDecl, PropertiesBlock, SurfaceSampler, LayerCall,
     IfStmt, LetStmt, StorageBufferDecl, SamplerDecl,
+    CallExpr, VarRef,
 )
 from luxc.features.evaluator import strip_features
 from luxc.expansion.surface_expander import expand_surfaces
@@ -737,3 +738,284 @@ class TestShadowsSPIRV:
         )
         spv_files = list(tmp_path.glob("*.spv"))
         assert len(spv_files) >= 1
+
+
+# ---------------------------------------------------------------------------
+# P17.3 — Shadow sampling wiring tests
+# ---------------------------------------------------------------------------
+
+class TestShadowSamplingWiring:
+    """P17.3: Shadow sampling wired into multi-light loop."""
+
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def _expand_with_shadows(self, pipeline="GltfForward"):
+        """Expand gltf_pbr_layered.lux with has_shadows and return fragment stage."""
+        src = (EXAMPLES / "gltf_pbr_layered.lux").read_text()
+        mod = parse_lux(src)
+        strip_features(mod, {"has_shadows"})
+        _resolve_imports(mod, EXAMPLES)
+        expand_surfaces(mod, pipeline_filter=pipeline)
+        frag_stages = [s for s in mod.stages if s.stage_type == "fragment"]
+        if not frag_stages:
+            # For RT pipelines, check closest_hit
+            frag_stages = [s for s in mod.stages if s.stage_type == "closest_hit"]
+        assert len(frag_stages) >= 1
+        return frag_stages[0]
+
+    def test_shadow_matrices_ssbo_emitted(self):
+        """ShadowEntry SSBO present in fragment stage when shadow_map arg present."""
+        frag = self._expand_with_shadows()
+        ssbo_map = {sb.name: sb.element_type for sb in frag.storage_buffers}
+        assert "shadow_matrices" in ssbo_map
+        assert ssbo_map["shadow_matrices"] == "ShadowEntry"
+
+    def test_shadow_factor_in_accumulation(self):
+        """shadow_0 variable is emitted in first multi-light iteration."""
+        frag = self._expand_with_shadows()
+        main_fn = frag.functions[0]
+        # Find the first multi-light iteration (contains lt_0)
+        for stmt in main_fn.body:
+            if isinstance(stmt, IfStmt):
+                inner_names = [s.name for s in stmt.then_body
+                               if isinstance(s, LetStmt)]
+                if "lt_0" in inner_names:
+                    assert "shadow_0" in inner_names
+                    return
+        pytest.fail("shadow_0 not found in first multi-light iteration")
+
+    def test_shadow_guard_on_shadow_index(self):
+        """Shadow evaluation is guarded by shadow_index >= 0.0."""
+        frag = self._expand_with_shadows()
+        main_fn = frag.functions[0]
+        # Find the first multi-light iteration, then look for nested IfStmt
+        for stmt in main_fn.body:
+            if isinstance(stmt, IfStmt):
+                inner_names = [s.name for s in stmt.then_body
+                               if isinstance(s, LetStmt)]
+                if "lt_0" in inner_names:
+                    # Look for a nested IfStmt that guards shadow evaluation
+                    nested_ifs = [s for s in stmt.then_body if isinstance(s, IfStmt)]
+                    assert len(nested_ifs) >= 1, "No nested IfStmt guard for shadow eval"
+                    # The guard should compare lsi_0 >= 0.0
+                    guard = nested_ifs[0]
+                    from luxc.parser.ast_nodes import BinaryOp
+                    assert isinstance(guard.condition, BinaryOp)
+                    assert guard.condition.op == ">="
+                    return
+        pytest.fail("Shadow guard IfStmt not found")
+
+    def test_no_shadow_without_shadow_map_arg(self):
+        """No shadow code when shadow_map arg is absent."""
+        src = (EXAMPLES / "gltf_pbr_layered.lux").read_text()
+        mod = parse_lux(src)
+        strip_features(mod, set())  # no has_shadows
+        _resolve_imports(mod, EXAMPLES)
+        expand_surfaces(mod, pipeline_filter="GltfForward")
+        frag = [s for s in mod.stages if s.stage_type == "fragment"][0]
+        main_fn = frag.functions[0]
+        # Check no shadow_0 variable exists
+        for stmt in main_fn.body:
+            if isinstance(stmt, IfStmt):
+                inner_names = [s.name for s in stmt.then_body
+                               if isinstance(s, LetStmt)]
+                if "shadow_0" in inner_names:
+                    pytest.fail("shadow_0 found when has_shadows is not enabled")
+        # Also verify no shadow_matrices SSBO
+        ssbo_names = [sb.name for sb in frag.storage_buffers]
+        assert "shadow_matrices" not in ssbo_names
+
+
+# ---------------------------------------------------------------------------
+# P17.3 — Builtin type checks
+# ---------------------------------------------------------------------------
+
+class TestShadowBuiltins:
+    """P17.3: sample_compare and sample_array builtin type checks."""
+
+    def test_sample_compare_type_checks(self):
+        """sample_compare(sampler2DArray, vec3, scalar) -> scalar."""
+        from luxc.builtins.functions import lookup_builtin
+        from luxc.builtins.types import SAMPLER_2D_ARRAY, VEC3, SCALAR
+        sig = lookup_builtin("sample_compare", [SAMPLER_2D_ARRAY, VEC3, SCALAR])
+        assert sig is not None
+        assert sig.return_type == SCALAR
+
+    def test_sample_array_type_checks(self):
+        """sample_array(sampler2DArray, vec2, scalar) -> vec4."""
+        from luxc.builtins.functions import lookup_builtin
+        from luxc.builtins.types import SAMPLER_2D_ARRAY, VEC2, SCALAR, VEC4
+        sig = lookup_builtin("sample_array", [SAMPLER_2D_ARRAY, VEC2, SCALAR])
+        assert sig is not None
+        assert sig.return_type == VEC4
+
+    def test_sample_compare_no_match_wrong_sampler(self):
+        """sample_compare rejects sampler2d (requires sampler2DArray)."""
+        from luxc.builtins.functions import lookup_builtin
+        from luxc.builtins.types import SAMPLER2D, VEC3, SCALAR
+        sig = lookup_builtin("sample_compare", [SAMPLER2D, VEC3, SCALAR])
+        assert sig is None
+
+
+# ---------------------------------------------------------------------------
+# P17.3 — Filter tests
+# ---------------------------------------------------------------------------
+
+class TestShadowFilters:
+    """P17.3: Shadow filter emitters produce correct code patterns."""
+
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def _get_shadow_body(self, shadow_filter="pcf"):
+        """Extract shadow evaluation body from first iteration of multi-light loop."""
+        src = (EXAMPLES / "gltf_pbr_layered.lux").read_text()
+        # Inject the desired shadow_filter
+        src = src.replace("shadow_filter: pcf", f"shadow_filter: {shadow_filter}")
+        mod = parse_lux(src)
+        strip_features(mod, {"has_shadows"})
+        _resolve_imports(mod, EXAMPLES)
+        expand_surfaces(mod, pipeline_filter="GltfForward")
+        frag = [s for s in mod.stages if s.stage_type == "fragment"][0]
+        main_fn = frag.functions[0]
+        # Find first iteration
+        for stmt in main_fn.body:
+            if isinstance(stmt, IfStmt):
+                inner_names = [s.name for s in stmt.then_body
+                               if isinstance(s, LetStmt)]
+                if "lt_0" in inner_names:
+                    # Find the nested shadow guard IfStmt
+                    for inner_stmt in stmt.then_body:
+                        if isinstance(inner_stmt, IfStmt):
+                            return inner_stmt.then_body
+        pytest.fail("Shadow body not found")
+
+    def test_hard_filter_emits_1_sample_compare(self):
+        """hard filter emits 1 sample_compare call per light."""
+        shadow_body = self._get_shadow_body("hard")
+        from luxc.parser.ast_nodes import CallExpr
+        sample_compares = [s for s in shadow_body if isinstance(s, LetStmt)
+                          and isinstance(s.value, CallExpr)
+                          and isinstance(s.value.func, VarRef)
+                          and s.value.func.name == "sample_compare"]
+        assert len(sample_compares) == 1
+
+    def test_pcf_filter_emits_4_sample_compare(self):
+        """PCF filter emits 4 sample_compare calls per light."""
+        shadow_body = self._get_shadow_body("pcf")
+        from luxc.parser.ast_nodes import CallExpr
+        sample_compares = [s for s in shadow_body if isinstance(s, LetStmt)
+                          and isinstance(s.value, CallExpr)
+                          and isinstance(s.value.func, VarRef)
+                          and s.value.func.name == "sample_compare"]
+        assert len(sample_compares) == 4
+
+    def test_pcss_filter_emits_sample_array_and_sample_compare(self):
+        """PCSS filter emits 16 sample_array + 16 sample_compare per light."""
+        shadow_body = self._get_shadow_body("pcss")
+        from luxc.parser.ast_nodes import CallExpr
+        sample_compares = [s for s in shadow_body if isinstance(s, LetStmt)
+                          and isinstance(s.value, CallExpr)
+                          and isinstance(s.value.func, VarRef)
+                          and s.value.func.name == "sample_compare"]
+        sample_arrays = [s for s in shadow_body if isinstance(s, LetStmt)
+                        and isinstance(s.value, CallExpr)
+                        and isinstance(s.value.func, VarRef)
+                        and s.value.func.name == "sample_array"]
+        assert len(sample_arrays) == 16
+        assert len(sample_compares) == 16
+
+    def test_shadow_filter_arg_parsed(self):
+        """shadow_filter: pcf is extracted from layer args."""
+        src = (EXAMPLES / "gltf_pbr_layered.lux").read_text()
+        mod = parse_lux(src)
+        strip_features(mod, {"has_shadows"})
+        lighting = mod.lightings[0]
+        ml_layer = next(l for l in lighting.layers if l.name == "multi_light")
+        arg_map = {a.name: a for a in ml_layer.args}
+        assert "shadow_filter" in arg_map
+        assert arg_map["shadow_filter"].value.name == "pcf"
+
+
+# ---------------------------------------------------------------------------
+# P17.3 — All 6 pipelines with shadows compile
+# ---------------------------------------------------------------------------
+
+@requires_spirv_tools
+class TestAllPipelinesWithShadows:
+    """P17.3: All 6 pipeline paths (3 modes x 2 bindless) compile with shadows."""
+
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def _compile_with_shadows(self, tmp_path, pipeline, bindless=False):
+        src = (EXAMPLES / "gltf_pbr_layered.lux").read_text()
+        stem = f"p173_{pipeline}"
+        if bindless:
+            stem += "_bl"
+        compile_source(
+            src, stem, tmp_path, validate=True,
+            source_dir=EXAMPLES, pipeline=pipeline,
+            features={"has_shadows"}, bindless=bindless,
+        )
+        return list(tmp_path.glob("*.spv"))
+
+    def test_forward_shadows(self, tmp_path):
+        spvs = self._compile_with_shadows(tmp_path, "GltfForward")
+        assert any("frag" in str(f) for f in spvs)
+
+    def test_forward_bindless_shadows(self, tmp_path):
+        spvs = self._compile_with_shadows(tmp_path, "GltfForward", bindless=True)
+        assert any("frag" in str(f) for f in spvs)
+
+    def test_rt_shadows(self, tmp_path):
+        spvs = self._compile_with_shadows(tmp_path, "GltfRT")
+        assert any("rchit" in str(f) for f in spvs)
+
+    def test_rt_bindless_shadows(self, tmp_path):
+        spvs = self._compile_with_shadows(tmp_path, "GltfRT", bindless=True)
+        assert any("rchit" in str(f) for f in spvs)
+
+    def test_mesh_shadows(self, tmp_path):
+        spvs = self._compile_with_shadows(tmp_path, "GltfMesh")
+        assert any("frag" in str(f) for f in spvs)
+
+    def test_mesh_bindless_shadows(self, tmp_path):
+        spvs = self._compile_with_shadows(tmp_path, "GltfMesh", bindless=True)
+        assert any("frag" in str(f) for f in spvs)
+
+
+# ---------------------------------------------------------------------------
+# P17.3 — Shadow stdlib compilation
+# ---------------------------------------------------------------------------
+
+@requires_spirv_tools
+class TestShadowStdlib:
+    """P17.3: Shadow stdlib functions compile."""
+
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def test_shadow_stdlib_compiles(self, tmp_path):
+        """All shadow stdlib functions compile to valid SPIR-V via has_shadows pipeline."""
+        src = (EXAMPLES / "gltf_pbr_layered.lux").read_text()
+        compile_source(
+            src, "shadow_stdlib", tmp_path, validate=True,
+            source_dir=EXAMPLES, pipeline="GltfForward",
+            features={"has_shadows"},
+        )
+        frag_spvs = list(tmp_path.glob("*.frag.spv"))
+        assert len(frag_spvs) >= 1

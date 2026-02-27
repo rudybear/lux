@@ -57,3 +57,143 @@ fn compute_shadow_uv(
     let shadow_depth: scalar = shadow_ndc.z;
     return vec3(shadow_uv, shadow_depth);
 }
+
+// ---------------------------------------------------------------------------
+// Extended shadow utilities: bias, PCF kernels, and PCSS helpers
+// ---------------------------------------------------------------------------
+
+// Normal-offset bias: push position along surface normal to reduce shadow acne.
+// Scale increases at grazing angles where bias is most needed.
+fn normal_offset_world(
+    pos: vec3,
+    normal: vec3,
+    normal_bias: scalar,
+    n_dot_l: scalar
+) -> vec3 {
+    // Increase offset at grazing angles: scale = sqrt(1 - n_dot_l^2) ≈ sin(angle)
+    let scale: scalar = sqrt(max(1.0 - n_dot_l * n_dot_l, 0.0));
+    return pos + normal * (normal_bias * (1.0 + scale));
+}
+
+// Slope-scale bias: adjusts depth bias based on surface slope relative to light.
+fn slope_scale_bias(
+    n_dot_l: scalar,
+    constant_bias: scalar,
+    slope_scale: scalar
+) -> scalar {
+    // tan(acos(n_dot_l)) approximation using sqrt
+    let cos_clamped: scalar = max(n_dot_l, 0.001);
+    let tan_approx: scalar = sqrt(1.0 - cos_clamped * cos_clamped) / cos_clamped;
+    return constant_bias + slope_scale * min(tan_approx, 10.0);
+}
+
+// PCF averaging: 4-tap comparison results
+fn pcf_shadow_4(s0: scalar, s1: scalar, s2: scalar, s3: scalar) -> scalar {
+    return (s0 + s1 + s2 + s3) * 0.25;
+}
+
+// PCF averaging: 9-tap with Gaussian-like weights (3x3 kernel)
+fn pcf_shadow_9(
+    s0: scalar, s1: scalar, s2: scalar,
+    s3: scalar, s4: scalar, s5: scalar,
+    s6: scalar, s7: scalar, s8: scalar
+) -> scalar {
+    // Center = 4/16, edges = 2/16, corners = 1/16
+    let w: scalar = 0.0625;
+    return (s0 + s2 + s6 + s8) * w
+         + (s1 + s3 + s5 + s7) * (w * 2.0)
+         + s4 * (w * 4.0);
+}
+
+// PCF averaging: 16-tap uniform kernel (4x4)
+fn pcf_shadow_16(
+    s0: scalar, s1: scalar, s2: scalar, s3: scalar,
+    s4: scalar, s5: scalar, s6: scalar, s7: scalar,
+    s8: scalar, s9: scalar, s10: scalar, s11: scalar,
+    s12: scalar, s13: scalar, s14: scalar, s15: scalar
+) -> scalar {
+    return (s0 + s1 + s2 + s3
+          + s4 + s5 + s6 + s7
+          + s8 + s9 + s10 + s11
+          + s12 + s13 + s14 + s15) * 0.0625;
+}
+
+// PCSS: compute penumbra size from blocker distance ratio.
+// Implements the parallel-planes model: penumbra = light_size * (receiver - blocker) / blocker
+fn pcss_penumbra_size(
+    blocker_depth: scalar,
+    receiver_depth: scalar,
+    light_size: scalar
+) -> scalar {
+    let diff: scalar = max(receiver_depth - blocker_depth, 0.0);
+    let safe_blocker: scalar = max(blocker_depth, 0.001);
+    return light_size * diff / safe_blocker;
+}
+
+// PCSS: 4-sample blocker search. Returns vec2(average_blocker_depth, count/4).
+// Samples that are behind the receiver are blockers.
+fn pcss_average_blockers_4(
+    d0: scalar, d1: scalar, d2: scalar, d3: scalar,
+    ref_depth: scalar
+) -> vec2 {
+    let b0: scalar = (d0 < ref_depth) ? d0 : 0.0;
+    let b1: scalar = (d1 < ref_depth) ? d1 : 0.0;
+    let b2: scalar = (d2 < ref_depth) ? d2 : 0.0;
+    let b3: scalar = (d3 < ref_depth) ? d3 : 0.0;
+    let c0: scalar = (d0 < ref_depth) ? 1.0 : 0.0;
+    let c1: scalar = (d1 < ref_depth) ? 1.0 : 0.0;
+    let c2: scalar = (d2 < ref_depth) ? 1.0 : 0.0;
+    let c3: scalar = (d3 < ref_depth) ? 1.0 : 0.0;
+    let total_depth: scalar = b0 + b1 + b2 + b3;
+    let count: scalar = c0 + c1 + c2 + c3;
+    let avg: scalar = (count > 0.0) ? (total_depth / count) : 0.0;
+    return vec2(avg, count * 0.25);
+}
+
+// PCSS: 16-sample blocker search. Returns vec2(average_blocker_depth, count/16).
+fn pcss_average_blockers_16(
+    d0: scalar, d1: scalar, d2: scalar, d3: scalar,
+    d4: scalar, d5: scalar, d6: scalar, d7: scalar,
+    d8: scalar, d9: scalar, d10: scalar, d11: scalar,
+    d12: scalar, d13: scalar, d14: scalar, d15: scalar,
+    ref_depth: scalar
+) -> vec2 {
+    let b0: scalar = (d0 < ref_depth) ? d0 : 0.0;
+    let b1: scalar = (d1 < ref_depth) ? d1 : 0.0;
+    let b2: scalar = (d2 < ref_depth) ? d2 : 0.0;
+    let b3: scalar = (d3 < ref_depth) ? d3 : 0.0;
+    let b4: scalar = (d4 < ref_depth) ? d4 : 0.0;
+    let b5: scalar = (d5 < ref_depth) ? d5 : 0.0;
+    let b6: scalar = (d6 < ref_depth) ? d6 : 0.0;
+    let b7: scalar = (d7 < ref_depth) ? d7 : 0.0;
+    let b8: scalar = (d8 < ref_depth) ? d8 : 0.0;
+    let b9: scalar = (d9 < ref_depth) ? d9 : 0.0;
+    let b10: scalar = (d10 < ref_depth) ? d10 : 0.0;
+    let b11: scalar = (d11 < ref_depth) ? d11 : 0.0;
+    let b12: scalar = (d12 < ref_depth) ? d12 : 0.0;
+    let b13: scalar = (d13 < ref_depth) ? d13 : 0.0;
+    let b14: scalar = (d14 < ref_depth) ? d14 : 0.0;
+    let b15: scalar = (d15 < ref_depth) ? d15 : 0.0;
+    let c0: scalar = (d0 < ref_depth) ? 1.0 : 0.0;
+    let c1: scalar = (d1 < ref_depth) ? 1.0 : 0.0;
+    let c2: scalar = (d2 < ref_depth) ? 1.0 : 0.0;
+    let c3: scalar = (d3 < ref_depth) ? 1.0 : 0.0;
+    let c4: scalar = (d4 < ref_depth) ? 1.0 : 0.0;
+    let c5: scalar = (d5 < ref_depth) ? 1.0 : 0.0;
+    let c6: scalar = (d6 < ref_depth) ? 1.0 : 0.0;
+    let c7: scalar = (d7 < ref_depth) ? 1.0 : 0.0;
+    let c8: scalar = (d8 < ref_depth) ? 1.0 : 0.0;
+    let c9: scalar = (d9 < ref_depth) ? 1.0 : 0.0;
+    let c10: scalar = (d10 < ref_depth) ? 1.0 : 0.0;
+    let c11: scalar = (d11 < ref_depth) ? 1.0 : 0.0;
+    let c12: scalar = (d12 < ref_depth) ? 1.0 : 0.0;
+    let c13: scalar = (d13 < ref_depth) ? 1.0 : 0.0;
+    let c14: scalar = (d14 < ref_depth) ? 1.0 : 0.0;
+    let c15: scalar = (d15 < ref_depth) ? 1.0 : 0.0;
+    let total_depth: scalar = b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7
+                             + b8 + b9 + b10 + b11 + b12 + b13 + b14 + b15;
+    let count: scalar = c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7
+                       + c8 + c9 + c10 + c11 + c12 + c13 + c14 + c15;
+    let avg: scalar = (count > 0.0) ? (total_depth / count) : 0.0;
+    return vec2(avg, count * 0.0625);
+}

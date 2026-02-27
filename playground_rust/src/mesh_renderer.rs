@@ -390,6 +390,7 @@ impl MeshShaderRenderer {
         width: u32,
         height: u32,
         ibl_name: &str,
+        demo_lights: bool,
     ) -> Result<Self, String> {
         let device = ctx.device.clone();
 
@@ -405,7 +406,8 @@ impl MeshShaderRenderer {
         // Resolve single-material permutation from manifest + scene features
         let resolved_frag_base = if let Some(ref gs) = gltf_scene {
             if let Some(manifest) = try_load_manifest(pipeline_base) {
-                let scene_features = scene_manager::detect_scene_features(gs);
+                let demo_light_vec = if demo_lights { crate::setup_demo_lights() } else { vec![] };
+                let scene_features = scene_manager::detect_scene_features(gs, &demo_light_vec);
                 let suffix = find_permutation_suffix(&manifest, &scene_features);
                 if !suffix.is_empty() {
                     let candidate = format!("{}{}", pipeline_base, suffix);
@@ -457,7 +459,7 @@ impl MeshShaderRenderer {
         if use_bindless {
             info!("Mesh shader bindless mode detected: redirecting to new_bindless");
             return Self::new_bindless(ctx, scene_source, pipeline_base, width, height, ibl_name,
-                                      mesh_refl, frag_refl, gltf_scene);
+                                      mesh_refl, frag_refl, gltf_scene, demo_lights);
         }
 
         // Check for manifest to decide multi-pipeline mode
@@ -805,7 +807,9 @@ impl MeshShaderRenderer {
         });
 
         let mut sm = scene_manager::SceneManager::new();
-        if let Some(ref gs) = gltf_scene {
+        if demo_lights {
+            sm.override_lights(crate::setup_demo_lights());
+        } else if let Some(ref gs) = gltf_scene {
             sm.populate_lights_from_gltf(&gs.lights);
         } else {
             sm.populate_lights_from_gltf(&[]);
@@ -827,14 +831,13 @@ impl MeshShaderRenderer {
             lights_ssbo = Some(buf);
         }
 
+        // SceneLight UBO: vec3 view_pos at offset 0, int light_count at offset 12 (16 bytes total)
         let mut scene_light_ubo: Option<GpuBuffer> = None;
         if has_multi_light {
-            let mut scene_light_data = [0u8; 32];
+            let mut scene_light_data = [0u8; 16];
             scene_light_data[0..12].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
-            scene_light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
             let light_count = sm.lights.len() as i32;
-            scene_light_data[16..20].copy_from_slice(&light_count.to_le_bytes());
-            scene_light_data[20..32].fill(0);
+            scene_light_data[12..16].copy_from_slice(&light_count.to_le_bytes());
             let buf = create_buffer_with_data(
                 &device, ctx.allocator_mut(), &scene_light_data,
                 vk::BufferUsageFlags::UNIFORM_BUFFER, "mesh_scene_light_ubo",
@@ -2043,6 +2046,7 @@ impl MeshShaderRenderer {
         mesh_refl: reflected_pipeline::ReflectionData,
         frag_refl: reflected_pipeline::ReflectionData,
         gltf_scene: Option<crate::gltf_loader::GltfScene>,
+        demo_lights: bool,
     ) -> Result<Self, String> {
         let device = ctx.device.clone();
 
@@ -2245,7 +2249,9 @@ impl MeshShaderRenderer {
         });
 
         let mut sm = scene_manager::SceneManager::new();
-        if let Some(ref gs) = gltf_scene {
+        if demo_lights {
+            sm.override_lights(crate::setup_demo_lights());
+        } else if let Some(ref gs) = gltf_scene {
             sm.populate_lights_from_gltf(&gs.lights);
         } else {
             sm.populate_lights_from_gltf(&[]);
@@ -2267,14 +2273,13 @@ impl MeshShaderRenderer {
             lights_ssbo = Some(buf);
         }
 
+        // SceneLight UBO: vec3 view_pos at offset 0, int light_count at offset 12 (16 bytes total)
         let mut scene_light_ubo: Option<GpuBuffer> = None;
         if has_multi_light {
-            let mut scene_light_data = [0u8; 32];
+            let mut scene_light_data = [0u8; 16];
             scene_light_data[0..12].copy_from_slice(bytemuck::cast_slice(camera_pos.as_ref()));
-            scene_light_data[12..16].copy_from_slice(&0.0f32.to_le_bytes());
             let light_count = sm.lights.len() as i32;
-            scene_light_data[16..20].copy_from_slice(&light_count.to_le_bytes());
-            scene_light_data[20..32].fill(0);
+            scene_light_data[12..16].copy_from_slice(&light_count.to_le_bytes());
             let buf = create_buffer_with_data(
                 &device, ctx.allocator_mut(), &scene_light_data,
                 vk::BufferUsageFlags::UNIFORM_BUFFER, "mesh_bl_scene_light_ubo",

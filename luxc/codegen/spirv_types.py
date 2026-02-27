@@ -85,7 +85,7 @@ class TypeRegistry:
     def image_2d_array_type(self) -> str:
         f32 = self.float32()
         key = "image2d_array"
-        return self._ensure_type(key, f"OpTypeImage {f32} 2D 0 1 0 1 Unknown")
+        return self._ensure_type(key, f"OpTypeImage {f32} 2D 2 1 0 1 Unknown")
 
     def sampled_image_2d_array_type(self) -> str:
         img = self.image_2d_array_type()

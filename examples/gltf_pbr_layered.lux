@@ -13,6 +13,7 @@ import color;
 import compositing;
 import ibl;
 import lighting;
+import shadow;
 import texture;
 
 features {
@@ -113,6 +114,7 @@ lighting SceneLighting {
     layers [
         multi_light(count: SceneLight.light_count,
                     shadow_map: shadow_maps,
+                    shadow_filter: pcf,
                     max_lights: 16) if has_shadows,
         multi_light(count: SceneLight.light_count,
                     max_lights: 16) if !has_shadows,
