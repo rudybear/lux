@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
@@ -105,6 +106,8 @@ struct CLIOptions {
     bool headless = true;
     bool forceValidation = false;
     bool demoLights = false;
+    bool sponzaLights = false;
+    bool noIBL = false;
 };
 
 static void printUsage(const char* program) {
@@ -125,6 +128,8 @@ static void printUsage(const char* program) {
               << "  --headless             Offscreen render only (default)\n"
               << "  --validation           Enable Vulkan validation layers (even in release)\n"
               << "  --demo-lights          Add 3 demo lights (directional + point + spot) with shadows\n"
+              << "  --sponza-lights        Sponza courtyard lights (sun + orbiting torch + accent)\n"
+              << "  --no-ibl               Disable IBL environment loading\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -174,6 +179,10 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.forceValidation = true;
         } else if (arg == "--demo-lights") {
             opts.demoLights = true;
+        } else if (arg == "--sponza-lights") {
+            opts.sponzaLights = true;
+        } else if (arg == "--no-ibl") {
+            opts.noIBL = true;
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -260,12 +269,95 @@ static void setupDemoLights(SceneManager& scene) {
 }
 
 // --------------------------------------------------------------------------
+// Sponza courtyard lights: sun + orbiting torch + blue accent
+// --------------------------------------------------------------------------
+
+static void setupSponzaLights(SceneManager& scene) {
+    scene.clearLights();
+
+    // Sun: warm directional light casting shadows through arches
+    SceneLight sun;
+    sun.type = SceneLight::Directional;
+    sun.direction = glm::normalize(glm::vec3(0.5f, -0.7f, 0.3f));
+    sun.color = glm::vec3(1.0f, 0.95f, 0.85f);
+    sun.intensity = 8.0f;
+    sun.castsShadow = true;
+    scene.addLight(sun);
+
+    // Torch: orange spot light that orbits inside the courtyard (animated per frame)
+    SceneLight torch;
+    torch.type = SceneLight::Spot;
+    torch.position = glm::vec3(0.0f, 600.0f, 0.0f);
+    torch.direction = glm::normalize(glm::vec3(0.0f, -200.0f, 0.0f) - torch.position);
+    torch.color = glm::vec3(1.0f, 0.7f, 0.3f);
+    torch.intensity = 500000.0f;
+    torch.range = 3000.0f;
+    torch.innerConeAngle = 0.3f;
+    torch.outerConeAngle = 0.7f;
+    torch.castsShadow = true;
+    scene.addLight(torch);
+
+    // Accent: blue point light (no shadow)
+    SceneLight accent;
+    accent.type = SceneLight::Point;
+    accent.position = glm::vec3(-500.0f, 400.0f, -300.0f);
+    accent.color = glm::vec3(0.3f, 0.5f, 1.0f);
+    accent.intensity = 100000.0f;
+    accent.range = 2000.0f;
+    scene.addLight(accent);
+
+    std::cout << "[info] Sponza lights: 3 lights (sun+shadow, orbiting torch+shadow, blue accent)"
+              << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Lighttest scene lights: sun + red point + green point
+// --------------------------------------------------------------------------
+
+static void setupTestLights(SceneManager& scene) {
+    scene.clearLights();
+
+    // Directional sun (warm white, casts shadow) — angled to cast cube shadow on plane
+    // direction = toward the light (convention used by lighting.lux evaluate_directional_light)
+    SceneLight sun;
+    sun.type = SceneLight::Directional;
+    sun.direction = glm::normalize(glm::vec3(1.0f, 2.0f, 0.5f));
+    sun.color = glm::vec3(1.0f, 0.98f, 0.95f);
+    sun.intensity = 2.0f;
+    sun.castsShadow = true;
+    scene.addLight(sun);
+
+    // Red point light (left side, elevated)
+    SceneLight red;
+    red.type = SceneLight::Point;
+    red.position = glm::vec3(-3.0f, 2.5f, -2.0f);
+    red.color = glm::vec3(1.0f, 0.1f, 0.1f);
+    red.intensity = 15.0f;
+    red.range = 20.0f;
+    scene.addLight(red);
+
+    // Green point light (right side, elevated)
+    SceneLight green;
+    green.type = SceneLight::Point;
+    green.position = glm::vec3(3.0f, 2.5f, 2.0f);
+    green.color = glm::vec3(0.1f, 1.0f, 0.1f);
+    green.intensity = 15.0f;
+    green.range = 20.0f;
+    scene.addLight(green);
+
+    std::cout << "[info] Test lights: 3 lights (directional+shadow, red point, green point)"
+              << std::endl;
+}
+
+// --------------------------------------------------------------------------
 // Pipeline resolution and render path detection
 // --------------------------------------------------------------------------
 
 static std::string resolveDefaultPipeline(const std::string& scene) {
     if (scene.size() > 4 && (scene.substr(scene.size()-4) == ".glb" || scene.substr(scene.size()-5) == ".gltf"))
         return "examples/gltf_pbr";
+    if (scene == "lighttest")
+        return "shadercache/gltf_pbr_layered";
     if (scene == "fullscreen")
         throw std::runtime_error("--pipeline required for fullscreen scenes");
     if (scene == "triangle")
@@ -325,10 +417,39 @@ static int runHeadless(const CLIOptions& opts) {
     try {
         // Shared scene setup
         SceneManager scene;
-        scene.loadScene(ctx, opts.sceneSource);
+        bool isLightTest = (opts.sceneSource == "lighttest");
+        if (isLightTest) {
+            scene.loadProceduralTestScene(ctx);
+            setupTestLights(scene);
+            scene.overrideAutoCamera(
+                glm::vec3(6.0f, 4.0f, 6.0f),
+                glm::vec3(0.0f, 1.0f, 0.0f),
+                glm::vec3(0.0f, 1.0f, 0.0f),
+                50.0f);
+        } else {
+            scene.loadScene(ctx, opts.sceneSource);
+        }
 
-        // Set up demo lights if requested (before GPU upload so light count is known)
-        if (opts.demoLights) {
+        // Set up demo/sponza lights if requested (before GPU upload so light count is known)
+        // Auto-detect Sponza scene by filename
+        bool useSponzaLights = opts.sponzaLights;
+        if (!isLightTest && !useSponzaLights && !opts.demoLights) {
+            std::string sceneLower = opts.sceneSource;
+            std::transform(sceneLower.begin(), sceneLower.end(), sceneLower.begin(), ::tolower);
+            if (sceneLower.find("ponza") != std::string::npos) {
+                useSponzaLights = true;
+                std::cout << "[info] Auto-detected Sponza scene, enabling sponza lights" << std::endl;
+            }
+        }
+        if (useSponzaLights) {
+            setupSponzaLights(scene);
+            // Interior courtyard camera for headless renders
+            scene.overrideAutoCamera(
+                glm::vec3(-1200.0f, 200.0f, 0.0f),
+                glm::vec3(200.0f, 200.0f, 0.0f),
+                glm::vec3(0.0f, 1.0f, 0.0f),
+                5000.0f);
+        } else if (opts.demoLights) {
             setupDemoLights(scene);
         }
 
@@ -341,7 +462,10 @@ static int runHeadless(const CLIOptions& opts) {
 
         scene.uploadToGPU(ctx, vertexStride);
         scene.uploadTextures(ctx);
-        scene.loadIBLAssets(ctx, dstStage, opts.iblName);
+        bool skipIBL = opts.noIBL || isLightTest;
+        if (!skipIBL) {
+            scene.loadIBLAssets(ctx, dstStage, opts.iblName);
+        }
 
         // Resolve permutation for RT/mesh paths from manifest + scene features.
         // Renderers with multi-material support (raster, mesh, RT) handle
@@ -504,11 +628,42 @@ static int runInteractive(CLIOptions opts) {
     bool useRT = needRT;
     bool useMesh = needMesh;
 
-    try {
-        scene.loadScene(ctx, opts.sceneSource);
+    // Track whether this is a Sponza scene for torch animation
+    bool useSponzaLights = opts.sponzaLights;
 
-        // Set up demo lights if requested
-        if (opts.demoLights) {
+    bool isLightTest = (opts.sceneSource == "lighttest");
+
+    try {
+        if (isLightTest) {
+            scene.loadProceduralTestScene(ctx);
+            setupTestLights(scene);
+            scene.overrideAutoCamera(
+                glm::vec3(6.0f, 4.0f, 6.0f),
+                glm::vec3(0.0f, 1.0f, 0.0f),
+                glm::vec3(0.0f, 1.0f, 0.0f),
+                50.0f);
+        } else {
+            scene.loadScene(ctx, opts.sceneSource);
+        }
+
+        // Set up demo/sponza lights if requested
+        // Auto-detect Sponza scene by filename
+        if (!isLightTest && !useSponzaLights && !opts.demoLights) {
+            std::string sceneLower = opts.sceneSource;
+            std::transform(sceneLower.begin(), sceneLower.end(), sceneLower.begin(), ::tolower);
+            if (sceneLower.find("ponza") != std::string::npos) {
+                useSponzaLights = true;
+                std::cout << "[info] Auto-detected Sponza scene, enabling sponza lights" << std::endl;
+            }
+        }
+        if (useSponzaLights) {
+            setupSponzaLights(scene);
+            scene.overrideAutoCamera(
+                glm::vec3(-1000.0f, 100.0f, -200.0f),
+                glm::vec3(500.0f, 50.0f, 0.0f),
+                glm::vec3(0.0f, 1.0f, 0.0f),
+                3000.0f);
+        } else if (opts.demoLights) {
             setupDemoLights(scene);
         }
 
@@ -518,7 +673,10 @@ static int runInteractive(CLIOptions opts) {
 
         scene.uploadToGPU(ctx, vertexStride);
         scene.uploadTextures(ctx);
-        scene.loadIBLAssets(ctx, dstStage, opts.iblName);
+        bool skipIBL = opts.noIBL || isLightTest;
+        if (!skipIBL) {
+            scene.loadIBLAssets(ctx, dstStage, opts.iblName);
+        }
 
         // Resolve permutation for RT/mesh paths.
         // Multi-material scenes: pass unresolved base so renderers handle
@@ -589,6 +747,7 @@ static int runInteractive(CLIOptions opts) {
     std::cout << "[info] Mouse: drag to orbit, scroll to zoom." << std::endl;
 
     VkCommandBuffer rtBlitCmd = VK_NULL_HANDLE; // Track RT blit cmd for deferred free
+    auto startTime = std::chrono::high_resolution_clock::now();
 
     // Render loop
     while (!glfwWindowShouldClose(window)) {
@@ -641,6 +800,17 @@ static int runInteractive(CLIOptions opts) {
         }
 
         vkResetFences(ctx.device, 1, &inFlightFence);
+
+        // Animate Sponza torch light (light[1] orbits inside the courtyard)
+        if (useSponzaLights && scene.getLightCount() >= 2) {
+            auto now = std::chrono::high_resolution_clock::now();
+            float elapsed = std::chrono::duration<float>(now - startTime).count();
+            float angle = elapsed * 0.3f; // orbit speed
+            glm::vec3 pos(800.0f * sinf(angle), 600.0f, 400.0f * cosf(angle));
+            auto& lights = scene.getLightsMutable();
+            lights[1].position = pos;
+            lights[1].direction = glm::normalize(glm::vec3(0.0f, -200.0f, 0.0f) - pos);
+        }
 
         // Update orbit camera matrices each frame
         {

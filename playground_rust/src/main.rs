@@ -71,6 +71,10 @@ struct Args {
     /// Add 3 demo lights (directional + point + spot) with shadows.
     #[arg(long)]
     demo_lights: bool,
+
+    /// Sponza courtyard lights (sun + orbiting torch + accent).
+    #[arg(long)]
+    sponza_lights: bool,
 }
 
 fn main() {
@@ -176,6 +180,15 @@ fn run(args: Args) -> Result<(), String> {
 
     let ibl_name = args.ibl.as_deref().unwrap_or("");
 
+    // Auto-detect Sponza scene by filename
+    let mut sponza_lights = args.sponza_lights;
+    if !sponza_lights && !args.demo_lights {
+        if scene_source.to_lowercase().contains("ponza") {
+            sponza_lights = true;
+            info!("Auto-detected Sponza scene, enabling sponza lights");
+        }
+    }
+
     if args.interactive && !args.headless {
         // Use larger window for interactive mode if user didn't specify
         let (iw, ih) = if args.width == 512 && args.height == 512 {
@@ -183,9 +196,9 @@ fn run(args: Args) -> Result<(), String> {
         } else {
             (args.width, args.height)
         };
-        run_interactive(&pipeline_base, &scene_source, render_path, iw, ih, ibl_name, args.validation, args.demo_lights)?;
+        run_interactive(&pipeline_base, &scene_source, render_path, iw, ih, ibl_name, args.validation, args.demo_lights, sponza_lights)?;
     } else {
-        run_headless(&pipeline_base, &scene_source, render_path, args.width, args.height, &args.output, ibl_name, args.validation, args.demo_lights)?;
+        run_headless(&pipeline_base, &scene_source, render_path, args.width, args.height, &args.output, ibl_name, args.validation, args.demo_lights, sponza_lights)?;
     }
 
     Ok(())
@@ -235,6 +248,50 @@ fn setup_demo_lights() -> Vec<scene_manager::SceneLight> {
     ]
 }
 
+fn setup_sponza_lights() -> Vec<scene_manager::SceneLight> {
+    vec![
+        // Sun: warm directional light casting shadows through arches
+        scene_manager::SceneLight {
+            light_type: 0, // Directional
+            position: glam::Vec3::ZERO,
+            direction: glam::Vec3::new(0.5, -0.7, 0.3).normalize(),
+            color: glam::Vec3::new(1.0, 0.95, 0.85),
+            intensity: 5.0,
+            range: 0.0,
+            inner_cone_angle: 0.0,
+            outer_cone_angle: 0.7854,
+            casts_shadow: true,
+            shadow_index: -1,
+        },
+        // Torch: orange spot light that orbits inside the courtyard (animated per frame)
+        scene_manager::SceneLight {
+            light_type: 2, // Spot
+            position: glam::Vec3::new(0.0, 600.0, 0.0),
+            direction: glam::Vec3::new(0.0, -1.0, 0.0),
+            color: glam::Vec3::new(1.0, 0.7, 0.3),
+            intensity: 500000.0,
+            range: 3000.0,
+            inner_cone_angle: 0.3,
+            outer_cone_angle: 0.7,
+            casts_shadow: true,
+            shadow_index: -1,
+        },
+        // Accent: blue point light (no shadow)
+        scene_manager::SceneLight {
+            light_type: 1, // Point
+            position: glam::Vec3::new(-500.0, 400.0, -300.0),
+            direction: glam::Vec3::new(0.0, -1.0, 0.0),
+            color: glam::Vec3::new(0.3, 0.5, 1.0),
+            intensity: 100000.0,
+            range: 2000.0,
+            inner_cone_angle: 0.0,
+            outer_cone_angle: 0.7854,
+            casts_shadow: false,
+            shadow_index: -1,
+        },
+    ]
+}
+
 /// Run in headless mode: create context, render offscreen, save PNG.
 fn run_headless(
     pipeline_base: &str,
@@ -246,6 +303,7 @@ fn run_headless(
     ibl_name: &str,
     force_validation: bool,
     demo_lights: bool,
+    sponza_lights: bool,
 ) -> Result<(), String> {
     let enable_rt = render_path == "rt";
 
@@ -266,6 +324,7 @@ fn run_headless(
                 output_path,
                 ibl_name,
                 demo_lights,
+                sponza_lights,
             )
         }
         "fullscreen" => {
@@ -477,6 +536,7 @@ fn run_interactive(
     ibl_name: &str,
     force_validation: bool,
     demo_lights: bool,
+    sponza_lights: bool,
 ) -> Result<(), String> {
     use ash::vk;
     use scene_manager::Renderer;
@@ -500,6 +560,8 @@ fn run_interactive(
         ibl_name: String,
         force_validation: bool,
         demo_lights: bool,
+        sponza_lights: bool,
+        start_time: std::time::Instant,
         // Vulkan state (initialized after window creation)
         ctx: Option<vulkan_context::VulkanContext>,
         renderer: Option<Box<dyn Renderer>>,
@@ -578,6 +640,7 @@ fn run_interactive(
                     self.height,
                     &self.ibl_name,
                     self.demo_lights,
+                    self.sponza_lights,
                 ).map(|r| Box::new(r) as Box<dyn Renderer>)
             };
 
@@ -646,6 +709,18 @@ fn run_interactive(
                 Some(r) => r,
                 None => return,
             };
+
+            // Animate Sponza torch light (light[1] orbits inside the courtyard)
+            if self.sponza_lights {
+                let elapsed = self.start_time.elapsed().as_secs_f32();
+                let angle = elapsed * 0.3; // orbit speed
+                let pos = glam::Vec3::new(800.0 * angle.sin(), 600.0, 400.0 * angle.cos());
+                let dir = (glam::Vec3::new(0.0, -200.0, 0.0) - pos).normalize();
+                let mut lights = crate::setup_sponza_lights();
+                lights[1].position = pos;
+                lights[1].direction = dir;
+                renderer.update_lights(&lights);
+            }
 
             // Update camera
             let aspect = extent.width as f32 / extent.height as f32;
@@ -841,6 +916,8 @@ fn run_interactive(
         ibl_name: ibl_name.to_string(),
         force_validation,
         demo_lights,
+        sponza_lights,
+        start_time: std::time::Instant::now(),
         ctx: None,
         renderer: None,
         orbit: OrbitCamera::new(),

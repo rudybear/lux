@@ -270,6 +270,7 @@ GltfScene loadGltf(const std::string& path) {
     // --- Meshes ---
     for (size_t mi = 0; mi < data->meshes_count; mi++) {
         auto& mesh = data->meshes[mi];
+        size_t primStart = scene.meshes.size();
         for (size_t pi = 0; pi < mesh.primitives_count; pi++) {
             auto& prim = mesh.primitives[pi];
             GltfMesh gmesh;
@@ -335,6 +336,7 @@ GltfScene loadGltf(const std::string& path) {
 
             scene.meshes.push_back(std::move(gmesh));
         }
+        scene.meshPrimitiveRanges.push_back({primStart, scene.meshes.size() - primStart});
     }
 
     // --- Nodes ---
@@ -431,12 +433,24 @@ std::vector<DrawItem> flattenScene(GltfScene& scene) {
             auto& node = scene.nodes[nodeIdx];
             node.worldTransform = parentWorld * node.localTransform;
 
-            if (node.meshIndex >= 0 && node.meshIndex < static_cast<int>(scene.meshes.size())) {
-                DrawItem item;
-                item.worldTransform = node.worldTransform;
-                item.meshIndex = node.meshIndex;
-                item.materialIndex = scene.meshes[node.meshIndex].materialIndex;
-                items.push_back(item);
+            if (node.meshIndex >= 0) {
+                size_t mi = static_cast<size_t>(node.meshIndex);
+                if (mi < scene.meshPrimitiveRanges.size()) {
+                    auto [start, count] = scene.meshPrimitiveRanges[mi];
+                    for (size_t pi = start; pi < start + count; pi++) {
+                        DrawItem item;
+                        item.worldTransform = node.worldTransform;
+                        item.meshIndex = static_cast<int>(pi);
+                        item.materialIndex = scene.meshes[pi].materialIndex;
+                        items.push_back(item);
+                    }
+                } else if (mi < scene.meshes.size()) {
+                    DrawItem item;
+                    item.worldTransform = node.worldTransform;
+                    item.meshIndex = node.meshIndex;
+                    item.materialIndex = scene.meshes[mi].materialIndex;
+                    items.push_back(item);
+                }
             }
 
             // Extract world-space position and direction for lights attached to this node

@@ -107,6 +107,7 @@ if(Vulkan_FOUND)
 
     target_compile_definitions(${PROJECT_NAME} PRIVATE
         GLFW_INCLUDE_VULKAN
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
     )
 
     # Suppress specific MSVC warnings for third-party code

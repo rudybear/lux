@@ -85,7 +85,7 @@ impl Default for ShadowEntry {
 pub const MAX_SHADOW_MAPS: usize = 8;
 
 /// Shadow map resolution (width and height).
-pub const SHADOW_MAP_RESOLUTION: u32 = 1024;
+pub const SHADOW_MAP_RESOLUTION: u32 = 2048;
 
 /// Central scene manager: holds lights and provides buffer packing for GPU upload.
 pub struct SceneManager {
@@ -591,6 +591,9 @@ pub trait Renderer {
     /// Render a frame. For headless, this renders once. For interactive, call per frame.
     fn render(&mut self, ctx: &VulkanContext) -> Result<vk::CommandBuffer, String>;
 
+    /// Update lights for animation. Default: no-op.
+    fn update_lights(&mut self, _lights: &[SceneLight]) {}
+
     /// Update the camera from orbit parameters.
     fn update_camera(
         &mut self,
@@ -704,7 +707,7 @@ pub fn build_pipeline_path(base_path: &str, features: &std::collections::BTreeSe
 /// Detect features for a single material (not the whole scene).
 ///
 /// Returns a set of feature flags like "has_normal_map", "has_sheen", etc.
-pub fn detect_material_features(scene: &crate::gltf_loader::GltfScene, material_index: usize) -> BTreeSet<String> {
+pub fn detect_material_features(scene: &crate::gltf_loader::GltfScene, material_index: usize, lights: &[SceneLight]) -> BTreeSet<String> {
     let mut features = BTreeSet::new();
     if material_index >= scene.materials.len() {
         return features;
@@ -724,6 +727,10 @@ pub fn detect_material_features(scene: &crate::gltf_loader::GltfScene, material_
     }
     if mat.has_transmission {
         features.insert("has_transmission".to_string());
+    }
+    // Detect shadow support: if any light casts shadows, enable has_shadows
+    if lights.iter().any(|l| l.casts_shadow) {
+        features.insert("has_shadows".to_string());
     }
     features
 }
@@ -747,10 +754,10 @@ pub fn features_to_suffix(features: &BTreeSet<String>) -> String {
 /// Group materials by feature set, returning a map of suffix -> [material_indices].
 ///
 /// Each unique combination of features gets its own permutation suffix.
-pub fn group_materials_by_features(scene: &crate::gltf_loader::GltfScene) -> BTreeMap<String, Vec<usize>> {
+pub fn group_materials_by_features(scene: &crate::gltf_loader::GltfScene, lights: &[SceneLight]) -> BTreeMap<String, Vec<usize>> {
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for i in 0..scene.materials.len() {
-        let feats = detect_material_features(scene, i);
+        let feats = detect_material_features(scene, i, lights);
         let suffix = features_to_suffix(&feats);
         groups.entry(suffix).or_default().push(i);
     }
@@ -784,6 +791,7 @@ pub fn compute_auto_camera_from_draw_items(
     // Extract camera direction from first draw item's world transform
     let mut cam_dir = glam::Vec3::new(0.0, 0.0, 1.0);
     let mut cam_up_vec = glam::Vec3::new(0.0, 1.0, 0.0);
+    let mut used_blender_dir = false;
 
     if !draw_items.is_empty() {
         let upper = glam::Mat3::from_mat4(draw_items[0].world_transform);
@@ -812,8 +820,21 @@ pub fn compute_auto_camera_from_draw_items(
                 if cam_dir.dot(cam_up_vec).abs() > 0.9 {
                     cam_up_vec = glam::Vec3::new(0.0, 1.0, 0.0);
                 }
+                used_blender_dir = true;
             }
         }
+    }
+
+    // Fallback: look along the longest horizontal extent of the bounding box
+    if !used_blender_dir {
+        let ex = extent.x.abs();
+        let ez = extent.z.abs();
+        cam_dir = if ex >= ez {
+            glam::Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            glam::Vec3::new(0.0, 0.0, 1.0)
+        };
+        cam_up_vec = glam::Vec3::new(0.0, 1.0, 0.0);
     }
 
     // Perpendicular extent via projection

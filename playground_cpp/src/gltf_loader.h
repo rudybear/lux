@@ -130,6 +130,8 @@ struct GltfScene {
     std::vector<GltfCamera> cameras;
     std::vector<GltfLight> lights;
     std::vector<int> rootNodes;
+    // Maps glTF mesh index -> (start, count) in meshes vec (one entry per primitive)
+    std::vector<std::pair<size_t, size_t>> meshPrimitiveRanges;
 };
 
 struct DrawItem {

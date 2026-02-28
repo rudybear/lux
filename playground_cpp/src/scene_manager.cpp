@@ -83,6 +83,134 @@ void SceneManager::loadScene(VulkanContext& ctx, const std::string& sceneSource)
 }
 
 // --------------------------------------------------------------------------
+// Load procedural test scene (plane + cube + colored light spheres)
+// --------------------------------------------------------------------------
+
+void SceneManager::loadProceduralTestScene(VulkanContext& ctx) {
+    m_sceneSource = "lighttest";
+    m_gltfScene = {};
+
+    // Materials
+    GltfMaterial grayPlane;
+    grayPlane.name = "gray_plane";
+    grayPlane.baseColor = glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
+    grayPlane.metallic = 0.0f;
+    grayPlane.roughness = 0.8f;
+    m_gltfScene.materials.push_back(grayPlane);
+
+    GltfMaterial grayCube;
+    grayCube.name = "gray_cube";
+    grayCube.baseColor = glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
+    grayCube.metallic = 0.0f;
+    grayCube.roughness = 0.5f;
+    m_gltfScene.materials.push_back(grayCube);
+
+    GltfMaterial redSphere;
+    redSphere.name = "red_sphere";
+    redSphere.baseColor = glm::vec4(1.0f, 0.2f, 0.2f, 1.0f);
+    redSphere.metallic = 0.0f;
+    redSphere.roughness = 0.3f;
+    m_gltfScene.materials.push_back(redSphere);
+
+    GltfMaterial greenSphere;
+    greenSphere.name = "green_sphere";
+    greenSphere.baseColor = glm::vec4(0.2f, 1.0f, 0.2f, 1.0f);
+    greenSphere.metallic = 0.0f;
+    greenSphere.roughness = 0.3f;
+    m_gltfScene.materials.push_back(greenSphere);
+
+    // Light positions for sphere markers
+    glm::vec3 redLightPos(-3.0f, 2.5f, -2.0f);
+    glm::vec3 greenLightPos(3.0f, 2.5f, 2.0f);
+    float sphereRadius = 0.15f;
+
+    // Mesh 0: Ground plane (10x10)
+    {
+        GltfMesh mesh;
+        mesh.name = "plane";
+        mesh.materialIndex = 0;
+        mesh.hasTangents = true;
+        Scene::generatePlaneGltf(10.0f, mesh.vertices, mesh.indices);
+        m_gltfScene.meshes.push_back(std::move(mesh));
+    }
+
+    // Mesh 1: Cube (1x1) floating at Y=1.5
+    {
+        GltfMesh mesh;
+        mesh.name = "cube";
+        mesh.materialIndex = 1;
+        mesh.hasTangents = true;
+        Scene::generateCubeGltf(1.0f, mesh.vertices, mesh.indices);
+        // Offset vertices to Y=1.5
+        for (auto& v : mesh.vertices) {
+            v.position.y += 1.5f;
+        }
+        m_gltfScene.meshes.push_back(std::move(mesh));
+    }
+
+    // Mesh 2: Red sphere at red light position
+    {
+        GltfMesh mesh;
+        mesh.name = "red_light_sphere";
+        mesh.materialIndex = 2;
+        mesh.hasTangents = true;
+        Scene::generateSphereGltf(8, 16, mesh.vertices, mesh.indices);
+        for (auto& v : mesh.vertices) {
+            v.position = v.position * sphereRadius + redLightPos;
+        }
+        m_gltfScene.meshes.push_back(std::move(mesh));
+    }
+
+    // Mesh 3: Green sphere at green light position
+    {
+        GltfMesh mesh;
+        mesh.name = "green_light_sphere";
+        mesh.materialIndex = 3;
+        mesh.hasTangents = true;
+        Scene::generateSphereGltf(8, 16, mesh.vertices, mesh.indices);
+        for (auto& v : mesh.vertices) {
+            v.position = v.position * sphereRadius + greenLightPos;
+        }
+        m_gltfScene.meshes.push_back(std::move(mesh));
+    }
+
+    // Scene graph: 4 nodes, each referencing one mesh, identity transforms
+    // (positions are baked into vertex data)
+    for (int i = 0; i < 4; i++) {
+        GltfNode node;
+        node.name = m_gltfScene.meshes[i].name;
+        node.meshIndex = i;
+        m_gltfScene.nodes.push_back(node);
+        m_gltfScene.rootNodes.push_back(i);
+    }
+
+    // meshPrimitiveRanges: each glTF "mesh" has exactly one primitive
+    for (size_t i = 0; i < m_gltfScene.meshes.size(); i++) {
+        m_gltfScene.meshPrimitiveRanges.push_back({i, 1});
+    }
+
+    m_hasGltfScene = true;
+
+    // Build m_vertices for auto-camera computation
+    for (auto& gmesh : m_gltfScene.meshes) {
+        for (auto& gv : gmesh.vertices) {
+            Vertex v;
+            v.position = gv.position;
+            v.normal = gv.normal;
+            v.uv = gv.uv;
+            m_vertices.push_back(v);
+        }
+        for (auto idx : gmesh.indices) {
+            m_indices.push_back(idx);
+        }
+    }
+
+    computeAutoCamera(m_vertices);
+    std::cout << "[info] Procedural test scene: " << m_gltfScene.meshes.size()
+              << " meshes, " << m_gltfScene.materials.size() << " materials" << std::endl;
+}
+
+// --------------------------------------------------------------------------
 // Upload mesh to GPU
 // --------------------------------------------------------------------------
 
@@ -833,6 +961,7 @@ void SceneManager::computeAutoCamera(const std::vector<Vertex>& vertices) {
     // Determine camera direction from first node's transform (matches raster renderer)
     glm::vec3 camDir(0.0f, 0.0f, 1.0f);
     glm::vec3 camUp(0.0f, 1.0f, 0.0f);
+    bool usedBlenderDir = false;
 
     if (m_hasGltfScene) {
         auto drawItems = flattenScene(m_gltfScene);
@@ -863,9 +992,18 @@ void SceneManager::computeAutoCamera(const std::vector<Vertex>& vertices) {
                     if (std::abs(glm::dot(camDir, camUp)) > 0.9f) {
                         camUp = glm::vec3(0.0f, 1.0f, 0.0f);
                     }
+                    usedBlenderDir = true;
                 }
             }
         }
+    }
+
+    // Fallback: look along the longest horizontal extent of the bounding box
+    if (!usedBlenderDir) {
+        float ex = std::abs(extent.x);
+        float ez = std::abs(extent.z);
+        camDir = (ex >= ez) ? glm::vec3(1.0f, 0.0f, 0.0f) : glm::vec3(0.0f, 0.0f, 1.0f);
+        camUp = glm::vec3(0.0f, 1.0f, 0.0f);
     }
 
     // Compute perpendicular extent for distance calculation
@@ -1193,13 +1331,14 @@ void SceneManager::computeShadowData(const glm::mat4& cameraView, const glm::mat
             }
             center /= 8.0f;
 
-            // Build light view matrix looking along the light direction
+            // Build light view matrix: direction points TOWARD the light (shader convention),
+            // so negate to get the direction light travels, and place camera opposite that.
             glm::vec3 lightDir = glm::normalize(light.direction);
             glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f);
             if (std::abs(glm::dot(lightDir, up)) > 0.99f) {
                 up = glm::vec3(0.0f, 0.0f, 1.0f);
             }
-            glm::mat4 lightView = glm::lookAt(center - lightDir, center, up);
+            glm::mat4 lightView = glm::lookAt(center + lightDir, center, up);
 
             // Find bounding box in light space
             float minX =  FLT_MAX, maxX = -FLT_MAX;
@@ -1217,7 +1356,9 @@ void SceneManager::computeShadowData(const glm::mat4& cameraView, const glm::mat
             minZ -= zRange * 0.5f;
             maxZ += zRange * 0.5f;
 
-            glm::mat4 lightProj = glm::ortho(minX, maxX, minY, maxY, minZ, maxZ);
+            // GLM orthoRH expects positive distances: near plane at z=-zNear, far at z=-zFar.
+            // In light view space, objects in front have negative z, so negate & swap.
+            glm::mat4 lightProj = glm::ortho(minX, maxX, minY, maxY, -maxZ, -minZ);
             entry.viewProjection = lightProj * lightView;
         } else if (light.type == SceneLight::Spot) {
             // Perspective shadow projection for spot lights

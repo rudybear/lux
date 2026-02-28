@@ -1100,7 +1100,7 @@ impl MeshShaderRenderer {
             // MULTI-PIPELINE MODE
             // ---------------------------------------------------------------
             let gltf_s = gltf_scene.as_ref().unwrap();
-            let groups = scene_manager::group_materials_by_features(gltf_s);
+            let groups = scene_manager::group_materials_by_features(gltf_s, &sm.lights);
             let total_materials = gltf_s.materials.len();
 
             let mut material_to_permutation: Vec<usize> = vec![0; total_materials];

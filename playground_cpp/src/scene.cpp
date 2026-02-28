@@ -1,4 +1,5 @@
 #include "scene.h"
+#include "gltf_loader.h"   // GltfVertex
 #include <cmath>
 #include <stdexcept>
 #include <cstring>
@@ -383,6 +384,152 @@ void uploadBuffer(VmaAllocator allocator, VkDevice device,
                   VkBuffer& outBuffer, VmaAllocation& outAllocation) {
     createBufferWithData(allocator, device, cmdPool, queue,
                          data, size, usage, outBuffer, outAllocation);
+}
+
+// -----------------------------------------------------------------------
+// Procedural geometry generators (GltfVertex, 48 bytes per vertex)
+// -----------------------------------------------------------------------
+
+void generatePlaneGltf(float size,
+                       std::vector<GltfVertex>& outVertices,
+                       std::vector<uint32_t>& outIndices) {
+    outVertices.clear();
+    outIndices.clear();
+
+    float half = size * 0.5f;
+    glm::vec3 normal(0.0f, 1.0f, 0.0f);
+    glm::vec4 tangent(1.0f, 0.0f, 0.0f, 1.0f);
+
+    // 4 vertices: corners of a quad on the XZ plane at Y=0
+    GltfVertex v;
+    v.normal = normal;
+    v.tangent = tangent;
+
+    v.position = glm::vec3(-half, 0.0f, -half); v.uv = glm::vec2(0.0f, 0.0f);
+    outVertices.push_back(v);
+    v.position = glm::vec3( half, 0.0f, -half); v.uv = glm::vec2(1.0f, 0.0f);
+    outVertices.push_back(v);
+    v.position = glm::vec3( half, 0.0f,  half); v.uv = glm::vec2(1.0f, 1.0f);
+    outVertices.push_back(v);
+    v.position = glm::vec3(-half, 0.0f,  half); v.uv = glm::vec2(0.0f, 1.0f);
+    outVertices.push_back(v);
+
+    // Two triangles (CCW winding when viewed from above)
+    outIndices = {0, 2, 1, 0, 3, 2};
+}
+
+void generateCubeGltf(float size,
+                      std::vector<GltfVertex>& outVertices,
+                      std::vector<uint32_t>& outIndices) {
+    outVertices.clear();
+    outIndices.clear();
+
+    float h = size * 0.5f;
+
+    // Face data: normal, tangent, 4 corner positions (CCW)
+    struct Face {
+        glm::vec3 normal;
+        glm::vec4 tangent;
+        glm::vec3 corners[4];
+        glm::vec2 uvs[4];
+    };
+
+    // Corner order: CCW when viewed from outside (so cross product points outward)
+    Face faces[6] = {
+        // +Y (top)
+        {{0,1,0}, {1,0,0,1},
+         {{-h,h,h},{h,h,h},{h,h,-h},{-h,h,-h}},
+         {{0,0},{1,0},{1,1},{0,1}}},
+        // -Y (bottom)
+        {{0,-1,0}, {1,0,0,1},
+         {{-h,-h,-h},{h,-h,-h},{h,-h,h},{-h,-h,h}},
+         {{0,0},{1,0},{1,1},{0,1}}},
+        // +Z (front)
+        {{0,0,1}, {1,0,0,1},
+         {{-h,-h,h},{h,-h,h},{h,h,h},{-h,h,h}},
+         {{0,0},{1,0},{1,1},{0,1}}},
+        // -Z (back)
+        {{0,0,-1}, {-1,0,0,1},
+         {{h,-h,-h},{-h,-h,-h},{-h,h,-h},{h,h,-h}},
+         {{0,0},{1,0},{1,1},{0,1}}},
+        // +X (right)
+        {{1,0,0}, {0,0,-1,1},
+         {{h,-h,h},{h,-h,-h},{h,h,-h},{h,h,h}},
+         {{0,0},{1,0},{1,1},{0,1}}},
+        // -X (left)
+        {{-1,0,0}, {0,0,1,1},
+         {{-h,-h,-h},{-h,-h,h},{-h,h,h},{-h,h,-h}},
+         {{0,0},{1,0},{1,1},{0,1}}},
+    };
+
+    for (int f = 0; f < 6; f++) {
+        uint32_t base = static_cast<uint32_t>(outVertices.size());
+        for (int c = 0; c < 4; c++) {
+            GltfVertex v;
+            v.position = faces[f].corners[c];
+            v.normal = faces[f].normal;
+            v.uv = faces[f].uvs[c];
+            v.tangent = faces[f].tangent;
+            outVertices.push_back(v);
+        }
+        // Two triangles per face
+        outIndices.push_back(base + 0);
+        outIndices.push_back(base + 1);
+        outIndices.push_back(base + 2);
+        outIndices.push_back(base + 0);
+        outIndices.push_back(base + 2);
+        outIndices.push_back(base + 3);
+    }
+}
+
+void generateSphereGltf(uint32_t stacks, uint32_t slices,
+                        std::vector<GltfVertex>& outVertices,
+                        std::vector<uint32_t>& outIndices) {
+    outVertices.clear();
+    outIndices.clear();
+
+    for (uint32_t i = 0; i <= stacks; i++) {
+        float phi = static_cast<float>(M_PI) * static_cast<float>(i) / static_cast<float>(stacks);
+        float vCoord = static_cast<float>(i) / static_cast<float>(stacks);
+
+        for (uint32_t j = 0; j <= slices; j++) {
+            float theta = 2.0f * static_cast<float>(M_PI) * static_cast<float>(j) / static_cast<float>(slices);
+            float uCoord = static_cast<float>(j) / static_cast<float>(slices);
+
+            float x = std::sin(phi) * std::cos(theta);
+            float y = std::cos(phi);
+            float z = std::sin(phi) * std::sin(theta);
+
+            GltfVertex v;
+            v.position = glm::vec3(x, y, z);
+            v.normal = glm::vec3(x, y, z);
+            v.uv = glm::vec2(uCoord, vCoord);
+
+            // Tangent: derivative of position w.r.t. theta (normalized)
+            glm::vec3 tang(-std::sin(theta), 0.0f, std::cos(theta));
+            float tLen = glm::length(tang);
+            if (tLen > 1e-6f) tang /= tLen;
+            else tang = glm::vec3(1.0f, 0.0f, 0.0f);
+            v.tangent = glm::vec4(tang, 1.0f);
+
+            outVertices.push_back(v);
+        }
+    }
+
+    for (uint32_t i = 0; i < stacks; i++) {
+        for (uint32_t j = 0; j < slices; j++) {
+            uint32_t a = i * (slices + 1) + j;
+            uint32_t b = a + slices + 1;
+
+            outIndices.push_back(a);
+            outIndices.push_back(b);
+            outIndices.push_back(a + 1);
+
+            outIndices.push_back(b);
+            outIndices.push_back(b + 1);
+            outIndices.push_back(a + 1);
+        }
+    }
 }
 
 void destroyMesh(VmaAllocator allocator, GPUMesh& mesh) {

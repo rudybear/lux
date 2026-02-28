@@ -20,6 +20,10 @@ screenshots/
 
 # Assets tracked via Git LFS (glTF models, IBL maps)
 
+# Downloaded Sponza model (too large to commit; regenerate with download_sponza.py)
+assets/Sponza.glb
+assets/sponza_gltf/
+
 # C++/Rust build artifacts
 playground_cpp/build/
 playground_cpp/build-metal/

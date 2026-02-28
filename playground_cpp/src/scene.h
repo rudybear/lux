@@ -6,6 +6,10 @@
 #include <vector>
 #include <cstdint>
 
+// Forward-declare GltfVertex (defined in gltf_loader.h) so we can use it here
+// without pulling in the full glTF header.
+struct GltfVertex;
+
 // PBR sphere vertex: position + normal + UV = 32 bytes
 struct Vertex {
     glm::vec3 position;
@@ -77,6 +81,23 @@ void uploadBuffer(VmaAllocator allocator, VkDevice device,
                   const void* data, VkDeviceSize size,
                   VkBufferUsageFlags usage,
                   VkBuffer& outBuffer, VmaAllocation& outAllocation);
+
+// --- Procedural geometry generators (GltfVertex output, 48 bytes) ---
+
+// Generate a ground plane centered at origin, lying on Y=0, with upward normals
+void generatePlaneGltf(float size,
+                       std::vector<GltfVertex>& outVertices,
+                       std::vector<uint32_t>& outIndices);
+
+// Generate a unit cube centered at origin with face normals and tangents
+void generateCubeGltf(float size,
+                      std::vector<GltfVertex>& outVertices,
+                      std::vector<uint32_t>& outIndices);
+
+// Generate a UV sphere with tangents (GltfVertex output)
+void generateSphereGltf(uint32_t stacks, uint32_t slices,
+                        std::vector<GltfVertex>& outVertices,
+                        std::vector<uint32_t>& outIndices);
 
 // Cleanup GPU resources
 void destroyMesh(VmaAllocator allocator, GPUMesh& mesh);

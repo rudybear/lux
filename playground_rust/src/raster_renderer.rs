@@ -478,6 +478,7 @@ pub fn render_raster(
     output_path: &Path,
     ibl_name: &str,
     demo_lights: bool,
+    sponza_lights: bool,
 ) -> Result<(), String> {
     info!(
         "Raster render: scene='{}', pipeline='{}', {}x{}",
@@ -505,8 +506,8 @@ pub fn render_raster(
             // Resolve permutation suffix from manifest + scene features
             let resolved_base = if let Some(manifest) = try_load_manifest(pipeline_base) {
                 let gltf_scene = crate::gltf_loader::load_gltf(Path::new(source))?;
-                let demo_light_vec = if demo_lights { crate::setup_demo_lights() } else { vec![] };
-                let scene_features = scene_manager::detect_scene_features(&gltf_scene, &demo_light_vec);
+                let light_vec = if sponza_lights { crate::setup_sponza_lights() } else if demo_lights { crate::setup_demo_lights() } else { vec![] };
+                let scene_features = scene_manager::detect_scene_features(&gltf_scene, &light_vec);
                 let suffix = find_permutation_suffix(&manifest, &scene_features);
                 if !suffix.is_empty() {
                     let candidate = format!("{}{}", pipeline_base, suffix);
@@ -532,7 +533,7 @@ pub fn render_raster(
             let frag_module = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
 
             // For glTF, use the PBR rendering path with glTF mesh data
-            render_pbr_scene(ctx, vert_module, frag_module, &resolved_base, scene_source, width, height, output_path, ibl_name, demo_lights)?;
+            render_pbr_scene(ctx, vert_module, frag_module, &resolved_base, scene_source, width, height, output_path, ibl_name, demo_lights, sponza_lights)?;
 
             unsafe {
                 ctx.device.destroy_shader_module(frag_module, None);
@@ -548,7 +549,7 @@ pub fn render_raster(
             let vert_module = spv_loader::create_shader_module(&ctx.device, &vert_code)?;
             let frag_module = spv_loader::create_shader_module(&ctx.device, &frag_code)?;
 
-            render_pbr_scene(ctx, vert_module, frag_module, pipeline_base, scene_source, width, height, output_path, ibl_name, demo_lights)?;
+            render_pbr_scene(ctx, vert_module, frag_module, pipeline_base, scene_source, width, height, output_path, ibl_name, demo_lights, sponza_lights)?;
 
             unsafe {
                 ctx.device.destroy_shader_module(frag_module, None);
@@ -1194,6 +1195,7 @@ fn render_pbr_scene_bindless(
     vert_refl: reflected_pipeline::ReflectionData,
     frag_refl: reflected_pipeline::ReflectionData,
     demo_lights: bool,
+    sponza_lights: bool,
 ) -> Result<(), String> {
     let device_owned = ctx.device.clone();
     let device = &device_owned;
@@ -1307,6 +1309,14 @@ fn render_pbr_scene_bindless(
         );
         auto_eye = eye; auto_target = target; auto_up = up; auto_far = far;
 
+        // Override camera for Sponza: place inside the courtyard looking down the colonnade
+        if sponza_lights {
+            auto_eye = glam::Vec3::new(-1000.0, 100.0, -200.0);
+            auto_target = glam::Vec3::new(500.0, 50.0, 0.0);
+            auto_up = glam::Vec3::new(0.0, 1.0, 0.0);
+            auto_far = 3000.0;
+        }
+
         let data: Vec<u8> = bytemuck::cast_slice(&vdata).to_vec();
         (data, all_indices, draw_ranges)
     } else {
@@ -1349,7 +1359,9 @@ fn render_pbr_scene_bindless(
     // --- Multi-light SSBO (Phase E) ---
     // Build a SceneManager and populate lights from glTF scene data.
     let mut sm = scene_manager::SceneManager::new();
-    if demo_lights {
+    if sponza_lights {
+        sm.override_lights(crate::setup_sponza_lights());
+    } else if demo_lights {
         sm.override_lights(crate::setup_demo_lights());
     } else if let Some(ref gs) = gltf_scene {
         sm.populate_lights_from_gltf(&gs.lights);
@@ -1449,6 +1461,7 @@ fn render_pbr_scene_bindless(
         let default_scene = crate::gltf_loader::GltfScene {
             meshes: Vec::new(), materials: Vec::new(), nodes: Vec::new(),
             cameras: Vec::new(), lights: Vec::new(), root_nodes: Vec::new(),
+            mesh_primitive_ranges: Vec::new(),
         };
         scene_manager::build_materials_ssbo(
             device, ctx.allocator_mut(), &default_scene, &dedup, &per_material_textures,
@@ -1843,6 +1856,7 @@ fn render_pbr_scene(
     output_path: &Path,
     ibl_name: &str,
     demo_lights: bool,
+    sponza_lights: bool,
 ) -> Result<(), String> {
     let device_owned = ctx.device.clone();
     let device = &device_owned;
@@ -1872,7 +1886,7 @@ fn render_pbr_scene(
         return render_pbr_scene_bindless(
             ctx, vert_module, frag_module, pipeline_base, scene_source,
             width, height, output_path, ibl_name, vert_refl, frag_refl,
-            demo_lights,
+            demo_lights, sponza_lights,
         );
     }
 
@@ -2112,6 +2126,14 @@ fn render_pbr_scene(
             auto_far = far;
         }
 
+        // Override camera for Sponza: place inside the courtyard looking down the colonnade
+        if sponza_lights {
+            auto_eye = glam::Vec3::new(-1000.0, 100.0, -200.0);
+            auto_target = glam::Vec3::new(500.0, 50.0, 0.0);
+            auto_up = glam::Vec3::new(0.0, 1.0, 0.0);
+            auto_far = 3000.0;
+        }
+
         let data: Vec<u8> = bytemuck::cast_slice(&vdata).to_vec();
         (data, all_indices, draw_ranges)
     } else {
@@ -2199,7 +2221,9 @@ fn render_pbr_scene(
 
     // --- Multi-light SSBO (Phase E) ---
     let mut sm = scene_manager::SceneManager::new();
-    if demo_lights {
+    if sponza_lights {
+        sm.override_lights(crate::setup_sponza_lights());
+    } else if demo_lights {
         sm.override_lights(crate::setup_demo_lights());
     } else if let Some(ref gs) = gltf_scene {
         sm.populate_lights_from_gltf(&gs.lights);
@@ -3279,6 +3303,7 @@ impl PersistentRenderer {
         height: u32,
         ibl_name: &str,
         demo_lights: bool,
+        sponza_lights: bool,
     ) -> Result<Self, String> {
         let device = ctx.device.clone();
 
@@ -3306,8 +3331,8 @@ impl PersistentRenderer {
         let resolved_base = if !use_multi_pipeline {
             if let Some(ref mf) = manifest {
                 if let Some(ref gs) = gltf_scene {
-                    let demo_light_vec = if demo_lights { crate::setup_demo_lights() } else { vec![] };
-                    let scene_features = scene_manager::detect_scene_features(gs, &demo_light_vec);
+                    let light_vec = if sponza_lights { crate::setup_sponza_lights() } else if demo_lights { crate::setup_demo_lights() } else { vec![] };
+                    let scene_features = scene_manager::detect_scene_features(gs, &light_vec);
                     let suffix = find_permutation_suffix(mf, &scene_features);
                     if !suffix.is_empty() {
                         let candidate = format!("{}{}", pipeline_base, suffix);
@@ -3447,6 +3472,14 @@ impl PersistentRenderer {
                 auto_far = far;
             }
 
+            // Override camera for Sponza: place inside the courtyard looking down the colonnade
+            if sponza_lights {
+                auto_eye = glam::Vec3::new(-1000.0, 500.0, 0.0);
+                auto_target = glam::Vec3::new(1000.0, 300.0, 0.0);
+                auto_up = glam::Vec3::new(0.0, 1.0, 0.0);
+                auto_far = 5000.0;
+            }
+
             let data: Vec<u8> = bytemuck::cast_slice(&vdata).to_vec();
             (data, all_indices, draw_ranges)
         } else {
@@ -3515,7 +3548,9 @@ impl PersistentRenderer {
 
         // --- Multi-light SSBO (Phase E) ---
         let mut sm = scene_manager::SceneManager::new();
-        if demo_lights {
+        if sponza_lights {
+            sm.override_lights(crate::setup_sponza_lights());
+        } else if demo_lights {
             sm.override_lights(crate::setup_demo_lights());
         } else if let Some(ref gs) = gltf_scene {
             sm.populate_lights_from_gltf(&gs.lights);
@@ -3848,7 +3883,7 @@ impl PersistentRenderer {
             // MULTI-PIPELINE MODE
             // ---------------------------------------------------------------
             let gltf_s = gltf_scene.as_ref().unwrap();
-            let groups = scene_manager::group_materials_by_features(gltf_s);
+            let groups = scene_manager::group_materials_by_features(gltf_s, &sm.lights);
             let total_materials = gltf_s.materials.len();
 
             let mut material_to_permutation: Vec<usize> = vec![0; total_materials];
@@ -5016,9 +5051,40 @@ impl PersistentRenderer {
         }
     }
 
+    /// Update lights for animation: overrides scene_manager lights and re-uploads SSBOs.
+    pub fn update_lights_impl(&mut self, lights: &[scene_manager::SceneLight]) {
+        self.scene_manager.lights = lights.to_vec();
+
+        // Re-upload lights SSBO
+        if self.has_multi_light {
+            if let Some(ref mut lights_buf) = self.lights_ssbo {
+                let light_floats = self.scene_manager.pack_lights_buffer();
+                if !light_floats.is_empty() {
+                    let light_data: &[u8] = bytemuck::cast_slice(&light_floats);
+                    if let Some(ref mut alloc) = lights_buf.allocation {
+                        if let Some(mapped) = alloc.mapped_slice_mut() {
+                            let copy_len = light_data.len().min(mapped.len());
+                            mapped[..copy_len].copy_from_slice(&light_data[..copy_len]);
+                        }
+                    }
+                }
+            }
+
+            // Update light count in SceneLight UBO (offset 12, 4 bytes)
+            if let Some(ref mut sl_buf) = self.scene_light_ubo {
+                if let Some(ref mut alloc) = sl_buf.allocation {
+                    if let Some(mapped) = alloc.mapped_slice_mut() {
+                        let light_count = self.scene_manager.lights.len() as i32;
+                        mapped[12..16].copy_from_slice(&light_count.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+
     /// Record and submit rendering commands. The offscreen color_image
     /// ends up in TRANSFER_SRC_OPTIMAL layout ready for blit.
-    pub fn render_frame(&self, ctx: &VulkanContext) -> Result<vk::CommandBuffer, String> {
+    pub fn render_frame(&mut self, ctx: &VulkanContext) -> Result<vk::CommandBuffer, String> {
         let device = &ctx.device;
 
         let alloc_info = vk::CommandBufferAllocateInfo::default()
@@ -5039,6 +5105,54 @@ impl PersistentRenderer {
             device
                 .begin_command_buffer(cmd, &begin_info)
                 .map_err(|e| format!("Failed to begin command buffer: {:?}", e))?;
+        }
+
+        // --- Recompute shadow data per frame (for animated lights) ---
+        if self.shadow_enabled && self.shadow_count > 0 {
+            // Read current view/proj from the mapped MVP buffer
+            let mut view_arr = [0.0f32; 16];
+            let mut proj_arr = [0.0f32; 16];
+            if let Some(ref alloc) = self.mvp_buffer.allocation {
+                if let Some(mapped) = alloc.mapped_slice() {
+                    let floats: &[f32] = bytemuck::cast_slice(&mapped[..192]);
+                    view_arr.copy_from_slice(&floats[16..32]);
+                    proj_arr.copy_from_slice(&floats[32..48]);
+                }
+            }
+            let near_val = 0.1f32;
+            let far_val = if self.has_scene_bounds { self.auto_far } else { 100.0 };
+            self.scene_manager.compute_shadow_data(&view_arr, &proj_arr, near_val, far_val);
+            self.shadow_count = self.scene_manager.shadow_count() as u32;
+
+            // Re-upload shadow matrices SSBO
+            if let Some(ref mut shadow_buf) = self.shadow_matrices_ssbo {
+                let shadow_floats = self.scene_manager.pack_shadow_buffer();
+                if !shadow_floats.is_empty() {
+                    let data: &[u8] = bytemuck::cast_slice(&shadow_floats);
+                    if let Some(ref mut alloc) = shadow_buf.allocation {
+                        if let Some(mapped) = alloc.mapped_slice_mut() {
+                            let copy_len = data.len().min(mapped.len());
+                            mapped[..copy_len].copy_from_slice(&data[..copy_len]);
+                        }
+                    }
+                }
+            }
+
+            // Re-upload lights SSBO (shadow indices may have changed)
+            if self.has_multi_light {
+                if let Some(ref mut lights_buf) = self.lights_ssbo {
+                    let light_floats = self.scene_manager.pack_lights_buffer();
+                    if !light_floats.is_empty() {
+                        let light_data: &[u8] = bytemuck::cast_slice(&light_floats);
+                        if let Some(ref mut alloc) = lights_buf.allocation {
+                            if let Some(mapped) = alloc.mapped_slice_mut() {
+                                let copy_len = light_data.len().min(mapped.len());
+                                mapped[..copy_len].copy_from_slice(&light_data[..copy_len]);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // --- Shadow pass (before main color pass) ---
@@ -5428,6 +5542,10 @@ impl PersistentRenderer {
 impl scene_manager::Renderer for PersistentRenderer {
     fn render(&mut self, ctx: &VulkanContext) -> Result<vk::CommandBuffer, String> {
         self.render_frame(ctx)
+    }
+
+    fn update_lights(&mut self, lights: &[scene_manager::SceneLight]) {
+        self.update_lights_impl(lights);
     }
 
     fn update_camera(

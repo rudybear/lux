@@ -119,7 +119,7 @@ private:
     bool m_hasMultiLight = false;
 
     // Shadow map resources
-    static constexpr uint32_t SHADOW_MAP_SIZE = 1024;
+    static constexpr uint32_t SHADOW_MAP_SIZE = 2048;
     static constexpr uint32_t MAX_SHADOW_MAPS = 8;
     VkImage m_shadowImage = VK_NULL_HANDLE;
     VmaAllocation m_shadowImageAlloc = VK_NULL_HANDLE;

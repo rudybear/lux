@@ -449,7 +449,7 @@ impl RTRenderer {
 
         // --- 0c. Determine permutation groups ---
         let groups: BTreeMap<String, Vec<usize>> = if use_multi_material {
-            scene_manager::group_materials_by_features(gltf_scene_opt.as_ref().unwrap())
+            scene_manager::group_materials_by_features(gltf_scene_opt.as_ref().unwrap(), &[])
         } else {
             BTreeMap::new()
         };

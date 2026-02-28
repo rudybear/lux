@@ -62,6 +62,7 @@ struct BindlessMaterialsSSBO {
 class SceneManager {
 public:
     void loadScene(VulkanContext& ctx, const std::string& sceneSource);
+    void loadProceduralTestScene(VulkanContext& ctx);
     void uploadToGPU(VulkanContext& ctx, int vertexStride = 32);
     void uploadTextures(VulkanContext& ctx);
     void loadIBLAssets(VulkanContext& ctx, VkPipelineStageFlags dstStage,
@@ -73,6 +74,10 @@ public:
     glm::vec3 getAutoTarget() const { return m_autoTarget; }
     glm::vec3 getAutoUp() const { return m_autoUp; }
     float getAutoFar() const { return m_autoFar; }
+    void overrideAutoCamera(glm::vec3 eye, glm::vec3 target, glm::vec3 up, float farPlane) {
+        m_autoEye = eye; m_autoTarget = target; m_autoUp = up; m_autoFar = farPlane;
+        m_hasSceneBounds = true;
+    }
 
     // Resource access
     GPUTexture& getTextureForBinding(const std::string& name);
@@ -87,6 +92,7 @@ public:
     void addLight(const SceneLight& light) { m_lights.push_back(light); }
     void clearLights() { m_lights.clear(); }
     const std::vector<SceneLight>& getLights() const { return m_lights; }
+    std::vector<SceneLight>& getLightsMutable() { return m_lights; }
     int getLightCount() const { return static_cast<int>(m_lights.size()); }
 
     // Convert glTF lights to SceneLights (called after scene load)

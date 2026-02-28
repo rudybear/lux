@@ -984,18 +984,21 @@ void RasterRenderer::renderShadowMaps(VulkanContext& ctx, VkCommandBuffer cmd) {
         glm::mat4 lightMVP = shadowEntries[i].viewProjection;
 
         const auto& drawRanges = m_scene->getDrawRanges();
+        int totalIndices = 0;
         if (!drawRanges.empty()) {
             for (auto& range : drawRanges) {
                 vkCmdPushConstants(cmd, m_shadowPipelineLayout,
                                    VK_SHADER_STAGE_VERTEX_BIT, 0,
                                    sizeof(glm::mat4), &lightMVP);
                 vkCmdDrawIndexed(cmd, range.indexCount, 1, range.indexOffset, 0, 0);
+                totalIndices += range.indexCount;
             }
         } else {
             vkCmdPushConstants(cmd, m_shadowPipelineLayout,
                                VK_SHADER_STAGE_VERTEX_BIT, 0,
                                sizeof(glm::mat4), &lightMVP);
             vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+            totalIndices = mesh.indexCount;
         }
 
         vkCmdEndRenderPass(cmd);
@@ -1743,7 +1746,7 @@ void RasterRenderer::init(VulkanContext& ctx, SceneManager& scene,
     const std::string& sceneSource = m_scene->getSceneSource();
 
     // Determine if depth buffer is needed based on scene
-    m_needsDepth = (sceneSource == "sphere" || SceneManager::isGltfFile(sceneSource));
+    m_needsDepth = (sceneSource == "sphere" || sceneSource == "lighttest" || SceneManager::isGltfFile(sceneSource));
 
     // Upload scene resources
     if (sceneSource == "triangle") {
@@ -2036,7 +2039,25 @@ void RasterRenderer::setupMultiPipeline(VulkanContext& ctx, const ShaderManifest
     namespace fs = std::filesystem;
     m_multiPipeline = true;
 
-    // Group materials by feature set
+    // Pre-enable castsShadow on directional/spot lights if the shader manifest
+    // supports shadows. This must happen BEFORE groupMaterialsByFeatures() so
+    // that detectMaterialFeatures() includes "has_shadows" in each material's
+    // feature set, selecting the correct +shadows permutation.
+    {
+        bool manifestHasShadows = false;
+        for (const auto& fname : manifest.featureNames) {
+            if (fname == "has_shadows") { manifestHasShadows = true; break; }
+        }
+        if (manifestHasShadows && m_scene) {
+            auto& lights = const_cast<std::vector<SceneLight>&>(m_scene->getLights());
+            for (auto& l : lights) {
+                if (l.type == SceneLight::Directional || l.type == SceneLight::Spot)
+                    l.castsShadow = true;
+            }
+        }
+    }
+
+    // Group materials by feature set (now includes has_shadows if applicable)
     auto groups = m_scene->groupMaterialsByFeatures();
     size_t totalMaterials = m_scene->getGltfScene().materials.size();
 

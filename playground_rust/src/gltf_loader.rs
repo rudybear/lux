@@ -190,6 +190,8 @@ pub struct GltfScene {
     pub cameras: Vec<GltfCamera>,
     pub lights: Vec<GltfLight>,
     pub root_nodes: Vec<usize>,
+    /// Maps glTF mesh index → (start, count) in `meshes` vec (one entry per primitive).
+    pub mesh_primitive_ranges: Vec<(usize, usize)>,
 }
 
 pub struct DrawItem {
@@ -225,7 +227,16 @@ pub fn flatten_scene(scene: &mut GltfScene) -> Vec<DrawItem> {
         let mesh_idx = scene.nodes[node_idx].mesh_index;
         if mesh_idx >= 0 {
             let mi = mesh_idx as usize;
-            if mi < scene.meshes.len() {
+            if mi < scene.mesh_primitive_ranges.len() {
+                let (start, count) = scene.mesh_primitive_ranges[mi];
+                for pi in start..start + count {
+                    items.push(DrawItem {
+                        world_transform: world,
+                        mesh_index: pi,
+                        material_index: scene.meshes[pi].material_index,
+                    });
+                }
+            } else if mi < scene.meshes.len() {
                 items.push(DrawItem {
                     world_transform: world,
                     mesh_index: mi,
@@ -398,6 +409,7 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
         cameras: Vec::new(),
         lights: Vec::new(),
         root_nodes: Vec::new(),
+        mesh_primitive_ranges: Vec::new(),
     };
 
     // --- Materials (with texture extraction) ---
@@ -551,6 +563,7 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
 
     // --- Meshes ---
     for mesh in document.meshes() {
+        let prim_start = scene.meshes.len();
         for prim in mesh.primitives() {
             let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
 
@@ -618,6 +631,7 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                 has_tangents,
             });
         }
+        scene.mesh_primitive_ranges.push((prim_start, scene.meshes.len() - prim_start));
     }
 
     // --- Nodes ---
