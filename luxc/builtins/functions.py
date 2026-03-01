@@ -177,6 +177,38 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     # barrier() -> void (workgroup execution + memory barrier)
     add([FuncSig("barrier", (), VOID)])
 
+    # --- Atomic operations ---
+    # atomic_add(uint, uint) -> uint / (int, int) -> int
+    add([FuncSig("atomic_add", (UINT, UINT), UINT)])
+    add([FuncSig("atomic_add", (INT, INT), INT)])
+
+    # atomic_min/max: uint and int overloads
+    add([FuncSig("atomic_min", (UINT, UINT), UINT)])
+    add([FuncSig("atomic_min", (INT, INT), INT)])
+    add([FuncSig("atomic_max", (UINT, UINT), UINT)])
+    add([FuncSig("atomic_max", (INT, INT), INT)])
+
+    # atomic_and/or/xor: uint only
+    add([FuncSig("atomic_and", (UINT, UINT), UINT)])
+    add([FuncSig("atomic_or", (UINT, UINT), UINT)])
+    add([FuncSig("atomic_xor", (UINT, UINT), UINT)])
+
+    # atomic_exchange: uint and int
+    add([FuncSig("atomic_exchange", (UINT, UINT), UINT)])
+    add([FuncSig("atomic_exchange", (INT, INT), INT)])
+
+    # atomic_compare_exchange(ref, comparator, value) -> old_value
+    add([FuncSig("atomic_compare_exchange", (UINT, UINT, UINT), UINT)])
+    add([FuncSig("atomic_compare_exchange", (INT, INT, INT), INT)])
+
+    # atomic_load(ref) -> value
+    add([FuncSig("atomic_load", (UINT,), UINT)])
+    add([FuncSig("atomic_load", (INT,), INT)])
+
+    # atomic_store(ref, value) -> void
+    add([FuncSig("atomic_store", (UINT, UINT), VOID)])
+    add([FuncSig("atomic_store", (INT, INT), VOID)])
+
     return table
 
 

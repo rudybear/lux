@@ -8,7 +8,9 @@ from luxc.parser.ast_nodes import (
     TernaryExpr, AssignTarget,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
     StorageImageDecl, StorageBufferDecl, BindlessTextureArrayDecl,
+    SharedDecl,
     DebugPrintStmt, AssertStmt, DebugBlock,
+    ForStmt, WhileStmt, BreakStmt, ContinueStmt,
 )
 from luxc.codegen.spirv_types import TypeRegistry
 from luxc.codegen.glsl_ext import GLSL_STD_450, LUX_TO_GLSL
@@ -162,6 +164,11 @@ class SpvGenerator:
         self.storage_buffer_var_ids: dict[str, str] = {}     # buffer name -> %id
         self.storage_buffer_element_types: dict[str, str] = {} # buffer name -> element type name
 
+        # Shared memory (Workgroup storage class)
+        self.shared_var_ids: dict[str, str] = {}           # shared var name -> %id
+        self.shared_element_types: dict[str, str] = {}     # shared var name -> element type name
+        self.shared_array_sizes: dict[str, int | None] = {} # shared var name -> array size (None for scalar)
+
         # gl_PerVertex output block for vertex shader
         self.per_vertex_var_id: str | None = None
         self.per_vertex_struct_id: str | None = None
@@ -169,6 +176,9 @@ class SpvGenerator:
         # Debug info tracking
         self._debug_source_id: str | None = None
         self._debug_current_line: int = -1  # track last emitted line to avoid redundancy
+
+        # Loop label stack for break/continue
+        self._loop_label_stack: list[tuple[str, str]] = []  # (merge_label, continue_label)
 
         # DebugPrintf extension (NonSemantic.DebugPrintf)
         self._debug_printf_ext_id: str | None = None
@@ -191,6 +201,12 @@ class SpvGenerator:
                 if self._scan_for_debug_stmts(stmt.then_body):
                     return True
                 if self._scan_for_debug_stmts(stmt.else_body):
+                    return True
+            if isinstance(stmt, ForStmt):
+                if self._scan_for_debug_stmts(stmt.body):
+                    return True
+            if isinstance(stmt, WhileStmt):
+                if self._scan_for_debug_stmts(stmt.body):
                     return True
         return False
 
@@ -721,6 +737,30 @@ class SpvGenerator:
                     self.interface_ids.append(var_id)
                     emitted_builtins[spv_builtin] = var_id
 
+        # --- Shared memory variables (Workgroup storage class) ---
+        if self.stage.stage_type == "compute":
+            for sd in getattr(self.stage, 'shared_decls', []):
+                elem_type_id = self.reg.lux_type_to_spirv(sd.type_name)
+                if sd.array_size is not None:
+                    # Fixed-size array: OpTypeArray
+                    arr_type = self._make_array_type(elem_type_id, sd.array_size)
+                    ptr_type = self.reg.pointer("Workgroup", arr_type)
+                    var_id = self.reg.next_id()
+                    self.global_vars.append(f"{var_id} = OpVariable {ptr_type} Workgroup")
+                else:
+                    # Scalar shared variable
+                    ptr_type = self.reg.pointer("Workgroup", elem_type_id)
+                    var_id = self.reg.next_id()
+                    self.global_vars.append(f"{var_id} = OpVariable {ptr_type} Workgroup")
+
+                self.shared_var_ids[sd.name] = var_id
+                self.shared_element_types[sd.name] = sd.type_name
+                self.shared_array_sizes[sd.name] = sd.array_size
+                self.var_map[sd.name] = var_id
+                self.var_types[sd.name] = sd.type_name
+                self.var_storage[sd.name] = "Workgroup"
+                self.interface_ids.append(var_id)
+
         # --- Mesh: Output arrays (gl_MeshPerVertexEXT, PrimitiveTriangleIndicesEXT) ---
         if self.stage.stage_type == "mesh":
             defines = getattr(self.module, '_defines', {})
@@ -947,6 +987,11 @@ class SpvGenerator:
                 self._pre_declare_locals(stmt.else_body)
             elif isinstance(stmt, DebugBlock):
                 self._pre_declare_locals(stmt.body)
+            elif isinstance(stmt, ForStmt):
+                self._alloc_local(stmt.loop_var, stmt.loop_var_type)
+                self._pre_declare_locals(stmt.body)
+            elif isinstance(stmt, WhileStmt):
+                self._pre_declare_locals(stmt.body)
 
     def _emit_debug_line(self, node, lines: list[str]) -> None:
         """Emit OpLine before a statement/expression if debug mode is on and the node has a loc."""
@@ -971,6 +1016,8 @@ class SpvGenerator:
             # Evaluate RHS and store
             val_id, val_lines = self._gen_expr(stmt.value)
             lines.extend(val_lines)
+            # Coerce RHS to declared type if needed (e.g., int -> scalar)
+            val_id = self._coerce_to_type(val_id, stmt.value, stmt.type_name, lines)
             lines.append(f"OpStore {var_id} {val_id}")
 
         elif isinstance(stmt, AssignStmt):
@@ -979,6 +1026,10 @@ class SpvGenerator:
                 target = target.expr
             val_id, val_lines = self._gen_expr(stmt.value)
             lines.extend(val_lines)
+            # Coerce value to target type if needed
+            target_type_name = self._resolve_store_target_type(target)
+            if target_type_name:
+                val_id = self._coerce_to_type(val_id, stmt.value, target_type_name, lines)
             ptr_id, ptr_lines = self._gen_store_target(target)
             lines.extend(ptr_lines)
             lines.append(f"OpStore {ptr_id} {val_id}")
@@ -1024,6 +1075,104 @@ class SpvGenerator:
             # Flatten: emit body statements inline
             for s in stmt.body:
                 lines.extend(self._gen_stmt(s))
+
+        elif isinstance(stmt, ForStmt):
+            # Store initial value
+            var_id = self.local_vars[stmt.loop_var]
+            init_id, init_lines = self._gen_expr(stmt.init_value)
+            lines.extend(init_lines)
+            # Coerce init value to loop var type if needed
+            init_id = self._coerce_to_type(init_id, stmt.init_value, stmt.loop_var_type, lines)
+            lines.append(f"OpStore {var_id} {init_id}")
+
+            header_label = self._next_label()
+            body_label = self._next_label()
+            continue_label = self._next_label()
+            merge_label = self._next_label()
+
+            lines.append(f"OpBranch {header_label}")
+            lines.append(f"{header_label} = OpLabel")
+
+            # Condition (must come before OpLoopMerge)
+            cond_id, cond_lines = self._gen_expr(stmt.condition)
+            lines.extend(cond_lines)
+
+            # Loop merge with optional unroll (must immediately precede branch)
+            unroll_ctrl = "Unroll" if stmt.unroll else "None"
+            lines.append(f"OpLoopMerge {merge_label} {continue_label} {unroll_ctrl}")
+            lines.append(f"OpBranchConditional {cond_id} {body_label} {merge_label}")
+
+            # Body
+            lines.append(f"{body_label} = OpLabel")
+            self._loop_label_stack.append((merge_label, continue_label))
+            for s in stmt.body:
+                lines.extend(self._gen_stmt(s))
+            self._loop_label_stack.pop()
+            lines.append(f"OpBranch {continue_label}")
+
+            # Continue block (update)
+            lines.append(f"{continue_label} = OpLabel")
+            update_val_id, update_lines = self._gen_expr(stmt.update_value)
+            lines.extend(update_lines)
+            # Coerce update value to loop var type
+            update_val_id = self._coerce_to_type(update_val_id, stmt.update_value, stmt.loop_var_type, lines)
+            target = stmt.update_target
+            if isinstance(target, AssignTarget):
+                target = target.expr
+            if isinstance(target, VarRef) and target.name in self.local_vars:
+                lines.append(f"OpStore {self.local_vars[target.name]} {update_val_id}")
+            else:
+                ptr_id, ptr_lines = self._gen_store_target(target)
+                lines.extend(ptr_lines)
+                lines.append(f"OpStore {ptr_id} {update_val_id}")
+            lines.append(f"OpBranch {header_label}")
+
+            # Merge
+            lines.append(f"{merge_label} = OpLabel")
+
+        elif isinstance(stmt, WhileStmt):
+            header_label = self._next_label()
+            body_label = self._next_label()
+            continue_label = self._next_label()
+            merge_label = self._next_label()
+
+            lines.append(f"OpBranch {header_label}")
+            lines.append(f"{header_label} = OpLabel")
+
+            # Condition (must come before OpLoopMerge)
+            cond_id, cond_lines = self._gen_expr(stmt.condition)
+            lines.extend(cond_lines)
+
+            unroll_ctrl = "Unroll" if stmt.unroll else "None"
+            lines.append(f"OpLoopMerge {merge_label} {continue_label} {unroll_ctrl}")
+            lines.append(f"OpBranchConditional {cond_id} {body_label} {merge_label}")
+
+            lines.append(f"{body_label} = OpLabel")
+            self._loop_label_stack.append((merge_label, continue_label))
+            for s in stmt.body:
+                lines.extend(self._gen_stmt(s))
+            self._loop_label_stack.pop()
+            lines.append(f"OpBranch {continue_label}")
+
+            lines.append(f"{continue_label} = OpLabel")
+            lines.append(f"OpBranch {header_label}")
+
+            lines.append(f"{merge_label} = OpLabel")
+
+        elif isinstance(stmt, BreakStmt):
+            if self._loop_label_stack:
+                merge_label, _ = self._loop_label_stack[-1]
+                lines.append(f"OpBranch {merge_label}")
+                # Dead code label (SPIR-V requires a block after branch)
+                dead_label = self._next_label()
+                lines.append(f"{dead_label} = OpLabel")
+
+        elif isinstance(stmt, ContinueStmt):
+            if self._loop_label_stack:
+                _, continue_label = self._loop_label_stack[-1]
+                lines.append(f"OpBranch {continue_label}")
+                dead_label = self._next_label()
+                lines.append(f"{dead_label} = OpLabel")
 
         return lines
 
@@ -1132,6 +1281,26 @@ class SpvGenerator:
             return self._gen_store_target(target.object)
 
         elif isinstance(target, IndexAccess):
+            # Check for shared memory array store: shared_arr[index] = value
+            if isinstance(target.object, VarRef) and target.object.name in self.shared_var_ids:
+                name = target.object.name
+                if self.shared_array_sizes.get(name) is not None:
+                    elem_type_name = self.shared_element_types[name]
+                    elem_type_id = self.reg.lux_type_to_spirv(elem_type_name)
+                    var_id = self.shared_var_ids[name]
+                    idx_id, idx_lines = self._gen_expr(target.index)
+                    lines.extend(idx_lines)
+                    idx_lux_type = self._resolve_expr_lux_type(target.index)
+                    if idx_lux_type in ("scalar",):
+                        int_type = self.reg.int32()
+                        conv = self.reg.next_id()
+                        lines.append(f"{conv} = OpConvertFToS {int_type} {idx_id}")
+                        idx_id = conv
+                    ptr_elem = self.reg.pointer("Workgroup", elem_type_id)
+                    ac_id = self.reg.next_id()
+                    lines.append(f"{ac_id} = OpAccessChain {ptr_elem} {var_id} {idx_id}")
+                    return ac_id, lines
+
             # Check for storage buffer indexed store: buffer[index] = value
             if isinstance(target.object, VarRef) and target.object.name in self.storage_buffer_var_ids:
                 name = target.object.name
@@ -1222,10 +1391,14 @@ class SpvGenerator:
 
         if isinstance(expr, NumberLit):
             val = expr.value
+            resolved = getattr(expr, 'resolved_type', None)
+            if resolved == "int":
+                return self.reg.const_int(int(float(val)), signed=True), lines
+            if resolved == "uint":
+                return self.reg.const_uint(int(float(val))), lines
             if "." in val or "e" in val.lower():
                 result = self.reg.const_float(float(val))
             else:
-                # Integer literal, but in Lux v1 we treat all as float
                 result = self.reg.const_float(float(val))
             return result, lines
 
@@ -1301,8 +1474,11 @@ class SpvGenerator:
             lines.append(f"{result} = OpLoad {type_id} {self.local_vars[name]}")
             return result, lines
 
-        # Check global vars (inputs/outputs) - skip storage buffers (accessed via index)
+        # Check global vars (inputs/outputs) - skip storage buffers and shared arrays (accessed via index)
         if name in self.var_map:
+            if name in self.shared_var_ids and self.shared_array_sizes.get(name) is not None:
+                # Shared arrays must be accessed via indexing, not direct load
+                return self.var_map[name], lines
             if name in self.storage_buffer_var_ids:
                 # Storage buffers must be accessed via indexing, not direct load.
                 # Return the variable pointer so IndexAccess can use it.
@@ -1337,11 +1513,29 @@ class SpvGenerator:
         if op in ("==", "!=", "<", ">", "<=", ">="):
             bool_type = self.reg.bool_type()
 
-            # Convert int/uint operands to float for float comparison ops
             lt_type_obj = resolve_type(resolve_alias_chain(lt))
             rt_type_obj = resolve_type(resolve_alias_chain(rt))
             def _is_int_scalar(t):
                 return isinstance(t, ScalarType) and t.name in ("int", "uint")
+
+            both_int = _is_int_scalar(lt_type_obj) and _is_int_scalar(rt_type_obj)
+
+            if both_int:
+                # Integer comparisons
+                either_signed = (lt_type_obj.name == "int" or rt_type_obj.name == "int")
+                int_cmp_ops = {
+                    "==": "OpIEqual", "!=": "OpINotEqual",
+                }
+                if either_signed:
+                    int_cmp_ops.update({"<": "OpSLessThan", ">": "OpSGreaterThan",
+                                        "<=": "OpSLessThanEqual", ">=": "OpSGreaterThanEqual"})
+                else:
+                    int_cmp_ops.update({"<": "OpULessThan", ">": "OpUGreaterThan",
+                                        "<=": "OpULessThanEqual", ">=": "OpUGreaterThanEqual"})
+                lines.append(f"{result} = {int_cmp_ops[op]} {bool_type} {left_id} {right_id}")
+                return result, lines
+
+            # Convert int/uint operands to float for float comparison ops
             if _is_int_scalar(lt_type_obj):
                 conv_id = self.reg.next_id()
                 conv_op = "OpConvertSToF" if lt_type_obj.name == "int" else "OpConvertUToF"
@@ -1415,23 +1609,25 @@ class SpvGenerator:
                 return True
             return False
 
-        if _is_int_type(lt_type) and (_is_float_type(rt_type) or not _is_int_type(rt_type)):
-            conv_id = self.reg.next_id()
-            conv_type = self.reg.float32()
-            conv_op = "OpConvertSToF" if (isinstance(lt_type, ScalarType) and lt_type.name == "int") or (isinstance(lt_type, VectorType) and lt_type.component == "int") else "OpConvertUToF"
-            lines.append(f"{conv_id} = {conv_op} {conv_type} {left_id}")
-            left_id = conv_id
-            lt_type = resolve_type("scalar")
-            lt_resolved = "scalar"
+        both_int = _is_int_type(lt_type) and _is_int_type(rt_type)
+        if not both_int:
+            if _is_int_type(lt_type) and (_is_float_type(rt_type) or not _is_int_type(rt_type)):
+                conv_id = self.reg.next_id()
+                conv_type = self.reg.float32()
+                conv_op = "OpConvertSToF" if (isinstance(lt_type, ScalarType) and lt_type.name == "int") or (isinstance(lt_type, VectorType) and lt_type.component == "int") else "OpConvertUToF"
+                lines.append(f"{conv_id} = {conv_op} {conv_type} {left_id}")
+                left_id = conv_id
+                lt_type = resolve_type("scalar")
+                lt_resolved = "scalar"
 
-        if _is_int_type(rt_type) and (_is_float_type(lt_type) or not _is_int_type(lt_type)):
-            conv_id = self.reg.next_id()
-            conv_type = self.reg.float32()
-            conv_op = "OpConvertSToF" if (isinstance(rt_type, ScalarType) and rt_type.name == "int") or (isinstance(rt_type, VectorType) and rt_type.component == "int") else "OpConvertUToF"
-            lines.append(f"{conv_id} = {conv_op} {conv_type} {right_id}")
-            right_id = conv_id
-            rt_type = resolve_type("scalar")
-            rt_resolved = "scalar"
+            if _is_int_type(rt_type) and (_is_float_type(lt_type) or not _is_int_type(lt_type)):
+                conv_id = self.reg.next_id()
+                conv_type = self.reg.float32()
+                conv_op = "OpConvertSToF" if (isinstance(rt_type, ScalarType) and rt_type.name == "int") or (isinstance(rt_type, VectorType) and rt_type.component == "int") else "OpConvertUToF"
+                lines.append(f"{conv_id} = {conv_op} {conv_type} {right_id}")
+                right_id = conv_id
+                rt_type = resolve_type("scalar")
+                rt_resolved = "scalar"
 
         if op in ("+", "-", "/", "%"):
             if isinstance(lt_type, VectorType) and isinstance(rt_type, ScalarType):
@@ -1462,15 +1658,35 @@ class SpvGenerator:
         lt_type = resolve_type(resolve_alias_chain(lt))
         rt_type = resolve_type(resolve_alias_chain(rt))
 
+        # Check if both operands are integer types
+        def _both_int(lt_t, rt_t):
+            if isinstance(lt_t, ScalarType) and isinstance(rt_t, ScalarType):
+                return lt_t.name in ("int", "uint") and rt_t.name in ("int", "uint")
+            return False
+
+        bi = _both_int(lt_type, rt_type)
+
         if op == "+":
-            return "OpFAdd"
+            return "OpIAdd" if bi else "OpFAdd"
         elif op == "-":
-            return "OpFSub"
+            return "OpISub" if bi else "OpFSub"
         elif op == "/":
+            if bi:
+                if (isinstance(lt_type, ScalarType) and lt_type.name == "int") or \
+                   (isinstance(rt_type, ScalarType) and rt_type.name == "int"):
+                    return "OpSDiv"
+                return "OpUDiv"
             return "OpFDiv"
         elif op == "%":
+            if bi:
+                if (isinstance(lt_type, ScalarType) and lt_type.name == "int") or \
+                   (isinstance(rt_type, ScalarType) and rt_type.name == "int"):
+                    return "OpSMod"
+                return "OpUMod"
             return "OpFMod"
         elif op == "*":
+            if bi:
+                return "OpIMul"
             # Matrix * Vector
             if isinstance(lt_type, MatrixType) and isinstance(rt_type, VectorType):
                 return "OpMatrixTimesVector"
@@ -1500,10 +1716,39 @@ class SpvGenerator:
         result_type = self.reg.lux_type_to_spirv(expr.resolved_type)
         result = self.reg.next_id()
         if expr.op == "-":
-            lines.append(f"{result} = OpFNegate {result_type} {operand_id}")
+            operand_type = self._resolve_expr_lux_type(expr.operand)
+            if operand_type in ("int", "uint"):
+                lines.append(f"{result} = OpSNegate {result_type} {operand_id}")
+            else:
+                lines.append(f"{result} = OpFNegate {result_type} {operand_id}")
         elif expr.op == "!":
             lines.append(f"{result} = OpLogicalNot {result_type} {operand_id}")
         return result, lines
+
+    def _coerce_to_type(self, val_id: str, expr, target_type_name: str, lines: list[str]) -> str:
+        """Coerce a value to the target type if needed (e.g., float literal -> int)."""
+        src_type = self._resolve_expr_lux_type(expr)
+        if target_type_name in ("int", "uint") and src_type == "scalar":
+            # Float -> int/uint
+            if isinstance(expr, NumberLit) and "." not in expr.value and "e" not in expr.value.lower():
+                # Integer literal stored as float constant -- re-emit as int constant
+                int_val = int(expr.value)
+                if target_type_name == "int":
+                    return self.reg.const_int(int_val, signed=True)
+                else:
+                    return self.reg.const_uint(int_val)
+            int_type = self.reg.int32() if target_type_name == "int" else self.reg.uint32()
+            conv = self.reg.next_id()
+            conv_op = "OpConvertFToS" if target_type_name == "int" else "OpConvertFToU"
+            lines.append(f"{conv} = {conv_op} {int_type} {val_id}")
+            return conv
+        if target_type_name == "scalar" and src_type in ("int", "uint"):
+            float_type = self.reg.float32()
+            conv = self.reg.next_id()
+            conv_op = "OpConvertSToF" if src_type == "int" else "OpConvertUToF"
+            lines.append(f"{conv} = {conv_op} {float_type} {val_id}")
+            return conv
+        return val_id
 
     def _resolve_sampler_types(self, sam_type: str) -> tuple[str, str]:
         """Return (image_type, sampled_image_type) for a given sampler type name."""
@@ -1521,6 +1766,16 @@ class SpvGenerator:
             raise ValueError("Non-simple function calls not supported")
 
         fname = expr.func.name
+
+        # --- Atomic operations ---
+        _ATOMIC_FUNCS = {
+            "atomic_add", "atomic_min", "atomic_max",
+            "atomic_and", "atomic_or", "atomic_xor",
+            "atomic_exchange", "atomic_compare_exchange",
+            "atomic_load", "atomic_store",
+        }
+        if fname in _ATOMIC_FUNCS:
+            return self._gen_atomic_call(fname, expr, lines)
 
         # sample(tex, uv) — handle before general arg generation since tex
         # is not a loadable variable (it's split into sampler + texture)
@@ -2203,6 +2458,33 @@ class SpvGenerator:
         return result, lines
 
     def _gen_index_access(self, expr: IndexAccess, lines: list[str]) -> tuple[str, list[str]]:
+        # Check for shared memory array access: shared_arr[index]
+        if isinstance(expr.object, VarRef) and expr.object.name in self.shared_var_ids:
+            name = expr.object.name
+            if self.shared_array_sizes.get(name) is not None:
+                # It's a shared array — OpAccessChain into Workgroup array
+                elem_type_name = self.shared_element_types[name]
+                elem_type_id = self.reg.lux_type_to_spirv(elem_type_name)
+                var_id = self.shared_var_ids[name]
+
+                idx_id, idx_lines = self._gen_expr(expr.index)
+                lines.extend(idx_lines)
+
+                # Convert index to int if float
+                idx_lux_type = self._resolve_expr_lux_type(expr.index)
+                if idx_lux_type in ("scalar",):
+                    int_type = self.reg.int32()
+                    conv = self.reg.next_id()
+                    lines.append(f"{conv} = OpConvertFToS {int_type} {idx_id}")
+                    idx_id = conv
+
+                ptr_elem = self.reg.pointer("Workgroup", elem_type_id)
+                ac_id = self.reg.next_id()
+                lines.append(f"{ac_id} = OpAccessChain {ptr_elem} {var_id} {idx_id}")
+                result = self.reg.next_id()
+                lines.append(f"{result} = OpLoad {elem_type_id} {ac_id}")
+                return result, lines
+
         # Check for storage buffer access: buffer[index]
         if isinstance(expr.object, VarRef) and expr.object.name in self.storage_buffer_var_ids:
             buf_name = expr.object.name
@@ -2260,6 +2542,213 @@ class SpvGenerator:
 
     def _resolve_expr_type_name(self, expr) -> str:
         return self._resolve_expr_lux_type(expr)
+
+    def _resolve_store_target_type(self, target) -> str | None:
+        """Resolve the lux type name for a store target (variable)."""
+        if isinstance(target, VarRef):
+            name = target.name
+            if name in self.local_types:
+                return self.local_types[name]
+            if name in self.var_types:
+                return self.var_types[name]
+        elif isinstance(target, IndexAccess) and isinstance(target.object, VarRef):
+            name = target.object.name
+            if name in self.shared_element_types:
+                return self.shared_element_types[name]
+            if name in self.storage_buffer_element_types:
+                return self.storage_buffer_element_types[name]
+        return None
+
+    def _coerce_store_value(self, target, value_expr, val_id: str, lines: list[str]) -> str:
+        """Coerce a store value to match the target type (e.g., float -> uint for shared/SSBO)."""
+        val_type = self._resolve_expr_lux_type(value_expr)
+        if val_type not in ("scalar",):
+            return val_id  # No coercion needed if not float
+
+        # Determine target element type
+        target_type_name = None
+        if isinstance(target, IndexAccess) and isinstance(target.object, VarRef):
+            name = target.object.name
+            if name in self.shared_element_types:
+                target_type_name = self.shared_element_types[name]
+            elif name in self.storage_buffer_element_types:
+                target_type_name = self.storage_buffer_element_types[name]
+        elif isinstance(target, VarRef):
+            name = target.name
+            if name in self.shared_element_types:
+                target_type_name = self.shared_element_types[name]
+
+        if target_type_name in ("uint", "int"):
+            target_type_id = self.reg.lux_type_to_spirv(target_type_name)
+            conv = self.reg.next_id()
+            conv_op = "OpConvertFToU" if target_type_name == "uint" else "OpConvertFToS"
+            lines.append(f"{conv} = {conv_op} {target_type_id} {val_id}")
+            return conv
+
+        return val_id
+
+    # --- Atomic operations codegen ---
+
+    def _gen_atomic_call(self, fname: str, expr: CallExpr, lines: list[str]) -> tuple[str, list[str]]:
+        """Generate SPIR-V for atomic operations on shared memory or SSBOs."""
+        # First arg is the memory location — need pointer, not value
+        first_arg = expr.args[0]
+        ptr_id, ptr_lines = self._gen_atomic_pointer(first_arg)
+        lines.extend(ptr_lines)
+
+        # Determine scope and semantics
+        is_shared = self._is_shared_ref(first_arg)
+        scope_const = self.reg.const_uint(2) if is_shared else self.reg.const_uint(1)  # Workgroup=2, Device=1
+        semantics_const = self.reg.const_uint(0x108)  # AcquireRelease | WorkgroupMemory
+
+        # Determine result type from the element type
+        elem_type_name = self._resolve_atomic_element_type(first_arg)
+        elem_type_id = self.reg.lux_type_to_spirv(elem_type_name)
+
+        # Load remaining args normally
+        remaining_arg_ids = []
+        for arg in expr.args[1:]:
+            aid, alines = self._gen_expr(arg)
+            lines.extend(alines)
+            # Coerce float literals to int/uint if element type is integer
+            if elem_type_name in ("int", "uint") and self._resolve_expr_lux_type(arg) == "scalar":
+                if isinstance(arg, NumberLit) and "." not in arg.value:
+                    if elem_type_name == "uint":
+                        aid = self.reg.const_uint(int(arg.value))
+                    else:
+                        aid = self.reg.const_int(int(arg.value), signed=True)
+                else:
+                    conv_type = self.reg.uint32() if elem_type_name == "uint" else self.reg.int32()
+                    conv = self.reg.next_id()
+                    conv_op = "OpConvertFToU" if elem_type_name == "uint" else "OpConvertFToS"
+                    lines.append(f"{conv} = {conv_op} {conv_type} {aid}")
+                    aid = conv
+            remaining_arg_ids.append(aid)
+
+        result = self.reg.next_id()
+
+        if fname == "atomic_add":
+            lines.append(f"{result} = OpAtomicIAdd {elem_type_id} {ptr_id} {scope_const} {semantics_const} {remaining_arg_ids[0]}")
+            return result, lines
+
+        if fname == "atomic_min":
+            op = "OpAtomicSMin" if elem_type_name == "int" else "OpAtomicUMin"
+            lines.append(f"{result} = {op} {elem_type_id} {ptr_id} {scope_const} {semantics_const} {remaining_arg_ids[0]}")
+            return result, lines
+
+        if fname == "atomic_max":
+            op = "OpAtomicSMax" if elem_type_name == "int" else "OpAtomicUMax"
+            lines.append(f"{result} = {op} {elem_type_id} {ptr_id} {scope_const} {semantics_const} {remaining_arg_ids[0]}")
+            return result, lines
+
+        if fname in ("atomic_and", "atomic_or", "atomic_xor"):
+            _ATOMIC_OP_MAP = {
+                "atomic_and": "OpAtomicAnd",
+                "atomic_or": "OpAtomicOr",
+                "atomic_xor": "OpAtomicXor",
+            }
+            op = _ATOMIC_OP_MAP[fname]
+            lines.append(f"{result} = {op} {elem_type_id} {ptr_id} {scope_const} {semantics_const} {remaining_arg_ids[0]}")
+            return result, lines
+
+        if fname == "atomic_exchange":
+            lines.append(f"{result} = OpAtomicExchange {elem_type_id} {ptr_id} {scope_const} {semantics_const} {remaining_arg_ids[0]}")
+            return result, lines
+
+        if fname == "atomic_compare_exchange":
+            # OpAtomicCompareExchange result_type pointer scope equal_semantics unequal_semantics value comparator
+            # Note: SPIR-V order is (value, comparator) but Lux order is (ref, comparator, value)
+            semantics_neq = self.reg.const_uint(0)  # Relaxed for unequal
+            lines.append(f"{result} = OpAtomicCompareExchange {elem_type_id} {ptr_id} {scope_const} {semantics_const} {semantics_neq} {remaining_arg_ids[1]} {remaining_arg_ids[0]}")
+            return result, lines
+
+        if fname == "atomic_load":
+            lines.append(f"{result} = OpAtomicLoad {elem_type_id} {ptr_id} {scope_const} {semantics_const}")
+            return result, lines
+
+        if fname == "atomic_store":
+            # OpAtomicStore is void
+            lines.append(f"OpAtomicStore {ptr_id} {scope_const} {semantics_const} {remaining_arg_ids[0]}")
+            result = self.reg.const_float(0.0)  # void return placeholder
+            return result, lines
+
+        raise ValueError(f"Unknown atomic function: {fname}")
+
+    def _gen_atomic_pointer(self, expr) -> tuple[str, list[str]]:
+        """Generate a pointer to the atomic target (shared var, shared array element, SSBO element)."""
+        lines = []
+
+        if isinstance(expr, IndexAccess):
+            # shared_arr[idx] or ssbo[idx]
+            if isinstance(expr.object, VarRef):
+                name = expr.object.name
+
+                # Shared array
+                if name in self.shared_var_ids and self.shared_array_sizes.get(name) is not None:
+                    elem_type_name = self.shared_element_types[name]
+                    elem_type_id = self.reg.lux_type_to_spirv(elem_type_name)
+                    var_id = self.shared_var_ids[name]
+                    idx_id, idx_lines = self._gen_expr(expr.index)
+                    lines.extend(idx_lines)
+                    idx_lux_type = self._resolve_expr_lux_type(expr.index)
+                    if idx_lux_type in ("scalar",):
+                        int_type = self.reg.int32()
+                        conv = self.reg.next_id()
+                        lines.append(f"{conv} = OpConvertFToS {int_type} {idx_id}")
+                        idx_id = conv
+                    ptr_elem = self.reg.pointer("Workgroup", elem_type_id)
+                    ac_id = self.reg.next_id()
+                    lines.append(f"{ac_id} = OpAccessChain {ptr_elem} {var_id} {idx_id}")
+                    return ac_id, lines
+
+                # SSBO
+                if name in self.storage_buffer_var_ids:
+                    buf_var_id = self.storage_buffer_var_ids[name]
+                    elem_type_name = self.storage_buffer_element_types[name]
+                    elem_type_id = self.reg.lux_type_to_spirv(elem_type_name)
+                    idx_id, idx_lines = self._gen_expr(expr.index)
+                    lines.extend(idx_lines)
+                    idx_lux_type = self._resolve_expr_lux_type(expr.index)
+                    if idx_lux_type in ("scalar",):
+                        int_type = self.reg.int32()
+                        conv = self.reg.next_id()
+                        lines.append(f"{conv} = OpConvertFToS {int_type} {idx_id}")
+                        idx_id = conv
+                    ptr_elem = self.reg.pointer("StorageBuffer", elem_type_id)
+                    const_0 = self.reg.const_int(0, signed=True)
+                    ac_id = self.reg.next_id()
+                    lines.append(f"{ac_id} = OpAccessChain {ptr_elem} {buf_var_id} {const_0} {idx_id}")
+                    return ac_id, lines
+
+        elif isinstance(expr, VarRef):
+            name = expr.name
+            # Shared scalar variable — just return its pointer
+            if name in self.shared_var_ids and self.shared_array_sizes.get(name) is None:
+                return self.shared_var_ids[name], lines
+
+        raise ValueError(f"Cannot generate atomic pointer for expression: {type(expr).__name__}")
+
+    def _is_shared_ref(self, expr) -> bool:
+        """Check if an expression references shared memory."""
+        if isinstance(expr, VarRef):
+            return expr.name in self.shared_var_ids
+        if isinstance(expr, IndexAccess) and isinstance(expr.object, VarRef):
+            return expr.object.name in self.shared_var_ids
+        return False
+
+    def _resolve_atomic_element_type(self, expr) -> str:
+        """Determine the element type for an atomic operation's target."""
+        if isinstance(expr, VarRef):
+            name = expr.name
+            if name in self.shared_element_types:
+                return self.shared_element_types[name]
+        if isinstance(expr, IndexAccess) and isinstance(expr.object, VarRef):
+            name = expr.object.name
+            if name in self.shared_element_types:
+                return self.shared_element_types[name]
+            if name in self.storage_buffer_element_types:
+                return self.storage_buffer_element_types[name]
+        return "uint"  # default
 
 
 def _swizzle_index(c: str) -> int:

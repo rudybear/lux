@@ -1,0 +1,28 @@
+// Per-workgroup histogram using shared memory and atomics
+// Compile: luxc compute_histogram.lux --define workgroup_size=256
+
+compute {
+    storage_buffer input_data: uint;
+    storage_buffer output_histogram: uint;
+    shared histogram: uint[256];
+
+    fn main() {
+        let tid: uint = local_invocation_index;
+        let gid: uvec3 = global_invocation_id;
+
+        // Clear shared histogram
+        histogram[tid] = 0;
+        barrier();
+
+        // Bin input value into local histogram
+        let value: uint = input_data[gid.x];
+        let bin: uint = value;
+        let old: uint = atomic_add(histogram[bin], 1);
+
+        barrier();
+
+        // Write local histogram to global output
+        let count: uint = histogram[tid];
+        let prev: uint = atomic_add(output_histogram[tid], count);
+    }
+}

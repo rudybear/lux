@@ -8,13 +8,15 @@ from luxc.parser.ast_nodes import (
     TernaryExpr, AssignTarget,
     TypeAlias, ImportDecl, SurfaceDecl, GeometryDecl, PipelineDecl,
     DebugPrintStmt, AssertStmt, DebugBlock,
+    ForStmt, WhileStmt, BreakStmt, ContinueStmt,
+    SharedDecl,
 )
 from luxc.builtins.types import (
     LuxType, resolve_type, TYPE_MAP, SCALAR, BOOL, VOID,
     VEC2, VEC3, VEC4, MAT2, MAT3, MAT4,
     VectorType, MatrixType, ScalarType, BoolType, is_numeric,
     register_type_alias, clear_type_aliases,
-    RuntimeArrayType,
+    RuntimeArrayType, FixedArrayType,
 )
 from luxc.builtins.functions import lookup_builtin
 from luxc.analysis.symbols import Scope, Symbol
@@ -83,6 +85,7 @@ class TypeChecker:
         self.global_scope = Scope()
         self.current_scope: Scope = self.global_scope
         self.current_stage: StageBlock | None = None
+        self._loop_depth: int = 0
         self._register_type_aliases()
         self._register_constants()
 
@@ -247,6 +250,19 @@ class TypeChecker:
             if t is not None:
                 scope.define(Symbol(tp.name, t, "task_payload"))
 
+        # Register shared memory variables (only valid in compute stages)
+        for sd in getattr(stage, 'shared_decls', []):
+            if stage.stage_type != "compute":
+                raise TypeCheckError(f"'shared' variables only allowed in compute stages, not '{stage.stage_type}'")
+            if sd.array_size is not None:
+                arr_type = FixedArrayType(f"_shared_arr_{sd.type_name}_{sd.array_size}", sd.type_name, sd.array_size)
+                scope.define(Symbol(sd.name, arr_type, "shared"))
+            else:
+                t = resolve_type(sd.type_name)
+                if t is None:
+                    raise TypeCheckError(f"Unknown type '{sd.type_name}' in shared declaration '{sd.name}'")
+                scope.define(Symbol(sd.name, t, "shared"))
+
         for fn in stage.functions:
             self._check_function(fn, scope)
 
@@ -320,6 +336,42 @@ class TypeChecker:
             for s in stmt.body:
                 self._check_stmt(s, scope, ret_type)
 
+        elif isinstance(stmt, ForStmt):
+            # Create child scope for loop variable
+            loop_scope = scope.child()
+            t = resolve_type(stmt.loop_var_type)
+            if t is None:
+                raise TypeCheckError(f"Unknown type '{stmt.loop_var_type}'")
+            # Check init value type
+            init_t = self._check_expr(stmt.init_value, scope)
+            if init_t.name != t.name and not _implicit_convert(init_t, t):
+                raise TypeCheckError(f"Type mismatch in for loop init: expected {t.name}, got {init_t.name}")
+            loop_scope.define(Symbol(stmt.loop_var, t, "variable"))
+            # Check condition (should be bool)
+            self._check_expr(stmt.condition, loop_scope)
+            # Check update expression
+            self._check_expr(stmt.update_value, loop_scope)
+            # Check body
+            self._loop_depth += 1
+            for s in stmt.body:
+                self._check_stmt(s, loop_scope, ret_type)
+            self._loop_depth -= 1
+
+        elif isinstance(stmt, WhileStmt):
+            self._check_expr(stmt.condition, scope)
+            self._loop_depth += 1
+            for s in stmt.body:
+                self._check_stmt(s, scope, ret_type)
+            self._loop_depth -= 1
+
+        elif isinstance(stmt, BreakStmt):
+            if self._loop_depth == 0:
+                raise TypeCheckError("'break' used outside of a loop")
+
+        elif isinstance(stmt, ContinueStmt):
+            if self._loop_depth == 0:
+                raise TypeCheckError("'continue' used outside of a loop")
+
     def _check_assign_target(self, target, scope: Scope) -> LuxType:
         if isinstance(target, AssignTarget):
             return self._check_expr(target.expr, scope)
@@ -346,6 +398,16 @@ class TypeChecker:
         elif isinstance(expr, BinaryOp):
             lt = self._check_expr(expr.left, scope)
             rt = self._check_expr(expr.right, scope)
+            # Promote integer-looking NumberLit to int when paired with int/uint
+            _int_names = {"int", "uint"}
+            if isinstance(lt, ScalarType) and lt.name in _int_names and isinstance(expr.right, NumberLit):
+                if "." not in expr.right.value and "e" not in expr.right.value.lower():
+                    expr.right.resolved_type = lt.name
+                    rt = lt
+            if isinstance(rt, ScalarType) and rt.name in _int_names and isinstance(expr.left, NumberLit):
+                if "." not in expr.left.value and "e" not in expr.left.value.lower():
+                    expr.left.resolved_type = rt.name
+                    lt = rt
             result = _check_binary_op(expr.op, lt, rt)
             expr.resolved_type = result.name
             return result
@@ -453,6 +515,13 @@ class TypeChecker:
         elif isinstance(expr, IndexAccess):
             obj_type = self._check_expr(expr.object, scope)
             self._check_expr(expr.index, scope)
+            # shared array[N] indexing -> element type
+            if isinstance(obj_type, FixedArrayType):
+                result = resolve_type(obj_type.element_type_name)
+                if result is None:
+                    result = SCALAR
+                expr.resolved_type = result.name
+                return result
             # storage_buffer[i] -> element_type
             if isinstance(obj_type, RuntimeArrayType):
                 result = resolve_type(obj_type.element_type_name)
@@ -596,6 +665,11 @@ def _check_binary_op(op: str, left: LuxType, right: LuxType) -> LuxType:
 
 def _implicit_convert(from_type: LuxType, to_type: LuxType) -> bool:
     from luxc.builtins.types import SemanticType, unwrap_semantic_type
+    # Allow scalar <-> int/uint conversions (numeric promotion)
+    if isinstance(from_type, ScalarType) and isinstance(to_type, ScalarType):
+        numeric_set = {"scalar", "int", "uint"}
+        if from_type.name in numeric_set and to_type.name in numeric_set:
+            return True
     # SemanticType("A") -> its base type: OK (implicit unwrap)
     if isinstance(from_type, SemanticType) and not isinstance(to_type, SemanticType):
         return from_type.base_type.name == to_type.name

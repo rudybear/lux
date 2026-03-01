@@ -1,0 +1,89 @@
+// Parallel sum reduction using shared memory
+// Compile: luxc compute_reduction.lux --define workgroup_size=256
+
+compute {
+    storage_buffer input_data: uint;
+    storage_buffer output_data: uint;
+    shared scratch: uint[256];
+
+    fn main() {
+        let tid: uint = local_invocation_index;
+        let gid: uvec3 = global_invocation_id;
+
+        // Load input into shared memory
+        scratch[tid] = input_data[gid.x];
+        barrier();
+
+        // Tree reduction (manually unrolled steps)
+        // Step 1: stride 128
+        let half: uint = 128;
+        if (tid < half) {
+            let a: uint = scratch[tid];
+            let b: uint = scratch[tid + half];
+            scratch[tid] = a + b;
+        }
+        barrier();
+
+        // Step 2: stride 64
+        if (tid < 64) {
+            let a: uint = scratch[tid];
+            let b: uint = scratch[tid + 64];
+            scratch[tid] = a + b;
+        }
+        barrier();
+
+        // Step 3: stride 32
+        if (tid < 32) {
+            let a: uint = scratch[tid];
+            let b: uint = scratch[tid + 32];
+            scratch[tid] = a + b;
+        }
+        barrier();
+
+        // Step 4: stride 16
+        if (tid < 16) {
+            let a: uint = scratch[tid];
+            let b: uint = scratch[tid + 16];
+            scratch[tid] = a + b;
+        }
+        barrier();
+
+        // Step 5: stride 8
+        if (tid < 8) {
+            let a: uint = scratch[tid];
+            let b: uint = scratch[tid + 8];
+            scratch[tid] = a + b;
+        }
+        barrier();
+
+        // Step 6: stride 4
+        if (tid < 4) {
+            let a: uint = scratch[tid];
+            let b: uint = scratch[tid + 4];
+            scratch[tid] = a + b;
+        }
+        barrier();
+
+        // Step 7: stride 2
+        if (tid < 2) {
+            let a: uint = scratch[tid];
+            let b: uint = scratch[tid + 2];
+            scratch[tid] = a + b;
+        }
+        barrier();
+
+        // Step 8: stride 1
+        if (tid < 1) {
+            let a: uint = scratch[tid];
+            let b: uint = scratch[tid + 1];
+            scratch[tid] = a + b;
+        }
+        barrier();
+
+        // Thread 0 writes final result
+        if (tid < 1) {
+            let wg_id: uvec3 = workgroup_id;
+            output_data[wg_id.x] = scratch[0];
+        }
+    }
+}

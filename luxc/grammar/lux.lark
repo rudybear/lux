@@ -123,6 +123,7 @@ STAGE_TYPE: "vertex" | "fragment" | "compute" | "raygen" | "closest_hit" | "any_
            | storage_buffer_decl
            | mesh_output_decl
            | task_payload_decl
+           | shared_decl
 
 in_decl: "in" IDENT ":" type ";"
 out_decl: "out" IDENT ":" type ";"
@@ -147,6 +148,9 @@ storage_buffer_decl: "storage_buffer" IDENT ":" type ";"
 mesh_output_decl: "mesh_output" IDENT "{" block_field ("," block_field)* ","? "}"
 task_payload_decl: "task_payload" IDENT ":" type ";"
 
+// Shared memory (compute shader workgroup-local)
+shared_decl: "shared" IDENT ":" type ";"
+
 // --- Functions ---
 
 function_def: attribute* "fn" IDENT "(" param_list? ")" ("->" type)? "{" statement* "}"
@@ -161,6 +165,10 @@ param: IDENT ":" type
           | assign_stmt
           | return_stmt
           | if_stmt
+          | for_stmt
+          | while_stmt
+          | break_stmt
+          | continue_stmt
           | debug_print_stmt
           | assert_stmt
           | debug_block
@@ -172,6 +180,13 @@ return_stmt: "return" expr ";"
 if_stmt: "if" "(" expr ")" "{" statement* "}" ("else" "{" statement* "}")?
 
 expr_stmt: expr ";"
+
+for_stmt: loop_annotation? "for" "(" "let" IDENT ":" type "=" expr ";" expr ";" assign_target "=" expr ")" "{" statement* "}"
+while_stmt: loop_annotation? "while" "(" expr ")" "{" statement* "}"
+break_stmt: "break" ";"
+continue_stmt: "continue" ";"
+loop_annotation: "@[" IDENT "]"
+               | "@[" IDENT "(" NUMBER ")" "]"
 
 debug_print_stmt: "debug_print" "(" STRING ("," expr)* ")" ";"
 assert_stmt: "assert" "(" expr ("," STRING)? ")" ";"
@@ -186,7 +201,8 @@ STRING: "\"" /[^"]*/ "\""
 
 // --- Types ---
 
-?type: base_type
+?type: array_type | base_type
+array_type: base_type "[" NUMBER "]"
 
 base_type: TYPE_NAME
 

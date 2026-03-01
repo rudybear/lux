@@ -73,6 +73,13 @@ class RuntimeArrayType(LuxType):
 
 
 @dataclass(frozen=True)
+class FixedArrayType(LuxType):
+    """Type representing a fixed-size array (e.g., shared uint[256])."""
+    element_type_name: str
+    size: int
+
+
+@dataclass(frozen=True)
 class UniformBlockType(LuxType):
     """Type representing a uniform block, allowing qualified field access (Block.field)."""
     fields: tuple  # tuple of (field_name, type_name) pairs

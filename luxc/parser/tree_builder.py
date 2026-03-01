@@ -22,6 +22,8 @@ from luxc.parser.ast_nodes import (
     StorageImageDecl, StorageBufferDecl, MeshOutputDecl, TaskPayloadDecl,
     FeaturesDecl, ConditionalBlock, FeatureRef, FeatureAnd, FeatureOr, FeatureNot,
     DebugPrintStmt, AssertStmt, DebugBlock,
+    ForStmt, WhileStmt, BreakStmt, ContinueStmt,
+    SharedDecl,
 )
 
 _CONSTRUCTOR_TYPES = frozenset({
@@ -345,6 +347,8 @@ class LuxTransformer(Transformer):
                 block.mesh_outputs.append(item)
             elif isinstance(item, TaskPayloadDecl):
                 block.task_payloads.append(item)
+            elif isinstance(item, SharedDecl):
+                block.shared_decls.append(item)
         return block
 
     def in_decl(self, args):
@@ -414,6 +418,22 @@ class LuxTransformer(Transformer):
         name = args[0]
         type_name = _extract_type(args[1])
         return TaskPayloadDecl(str(name), type_name, loc=_tok_loc(name))
+
+    # --- Shared memory declarations ---
+
+    def shared_decl(self, args):
+        name = args[0]
+        type_info = args[1]
+        # type_info could be a plain type string or a (base_type, array_size) tuple from array_type
+        if isinstance(type_info, tuple) and len(type_info) == 2:
+            base_type, array_size = type_info
+            return SharedDecl(str(name), base_type, array_size=array_size, loc=_tok_loc(name))
+        return SharedDecl(str(name), _extract_type(type_info), loc=_tok_loc(name))
+
+    def array_type(self, args):
+        base = _extract_type(args[0])
+        size = int(str(args[1]))
+        return (base, size)
 
     # --- Functions ---
 
@@ -503,6 +523,47 @@ class LuxTransformer(Transformer):
 
     def debug_block(self, args):
         return DebugBlock(list(args))
+
+    def for_stmt(self, args):
+        # args: optional loop_annotation, IDENT, type, init_expr, cond_expr, assign_target, update_expr, body stmts...
+        idx = 0
+        unroll = False
+        unroll_count = None
+        if idx < len(args) and isinstance(args[idx], tuple) and len(args[idx]) >= 1 and args[idx][0] == '_annotation':
+            _, unroll, unroll_count = args[idx]
+            idx += 1
+        name = args[idx]; idx += 1
+        type_name = _extract_type(args[idx]); idx += 1
+        init_value = args[idx]; idx += 1
+        condition = args[idx]; idx += 1
+        update_target = args[idx]; idx += 1
+        update_value = args[idx]; idx += 1
+        body = list(args[idx:])
+        return ForStmt(str(name), type_name, init_value, condition, update_target, update_value, body,
+                       unroll=unroll, unroll_count=unroll_count, loc=_tok_loc(name))
+
+    def while_stmt(self, args):
+        idx = 0
+        unroll = False
+        unroll_count = None
+        if idx < len(args) and isinstance(args[idx], tuple) and len(args[idx]) >= 1 and args[idx][0] == '_annotation':
+            _, unroll, unroll_count = args[idx]
+            idx += 1
+        condition = args[idx]; idx += 1
+        body = list(args[idx:])
+        return WhileStmt(condition, body, unroll=unroll, unroll_count=unroll_count)
+
+    def break_stmt(self, args):
+        return BreakStmt()
+
+    def continue_stmt(self, args):
+        return ContinueStmt()
+
+    def loop_annotation(self, args):
+        name = str(args[0])
+        count = int(args[1]) if len(args) > 1 else None
+        is_unroll = name == "unroll"
+        return ('_annotation', is_unroll, count)
 
     # --- Assignment targets ---
 
@@ -607,6 +668,9 @@ def _left_assoc_ops(args):
 
 
 def _extract_type(node) -> str:
+    if isinstance(node, tuple) and len(node) == 2:
+        # array_type returns (base, size) — just return base for contexts that need plain type
+        return node[0]
     if isinstance(node, str):
         return node
     if isinstance(node, Token):

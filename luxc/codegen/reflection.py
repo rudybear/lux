@@ -15,7 +15,7 @@ import json
 from luxc.parser.ast_nodes import (
     Module, StageBlock, VarDecl, UniformBlock, PushBlock, BlockField,
     SamplerDecl, AccelDecl, StorageImageDecl, StorageBufferDecl,
-    BindlessTextureArrayDecl,
+    BindlessTextureArrayDecl, SharedDecl,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl,
     NumberLit, ConstructorExpr, UnaryOp,
 )
@@ -353,6 +353,27 @@ def generate_reflection(
         wg_y = defines.get('workgroup_size_y', 1)
         wg_z = defines.get('workgroup_size_z', 1)
         result["compute"] = {"workgroup_size": [wg_x, wg_y, wg_z]}
+
+    # --- Shared memory metadata ---
+    shared_decls = getattr(stage, 'shared_decls', [])
+    if shared_decls:
+        shared_list = []
+        total_bytes = 0
+        for sd in shared_decls:
+            elem_size = _TYPE_BYTE_SIZE.get(sd.type_name, 4)
+            count = sd.array_size if sd.array_size is not None else 1
+            byte_size = elem_size * count
+            total_bytes += byte_size
+            entry = {
+                "name": sd.name,
+                "type": sd.type_name,
+                "size_bytes": byte_size,
+            }
+            if sd.array_size is not None:
+                entry["array_size"] = sd.array_size
+            shared_list.append(entry)
+        result["shared_memory"] = shared_list
+        result["shared_memory_total_bytes"] = total_bytes
 
     return result
 

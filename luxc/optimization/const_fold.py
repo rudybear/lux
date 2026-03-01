@@ -14,6 +14,7 @@ from luxc.parser.ast_nodes import (
     LetStmt, AssignStmt, ReturnStmt, IfStmt, ExprStmt,
     NumberLit, BoolLit, VarRef, BinaryOp, UnaryOp, CallExpr,
     ConstructorExpr, FieldAccess, SwizzleAccess, IndexAccess, TernaryExpr,
+    ForStmt, WhileStmt,
 )
 
 # Builtin functions that can be folded when all args are literal floats.
@@ -134,6 +135,16 @@ def _fold_stmts(stmts: list, const_env: dict) -> list:
                 stmt.then_body = _fold_stmts(stmt.then_body, const_env)
                 stmt.else_body = _fold_stmts(stmt.else_body, const_env)
                 result.append(stmt)
+        elif isinstance(stmt, ForStmt):
+            stmt.init_value = _try_fold_expr(stmt.init_value, const_env)
+            stmt.condition = _try_fold_expr(stmt.condition, const_env)
+            stmt.update_value = _try_fold_expr(stmt.update_value, const_env)
+            stmt.body = _fold_stmts(stmt.body, const_env)
+            result.append(stmt)
+        elif isinstance(stmt, WhileStmt):
+            stmt.condition = _try_fold_expr(stmt.condition, const_env)
+            stmt.body = _fold_stmts(stmt.body, const_env)
+            result.append(stmt)
         else:
             result.append(stmt)
     return result

@@ -278,6 +278,7 @@ class StageBlock:
     bindless_texture_arrays: list[BindlessTextureArrayDecl] = field(default_factory=list)
     mesh_outputs: list[MeshOutputDecl] = field(default_factory=list)
     task_payloads: list[TaskPayloadDecl] = field(default_factory=list)
+    shared_decls: list[SharedDecl] = field(default_factory=list)
     loc: Optional[SourceLocation] = None
 
 
@@ -396,6 +397,16 @@ class TaskPayloadDecl:
     loc: Optional[SourceLocation] = None
 
 
+# --- Shared memory (compute shader workgroup-local) ---
+
+@dataclass
+class SharedDecl:
+    name: str
+    type_name: str               # element type ("uint", "vec4", etc.)
+    array_size: int | None = None  # None for scalar shared, N for shared array[N]
+    loc: Optional[SourceLocation] = None
+
+
 # --- Functions ---
 
 @dataclass
@@ -416,7 +427,7 @@ class Param:
 
 # --- Statements ---
 
-Stmt = "LetStmt | AssignStmt | ReturnStmt | IfStmt | ExprStmt | DebugPrintStmt | AssertStmt | DebugBlock"
+Stmt = "LetStmt | AssignStmt | ReturnStmt | IfStmt | ExprStmt | DebugPrintStmt | AssertStmt | DebugBlock | ForStmt | WhileStmt | BreakStmt | ContinueStmt"
 
 
 @dataclass
@@ -471,6 +482,39 @@ class AssertStmt:
 @dataclass
 class DebugBlock:
     body: list
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class ForStmt:
+    loop_var: str
+    loop_var_type: str
+    init_value: Expr
+    condition: Expr
+    update_target: Expr       # AssignTarget wrapping the update LHS
+    update_value: Expr
+    body: list
+    unroll: bool = False
+    unroll_count: int | None = None
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class WhileStmt:
+    condition: Expr
+    body: list
+    unroll: bool = False
+    unroll_count: int | None = None
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class BreakStmt:
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class ContinueStmt:
     loc: Optional[SourceLocation] = None
 
 

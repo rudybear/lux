@@ -113,7 +113,7 @@ luxc gltf_pbr_layered.lux --pipeline GltfMesh --features has_emission \
 
 ### Compute Shaders — GPU General-Purpose Computation
 
-Standalone `compute` stage for data-parallel GPU work — SSBO read/write, storage image output, configurable workgroup sizes, and `barrier()` synchronization. Same workgroup builtins as mesh shaders (`global_invocation_id`, `workgroup_id`, etc.), zero boilerplate.
+Standalone `compute` stage for data-parallel GPU work — `for`/`while` loops with `break`/`continue`, native integer arithmetic, workgroup shared memory with atomic operations, SSBO read/write, storage image output, configurable workgroup sizes, and `barrier()` synchronization.
 
 <p align="center">
 <img src="screenshots/compute_gradient.png" width="300">
@@ -121,7 +121,7 @@ Standalone `compute` stage for data-parallel GPU work — SSBO read/write, stora
 </p>
 
 ```lux
-// Mandelbrot set — compute shader writes directly to a storage image
+// Mandelbrot set — 64-iteration loop with early escape
 compute {
     storage_image output_img;
 
@@ -129,10 +129,33 @@ compute {
         let gid: uvec3 = global_invocation_id;
         let cx: scalar = -0.5 + (gid.x / 512.0 - 0.5) * 3.0;
         let cy: scalar = (gid.y / 512.0 - 0.5) * 3.0;
+        let zx: scalar = cx;
+        let zy: scalar = cy;
 
-        // Iterate z = z^2 + c ...
+        for (let i: int = 0; i < 64; i = i + 1) {
+            if (zx * zx + zy * zy > 4.0) { break; }
+            let new_zx: scalar = zx * zx - zy * zy + cx;
+            zy = 2.0 * zx * zy + cy;
+            zx = new_zx;
+        }
+
         let color: vec4 = vec4(r, g, b, 1.0);
         image_store(output_img, gid.xy, color);
+    }
+}
+```
+
+```lux
+// Per-workgroup histogram with shared memory + atomics
+compute {
+    shared histogram: uint[256];
+    storage_buffer data: uint;
+
+    fn main() {
+        histogram[local_invocation_index] = 0;
+        barrier();
+        let val: uint = data[global_invocation_id.x];
+        let old: uint = atomic_add(histogram[val], 1);
     }
 }
 ```
@@ -388,7 +411,8 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 - **Automatic differentiation** — `@differentiable` generates gradient functions via forward-mode autodiff
 - **Ray tracing** — `mode: raytrace` pipelines, `environment`/`procedural` declarations, RT stage blocks
 - **Mesh shaders** — `mode: mesh_shader` pipelines, `task`/`mesh` stages, meshlet-based geometry, `--define` compile-time parameters (C++ and Rust only)
-- **Compute shaders** — standalone `compute` stage for general-purpose GPU computation; read-write SSBOs, storage image output, configurable workgroup sizes via `--define`, `barrier()` synchronization; shares workgroup builtins with mesh/task stages
+- **Loops & control flow** — `for`/`while` loops, `break`/`continue`, `@[unroll]` hints, native integer arithmetic (`int`/`uint`); C-style `for (let i: int = 0; i < N; i = i + 1)` compiles to SPIR-V `OpLoopMerge` structured control flow
+- **Compute shaders** — standalone `compute` stage for general-purpose GPU computation; read-write SSBOs, storage image output, configurable workgroup sizes via `--define`, `barrier()` synchronization, workgroup shared memory (`shared` declarations with fixed-size arrays), 10 atomic operations (`atomic_add`, `atomic_min`, `atomic_max`, `atomic_and/or/xor`, `atomic_exchange`, `atomic_compare_exchange`, `atomic_load`, `atomic_store`); shares workgroup builtins with mesh/task stages
 - **GLSL transpiler** — `--transpile` converts GLSL fragment shaders to Lux
 - **AI material authoring** — text-to-shader (`--ai`), image-to-material (`--ai-from-image`), style transfer (`--ai-modify`), scene batch generation (`--ai-batch`), video-to-animation (`--ai-from-video`), reference matching (`--ai-match-reference`), validation/critique (`--ai-critique`), and a skill system for domain expertise injection; 5 providers (Anthropic, OpenAI, Gemini, Ollama, LM Studio); 58-material PBR reference database; see [AI.md](AI.md)
 - **One file, multi-stage** — vertex, fragment, and RT stages in a single `.lux` file
@@ -1127,6 +1151,8 @@ Import modules with `import <name>;` — functions are inlined at the call site.
 
 **Ray tracing**: `trace_ray`, `report_intersection`, `execute_callable`, `ignore_intersection`, `terminate_ray`
 
+**Compute**: `barrier()`, `atomic_add`, `atomic_min`, `atomic_max`, `atomic_and`, `atomic_or`, `atomic_xor`, `atomic_exchange`, `atomic_compare_exchange`, `atomic_load`, `atomic_store`, `image_store`
+
 ### User-Defined Functions
 
 ```
@@ -1349,6 +1375,9 @@ tools/
 | `viz_param_sweep.lux` | Parameter sweep heatmaps: roughness x metallic, roughness x NdotV |
 | `viz_furnace_test.lux` | White furnace test: energy conservation with hemisphere integration |
 | `viz_layer_energy.lux` | Per-layer energy breakdown: stacked area chart of BRDF contributions |
+| `compute_mandelbrot.lux` | Compute shader: 64-iteration Mandelbrot with `for` loop + `break`, storage image output |
+| `compute_histogram.lux` | Shared memory: per-workgroup histogram with `shared uint[256]` + `atomic_add` |
+| `compute_reduction.lux` | Parallel reduction: barrier-synchronized tree sum with shared memory |
 | `debug_features_demo.lux` | Debug instrumentation: `debug_print`, `assert`, `@[debug]` blocks, semantic types, `any_nan`/`any_inf` |
 
 ## Screenshot Tests
@@ -1509,7 +1538,7 @@ The `assets/` directory contains glTF 2.0 sample models and HDR environment maps
 | Schedule separation | `schedule` blocks | Same material, different quality targets |
 | Function inlining | No SPIR-V OpFunctionCall | Simplifies codegen, stdlib works everywhere |
 | Forward-mode autodiff | `@differentiable` annotation | Natural for shader parameter gradients |
-| No loops | Unrolled FBM/Voronoi | Simpler codegen, deterministic performance |
+| Structured loops | `for`/`while` with `OpLoopMerge` | `@[unroll]` hint for GPU-friendly unrolling, `break`/`continue` for early exit |
 | Direct AST to SPIR-V | No IR | Simpler, faster path to working output |
 
 ## License
