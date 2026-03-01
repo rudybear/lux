@@ -137,6 +137,18 @@ def main(argv: list[str] | None = None) -> None:
         help="Enable static analysis warnings for potential NaN/Inf operations",
     )
     parser.add_argument(
+        "-O", "--optimize", action="store_true", default=False,
+        help="Run spirv-opt -O on generated SPIR-V binaries (requires spirv-opt on PATH)",
+    )
+    parser.add_argument(
+        "--watch", action="store_true",
+        help="Watch source files for changes and recompile automatically",
+    )
+    parser.add_argument(
+        "--watch-poll", type=int, default=500, metavar="MS",
+        help="Polling interval in milliseconds for watch mode (default: 500)",
+    )
+    parser.add_argument(
         "--version", action="version", version="luxc 0.1.0"
     )
 
@@ -466,6 +478,7 @@ def main(argv: list[str] | None = None) -> None:
                     source_name=input_path.name, pipeline=args.pipeline,
                     defines=defines, bindless=args.bindless,
                     warn_nan=args.warn_nan,
+                    optimize=args.optimize,
                 )
             except Exception as e:
                 print(f"Error: {e}", file=sys.stderr)
@@ -496,6 +509,7 @@ def main(argv: list[str] | None = None) -> None:
                     source_name=input_path.name, pipeline=args.pipeline,
                     features=perm, defines=defines, bindless=args.bindless,
                     warn_nan=args.warn_nan,
+                    optimize=args.optimize,
                 )
             except Exception as e:
                 print(f"Error (features={sorted(perm)}): {e}", file=sys.stderr)
@@ -528,7 +542,57 @@ def main(argv: list[str] | None = None) -> None:
             defines=defines,
             bindless=args.bindless,
             warn_nan=args.warn_nan,
+            optimize=args.optimize,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        if not args.watch:
+            sys.exit(1)
+
+    # --- Watch mode ---
+    if args.watch:
+        from luxc.hot_reload import HotReloader
+        from luxc.watcher import LuxFileWatcher
+
+        reloader = HotReloader(
+            source_path=input_path,
+            output_dir=output_dir,
+            validate=not args.no_validate,
+            emit_reflection=not args.no_reflection,
+            debug=args.debug,
+            pipeline=args.pipeline,
+            features=feature_set,
+            defines=defines,
+            bindless=args.bindless,
+        )
+
+        watched_files = reloader.get_import_paths()
+        print(f"[watch] Monitoring {len(watched_files)} files...", flush=True)
+
+        def on_change(changed_path):
+            print(f"[watch] Changed: {changed_path.name}", flush=True)
+            result = reloader.recompile()
+            if result.success:
+                print(f"[watch] Recompiling... done ({result.elapsed_ms:.0f}ms)", flush=True)
+                # Re-scan imports in case they changed
+                new_files = reloader.get_import_paths()
+                watcher.update_files(new_files)
+                if len(new_files) != len(watched_files):
+                    print(f"[watch] Monitoring {len(new_files)} files...", flush=True)
+            else:
+                print(f"[watch] FAILED: {result.error_message}", flush=True)
+
+        watcher = LuxFileWatcher(
+            files=watched_files,
+            callback=on_change,
+            poll_interval_ms=args.watch_poll,
+        )
+        watcher.start()
+
+        try:
+            while True:
+                import time
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[watch] Stopped.", flush=True)
+            watcher.stop()

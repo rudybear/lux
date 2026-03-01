@@ -416,6 +416,8 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 - **GLSL transpiler** — `--transpile` converts GLSL fragment shaders to Lux
 - **AI material authoring** — text-to-shader (`--ai`), image-to-material (`--ai-from-image`), style transfer (`--ai-modify`), scene batch generation (`--ai-batch`), video-to-animation (`--ai-from-video`), reference matching (`--ai-match-reference`), validation/critique (`--ai-critique`), and a skill system for domain expertise injection; 5 providers (Anthropic, OpenAI, Gemini, Ollama, LM Studio); 58-material PBR reference database; see [AI.md](AI.md)
 - **One file, multi-stage** — vertex, fragment, and RT stages in a single `.lux` file
+- **Hot reload** — `--watch` mode monitors `.lux` files (including transitive imports) for changes and recompiles automatically; writes `.reload` sentinel files for engine integration; `--watch-poll <ms>` configurable polling interval; error recovery preserves last-good `.spv` on failure
+- **SPIR-V optimization** — `-O` flag runs `spirv-opt -O` (mem2reg, constant propagation, dead code elimination) for 60-65% smaller binaries; compile-time algebraic identity folding (`x*1.0→x`, `x+0.0→x`, `x*0.0→0`, `-(-x)→x`, `!(!x)→x`)
 - **Full SPIR-V output** — compiles to validated `.spv` binaries via `spirv-as` + `spirv-val`
 - **40+ built-in functions** — math, vector, matrix, texture sampling (2D + cubemap + explicit LOD), RT instructions, NaN/Inf detection
 - **glTF 2.0 PBR** — tangent normal mapping, metallic-roughness, image-based lighting, multi-scattering
@@ -492,6 +494,27 @@ python -m luxc examples/compute_saxpy.lux --define workgroup_size=256
 # 2D workgroup (image processing)
 python -m luxc examples/compute_mandelbrot.lux --define workgroup_size_x=16 --define workgroup_size_y=16
 # Wrote examples/compute_mandelbrot.comp.spv
+```
+
+### Watch mode (hot reload)
+
+```bash
+# Recompile on save — watches file + all imports
+python -m luxc examples/pbr_surface.lux --watch
+# Watching examples/pbr_surface.lux (+ 3 imports)...
+# [12:34:56] Recompiled pbr_surface (2 stages) in 0.04s
+
+# Custom poll interval (default 500ms)
+python -m luxc examples/pbr_surface.lux --watch --watch-poll 200
+```
+
+### Optimize SPIR-V output
+
+```bash
+# Run spirv-opt for smaller binaries
+python -m luxc examples/hello_triangle.lux -O
+# Wrote examples/hello_triangle.vert.spv (optimized)
+# Wrote examples/hello_triangle.frag.spv (optimized)
 ```
 
 ### Compile a specific pipeline
@@ -580,6 +603,9 @@ Options:
   --no-reflection     Skip .lux.json reflection metadata
   -g, --debug         Enable debug instrumentation (OpLine, debug_print, assert, @[debug] blocks)
   --warn-nan          Static analysis warnings for risky float operations
+  -O, --optimize      Run spirv-opt on output binaries
+  --watch             Watch input file for changes and recompile
+  --watch-poll MS     Polling interval in milliseconds (default: 500)
   --bindless          Emit bindless descriptor uber-shaders
   --transpile         Transpile GLSL input to Lux
   --ai DESCRIPTION    Generate shader from natural language

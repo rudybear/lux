@@ -6,7 +6,7 @@ from luxc.analysis.type_checker import type_check
 from luxc.optimization.const_fold import constant_fold
 from luxc.analysis.layout_assigner import assign_layouts
 from luxc.codegen.spirv_builder import generate_spirv
-from luxc.codegen.spv_assembler import assemble_and_validate
+from luxc.codegen.spv_assembler import assemble_and_validate, run_spirv_opt
 from luxc.codegen.reflection import generate_reflection, emit_reflection_json
 from luxc.builtins.types import clear_type_aliases
 from luxc.features.evaluator import collect_feature_names, strip_features
@@ -87,6 +87,52 @@ def _resolve_imports(module, source_dir: Path | None = None):
             # (already handled by extend above since we recurse first)
 
 
+def collect_import_paths(source: str, source_dir: Path | None = None) -> set[Path]:
+    """Resolve all import paths from source text without full compilation.
+
+    Returns the set of resolved file paths for all transitive imports.
+    Reuses the same import resolution logic as _resolve_imports().
+    """
+    module = parse_lux(source)
+    paths: set[Path] = set()
+    _collect_import_paths_recursive(module, source_dir, paths, set())
+    return paths
+
+
+def _collect_import_paths_recursive(
+    module, source_dir: Path | None, paths: set[Path], resolved_names: set[str]
+) -> None:
+    """Recursively collect import file paths without merging modules."""
+    for imp in module.imports:
+        name = imp.module_name
+        if name in resolved_names:
+            continue
+        resolved_names.add(name)
+
+        candidates = [_STDLIB_DIR / f"{name}.lux"]
+        if source_dir:
+            candidates.append(source_dir / f"{name}.lux")
+
+        found = None
+        for path in candidates:
+            if path.exists():
+                found = path
+                break
+
+        if found is None:
+            continue  # Skip unresolvable imports (don't crash in collection mode)
+
+        paths.add(found.resolve())
+
+        # Recursively collect from imported file
+        try:
+            imported_source = found.read_text(encoding="utf-8")
+            imported = parse_lux(imported_source)
+            _collect_import_paths_recursive(imported, found.parent, paths, resolved_names)
+        except Exception:
+            pass  # Best-effort collection
+
+
 def compile_source(
     source: str,
     stem: str,
@@ -103,6 +149,7 @@ def compile_source(
     defines: dict[str, int] | None = None,
     bindless: bool = False,
     warn_nan: bool = False,
+    optimize: bool = False,
 ) -> None:
     # Clear type aliases from previous compilations
     clear_type_aliases()
@@ -187,6 +234,10 @@ def compile_source(
 
         spv_path = output_dir / f"{out_stem}.{suffix}.spv"
         assemble_and_validate(asm_text, spv_path, validate=validate)
+
+        if optimize:
+            run_spirv_opt(spv_path)
+
         print(f"Wrote {spv_path}")
 
         if emit_reflection:

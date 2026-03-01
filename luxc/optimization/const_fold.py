@@ -75,6 +75,14 @@ def _as_float(node) -> float | None:
     return None
 
 
+def _as_float_value(expr) -> float | None:
+    """Return the float value if expr is a NumberLit, or None otherwise.
+
+    This is an alias for _as_float exposed for algebraic identity checks.
+    """
+    return _as_float(expr)
+
+
 def _as_bool(node) -> bool | None:
     """Extract bool value from a BoolLit, or None."""
     if isinstance(node, BoolLit):
@@ -170,10 +178,16 @@ def _try_fold_expr(expr, const_env: dict):
             val = _as_float(expr.operand)
             if val is not None:
                 return _make_number(-val, expr.resolved_type or expr.operand.resolved_type)
+            # Double negation: -(-x) -> x
+            if isinstance(expr.operand, UnaryOp) and expr.operand.op == "-":
+                return expr.operand.operand
         elif expr.op == "!":
             bval = _as_bool(expr.operand)
             if bval is not None:
                 return BoolLit(not bval, resolved_type=expr.resolved_type)
+            # Boolean double negation: !(!x) -> x
+            if isinstance(expr.operand, UnaryOp) and expr.operand.op == "!":
+                return expr.operand.operand
         return expr
 
     if isinstance(expr, BinaryOp):
@@ -187,6 +201,12 @@ def _try_fold_expr(expr, const_env: dict):
                 if isinstance(result, bool):
                     return BoolLit(result, resolved_type=expr.resolved_type or "bool")
                 return _make_number(result, expr.resolved_type or expr.left.resolved_type)
+
+        # Algebraic identity simplifications (one operand is a literal)
+        folded = _try_fold_algebraic(expr, lval, rval)
+        if folded is not None:
+            return folded
+
         return expr
 
     if isinstance(expr, CallExpr):
@@ -231,6 +251,52 @@ def _try_fold_expr(expr, const_env: dict):
         return expr
 
     return expr
+
+
+def _try_fold_algebraic(expr: BinaryOp, lval: float | None, rval: float | None):
+    """Try algebraic identity simplifications when one operand is a known constant.
+
+    Returns the simplified expression, or None if no simplification applies.
+    """
+    op = expr.op
+
+    # Multiplicative identities
+    if op == "*":
+        # x * 1.0 -> x
+        if rval is not None and rval == 1.0:
+            return expr.left
+        # 1.0 * x -> x
+        if lval is not None and lval == 1.0:
+            return expr.right
+        # x * 0.0 -> 0.0
+        if rval is not None and rval == 0.0:
+            return _make_number(0.0, expr.resolved_type or expr.right.resolved_type)
+        # 0.0 * x -> 0.0
+        if lval is not None and lval == 0.0:
+            return _make_number(0.0, expr.resolved_type or expr.left.resolved_type)
+
+    # Division identity
+    if op == "/":
+        # x / 1.0 -> x
+        if rval is not None and rval == 1.0:
+            return expr.left
+
+    # Additive identities
+    if op == "+":
+        # x + 0.0 -> x
+        if rval is not None and rval == 0.0:
+            return expr.left
+        # 0.0 + x -> x
+        if lval is not None and lval == 0.0:
+            return expr.right
+
+    # Subtraction identity
+    if op == "-":
+        # x - 0.0 -> x
+        if rval is not None and rval == 0.0:
+            return expr.left
+
+    return None
 
 
 def _fold_binary(op: str, lval: float, rval: float):

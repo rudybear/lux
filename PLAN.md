@@ -855,8 +855,8 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P20** | Validation & debugging (debug_print, assert, @[debug], semantic types, NaN analysis, OpMemberName, debug utils labels) | ✅ Complete |
 | **P22** | Loops & control flow (`for`/`while` loops, `break`/`continue`, `@[unroll]`, native integer arithmetic) | ✅ Complete |
 | **P23** | GPU compute shaders (compute stage, RW SSBOs, storage images, barriers, shared memory, atomics, dispatch) | ✅ Complete (23.1 + 23.2) |
-| **P24** | Shader hot-reload (file watcher, live recompile, engine hot-swap) | Planned |
-| **P25** | Performance optimization (SSA IR, dead code elimination, CSE, register pressure) | Planned |
+| **P24** | Shader hot-reload (`--watch` file watcher, live recompile, sentinel protocol for engine hot-swap) | ✅ Complete |
+| **P25** | Performance optimization (`-O` spirv-opt integration, algebraic identity folding) | ✅ Complete (25.1) |
 
 ---
 
