@@ -14,6 +14,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 ai = ["anthropic>=0.30"]
+ai-anthropic = ["anthropic>=0.30"]
+ai-openai = ["openai>=1.0"]
+ai-gemini = ["google-generativeai>=0.5"]
+ai-all = ["anthropic>=0.30", "openai>=1.0", "google-generativeai>=0.5"]
 
 [project.scripts]
 luxc = "luxc.cli:main"

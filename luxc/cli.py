@@ -35,12 +35,32 @@ def main(argv: list[str] | None = None) -> None:
         help='Generate shader from description (e.g., --ai "frosted glass")',
     )
     parser.add_argument(
-        "--ai-model", type=str, default="claude-sonnet-4-20250514",
-        help="Model to use for AI generation",
+        "--ai-setup", action="store_true",
+        help="Run interactive AI provider setup wizard",
+    )
+    parser.add_argument(
+        "--ai-provider", type=str, metavar="NAME",
+        help="Override AI provider (anthropic, openai, gemini, ollama, lm-studio)",
+    )
+    parser.add_argument(
+        "--ai-base-url", type=str, metavar="URL",
+        help="Override AI provider base URL (for OpenAI-compatible endpoints)",
+    )
+    parser.add_argument(
+        "--ai-model", type=str, default=None,
+        help="Model to use for AI generation (default: from config)",
     )
     parser.add_argument(
         "--ai-no-verify", action="store_true",
         help="Skip compilation verification of AI-generated code",
+    )
+    parser.add_argument(
+        "--ai-retries", type=int, default=2, metavar="N",
+        help="Max retry attempts for AI generation (default: 2)",
+    )
+    parser.add_argument(
+        "--ai-from-image", type=str, metavar="IMAGE_PATH",
+        help="Generate surface material from an image (e.g., --ai-from-image photo.jpg)",
     )
     parser.add_argument(
         "--no-reflection",
@@ -86,6 +106,46 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
 
+    # --- AI setup wizard ---
+    if args.ai_setup:
+        from luxc.ai.setup import run_setup
+        run_setup()
+        return
+
+    # --- AI image-to-material mode ---
+    if args.ai_from_image:
+        from luxc.ai.generate import generate_material_from_image
+        try:
+            result = generate_material_from_image(
+                args.ai_from_image,
+                description=args.ai or "",
+                verify=not args.ai_no_verify,
+                model=args.ai_model,
+                max_retries=args.ai_retries,
+                provider=args.ai_provider,
+                base_url=args.ai_base_url,
+            )
+            if args.input:
+                output_path = Path(args.input)
+            else:
+                output_path = Path("generated.lux")
+            if args.output_dir:
+                output_path = args.output_dir / output_path.name
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(result.lux_source, encoding="utf-8")
+            print(f"Generated material: {output_path}")
+            if result.attempts > 1:
+                print(f"  (took {result.attempts} attempts)", file=sys.stderr)
+            if result.errors:
+                for err in result.errors:
+                    print(f"  Warning: {err.phase}: {err.message}", file=sys.stderr)
+            if not result.compilation_success and not args.ai_no_verify:
+                print("  Note: generated code did not pass compilation check", file=sys.stderr)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
     # --- AI generation mode ---
     if args.ai:
         from luxc.ai.generate import generate_lux_shader
@@ -94,6 +154,9 @@ def main(argv: list[str] | None = None) -> None:
                 args.ai,
                 verify=not args.ai_no_verify,
                 model=args.ai_model,
+                max_retries=args.ai_retries,
+                provider=args.ai_provider,
+                base_url=args.ai_base_url,
             )
             if args.input:
                 output_path = Path(args.input)
@@ -104,9 +167,11 @@ def main(argv: list[str] | None = None) -> None:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(result.lux_source, encoding="utf-8")
             print(f"Generated: {output_path}")
+            if result.attempts > 1:
+                print(f"  (took {result.attempts} attempts)", file=sys.stderr)
             if result.errors:
                 for err in result.errors:
-                    print(f"  Warning: {err}", file=sys.stderr)
+                    print(f"  Warning: {err.phase}: {err.message}", file=sys.stderr)
             if not result.compilation_success and not args.ai_no_verify:
                 print("  Note: generated code did not pass compilation check", file=sys.stderr)
         except Exception as e:

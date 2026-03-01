@@ -458,8 +458,20 @@ python -m luxc shader.glsl --transpile
 ### Generate a shader with AI
 
 ```bash
+# Using default provider (Anthropic Claude)
 python -m luxc --ai "frosted glass with subsurface scattering" -o generated.lux
-# Generated: generated.lux
+
+# Using local Ollama
+python -m luxc --ai "glossy copper metal" --ai-provider ollama --ai-model llama3.2
+
+# Using OpenAI
+python -m luxc --ai "brushed steel" --ai-provider openai --ai-model gpt-4o
+
+# Using any OpenAI-compatible endpoint
+python -m luxc --ai "marble" --ai-provider openai --ai-base-url http://my-server:8080/v1
+
+# Interactive setup wizard (saves to ~/.luxc/config.toml)
+python -m luxc --ai-setup
 ```
 
 ### Options
@@ -483,8 +495,12 @@ Options:
   --bindless          Emit bindless descriptor uber-shaders
   --transpile         Transpile GLSL input to Lux
   --ai DESCRIPTION    Generate shader from natural language
-  --ai-model MODEL    Model for AI generation (default: claude-sonnet-4-20250514)
+  --ai-setup          Run interactive AI provider setup wizard
+  --ai-provider NAME  Override AI provider (anthropic, openai, gemini, ollama, lm-studio)
+  --ai-model MODEL    Model for AI generation (default: from config)
+  --ai-base-url URL   Override AI provider base URL (OpenAI-compatible endpoints)
   --ai-no-verify      Skip compilation verification of AI output
+  --ai-from-image IMG Generate surface material from a reference image
   --version           Show version
 ```
 
@@ -1102,8 +1118,15 @@ luxc/
     cli.py                   # argparse CLI
     compiler.py              # pipeline orchestration
     ai/
-        generate.py          # AI shader generation
+        generate.py          # AI shader generation (multi-provider)
         system_prompt.py     # LLM system prompt
+        config.py            # AIConfig + TOML persistence (~/.luxc/config.toml)
+        setup.py             # interactive provider setup wizard
+        providers/
+            base.py          # abstract AIProvider interface
+            anthropic.py     # Anthropic (Claude)
+            openai_compat.py # OpenAI + Ollama + LM Studio + custom endpoints
+            gemini.py        # Google Gemini
     analysis/
         symbols.py           # symbol table, scopes
         type_checker.py      # type checking + overload resolution
@@ -1213,6 +1236,8 @@ tests/
     test_autodiff.py
     test_transpiler.py
     test_ai_generate.py
+    test_ai_config.py
+    test_ai_providers.py
     test_training_data.py
     test_p5_builtins.py
     test_p5_3_advanced.py
