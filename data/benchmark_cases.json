@@ -1,0 +1,219 @@
+[
+    {
+        "id": "metal-gold",
+        "description": "Create a polished gold metal material",
+        "category": "basic-metal",
+        "expected_properties": {
+            "metallic": 1.0,
+            "roughness": [0.0, 0.15],
+            "albedo_r": [0.85, 1.0],
+            "albedo_g": [0.65, 0.85],
+            "albedo_b": [0.2, 0.5]
+        },
+        "required_layers": ["base"]
+    },
+    {
+        "id": "metal-copper",
+        "description": "Create a brushed copper material with moderate roughness",
+        "category": "basic-metal",
+        "expected_properties": {
+            "metallic": 1.0,
+            "roughness": [0.2, 0.45],
+            "albedo_r": [0.8, 1.0],
+            "albedo_g": [0.5, 0.7],
+            "albedo_b": [0.4, 0.6]
+        },
+        "required_layers": ["base"]
+    },
+    {
+        "id": "metal-silver",
+        "description": "Create a mirror-polished silver material",
+        "category": "basic-metal",
+        "expected_properties": {
+            "metallic": 1.0,
+            "roughness": [0.0, 0.05],
+            "albedo_r": [0.9, 1.0],
+            "albedo_g": [0.9, 1.0],
+            "albedo_b": [0.9, 1.0]
+        },
+        "required_layers": ["base"]
+    },
+    {
+        "id": "metal-iron-rough",
+        "description": "Create a rough, unpolished iron material",
+        "category": "basic-metal",
+        "expected_properties": {
+            "metallic": 1.0,
+            "roughness": [0.5, 0.9]
+        },
+        "required_layers": ["base"]
+    },
+    {
+        "id": "dielectric-plastic",
+        "description": "Create a shiny red plastic material",
+        "category": "basic-dielectric",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.0, 0.3],
+            "albedo_r": [0.5, 1.0]
+        },
+        "required_layers": ["base"]
+    },
+    {
+        "id": "dielectric-wood",
+        "description": "Create a natural oak wood material with visible grain roughness",
+        "category": "basic-dielectric",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.4, 0.8]
+        },
+        "required_layers": ["base"]
+    },
+    {
+        "id": "dielectric-concrete",
+        "description": "Create a rough concrete material",
+        "category": "basic-dielectric",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.5, 0.95]
+        },
+        "required_layers": ["base"]
+    },
+    {
+        "id": "dielectric-ceramic",
+        "description": "Create a glazed white ceramic material",
+        "category": "basic-dielectric",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.0, 0.2],
+            "albedo_r": [0.7, 0.95],
+            "albedo_g": [0.7, 0.95],
+            "albedo_b": [0.7, 0.95]
+        },
+        "required_layers": ["base"]
+    },
+    {
+        "id": "glass-clear",
+        "description": "Create a clear glass material with IOR 1.52",
+        "category": "transmissive",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.0, 0.05],
+            "ior": [1.4, 1.6]
+        },
+        "required_layers": ["base", "transmission"]
+    },
+    {
+        "id": "glass-frosted",
+        "description": "Create a frosted glass material",
+        "category": "transmissive",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.3, 0.7]
+        },
+        "required_layers": ["base", "transmission"]
+    },
+    {
+        "id": "water",
+        "description": "Create a clear water surface material with IOR 1.33",
+        "category": "transmissive",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.0, 0.1],
+            "ior": [1.3, 1.4]
+        },
+        "required_layers": ["base", "transmission"]
+    },
+    {
+        "id": "car-paint",
+        "description": "Create a glossy red car paint with clear coat layer",
+        "category": "layered",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.1, 0.5]
+        },
+        "required_layers": ["base", "coat"]
+    },
+    {
+        "id": "coated-metal",
+        "description": "Create a clear-coated brass material",
+        "category": "layered",
+        "expected_properties": {
+            "metallic": 1.0
+        },
+        "required_layers": ["base", "coat"]
+    },
+    {
+        "id": "velvet-fabric",
+        "description": "Create a dark red velvet fabric material with sheen",
+        "category": "layered",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.6, 1.0]
+        },
+        "required_layers": ["base", "sheen"]
+    },
+    {
+        "id": "silk-fabric",
+        "description": "Create a white silk fabric material with subtle sheen",
+        "category": "layered",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.5, 0.9]
+        },
+        "required_layers": ["base", "sheen"]
+    },
+    {
+        "id": "emissive-neon",
+        "description": "Create a neon sign material that glows bright blue",
+        "category": "emissive",
+        "expected_properties": {
+            "metallic": 0.0
+        },
+        "required_layers": ["base", "emission"]
+    },
+    {
+        "id": "emissive-lava",
+        "description": "Create a lava material with orange-red emission and dark rough base",
+        "category": "emissive",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.6, 1.0]
+        },
+        "required_layers": ["base", "emission"]
+    },
+    {
+        "id": "diamond",
+        "description": "Create a diamond material with high IOR (2.42) and zero roughness",
+        "category": "transmissive",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.0, 0.02],
+            "ior": [2.3, 2.5]
+        },
+        "required_layers": ["base", "transmission"]
+    },
+    {
+        "id": "skin-medium",
+        "description": "Create a medium human skin material",
+        "category": "organic",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.3, 0.7]
+        },
+        "required_layers": ["base"]
+    },
+    {
+        "id": "marble-polished",
+        "description": "Create a polished white marble material",
+        "category": "basic-dielectric",
+        "expected_properties": {
+            "metallic": 0.0,
+            "roughness": [0.0, 0.15],
+            "albedo_r": [0.7, 0.95],
+            "albedo_g": [0.65, 0.9],
+            "albedo_b": [0.6, 0.85]
+        },
+        "required_layers": ["base"]
+    }
+]

@@ -63,6 +63,42 @@ def main(argv: list[str] | None = None) -> None:
         help="Generate surface material from an image (e.g., --ai-from-image photo.jpg)",
     )
     parser.add_argument(
+        "--ai-skills", type=str, metavar="SKILL,...",
+        help="Load specific skills into the AI prompt (comma-separated)",
+    )
+    parser.add_argument(
+        "--ai-list-skills", action="store_true",
+        help="List available AI skills and exit",
+    )
+    parser.add_argument(
+        "--ai-critique", type=str, metavar="FILE",
+        help="AI review of a .lux file (e.g., --ai-critique material.lux)",
+    )
+    parser.add_argument(
+        "--ai-modify", type=str, metavar="INSTRUCTION",
+        help='Modify existing material (e.g., --ai-modify "add weathering")',
+    )
+    parser.add_argument(
+        "--ai-batch", type=str, metavar="DESCRIPTION",
+        help='Generate batch of materials (e.g., --ai-batch "medieval tavern")',
+    )
+    parser.add_argument(
+        "--ai-batch-count", type=int, default=None, metavar="N",
+        help="Number of materials in batch (default: AI decides)",
+    )
+    parser.add_argument(
+        "--ai-from-video", type=str, metavar="VIDEO",
+        help="Generate animated shader from video (e.g., --ai-from-video fire.mp4)",
+    )
+    parser.add_argument(
+        "--ai-match-reference", type=str, metavar="IMAGE",
+        help="Iteratively match a reference image",
+    )
+    parser.add_argument(
+        "--ai-match-iterations", type=int, default=5, metavar="N",
+        help="Max refinement iterations for reference matching (default: 5)",
+    )
+    parser.add_argument(
         "--no-reflection",
         action="store_true",
         help="Skip .lux.json reflection metadata emission",
@@ -110,6 +146,173 @@ def main(argv: list[str] | None = None) -> None:
     if args.ai_setup:
         from luxc.ai.setup import run_setup
         run_setup()
+        return
+
+    # --- AI list skills ---
+    if args.ai_list_skills:
+        from luxc.ai.skills import discover_skills
+        skills = discover_skills()
+        if skills:
+            print("Available AI skills:")
+            for name, skill in sorted(skills.items()):
+                print(f"  {name:<25} {skill.title}")
+        else:
+            print("No skills found.")
+        return
+
+    # --- AI critique mode ---
+    if args.ai_critique:
+        from luxc.ai.generate import critique_lux_file
+        critique_path = Path(args.ai_critique)
+        if not critique_path.exists():
+            print(f"Error: file not found: {critique_path}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            source = critique_path.read_text(encoding="utf-8")
+            result = critique_lux_file(
+                source,
+                model=args.ai_model,
+                provider=args.ai_provider,
+                base_url=args.ai_base_url,
+            )
+            if result.issues:
+                for issue in result.issues:
+                    icon = {"error": "E", "warning": "W", "info": "I"}.get(issue.severity, "?")
+                    loc = f":{issue.line}" if issue.line else ""
+                    print(f"  [{icon}] {issue.category}{loc}: {issue.message}")
+                    if issue.suggestion:
+                        print(f"      -> {issue.suggestion}")
+                print()
+            if result.summary:
+                print(f"Summary: {result.summary}")
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # --- AI modify mode ---
+    if args.ai_modify:
+        from luxc.ai.generate import modify_material
+        if not args.input:
+            print("Error: --ai-modify requires an input file", file=sys.stderr)
+            sys.exit(1)
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"Error: file not found: {input_path}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            source = input_path.read_text(encoding="utf-8")
+            result = modify_material(
+                source,
+                args.ai_modify,
+                verify=not args.ai_no_verify,
+                model=args.ai_model,
+                max_retries=args.ai_retries,
+                provider=args.ai_provider,
+                base_url=args.ai_base_url,
+            )
+            output_path = input_path
+            if args.output_dir:
+                output_path = args.output_dir / input_path.name
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(result.lux_source, encoding="utf-8")
+            print(f"Modified: {output_path}")
+            if result.attempts > 1:
+                print(f"  (took {result.attempts} attempts)", file=sys.stderr)
+            if not result.compilation_success and not args.ai_no_verify:
+                print("  Note: modified code did not pass compilation check", file=sys.stderr)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # --- AI batch generation mode ---
+    if args.ai_batch:
+        from luxc.ai.generate import generate_material_batch
+        try:
+            result = generate_material_batch(
+                args.ai_batch,
+                count=args.ai_batch_count,
+                verify=not args.ai_no_verify,
+                model=args.ai_model,
+                max_retries=args.ai_retries,
+                provider=args.ai_provider,
+                base_url=args.ai_base_url,
+            )
+            output_dir = args.output_dir or Path("batch_materials")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for name, mat_result in zip(result.material_names, result.materials):
+                out_path = output_dir / f"{name}.lux"
+                out_path.write_text(mat_result.lux_source, encoding="utf-8")
+                status = "ok" if mat_result.compilation_success else "FAIL"
+                print(f"  [{status}] {out_path}")
+            print(f"\nGenerated {len(result.materials)} materials in {output_dir}")
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # --- AI video-to-animation mode ---
+    if args.ai_from_video:
+        from luxc.ai.generate import generate_animated_shader_from_video
+        try:
+            result = generate_animated_shader_from_video(
+                Path(args.ai_from_video),
+                description=args.ai or "",
+                verify=not args.ai_no_verify,
+                model=args.ai_model,
+                max_retries=args.ai_retries,
+                provider=args.ai_provider,
+                base_url=args.ai_base_url,
+            )
+            if args.input:
+                output_path = Path(args.input)
+            else:
+                output_path = Path("animated.lux")
+            if args.output_dir:
+                output_path = args.output_dir / output_path.name
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(result.lux_source, encoding="utf-8")
+            print(f"Generated animated shader: {output_path}")
+            if result.attempts > 1:
+                print(f"  (took {result.attempts} attempts)", file=sys.stderr)
+            if not result.compilation_success and not args.ai_no_verify:
+                print("  Note: generated code did not pass compilation check", file=sys.stderr)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # --- AI reference matching mode ---
+    if args.ai_match_reference:
+        from luxc.ai.reference_match import match_reference_image
+        try:
+            result = match_reference_image(
+                Path(args.ai_match_reference),
+                description=args.ai or "",
+                max_iterations=args.ai_match_iterations,
+                verify=not args.ai_no_verify,
+                model=args.ai_model,
+                provider=args.ai_provider,
+                base_url=args.ai_base_url,
+            )
+            if args.input:
+                output_path = Path(args.input)
+            else:
+                output_path = Path("matched.lux")
+            if args.output_dir:
+                output_path = args.output_dir / output_path.name
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(result.final_result.lux_source, encoding="utf-8")
+            print(f"Reference match: {output_path}")
+            print(f"  Iterations: {len(result.iterations)}")
+            if result.comparison:
+                print(f"  PSNR: {result.comparison.psnr:.1f}")
+                print(f"  SSIM: {result.comparison.ssim:.3f}")
+            print(f"  Converged: {result.converged}")
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
         return
 
     # --- AI image-to-material mode ---

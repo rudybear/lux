@@ -17,7 +17,8 @@ ai = ["anthropic>=0.30"]
 ai-anthropic = ["anthropic>=0.30"]
 ai-openai = ["openai>=1.0"]
 ai-gemini = ["google-generativeai>=0.5"]
-ai-all = ["anthropic>=0.30", "openai>=1.0", "google-generativeai>=0.5"]
+ai-video = ["opencv-python>=4.8"]
+ai-all = ["anthropic>=0.30", "openai>=1.0", "google-generativeai>=0.5", "opencv-python>=4.8"]
 
 [project.scripts]
 luxc = "luxc.cli:main"

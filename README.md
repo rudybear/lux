@@ -274,6 +274,25 @@ python -m tools.visualize_brdf --shader layers
 | `viz_furnace_test.lux` | White furnace test: hemisphere integration with 16 unrolled samples |
 | `viz_layer_energy.lux` | Stacked area chart: per-layer energy (diffuse, specular, coat, sheen) vs viewing angle |
 
+### AI-Generated Materials
+
+Generate physically-based materials from text, images, or video. The AI pipeline produces compilable Lux code with automatic verification, retry on failure, and structured critique. Five providers supported (Anthropic, OpenAI, Gemini, Ollama, LM Studio).
+
+<p align="center"><img src="screenshots/ai_gallery.png" width="700"></p>
+
+```bash
+luxc --ai "polished gold"                              # text-to-shader
+luxc --ai-from-image copper_pipe.jpg                    # image-to-material
+luxc --ai-modify "add weathering" brass.lux             # style transfer
+luxc --ai-batch "medieval tavern" -o tavern/            # scene batch (5+ materials)
+luxc --ai-critique material.lux                         # validation & review
+luxc --ai-match-reference marble.png                    # iterative render-compare
+```
+
+Every generated material passes the compiler's parse, type-check, and energy-conservation validation before output. Materials are grounded against a 58-entry PBR reference database (physically measured F0, roughness, IOR values). The AI skill system loads domain expertise (PBR authoring, layer composition, optimization, debugging) into prompts for better results.
+
+See [AI.md](AI.md) for the complete AI feature reference with pipeline diagrams, generated code samples, and CLI output examples.
+
 ### Native GPU Playgrounds
 
 Four rendering backends — Python/wgpu, C++/Vulkan, C++/Metal, Rust/ash — all driven by the same reflection JSON from the Lux compiler:
@@ -338,7 +357,7 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 - **Ray tracing** — `mode: raytrace` pipelines, `environment`/`procedural` declarations, RT stage blocks
 - **Mesh shaders** — `mode: mesh_shader` pipelines, `task`/`mesh` stages, meshlet-based geometry, `--define` compile-time parameters (C++ and Rust only)
 - **GLSL transpiler** — `--transpile` converts GLSL fragment shaders to Lux
-- **AI generation** — `--ai "description"` generates shaders from natural language
+- **AI material authoring** — text-to-shader (`--ai`), image-to-material (`--ai-from-image`), style transfer (`--ai-modify`), scene batch generation (`--ai-batch`), video-to-animation (`--ai-from-video`), reference matching (`--ai-match-reference`), validation/critique (`--ai-critique`), and a skill system for domain expertise injection; 5 providers (Anthropic, OpenAI, Gemini, Ollama, LM Studio); 58-material PBR reference database; see [AI.md](AI.md)
 - **One file, multi-stage** — vertex, fragment, and RT stages in a single `.lux` file
 - **Full SPIR-V output** — compiles to validated `.spv` binaries via `spirv-as` + `spirv-val`
 - **40+ built-in functions** — math, vector, matrix, texture sampling (2D + cubemap + explicit LOD), RT instructions, NaN/Inf detection

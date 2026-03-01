@@ -14,7 +14,11 @@ from luxc.ai.materials import build_material_reference
 _EXAMPLES_DIR = Path(__file__).parent.parent.parent / "examples"
 
 
-def build_system_prompt(mode: str = "general") -> str:
+def build_system_prompt(
+    mode: str = "general",
+    skills: list[str] | None = None,
+    extra_context: str = "",
+) -> str:
     """Construct the system prompt for Claude to generate Lux shaders.
 
     Parameters
@@ -23,6 +27,11 @@ def build_system_prompt(mode: str = "general") -> str:
         Prompt specialisation.  Only ``"general"`` is meaningful today;
         the parameter exists so future callers can request focused prompts
         without changing the signature.
+    skills:
+        Optional list of skill names to load and inject between the stdlib
+        reference and constraints sections.
+    extra_context:
+        Optional additional context to insert after skills.
     """
     sections = [
         _HEADER,
@@ -30,10 +39,23 @@ def build_system_prompt(mode: str = "general") -> str:
         _BUILTIN_REFERENCE,
         _STDLIB_REFERENCE,
         build_material_reference(),
+    ]
+
+    # Inject skill context if requested
+    if skills:
+        from luxc.ai.skills import build_skill_context
+        skill_text = build_skill_context(skills)
+        if skill_text:
+            sections.append(skill_text)
+
+    if extra_context:
+        sections.append(extra_context)
+
+    sections.extend([
         _CONSTRAINTS,
         _examples_section(),
         _FOOTER,
-    ]
+    ])
     return "\n\n".join(sections)
 
 
@@ -459,6 +481,143 @@ Emit a complete Lux program containing:
 defaults
 - A `surface` declaration referencing the properties block and listing \
 the appropriate `layers [...]`
+
+Output ONLY the Lux code, with no markdown fences or explanatory text."""
+
+
+def build_critique_prompt() -> str:
+    """Build a specialised prompt for AI critique / validation mode.
+
+    Automatically loads the ``debugging`` and ``pbr-authoring`` skills
+    and instructs the AI to output a structured JSON list of issues.
+    """
+    base = build_system_prompt(skills=["debugging", "pbr-authoring"])
+    return base + "\n\n" + _CRITIQUE_INSTRUCTIONS
+
+
+def build_style_transfer_prompt() -> str:
+    """Build a prompt for style-transfer / material modification.
+
+    Loads ``layer-composition`` and ``pbr-authoring`` skills and instructs
+    the AI to receive existing source + modification instruction and output
+    a complete modified Lux program.
+    """
+    base = build_system_prompt(skills=["layer-composition", "pbr-authoring"])
+    return base + "\n\n" + _STYLE_TRANSFER_INSTRUCTIONS
+
+
+def build_batch_planning_prompt() -> str:
+    """Build a prompt for batch material planning.
+
+    Instructs the AI to generate a JSON list of material plans
+    (name + description) for a scene description.
+    """
+    base = "\n\n".join([
+        _HEADER,
+        build_material_reference(),
+    ])
+    return base + "\n\n" + _BATCH_PLANNING_INSTRUCTIONS
+
+
+def build_video_analysis_prompt() -> str:
+    """Build a prompt for video-to-animation shader generation.
+
+    Instructs the AI to generate an animated Lux shader using time-based
+    noise and procedural patterns based on observed motion.
+    """
+    base = build_system_prompt(skills=["pbr-authoring"])
+    return base + "\n\n" + _VIDEO_ANIMATION_INSTRUCTIONS
+
+
+# ---------------------------------------------------------------------------
+# Specialised instruction blocks
+# ---------------------------------------------------------------------------
+
+_CRITIQUE_INSTRUCTIONS = """\
+## Critique Task
+
+You are reviewing a Lux shader program for correctness, physical plausibility,
+and performance. Analyse the provided source code and output a JSON object
+with the following structure:
+
+```json
+{
+    "issues": [
+        {
+            "severity": "error|warning|info",
+            "category": "physics|energy|performance|style|correctness",
+            "message": "Description of the issue",
+            "line": 10,
+            "suggestion": "How to fix it"
+        }
+    ],
+    "summary": "Brief overall assessment"
+}
+```
+
+Check for:
+- **correctness**: Syntax errors, type mismatches, undefined variables
+- **physics**: Non-physical parameter values (albedo > 1.0, metallic 0.5)
+- **energy**: Energy conservation violations, excessive brightness
+- **performance**: Expensive operations, unguarded layers, heavy noise
+- **style**: Naming conventions, code organisation, missing properties
+
+Output ONLY the JSON object, no markdown fences or explanatory text."""
+
+_STYLE_TRANSFER_INSTRUCTIONS = """\
+## Material Modification Task
+
+You will receive an existing Lux shader program and an instruction describing
+how to modify it (e.g., "make it more weathered", "add clear coat",
+"change to dark copper").
+
+Rules:
+1. Preserve the overall structure (surface name, properties block layout)
+2. Modify only what the instruction requests
+3. Keep all parameter values physically plausible
+4. If adding a new layer, follow the correct layer ordering
+5. Output the COMPLETE modified Lux program (not just the changes)
+
+Output ONLY the Lux code, with no markdown fences or explanatory text."""
+
+_BATCH_PLANNING_INSTRUCTIONS = """\
+## Batch Material Planning Task
+
+You will receive a scene description (e.g., "medieval tavern",
+"sci-fi spacecraft interior"). Generate a JSON list of complementary
+materials that would be needed for this scene.
+
+Output format:
+```json
+[
+    {"name": "tavern_wood_floor", "description": "Dark aged oak wood flooring with visible grain"},
+    {"name": "tavern_stone_wall", "description": "Rough grey stone wall material"},
+    ...
+]
+```
+
+Rules:
+- Each material should have a unique, descriptive snake_case name
+- Descriptions should be specific enough to generate a complete PBR material
+- Include a variety of material types (metals, dielectrics, fabrics, etc.)
+- Materials should be complementary and coherent for the scene
+- If no count is specified, generate 4-8 materials
+
+Output ONLY the JSON array, no markdown fences or explanatory text."""
+
+_VIDEO_ANIMATION_INSTRUCTIONS = """\
+## Animated Shader Task
+
+You will receive a motion description derived from video analysis.
+Generate an animated Lux shader that captures the observed motion pattern.
+
+Rules:
+1. Use `import noise;` for procedural animation
+2. Accept a `time` uniform for animation (add it to a properties or uniform block)
+3. Use time-based noise (e.g., `noise.fbm2d_4(uv + vec2(time * 0.5, 0.0), 2.0, 0.5)`)
+4. Match the described motion speed, direction, and pattern
+5. Output a complete, compilable surface declaration
+6. Keep parameters physically plausible
 
 Output ONLY the Lux code, with no markdown fences or explanatory text."""
 

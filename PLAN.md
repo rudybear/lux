@@ -840,7 +840,7 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P8** | `@layer` custom functions (user-defined layer extensibility) | ✅ Complete |
 | **P9** | Deferred pipeline mode (`--pipeline deferred`, G-buffer pass) | Planned |
 | **P10** | Ray tracing pipeline — full (RT stages, SPIR-V codegen, surface→RT expansion) | ✅ Complete |
-| **P11** | Metal backend via SPIR-V cross-compilation (SPIRV-Cross → MSL) | Planned |
+| **P11** | Metal backend via SPIR-V cross-compilation (SPIRV-Cross → MSL) | ✅ Complete |
 | **P12** | Official glTF PBR extensions in engine materials (auto-detect, permutation selection) | ✅ Complete |
 | **P13** | Mesh shader support (`task`/`mesh` stages, meshlet-based geometry, `--define` compile-time parameters) | ✅ Complete |
 | **P14** | Gaussian splatting representation (splat sorting, tile-based rasterizer, SH evaluation) | Planned |
@@ -848,7 +848,8 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P16** | AI features for Lux (image-to-shader, prompt-based generation, AI skills, training pipeline) | Planned |
 | **P17.1** | Lighting block (`lighting` declarations, `directional()` + `ibl()` layers, IBL migration from surface to lighting, backward compat) | ✅ Complete |
 | **P17.2** | Multi-light + shadows (`multi_light()` layer, compile-time unrolled N-light loop, `LightData` + `ShadowEntry` SSBOs, `sampler2DArray` + `samplerCubeArray` types, `shadow.lux` stdlib, shadow map infrastructure in all engines) | ✅ Complete |
-| **P17.3+** | Full light & shadow management (declarative lights, CSM/cubemap/perspective shadows, PCSS/VSM/MSM filtering, tiled/clustered culling, volumetric lighting, light probes, LPV) | Planned |
+| **P17.3** | Shadow sampling & validation (shadow stdlib, `+shadows` permutation, PCF4 filtering, procedural lighttest scene, shadow direction fix) | ✅ Complete |
+| **P17.4+** | Advanced shadow & light management (CSM, cubemap/perspective shadows, PCSS/VSM/MSM filtering, tiled/clustered culling, volumetric lighting, light probes, LPV) | Planned |
 | **P18** | Material property pipeline (`properties` block, Material UBO, `Material.field` access, engine wiring) | ✅ Complete (18.1) |
 | **P19** | Linux support (build scripts, path handling, CI) | Planned |
 | **P20** | Validation & debugging (debug_print, assert, @[debug], semantic types, NaN analysis, OpMemberName, debug utils labels) | ✅ Complete |
@@ -1051,7 +1052,7 @@ pipeline GltfForward {
 - **Tests**: 21 new tests (parsing, feature stripping, expansion, cross-block interaction); 497 total tests passing
 - **Zero engine changes**: Light UBO field names and IBL sampler names unchanged in reflection JSON
 
-**Future (P17.3+):** Full declarative light types, advanced shadow filtering (PCSS, VSM, MSM), tiled/clustered light culling, volumetric lighting, light probes.
+**Future (P17.4+):** Full declarative light types, advanced shadow filtering (PCSS, VSM, MSM), tiled/clustered light culling, volumetric lighting, light probes.
 
 ---
 
@@ -1084,6 +1085,33 @@ Extended the lighting system with runtime N-light evaluation and shadow mapping 
 - Updated `examples/gltf_pbr_layered.lux` with `multi_light()` layers and `has_shadows` feature
 - `tests/test_multi_light.py` — 40 new tests covering parsing, AST unrolling, SSBO generation, sampler arrays, backward compat, all 6 pipeline paths, shadow args
 - 542 total tests passing (zero regressions)
+
+---
+
+### Phase 17.3: Shadow Sampling & Validation ✅ COMPLETE
+
+Extended the shadow infrastructure with sampling functions, shader permutation support, and a procedural test scene for visual validation.
+
+**Compiler changes:**
+- **`shadow.lux` stdlib**: `sample_shadow_basic()` (hard shadows), `sample_shadow_pcf4()` (4-tap PCF), `select_cascade()`, `compute_shadow_uv()` — all consume `ShadowEntry` SSBO + `sampler2DArray`
+- **`+shadows` permutation**: `has_shadows` feature flag gates shadow sampling in `gltf_pbr_layered.lux`; manifest generates both `base` and `base+shadows` SPIR-V variants
+- **SceneLightUBO layout fix**: reordered to match std140 padding rules for multi-light rendering
+
+**Engine changes (C++, Rust):**
+- Shadow permutation selection: engines detect `castsShadow` on any light → select `+shadows` pipeline variant from manifest
+- Light direction convention fix: shaders use direction-toward-light (`dot(N, dir) > 0` = lit); shadow matrix uses `lookAt(center + lightDir, center, up)` to match
+- `groupMaterialsByFeatures()` ordering: `castsShadow` must be set BEFORE feature grouping to ensure correct permutation selection
+- Depth buffer fix: `m_needsDepth` extended to recognize procedural scene types ("lighttest")
+
+**Procedural lighttest scene:**
+- Ground plane (10×10), floating cube, red/green light-marker spheres — all using `GltfVertex` (48-byte: pos + normal + uv + tangent)
+- Geometry generators: `generatePlaneGltf()`, `generateCubeGltf()`, `generateSphereGltf()` in `scene.cpp`
+- `loadProceduralTestScene()` in SceneManager: 4 materials, 4 meshes, 4 nodes, programmatic `GltfScene`
+- `setupTestLights()`: directional sun (shadow-casting) + red/green point lights
+- `--scene lighttest` CLI routing, `--no-ibl` flag, auto-camera at (6,4,6) looking at (0,1,0)
+- Visual validation: colored light tinting visible, cube shadow clearly falls on ground plane
+
+**Future (P17.4+):** Full declarative light types, advanced shadow filtering (PCSS, VSM, MSM), tiled/clustered light culling, volumetric lighting, light probes.
 
 ---
 

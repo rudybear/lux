@@ -133,8 +133,17 @@ def render_pbr(
     frag_spv_path: Path,
     width: int = 512,
     height: int = 512,
+    texture_data: "np.ndarray | None" = None,
+    light_dir: "tuple[float, float, float] | None" = None,
 ) -> np.ndarray:
-    """Render a PBR-lit sphere and return an (H, W, 4) uint8 RGBA array."""
+    """Render a PBR-lit sphere and return an (H, W, 4) uint8 RGBA array.
+
+    Args:
+        texture_data: Optional (H, W, 4) uint8 RGBA texture. If None, uses
+            the default colorful procedural checkerboard.
+        light_dir: Optional (x, y, z) light direction. If None, uses default
+            (1.0, 0.8, 0.6).
+    """
 
     # --- GPU setup ---
     adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
@@ -172,9 +181,12 @@ def render_pbr(
     )
 
     # --- Light uniform buffer (std140: vec3 padded to 16 bytes each) ---
-    light_dir = np.array([1.0, 0.8, 0.6], dtype=np.float32)
-    light_dir = light_dir / np.linalg.norm(light_dir)
-    light_data = struct.pack("3f", *light_dir) + struct.pack("f", 0.0)  # pad
+    if light_dir is not None:
+        ld = np.array(light_dir, dtype=np.float32)
+    else:
+        ld = np.array([1.0, 0.8, 0.6], dtype=np.float32)
+    ld = ld / np.linalg.norm(ld)
+    light_data = struct.pack("3f", *ld) + struct.pack("f", 0.0)  # pad
     light_data += struct.pack("3f", *eye) + struct.pack("f", 0.0)       # pad
     light_buffer = device.create_buffer_with_data(
         data=light_data,
@@ -182,13 +194,16 @@ def render_pbr(
     )
 
     # --- Procedural albedo texture ---
-    print("Generating procedural texture...")
-    tex_data = generate_procedural_texture(512)
+    if texture_data is not None:
+        tex_data = texture_data
+    else:
+        print("Generating procedural texture...")
+        tex_data = generate_procedural_texture(512)
     tex_size = tex_data.shape[1]  # square
 
     albedo_texture = device.create_texture(
         size=(tex_size, tex_size, 1),
-        format=wgpu.TextureFormat.rgba8unorm,
+        format=wgpu.TextureFormat.rgba8unorm_srgb,
         usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
     )
     device.queue.write_texture(
@@ -264,7 +279,7 @@ def render_pbr(
     # --- Render target ---
     texture = device.create_texture(
         size=(width, height, 1),
-        format=wgpu.TextureFormat.rgba8unorm,
+        format=wgpu.TextureFormat.rgba8unorm_srgb,
         usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.COPY_SRC,
     )
     texture_view = texture.create_view()
@@ -322,7 +337,7 @@ def render_pbr(
             module=frag_module,
             entry_point="main",
             targets=[
-                wgpu.ColorTargetState(format=wgpu.TextureFormat.rgba8unorm),
+                wgpu.ColorTargetState(format=wgpu.TextureFormat.rgba8unorm_srgb),
             ],
         ),
     )
@@ -335,7 +350,7 @@ def render_pbr(
                 view=texture_view,
                 load_op=wgpu.LoadOp.clear,
                 store_op=wgpu.StoreOp.store,
-                clear_value=(0.05, 0.05, 0.08, 1.0),  # dark background
+                clear_value=(0.003, 0.003, 0.006, 1.0),  # dark background (sRGB-corrected)
             ),
         ],
         depth_stencil_attachment=wgpu.RenderPassDepthStencilAttachment(
