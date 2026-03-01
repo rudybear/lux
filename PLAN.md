@@ -854,7 +854,7 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P19** | Linux support (build scripts, path handling, CI) | Planned |
 | **P20** | Validation & debugging (debug_print, assert, @[debug], semantic types, NaN analysis, OpMemberName, debug utils labels) | ✅ Complete |
 | **P22** | Loops & control flow (`for`/`while` loops, `break`/`continue`, loop unrolling) | Planned |
-| **P23** | GPU compute shaders (compute stage, shared memory, barriers, dispatch) | Planned |
+| **P23** | GPU compute shaders (compute stage, RW SSBOs, storage images, barriers, dispatch) | ✅ Complete (23.1) |
 | **P24** | Shader hot-reload (file watcher, live recompile, engine hot-swap) | Planned |
 | **P25** | Performance optimization (SSA IR, dead code elimination, CSE, register pressure) | Planned |
 
