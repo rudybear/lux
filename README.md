@@ -111,6 +111,37 @@ luxc gltf_pbr_layered.lux --pipeline GltfMesh --features has_emission \
     --define max_vertices=64 --define max_primitives=124 --define workgroup_size=32
 ```
 
+### Compute Shaders — GPU General-Purpose Computation
+
+Standalone `compute` stage for data-parallel GPU work — SSBO read/write, storage image output, configurable workgroup sizes, and `barrier()` synchronization. Same workgroup builtins as mesh shaders (`global_invocation_id`, `workgroup_id`, etc.), zero boilerplate.
+
+<p align="center">
+<img src="screenshots/compute_gradient.png" width="300">
+<img src="screenshots/compute_mandelbrot.png" width="300">
+</p>
+
+```lux
+// Mandelbrot set — compute shader writes directly to a storage image
+compute {
+    storage_image output_img;
+
+    fn main() {
+        let gid: uvec3 = global_invocation_id;
+        let cx: scalar = -0.5 + (gid.x / 512.0 - 0.5) * 3.0;
+        let cy: scalar = (gid.y / 512.0 - 0.5) * 3.0;
+
+        // Iterate z = z^2 + c ...
+        let color: vec4 = vec4(r, g, b, 1.0);
+        image_store(output_img, gid.xy, color);
+    }
+}
+```
+
+```bash
+luxc compute_mandelbrot.lux --define workgroup_size_x=16 --define workgroup_size_y=16
+# Wrote compute_mandelbrot.comp.spv
+```
+
 ### Cartoon / Toon Shader — Custom `@layer`
 
 User-defined layers via `@layer` annotation — cel-shading with quantized NdotL and rim lighting, applied to glTF PBR models. One `@layer fn cartoon(...)` plugs into the standard layer compositing pipeline.
@@ -325,6 +356,7 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 |---------|:---:|:---:|:---:|:---:|
 | **Platforms** | Win, Linux, macOS | Win, Linux | macOS | Win, Linux |
 | **Rasterization** | yes | yes | yes | yes |
+| **Compute shaders** | yes | yes | yes | yes |
 | **Mesh shaders** | — | yes | yes (Metal 3) | yes |
 | **Ray tracing** | — | yes | — | yes |
 | **Bindless descriptors** | — | yes | — | yes |
@@ -356,6 +388,7 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 - **Automatic differentiation** — `@differentiable` generates gradient functions via forward-mode autodiff
 - **Ray tracing** — `mode: raytrace` pipelines, `environment`/`procedural` declarations, RT stage blocks
 - **Mesh shaders** — `mode: mesh_shader` pipelines, `task`/`mesh` stages, meshlet-based geometry, `--define` compile-time parameters (C++ and Rust only)
+- **Compute shaders** — standalone `compute` stage for general-purpose GPU computation; read-write SSBOs, storage image output, configurable workgroup sizes via `--define`, `barrier()` synchronization; shares workgroup builtins with mesh/task stages
 - **GLSL transpiler** — `--transpile` converts GLSL fragment shaders to Lux
 - **AI material authoring** — text-to-shader (`--ai`), image-to-material (`--ai-from-image`), style transfer (`--ai-modify`), scene batch generation (`--ai-batch`), video-to-animation (`--ai-from-video`), reference matching (`--ai-match-reference`), validation/critique (`--ai-critique`), and a skill system for domain expertise injection; 5 providers (Anthropic, OpenAI, Gemini, Ollama, LM Studio); 58-material PBR reference database; see [AI.md](AI.md)
 - **One file, multi-stage** — vertex, fragment, and RT stages in a single `.lux` file
@@ -423,6 +456,18 @@ python -m luxc examples/rt_pathtracer.lux
 python -m luxc examples/gltf_pbr_layered.lux --pipeline GltfMesh --features has_emission --define max_vertices=64 --define max_primitives=124 --define workgroup_size=32
 # Wrote shadercache/gltf_pbr_layered+emission.mesh.spv
 # Wrote shadercache/gltf_pbr_layered+emission.frag.spv
+```
+
+### Compile a compute shader
+
+```bash
+# 1D workgroup (data-parallel SSBO operations)
+python -m luxc examples/compute_saxpy.lux --define workgroup_size=256
+# Wrote examples/compute_saxpy.comp.spv
+
+# 2D workgroup (image processing)
+python -m luxc examples/compute_mandelbrot.lux --define workgroup_size_x=16 --define workgroup_size_y=16
+# Wrote examples/compute_mandelbrot.comp.spv
 ```
 
 ### Compile a specific pipeline

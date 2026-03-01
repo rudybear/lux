@@ -35,14 +35,18 @@ _RT_STAGES = frozenset(_RT_EXEC_MODELS.keys())
 _MESH_EXEC_MODELS = {"mesh": "MeshEXT", "task": "TaskEXT"}
 _MESH_STAGES = frozenset(_MESH_EXEC_MODELS.keys())
 
-# Mesh shader built-in variables
-_MESH_BUILTINS = {
-    "local_invocation_id":    ("uvec3", "LocalInvocationId",    {"mesh", "task"}),
-    "local_invocation_index": ("uint",  "LocalInvocationIndex", {"mesh", "task"}),
-    "workgroup_id":           ("uvec3", "WorkgroupId",          {"mesh", "task"}),
-    "num_workgroups":         ("uvec3", "NumWorkgroups",        {"mesh", "task"}),
-    "global_invocation_id":   ("uvec3", "GlobalInvocationId",   {"mesh", "task"}),
+# Workgroup built-in variables (shared by mesh, task, and compute stages)
+_WORKGROUP_BUILTINS = {
+    "local_invocation_id":    ("uvec3", "LocalInvocationId",    {"mesh", "task", "compute"}),
+    "local_invocation_index": ("uint",  "LocalInvocationIndex", {"mesh", "task", "compute"}),
+    "workgroup_id":           ("uvec3", "WorkgroupId",          {"mesh", "task", "compute"}),
+    "num_workgroups":         ("uvec3", "NumWorkgroups",        {"mesh", "task", "compute"}),
+    "global_invocation_id":   ("uvec3", "GlobalInvocationId",   {"mesh", "task", "compute"}),
 }
+
+# Compute stage types
+_COMPUTE_STAGES = frozenset({"compute"})
+_WORKGROUP_STAGES = _MESH_STAGES | _COMPUTE_STAGES
 
 # RT built-in variables: (name, type, SPIR-V BuiltIn, stages)
 _RT_BUILTINS = {
@@ -251,6 +255,8 @@ class SpvGenerator:
             exec_model = _RT_EXEC_MODELS[self.stage.stage_type]
         elif is_mesh:
             exec_model = _MESH_EXEC_MODELS[self.stage.stage_type]
+        elif self.stage.stage_type == "compute":
+            exec_model = "GLCompute"
         elif self.stage.stage_type == "vertex":
             exec_model = "Vertex"
         else:
@@ -275,6 +281,12 @@ class SpvGenerator:
             defines = getattr(self.module, '_defines', {})
             wg_size = defines.get('workgroup_size', 32)
             lines.append(f"OpExecutionMode %main LocalSize {wg_size} 1 1")
+        elif self.stage.stage_type == "compute":
+            defines = getattr(self.module, '_defines', {})
+            wg_x = defines.get('workgroup_size_x', defines.get('workgroup_size', 64))
+            wg_y = defines.get('workgroup_size_y', 1)
+            wg_z = defines.get('workgroup_size_z', 1)
+            lines.append(f"OpExecutionMode %main LocalSize {wg_x} {wg_y} {wg_z}")
 
         # Debug source info (OpString / OpSource) — must come after OpEntryPoint/OpExecutionMode
         if self.debug and self.source_name:
@@ -569,6 +581,7 @@ class SpvGenerator:
                 self.decorations.append(f"OpDecorate {var_id} DescriptorSet {si.set_number}")
             if si.binding is not None:
                 self.decorations.append(f"OpDecorate {var_id} Binding {si.binding}")
+            self.decorations.append(f"OpDecorate {var_id} NonReadable")
             self.var_map[si.name] = var_id
             self.var_types[si.name] = "storage_image"
             self.var_storage[si.name] = storage
@@ -631,8 +644,9 @@ class SpvGenerator:
             # Decorations
             self.decorations.append(f"OpDecorate {struct_id} Block")
             self.decorations.append(f"OpMemberDecorate {struct_id} 0 Offset 0")
-            self.decorations.append(f"OpMemberDecorate {struct_id} 0 NonWritable")
-            self.decorations.append(f"OpDecorate {var_id} NonWritable")
+            if self.stage.stage_type != "compute":
+                self.decorations.append(f"OpMemberDecorate {struct_id} 0 NonWritable")
+                self.decorations.append(f"OpDecorate {var_id} NonWritable")
             if sb.set_number is not None:
                 self.decorations.append(f"OpDecorate {var_id} DescriptorSet {sb.set_number}")
             if sb.binding is not None:
@@ -685,10 +699,10 @@ class SpvGenerator:
                     self.interface_ids.append(var_id)
                     emitted_builtins[spv_builtin] = var_id
 
-        # --- Mesh/Task: Built-in variables ---
-        if self.stage.stage_type in _MESH_STAGES:
+        # --- Workgroup built-in variables (mesh, task, compute) ---
+        if self.stage.stage_type in _WORKGROUP_STAGES:
             emitted_builtins: dict[str, str] = {}
-            for builtin_name, (btype, spv_builtin, valid_stages) in _MESH_BUILTINS.items():
+            for builtin_name, (btype, spv_builtin, valid_stages) in _WORKGROUP_BUILTINS.items():
                 if self.stage.stage_type in valid_stages:
                     if spv_builtin in emitted_builtins:
                         var_id = emitted_builtins[spv_builtin]
@@ -1118,6 +1132,27 @@ class SpvGenerator:
             return self._gen_store_target(target.object)
 
         elif isinstance(target, IndexAccess):
+            # Check for storage buffer indexed store: buffer[index] = value
+            if isinstance(target.object, VarRef) and target.object.name in self.storage_buffer_var_ids:
+                name = target.object.name
+                buf_var_id = self.storage_buffer_var_ids[name]
+                elem_type_name = self.storage_buffer_element_types[name]
+                elem_type_id = self.reg.lux_type_to_spirv(elem_type_name)
+                idx_id, idx_lines = self._gen_expr(target.index)
+                lines.extend(idx_lines)
+                # Convert float index to int
+                idx_lux_type = self._resolve_expr_lux_type(target.index)
+                if idx_lux_type in ("scalar",):
+                    int_type = self.reg.int32()
+                    conv = self.reg.next_id()
+                    lines.append(f"{conv} = OpConvertFToS {int_type} {idx_id}")
+                    idx_id = conv
+                ptr_elem = self.reg.pointer("StorageBuffer", elem_type_id)
+                const_0 = self.reg.const_int(0, signed=True)
+                ac_id = self.reg.next_id()
+                lines.append(f"{ac_id} = OpAccessChain {ptr_elem} {buf_var_id} {const_0} {idx_id}")
+                return ac_id, lines
+
             # Check for mesh output array writes: output_name[index]
             if isinstance(target.object, VarRef):
                 name = target.object.name
@@ -1780,6 +1815,14 @@ class SpvGenerator:
             else:
                 lines.append(f"OpEmitMeshTasksEXT {converted[0]} {converted[1]} {converted[2]}")
             result = self.reg.const_float(0.0)
+            return result, lines
+
+        if fname == "barrier":
+            # barrier() — workgroup execution + memory barrier
+            scope_wg = self.reg.const_uint(2)       # Workgroup scope
+            semantics = self.reg.const_uint(0x108)   # AcquireRelease | WorkgroupMemory
+            lines.append(f"OpControlBarrier {scope_wg} {scope_wg} {semantics}")
+            result = self.reg.const_float(0.0)  # void return placeholder
             return result, lines
 
         if fname == "image_store":

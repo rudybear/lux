@@ -1,0 +1,67 @@
+// Mandelbrot set rendered to a storage image via compute shader
+// Compile: luxc compute_mandelbrot.lux --define workgroup_size_x=16 --define workgroup_size_y=16
+
+compute {
+    storage_image output_img;
+
+    fn main() {
+        let gid: uvec3 = global_invocation_id;
+        let px: scalar = gid.x;
+        let py: scalar = gid.y;
+
+        // Map pixel to complex plane (512x512 assumed)
+        let w: scalar = 512.0;
+        let h: scalar = 512.0;
+        let zoom: scalar = 1.0;
+        let cx: scalar = -0.5 + (px / w - 0.5) * 3.0 / zoom;
+        let cy: scalar = (py / h - 0.5) * 3.0 / zoom;
+
+        // Iterate z = z^2 + c (16 unrolled iterations)
+        let zx1: scalar = cx;
+        let zy1: scalar = cy;
+        let zx2: scalar = zx1 * zx1 - zy1 * zy1 + cx;
+        let zy2: scalar = 2.0 * zx1 * zy1 + cy;
+        let zx3: scalar = zx2 * zx2 - zy2 * zy2 + cx;
+        let zy3: scalar = 2.0 * zx2 * zy2 + cy;
+        let zx4: scalar = zx3 * zx3 - zy3 * zy3 + cx;
+        let zy4: scalar = 2.0 * zx3 * zy3 + cy;
+        let zx5: scalar = zx4 * zx4 - zy4 * zy4 + cx;
+        let zy5: scalar = 2.0 * zx4 * zy4 + cy;
+        let zx6: scalar = zx5 * zx5 - zy5 * zy5 + cx;
+        let zy6: scalar = 2.0 * zx5 * zy5 + cy;
+        let zx7: scalar = zx6 * zx6 - zy6 * zy6 + cx;
+        let zy7: scalar = 2.0 * zx6 * zy6 + cy;
+        let zx8: scalar = zx7 * zx7 - zy7 * zy7 + cx;
+        let zy8: scalar = 2.0 * zx7 * zy7 + cy;
+
+        let zx9: scalar = zx8 * zx8 - zy8 * zy8 + cx;
+        let zy9: scalar = 2.0 * zx8 * zy8 + cy;
+        let zx10: scalar = zx9 * zx9 - zy9 * zy9 + cx;
+        let zy10: scalar = 2.0 * zx9 * zy9 + cy;
+        let zx11: scalar = zx10 * zx10 - zy10 * zy10 + cx;
+        let zy11: scalar = 2.0 * zx10 * zy10 + cy;
+        let zx12: scalar = zx11 * zx11 - zy11 * zy11 + cx;
+        let zy12: scalar = 2.0 * zx11 * zy11 + cy;
+        let zx13: scalar = zx12 * zx12 - zy12 * zy12 + cx;
+        let zy13: scalar = 2.0 * zx12 * zy12 + cy;
+        let zx14: scalar = zx13 * zx13 - zy13 * zy13 + cx;
+        let zy14: scalar = 2.0 * zx13 * zy13 + cy;
+        let zx15: scalar = zx14 * zx14 - zy14 * zy14 + cx;
+        let zy15: scalar = 2.0 * zx14 * zy14 + cy;
+        let zx16: scalar = zx15 * zx15 - zy15 * zy15 + cx;
+        let zy16: scalar = 2.0 * zx15 * zy15 + cy;
+
+        // Smooth coloring from escape magnitude
+        let mag: scalar = zx16 * zx16 + zy16 * zy16;
+        let t: scalar = clamp(sqrt(mag) / 4.0, 0.0, 1.0);
+
+        // Palette: deep blue inside, hot white outside
+        let inside: scalar = step(4.0, mag);
+        let r: scalar = inside * smoothstep(0.0, 0.8, t);
+        let g: scalar = inside * t * t;
+        let b: scalar = inside * clamp(t * 0.5 + 0.3, 0.0, 1.0);
+
+        let color: vec4 = vec4(r, g, b, 1.0);
+        image_store(output_img, gid.xy, color);
+    }
+}

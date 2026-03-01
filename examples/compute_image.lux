@@ -1,0 +1,16 @@
+// Image brightness adjustment using storage images
+// Compile: luxc compute_image.lux --define workgroup_size_x=16 --define workgroup_size_y=16
+
+compute {
+    storage_image output_img;
+
+    push params {
+        brightness: scalar,
+    }
+
+    fn main() {
+        let gid: vec2 = global_invocation_id.xy;
+        let color: vec4 = vec4(brightness, brightness, brightness, 1.0);
+        image_store(output_img, gid, color);
+    }
+}

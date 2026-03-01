@@ -155,6 +155,8 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
                 bindless=bindless, lighting=lighting,
             )
             module.stages.extend(stages)
+        elif mode == "compute":
+            pass  # Compute stages are written directly, no expansion needed
         elif surf_name and surf_name in surfaces:
             surface = surfaces[surf_name]
             geometry = geometries.get(geo_name) if geo_name else None

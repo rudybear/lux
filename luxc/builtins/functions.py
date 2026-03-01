@@ -173,6 +173,10 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     # emit_mesh_tasks(gx, gy, gz) -> void
     add([FuncSig("emit_mesh_tasks", (UINT, UINT, UINT), VOID)])
 
+    # --- Compute shader instructions ---
+    # barrier() -> void (workgroup execution + memory barrier)
+    add([FuncSig("barrier", (), VOID)])
+
     return table
 
 

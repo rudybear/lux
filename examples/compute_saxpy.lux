@@ -1,0 +1,20 @@
+// SAXPY: result[i] = a * x[i] + y[i]
+// Compile: luxc compute_saxpy.lux --define workgroup_size=256
+
+compute {
+    storage_buffer x: scalar;
+    storage_buffer y: scalar;
+    storage_buffer result: scalar;
+
+    push params {
+        a: scalar,
+        count: scalar,
+    }
+
+    fn main() {
+        let gid: scalar = global_invocation_id.x;
+        if (gid < count) {
+            result[gid] = a * x[gid] + y[gid];
+        }
+    }
+}

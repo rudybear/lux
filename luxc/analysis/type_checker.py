@@ -213,15 +213,15 @@ class TypeChecker:
                     if t is not None:
                         scope.define(Symbol(bname, t, "rt_builtin"))
 
-        # Register mesh/task built-in variables
-        _MESH_STAGE_TYPES = {"mesh", "task"}
-        if stage.stage_type in _MESH_STAGE_TYPES:
-            from luxc.codegen.spirv_builder import _MESH_BUILTINS
-            for bname, (btype, _, valid_stages) in _MESH_BUILTINS.items():
+        # Register mesh/task/compute built-in variables
+        _WORKGROUP_STAGE_TYPES = {"mesh", "task", "compute"}
+        if stage.stage_type in _WORKGROUP_STAGE_TYPES:
+            from luxc.codegen.spirv_builder import _WORKGROUP_BUILTINS
+            for bname, (btype, _, valid_stages) in _WORKGROUP_BUILTINS.items():
                 if stage.stage_type in valid_stages:
                     t = resolve_type(btype)
                     if t is not None:
-                        scope.define(Symbol(bname, t, "mesh_builtin"))
+                        scope.define(Symbol(bname, t, "workgroup_builtin"))
 
         # Register mesh output built-in variables as arrays
         # (IndexAccess on RuntimeArrayType returns the element type correctly)

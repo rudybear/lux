@@ -1,0 +1,17 @@
+// Doubles every element in a storage buffer
+// Compile: luxc compute_double.lux --define workgroup_size=64
+
+compute {
+    storage_buffer data: scalar;
+
+    push params {
+        count: scalar,
+    }
+
+    fn main() {
+        let gid: scalar = global_invocation_id.x;
+        if (gid < count) {
+            data[gid] = data[gid] * 2.0;
+        }
+    }
+}

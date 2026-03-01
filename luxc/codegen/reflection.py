@@ -33,6 +33,7 @@ _EXEC_MODELS = {
     "miss": "MissKHR",
     "intersection": "IntersectionKHR",
     "callable": "CallableKHR",
+    "compute": "GLCompute",
     "mesh": "MeshEXT",
     "task": "TaskEXT",
 }
@@ -346,6 +347,12 @@ def generate_reflection(
         result["task_shader"] = {
             "workgroup_size": [defines.get('workgroup_size', 32), 1, 1],
         }
+    elif stage.stage_type == "compute":
+        defines = getattr(module, '_defines', {})
+        wg_x = defines.get('workgroup_size_x', defines.get('workgroup_size', 64))
+        wg_y = defines.get('workgroup_size_y', 1)
+        wg_z = defines.get('workgroup_size_z', 1)
+        result["compute"] = {"workgroup_size": [wg_x, wg_y, wg_z]}
 
     return result
 

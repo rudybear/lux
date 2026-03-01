@@ -157,6 +157,7 @@ def compile_source(
         "miss": "rmiss",
         "intersection": "rint",
         "callable": "rcall",
+        "compute": "comp",
         "mesh": "mesh",
         "task": "task",
     }

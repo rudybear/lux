@@ -39,6 +39,12 @@ def assign_layouts(module: Module) -> None:
             if not hasattr(stage, '_descriptor_set_offset'):
                 stage._descriptor_set_offset = mesh_stage_order[stage.stage_type]
 
+    # Compute: standalone, set 0
+    compute_stages = [s for s in module.stages if s.stage_type == "compute"]
+    for stage in compute_stages:
+        if not hasattr(stage, '_descriptor_set_offset'):
+            stage._descriptor_set_offset = 0
+
     binding_counter = 0
     for stage in module.stages:
         _assign_stage_layouts(stage, binding_counter)

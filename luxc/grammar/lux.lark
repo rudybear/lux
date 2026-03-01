@@ -107,7 +107,7 @@ procedural_decl: "procedural" IDENT "{" procedural_item ("," procedural_item)* "
 
 stage_block: STAGE_TYPE "{" stage_item* "}"
 
-STAGE_TYPE: "vertex" | "fragment" | "raygen" | "closest_hit" | "any_hit" | "miss" | "intersection" | "callable" | "mesh" | "task"
+STAGE_TYPE: "vertex" | "fragment" | "compute" | "raygen" | "closest_hit" | "any_hit" | "miss" | "intersection" | "callable" | "mesh" | "task"
 
 ?stage_item: in_decl
            | out_decl
