@@ -845,7 +845,7 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P13** | Mesh shader support (`task`/`mesh` stages, meshlet-based geometry, `--define` compile-time parameters) | ✅ Complete |
 | **P14** | Gaussian splatting representation (splat sorting, tile-based rasterizer, SH evaluation) | Planned |
 | **P15** | BRDF & layer visualization (lobe plots, transfer function graphs, energy conservation tests) | ✅ Complete |
-| **P16** | AI features for Lux (image-to-shader, prompt-based generation, AI skills, training pipeline) | Planned |
+| **P16** | AI features for Lux (image-to-shader, prompt-based generation, AI skills, training pipeline, critique, style transfer, batch generation, video-to-animation, reference matching, benchmark) | ✅ Complete |
 | **P17.1** | Lighting block (`lighting` declarations, `directional()` + `ibl()` layers, IBL migration from surface to lighting, backward compat) | ✅ Complete |
 | **P17.2** | Multi-light + shadows (`multi_light()` layer, compile-time unrolled N-light loop, `LightData` + `ShadowEntry` SSBOs, `sampler2DArray` + `samplerCubeArray` types, `shadow.lux` stdlib, shadow map infrastructure in all engines) | ✅ Complete |
 | **P17.3** | Shadow sampling & validation (shadow stdlib, `+shadows` permutation, PCF4 filtering, procedural lighttest scene, shadow direction fix) | ✅ Complete |
