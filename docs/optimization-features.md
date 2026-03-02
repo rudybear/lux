@@ -32,6 +32,9 @@ Source (.lux)
   constant_fold()          -- Constant folding + strength reduction: const_fold.py
     |
     v
+  inline_functions()       -- AST-level function inlining (release only): inline.py
+    |
+    v
   dead_code_elim()         -- Dead code elimination: dead_code.py
     |
     v
@@ -41,7 +44,7 @@ Source (.lux)
   assign_layouts()         -- Descriptor set/binding assignment: layout_assigner.py
     |
     v
-  generate_spirv()         -- SPIR-V code generation: spirv_builder.py
+  generate_spirv()         -- SPIR-V codegen + mem2reg + const vector hoisting: spirv_builder.py
     |
     v
   assemble_and_validate()  -- spirv-as + spirv-val: spv_assembler.py
@@ -172,7 +175,109 @@ Two-phase approach for performance:
 
 ---
 
-## 4. Cost Estimator & VGPR Analysis
+## 4. AST-Level Function Inlining
+
+**Source**: `luxc/optimization/inline.py`
+
+Inlines user-defined function calls at the AST level before CSE runs. This allows CSE to catch duplicate expressions that result from inlining the same function multiple times (e.g., `dot(N, Lo)` inlined 4 times from a PBR BRDF).
+
+### How It Works
+
+1. Build a lookup of all user-defined functions (module-level + per-stage)
+2. Deep-copy function bodies before processing (pipeline expansion may share expression objects across stages)
+3. For each `CallExpr` to a user-defined function:
+   - Create unique let bindings for each parameter (`_inlN_paramName`)
+   - Rename local variables with unique prefix to avoid conflicts
+   - Replace the call with the function body's statements + return expression
+4. Process non-main stage functions first (they may call each other), then main
+
+### Inlineability Criteria
+
+A function is inlined if it has a simple structure:
+- A sequence of `LetStmt` nodes (optional `IfStmt`) followed by a `ReturnStmt`
+- Recursive calls are not inlined (current function is excluded)
+
+### Debug Mode
+
+**Skipped entirely** in debug mode (`-g`). Debug builds use codegen-time inlining to preserve the call structure for debugger step-through in RenderDoc and similar tools.
+
+### Impact
+
+On a PBR fragment shader: enables CSE to deduplicate ~15-25 expressions from inlined light calculations that were previously invisible to CSE.
+
+---
+
+## 5. Mem2Reg — SSA Value Forwarding
+
+**Source**: `luxc/codegen/spirv_builder.py` (codegen-time optimization)
+
+Eliminates redundant `OpVariable`/`OpStore`/`OpLoad` sequences for single-assignment variables by tracking SSA values directly during SPIR-V code generation.
+
+### Motivation
+
+Without mem2reg, every `let` binding generates:
+```
+%ptr = OpVariable %_ptr_Function_float Function  ; allocate stack slot
+       OpStore %ptr %value                        ; write value
+%val = OpLoad %float %ptr                         ; read it back
+```
+
+With mem2reg, single-assignment variables skip the stack entirely — the computed value is used directly wherever the variable is referenced.
+
+### Algorithm
+
+1. **Pre-scan** (`_scan_mutable_vars`): Walk the function body to find variables targeted by `AssignStmt` or used as `ForStmt` loop variables — these are "mutable" and must keep `OpVariable`
+2. **Forward-reference detection** (`_scan_forward_refs`): CSE may produce let bindings where one references another defined later in the statement list; these are forced to `OpVariable` to avoid use-before-definition
+3. **SSA path**: For non-mutable variables, store the computed SSA ID in `_ssa_values[name]` instead of emitting `OpStore`. On read, return the SSA ID directly instead of emitting `OpLoad`
+4. **Mutable path**: Variables in `_mutable_vars` use the existing `OpVariable`/`OpStore`/`OpLoad` path
+
+### Debug Mode
+
+**Skipped entirely** in debug mode. All variables get `OpVariable` for debugger variable inspection (RenderDoc, NSight). The debug flag causes `_scan_mutable_vars` to be skipped, treating all variables as mutable.
+
+### Impact
+
+On a PBR fragment shader: ~125 `OpVariable` → ~20 (only loop vars, accumulators), ~100 `OpLoad` eliminated. Single largest contributor to instruction count reduction.
+
+---
+
+## 6. Constant Vector Hoisting
+
+**Source**: `luxc/codegen/spirv_builder.py` (`_gen_constructor`)
+
+Replaces runtime `OpCompositeConstruct` with compile-time `OpConstantComposite` when all vector constructor arguments are `NumberLit` constants.
+
+### Before
+
+```
+%c1 = OpConstant %float 1.0
+%c2 = OpConstant %float 0.0
+%v  = OpCompositeConstruct %v3float %c1 %c2 %c2   ; runtime instruction
+```
+
+### After
+
+```
+%v = OpConstantComposite %v3float %c1 %c2 %c2      ; compile-time, deduplicated
+```
+
+### Handles
+
+- All vector types: `vec2`, `vec3`, `vec4`, `ivec*`, `uvec*`
+- Splat constructors: `vec3(1.0)` → single constant replicated 3 times
+- Automatic deduplication: `vec3(1.0)` appearing 6 times → 1 `OpConstantComposite`
+
+### Debug Mode
+
+**Applied in both debug and release** — constant composites are still inspectable in debuggers and don't eliminate any variable information.
+
+### Impact
+
+On a PBR fragment shader: 11 runtime `OpCompositeConstruct` → 2 deduplicated compile-time constants, saving ~45 instructions.
+
+---
+
+## 7. Cost Estimator & VGPR Analysis
 
 **Source**: `luxc/analysis/cost_estimator.py`
 
@@ -206,7 +311,7 @@ fragment: 312 instr, 89 ALU, 4 tex, VGPR: medium
 
 ---
 
-## 5. SPIR-V Optimization Profiles
+## 8. SPIR-V Optimization Profiles
 
 **Source**: `luxc/codegen/spv_assembler.py`
 
@@ -249,7 +354,7 @@ Both profiles operate in-place on the `.spv` binary. If spirv-opt fails, the ori
 
 ---
 
-## 6. CLI Flags
+## 9. CLI Flags
 
 **Source**: `luxc/cli.py`
 
@@ -312,7 +417,7 @@ luxc shader.lux --perf --watch
 
 ---
 
-## 7. Reflection & Performance Hints
+## 10. Reflection & Performance Hints
 
 **Source**: `luxc/codegen/reflection.py`
 

@@ -191,6 +191,10 @@ class SpvGenerator:
         self._needs_image_query: bool = False  # set to True if texture_levels/texture_size/image_size used
         self._debug_string_ids: dict[str, str] = {}  # format_string -> OpString %id
 
+        # SSA value forwarding for mem2reg (populated per-function in _gen_function)
+        self._ssa_values: dict[str, str] = {}      # name -> SSA ID (single-assignment lets)
+        self._mutable_vars: set[str] = set()        # names that need OpVariable
+
     def _next_label(self) -> str:
         self._label_counter += 1
         return f"%label_{self._label_counter}"
@@ -215,6 +219,110 @@ class SpvGenerator:
                 if self._scan_for_debug_stmts(stmt.body):
                     return True
         return False
+
+    def _scan_mutable_vars(self, stmts: list) -> None:
+        """Pre-scan statements to find variables that need OpVariable (reassigned or loop vars)."""
+        for stmt in stmts:
+            if isinstance(stmt, AssignStmt):
+                name = self._extract_assign_root_name(stmt.target)
+                if name is not None:
+                    self._mutable_vars.add(name)
+            elif isinstance(stmt, ForStmt):
+                self._mutable_vars.add(stmt.loop_var)
+                self._scan_mutable_vars(stmt.body)
+            elif isinstance(stmt, IfStmt):
+                self._scan_mutable_vars(stmt.then_body)
+                self._scan_mutable_vars(stmt.else_body)
+            elif isinstance(stmt, WhileStmt):
+                self._scan_mutable_vars(stmt.body)
+            elif isinstance(stmt, DebugBlock):
+                self._scan_mutable_vars(stmt.body)
+
+    def _scan_forward_refs(self, stmts: list) -> None:
+        """Mark SSA-eligible variables that are referenced before their LetStmt definition.
+
+        This handles CSE ordering quirks where one CSE variable's value references
+        another CSE variable whose LetStmt appears later in the statement list.
+        Such variables need OpVariable to avoid undefined SSA references.
+        """
+        let_pos: dict[str, int] = {}
+        for i, stmt in enumerate(stmts):
+            if isinstance(stmt, LetStmt):
+                let_pos[stmt.name] = i
+
+        for i, stmt in enumerate(stmts):
+            refs: set[str] = set()
+            if isinstance(stmt, LetStmt):
+                self._expr_var_refs(stmt.value, refs)
+            elif isinstance(stmt, AssignStmt):
+                self._expr_var_refs(stmt.value, refs)
+            elif isinstance(stmt, ReturnStmt):
+                self._expr_var_refs(stmt.value, refs)
+            elif isinstance(stmt, ExprStmt):
+                self._expr_var_refs(getattr(stmt, 'expr', None), refs)
+            elif isinstance(stmt, IfStmt):
+                self._expr_var_refs(stmt.condition, refs)
+            elif isinstance(stmt, ForStmt):
+                self._expr_var_refs(stmt.init_value, refs)
+                self._expr_var_refs(stmt.condition, refs)
+            for name in refs:
+                if name in let_pos and let_pos[name] > i:
+                    self._mutable_vars.add(name)
+
+        for stmt in stmts:
+            if isinstance(stmt, IfStmt):
+                self._scan_forward_refs(stmt.then_body)
+                self._scan_forward_refs(stmt.else_body)
+            elif isinstance(stmt, ForStmt):
+                self._scan_forward_refs(stmt.body)
+            elif isinstance(stmt, WhileStmt):
+                self._scan_forward_refs(stmt.body)
+            elif isinstance(stmt, DebugBlock):
+                self._scan_forward_refs(stmt.body)
+
+    @staticmethod
+    def _expr_var_refs(expr, refs: set) -> None:
+        """Collect all VarRef names from an expression tree."""
+        if expr is None:
+            return
+        if isinstance(expr, VarRef):
+            refs.add(expr.name)
+        elif isinstance(expr, BinaryOp):
+            SpvGenerator._expr_var_refs(expr.left, refs)
+            SpvGenerator._expr_var_refs(expr.right, refs)
+        elif isinstance(expr, UnaryOp):
+            SpvGenerator._expr_var_refs(expr.operand, refs)
+        elif isinstance(expr, CallExpr):
+            SpvGenerator._expr_var_refs(expr.func, refs)
+            for a in expr.args:
+                SpvGenerator._expr_var_refs(a, refs)
+        elif isinstance(expr, ConstructorExpr):
+            for a in expr.args:
+                SpvGenerator._expr_var_refs(a, refs)
+        elif isinstance(expr, FieldAccess):
+            SpvGenerator._expr_var_refs(expr.object, refs)
+        elif isinstance(expr, SwizzleAccess):
+            SpvGenerator._expr_var_refs(expr.object, refs)
+        elif isinstance(expr, IndexAccess):
+            SpvGenerator._expr_var_refs(expr.object, refs)
+            SpvGenerator._expr_var_refs(expr.index, refs)
+        elif isinstance(expr, TernaryExpr):
+            SpvGenerator._expr_var_refs(expr.condition, refs)
+            SpvGenerator._expr_var_refs(expr.then_expr, refs)
+            SpvGenerator._expr_var_refs(expr.else_expr, refs)
+
+    @staticmethod
+    def _extract_assign_root_name(target) -> str | None:
+        """Extract the root variable name from an assignment target."""
+        if isinstance(target, AssignTarget):
+            return SpvGenerator._extract_assign_root_name(target.expr)
+        if isinstance(target, VarRef):
+            return target.name
+        if isinstance(target, (SwizzleAccess, FieldAccess)):
+            return SpvGenerator._extract_assign_root_name(target.object)
+        if isinstance(target, IndexAccess):
+            return SpvGenerator._extract_assign_root_name(target.object)
+        return None
 
     def generate(self) -> str:
         self.glsl_ext_id = self.reg.next_id()
@@ -1060,6 +1168,13 @@ class SpvGenerator:
         self.local_vars: dict[str, str] = {}  # name -> %id (pointer)
         self.local_types: dict[str, str] = {}  # name -> lux type name
 
+        # SSA value forwarding (release mode only — debug preserves all OpVariable)
+        self._ssa_values = {}
+        self._mutable_vars = set()
+        if not self.debug:
+            self._scan_mutable_vars(fn.body)
+            self._scan_forward_refs(fn.body)
+
         # SPIR-V requires all OpVariable in a function to be at the top of
         # the first block. We use a deferred list that _alloc_local adds to.
         self._var_decls: list[str] = []
@@ -1092,6 +1207,9 @@ class SpvGenerator:
         """Pre-declare all local variables at the top of the function block."""
         for stmt in stmts:
             if isinstance(stmt, LetStmt):
+                # SSA-eligible vars skip OpVariable allocation (release mode)
+                if not self.debug and stmt.name not in self._mutable_vars:
+                    continue
                 self._alloc_local(stmt.name, stmt.type_name)
             elif isinstance(stmt, IfStmt):
                 self._pre_declare_locals(stmt.then_body)
@@ -1122,14 +1240,18 @@ class SpvGenerator:
         self._emit_debug_line(stmt, lines)
 
         if isinstance(stmt, LetStmt):
-            # Variable already declared in _pre_declare_locals
-            var_id = self.local_vars[stmt.name]
-            # Evaluate RHS and store
+            # Evaluate RHS
             val_id, val_lines = self._gen_expr(stmt.value)
             lines.extend(val_lines)
             # Coerce RHS to declared type if needed (e.g., int -> scalar)
             val_id = self._coerce_to_type(val_id, stmt.value, stmt.type_name, lines)
-            lines.append(f"OpStore {var_id} {val_id}")
+            if not self.debug and stmt.name not in self._mutable_vars:
+                # SSA path: forward value directly, no OpVariable/OpStore
+                self._ssa_values[stmt.name] = val_id
+            else:
+                # Variable already declared in _pre_declare_locals
+                var_id = self.local_vars[stmt.name]
+                lines.append(f"OpStore {var_id} {val_id}")
 
         elif isinstance(stmt, AssignStmt):
             target = stmt.target
@@ -1547,6 +1669,10 @@ class SpvGenerator:
 
     def _gen_var_load(self, name: str, lines: list[str]) -> tuple[str, list[str]]:
         """Load a variable value."""
+        # Check SSA values first (release mode mem2reg)
+        if name in self._ssa_values:
+            return self._ssa_values[name], lines
+
         # Check uniform fields (need OpAccessChain)
         if name in self.uniform_field_indices:
             block_name = self.uniform_block_for_field[name]
@@ -2407,23 +2533,43 @@ class SpvGenerator:
         # Save and create new local var scope for the inlined function
         saved_locals = self.local_vars
         saved_local_types = self.local_types
+        saved_ssa = self._ssa_values
+        saved_mutable = self._mutable_vars
         self.local_vars = dict(self.local_vars)
         self.local_types = dict(self.local_types)
+        self._ssa_values = dict(self._ssa_values)
 
         # Use unique names to avoid collisions with outer scope
         inline_id = self.reg.next_id().replace("%", "")
 
-        # Bind parameters to argument SSA ids using temp variables
+        # Scan inlined function body for mutable vars (release mode)
+        inline_mutable = set()
+        if not self.debug:
+            old_mutable = self._mutable_vars
+            self._mutable_vars = set()
+            self._scan_mutable_vars(fn.body)
+            self._scan_forward_refs(fn.body)
+            inline_mutable = self._mutable_vars
+            self._mutable_vars = inline_mutable
+
+        # Bind parameters to argument SSA ids
         for param, arg_id in zip(fn.params, arg_ids):
-            unique_name = f"_inline_{inline_id}_{param.name}"
-            self._alloc_local(unique_name, param.type_name)
-            lines.append(f"OpStore {self.local_vars[unique_name]} {arg_id}")
-            self.local_vars[param.name] = self.local_vars[unique_name]
-            self.local_types[param.name] = param.type_name
+            if not self.debug and param.name not in inline_mutable:
+                # SSA path: forward argument value directly
+                self._ssa_values[param.name] = arg_id
+            else:
+                # OpVariable path for mutable params
+                unique_name = f"_inline_{inline_id}_{param.name}"
+                self._alloc_local(unique_name, param.type_name)
+                lines.append(f"OpStore {self.local_vars[unique_name]} {arg_id}")
+                self.local_vars[param.name] = self.local_vars[unique_name]
+                self.local_types[param.name] = param.type_name
 
         # Pre-declare locals for the inlined function body
         for stmt in fn.body:
             if isinstance(stmt, LetStmt):
+                if not self.debug and stmt.name not in inline_mutable:
+                    continue  # SSA-eligible, handled in _gen_stmt
                 unique_name = f"_inline_{inline_id}_{stmt.name}"
                 self._alloc_local(unique_name, stmt.type_name)
                 self.local_vars[stmt.name] = self.local_vars[unique_name]
@@ -2443,6 +2589,8 @@ class SpvGenerator:
         # Restore scope
         self.local_vars = saved_locals
         self.local_types = saved_local_types
+        self._ssa_values = saved_ssa
+        self._mutable_vars = saved_mutable
 
         if return_val is None:
             raise ValueError(f"Inlined function '{fn.name}' has no return statement")
@@ -2465,6 +2613,23 @@ class SpvGenerator:
         if isinstance(target_type, VectorType):
             target_size = target_type.size
             target_comp = target_type.component  # "scalar"/"float", "int", or "uint"
+
+            # Constant vector hoisting: if ALL args are NumberLit, emit OpConstantComposite
+            if all(isinstance(a, NumberLit) for a in expr.args):
+                if target_comp in ("scalar", "float"):
+                    const_ids = [self.reg.const_float(float(a.value)) for a in expr.args]
+                elif target_comp == "int":
+                    const_ids = [self.reg.const_int(int(float(a.value)), signed=True) for a in expr.args]
+                elif target_comp == "uint":
+                    const_ids = [self.reg.const_int(int(float(a.value)), signed=False) for a in expr.args]
+                else:
+                    const_ids = None
+                if const_ids is not None:
+                    if len(const_ids) == 1 and target_size > 1:
+                        const_ids = const_ids * target_size
+                    if len(const_ids) == target_size:
+                        return self.reg.const_composite(result_type_id, const_ids), lines
+
             # Expand args: e.g., vec4(vec3, scalar) -> 4 components
             components = []
             for aid, atn in zip(arg_ids, arg_type_names):

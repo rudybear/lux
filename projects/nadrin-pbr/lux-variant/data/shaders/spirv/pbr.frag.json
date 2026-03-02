@@ -212,7 +212,7 @@
   "vertex_attributes": [],
   "vertex_stride": 0,
   "performance_hints": {
-    "instruction_count": 845,
+    "instruction_count": 424,
     "alu_ops": 148,
     "texture_samples": 7,
     "branches": 0,

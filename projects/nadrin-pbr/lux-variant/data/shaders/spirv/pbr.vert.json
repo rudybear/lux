@@ -132,7 +132,7 @@
   ],
   "vertex_stride": 56,
   "performance_hints": {
-    "instruction_count": 171,
+    "instruction_count": 156,
     "alu_ops": 7,
     "texture_samples": 0,
     "branches": 0,

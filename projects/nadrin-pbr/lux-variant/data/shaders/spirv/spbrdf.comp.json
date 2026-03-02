@@ -10,7 +10,7 @@
   "descriptor_sets": {
     "0": [
       {
-        "binding": 0,
+        "binding": 1,
         "type": "storage_image",
         "name": "LUT",
         "stage_flags": [
@@ -24,13 +24,13 @@
   "vertex_stride": 0,
   "compute": {
     "workgroup_size": [
-      64,
-      1,
+      32,
+      32,
       1
     ]
   },
   "performance_hints": {
-    "instruction_count": 356,
+    "instruction_count": 212,
     "alu_ops": 44,
     "texture_samples": 0,
     "branches": 2,

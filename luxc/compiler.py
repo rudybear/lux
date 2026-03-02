@@ -194,6 +194,11 @@ def compile_source(
 
     constant_fold(module)
 
+    # AST-level function inlining (release mode only — debug uses codegen-time inlining)
+    if not debug:
+        from luxc.optimization.inline import inline_functions
+        inline_functions(module)
+
     # Additional optimization passes
     from luxc.optimization.dead_code import dead_code_elim
     from luxc.optimization.cse import cse

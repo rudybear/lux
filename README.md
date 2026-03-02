@@ -311,11 +311,12 @@ End-to-end validation against [Nadrin/PBR](https://github.com/Nadrin/PBR), a rea
 | Metric | Result |
 |--------|--------|
 | Visual parity | Pixel-perfect (PSNR = infinity, SSIM = 1.0) across all optimization levels |
-| Instruction count (opt-O vs GLSL) | **-27.8%** total (PBR frag -28.9%, SPBRDF comp -55.4%) |
-| Binary size (opt-O vs GLSL) | **-18.3%** total (23,608 → 19,276 bytes) |
+| Default Lux vs GLSL | **-21.7%** fewer instructions (1,088 vs 1,390) — **no spirv-opt needed** |
+| PBR fragment shader | **424** instructions (GLSL: 533, **-20.5%**) |
+| With spirv-opt -O | Same instruction count — spirv-opt finds nothing left to optimize |
 | GPU runtime | Equivalent — NVIDIA driver JIT normalizes shader performance |
 
-Key insight: a 55% instruction reduction yielded only ~1% GPU time improvement at 45μs frame times — instruction count does not predict runtime. See the full [optimization protocol](projects/nadrin-pbr/optimization/protocol.md) and [optimization wisdom](projects/nadrin-pbr/optimization/wisdom.md) for methodology and principles.
+Lux's built-in optimizer (mem2reg, AST-level inlining, CSE, constant vector hoisting) produces smaller SPIR-V than hand-written GLSL compiled with glslangValidator — without any external optimization passes. The PBR fragment shader went from 845 instructions (pre-optimization) to 424, a **49.8% reduction**. See the full [optimization protocol](projects/nadrin-pbr/optimization/protocol.md) and [optimization wisdom](projects/nadrin-pbr/optimization/wisdom.md) for methodology and principles.
 
 ### BRDF & Layer Visualization
 
@@ -430,7 +431,7 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 - **AI material authoring** — text-to-shader (`--ai`), image-to-material (`--ai-from-image`), style transfer (`--ai-modify`), scene batch generation (`--ai-batch`), video-to-animation (`--ai-from-video`), reference matching (`--ai-match-reference`), validation/critique (`--ai-critique`), and a skill system for domain expertise injection; 5 providers (Anthropic, OpenAI, Gemini, Ollama, LM Studio); 58-material PBR reference database; see [AI.md](AI.md)
 - **One file, multi-stage** — vertex, fragment, and RT stages in a single `.lux` file
 - **Hot reload** — `--watch` mode monitors `.lux` files (including transitive imports) for changes and recompiles automatically; writes `.reload.json` sentinel files for engine integration; `--watch-poll <ms>` configurable polling interval; error recovery preserves last-good `.spv` on failure
-- **SPIR-V optimization** — `-O` flag runs `spirv-opt -O` (mem2reg, constant propagation, dead code elimination) for 60-65% smaller binaries; compile-time algebraic identity folding (`x*1.0→x`, `x+0.0→x`, `x*0.0→0`, `-(-x)→x`, `!(!x)→x`); validated against [Nadrin/PBR](https://github.com/Nadrin/PBR) Vulkan renderer: **27.8% fewer instructions** and **18.3% smaller binaries** than original GLSL with pixel-perfect visual parity; see [docs/optimization-features.md](docs/optimization-features.md) and [Optimization Wisdom](projects/nadrin-pbr/optimization/wisdom.md)
+- **SPIR-V optimization** — built-in optimizer produces **21.7% fewer instructions than hand-written GLSL** out of the box: mem2reg SSA value forwarding eliminates redundant OpVariable/OpLoad/OpStore, AST-level function inlining exposes cross-function CSE, constant vector hoisting replaces runtime OpCompositeConstruct with compile-time OpConstantComposite; PBR fragment shader: 845→424 instructions (**-49.8%**); optional `-O` flag runs external `spirv-opt` but finds nothing left to optimize; validated against [Nadrin/PBR](https://github.com/Nadrin/PBR) Vulkan renderer with pixel-perfect visual parity; see [docs/optimization-features.md](docs/optimization-features.md) and [Optimization Wisdom](projects/nadrin-pbr/optimization/wisdom.md)
 - **Full SPIR-V output** — compiles to validated `.spv` binaries via `spirv-as` + `spirv-val`
 - **40+ built-in functions** — math, vector, matrix, texture sampling (2D + cubemap + explicit LOD), RT instructions, NaN/Inf detection
 - **glTF 2.0 PBR** — tangent normal mapping, metallic-roughness, image-based lighting, multi-scattering

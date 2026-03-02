@@ -43,11 +43,11 @@
   "vertex_attributes": [],
   "vertex_stride": 0,
   "performance_hints": {
-    "instruction_count": 98,
+    "instruction_count": 76,
     "alu_ops": 6,
     "texture_samples": 1,
     "branches": 1,
     "function_calls": 0,
-    "vgpr_estimate": "high"
+    "vgpr_estimate": "medium"
   }
 }
