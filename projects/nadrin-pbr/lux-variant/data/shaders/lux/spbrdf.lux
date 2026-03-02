@@ -1,0 +1,87 @@
+// Nadrin/PBR - Specular BRDF LUT Compute Shader
+// Lux native conversion of spbrdf_cs.glsl
+// Copyright (c) 2017-2018 Michal Siejak (MIT License)
+//
+// Pre-integrates Cook-Torrance specular BRDF for varying roughness and
+// viewing directions. Output: DFG1/DFG2 split-sum approximation terms.
+// Compile with: luxc spbrdf.lux --define workgroup_size_x=32 --define workgroup_size_y=32
+
+const PI: scalar = 3.141592;
+const TWO_PI: scalar = 6.283184;
+const BRDF_EPSILON: scalar = 0.001;
+const NUM_SAMPLES: uint = 1024;
+const INV_NUM_SAMPLES: scalar = 0.0009765625;
+
+// Compute Van der Corput radical inverse.
+fn radical_inverse_vdc(bits_in: uint) -> scalar {
+    let b0: uint = (bits_in << 16) | (bits_in >> 16);
+    let b1: uint = ((b0 & 1431655765) << 1) | ((b0 & 2863311530) >> 1);
+    let b2: uint = ((b1 & 858993459) << 2) | ((b1 & 3435973836) >> 2);
+    let b3: uint = ((b2 & 252645135) << 4) | ((b2 & 4042322160) >> 4);
+    let b4: uint = ((b3 & 16711935) << 8) | ((b3 & 4278255360) >> 8);
+    return b4 * 2.3283064365386963e-10;
+}
+
+// Sample i-th point from Hammersley point set.
+fn sample_hammersley(i: uint) -> vec2 {
+    return vec2(i * INV_NUM_SAMPLES, radical_inverse_vdc(i));
+}
+
+// Importance sample GGX normal distribution function.
+fn sample_ggx(u1: scalar, u2: scalar, roughness: scalar) -> vec3 {
+    let alpha: scalar = roughness * roughness;
+    let cos_theta: scalar = sqrt((1.0 - u2) / (1.0 + (alpha * alpha - 1.0) * u2));
+    let sin_theta: scalar = sqrt(1.0 - cos_theta * cos_theta);
+    let phi: scalar = TWO_PI * u1;
+    return vec3(sin_theta * cos(phi), sin_theta * sin(phi), cos_theta);
+}
+
+// Single term for separable Schlick-GGX.
+fn ga_schlick_g1(cos_theta: scalar, k: scalar) -> scalar {
+    return cos_theta / (cos_theta * (1.0 - k) + k);
+}
+
+// Schlick-GGX approximation (IBL version: k = r^2 / 2).
+fn ga_schlick_ggx_ibl(cos_li: scalar, cos_lo: scalar, roughness: scalar) -> scalar {
+    let k: scalar = roughness * roughness / 2.0;
+    return ga_schlick_g1(cos_li, k) * ga_schlick_g1(cos_lo, k);
+}
+
+compute {
+    storage_image LUT: rg16f @binding(1);
+
+    fn main() {
+        let lut_size: ivec2 = image_size(LUT);
+        let cos_lo: scalar = max(global_invocation_id.x / lut_size.x, BRDF_EPSILON);
+        let roughness: scalar = global_invocation_id.y / lut_size.y;
+
+        // Derive tangent-space viewing vector from angle to normal.
+        let Lo: vec3 = vec3(sqrt(1.0 - cos_lo * cos_lo), 0.0, cos_lo);
+
+        let DFG1: scalar = 0.0;
+        let DFG2: scalar = 0.0;
+
+        for (let i: uint = 0; i < NUM_SAMPLES; i = i + 1) {
+            let u: vec2 = sample_hammersley(i);
+            let Lh: vec3 = sample_ggx(u.x, u.y, roughness);
+
+            // Compute incident direction by reflecting Lo around Lh.
+            let Li: vec3 = 2.0 * dot(Lo, Lh) * Lh - Lo;
+
+            let cos_li: scalar = Li.z;
+            let cos_lh: scalar = Lh.z;
+            let cos_lo_lh: scalar = max(dot(Lo, Lh), 0.0);
+
+            if (cos_li > 0.0) {
+                let G: scalar = ga_schlick_ggx_ibl(cos_li, cos_lo, roughness);
+                let Gv: scalar = G * cos_lo_lh / (cos_lh * cos_lo);
+                let Fc: scalar = pow(1.0 - cos_lo_lh, 5.0);
+
+                DFG1 = DFG1 + (1.0 - Fc) * Gv;
+                DFG2 = DFG2 + Fc * Gv;
+            }
+        }
+
+        image_store(LUT, ivec2(global_invocation_id.xy), vec4(DFG1, DFG2, 0.0, 0.0) * INV_NUM_SAMPLES);
+    }
+}

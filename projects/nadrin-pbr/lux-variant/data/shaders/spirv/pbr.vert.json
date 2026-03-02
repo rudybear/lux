@@ -1,0 +1,142 @@
+{
+  "version": 1,
+  "source": "pbr.lux",
+  "stage": "vertex",
+  "execution_model": "Vertex",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [
+    {
+      "name": "position",
+      "type": "vec3",
+      "location": 0
+    },
+    {
+      "name": "normal",
+      "type": "vec3",
+      "location": 1
+    },
+    {
+      "name": "tangent",
+      "type": "vec3",
+      "location": 2
+    },
+    {
+      "name": "bitangent",
+      "type": "vec3",
+      "location": 3
+    },
+    {
+      "name": "texcoord",
+      "type": "vec2",
+      "location": 4
+    }
+  ],
+  "outputs": [
+    {
+      "name": "world_position",
+      "type": "vec3",
+      "location": 0
+    },
+    {
+      "name": "frag_texcoord",
+      "type": "vec2",
+      "location": 1
+    },
+    {
+      "name": "tangent_basis_0",
+      "type": "vec3",
+      "location": 2
+    },
+    {
+      "name": "tangent_basis_1",
+      "type": "vec3",
+      "location": 3
+    },
+    {
+      "name": "tangent_basis_2",
+      "type": "vec3",
+      "location": 4
+    }
+  ],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "uniform_buffer",
+        "name": "TransformUniforms",
+        "fields": [
+          {
+            "name": "viewProjectionMatrix",
+            "type": "mat4",
+            "offset": 0,
+            "size": 64
+          },
+          {
+            "name": "skyProjectionMatrix",
+            "type": "mat4",
+            "offset": 64,
+            "size": 64
+          },
+          {
+            "name": "sceneRotationMatrix",
+            "type": "mat4",
+            "offset": 128,
+            "size": 64
+          }
+        ],
+        "size": 192,
+        "stage_flags": [
+          "vertex"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [
+    {
+      "location": 0,
+      "type": "vec3",
+      "name": "position",
+      "format": "R32G32B32_SFLOAT",
+      "offset": 0
+    },
+    {
+      "location": 1,
+      "type": "vec3",
+      "name": "normal",
+      "format": "R32G32B32_SFLOAT",
+      "offset": 12
+    },
+    {
+      "location": 2,
+      "type": "vec3",
+      "name": "tangent",
+      "format": "R32G32B32_SFLOAT",
+      "offset": 24
+    },
+    {
+      "location": 3,
+      "type": "vec3",
+      "name": "bitangent",
+      "format": "R32G32B32_SFLOAT",
+      "offset": 36
+    },
+    {
+      "location": 4,
+      "type": "vec2",
+      "name": "texcoord",
+      "format": "R32G32_SFLOAT",
+      "offset": 48
+    }
+  ],
+  "vertex_stride": 56,
+  "performance_hints": {
+    "instruction_count": 171,
+    "alu_ops": 7,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

@@ -1,0 +1,312 @@
+{
+  "original": {
+    "pbr": {
+      "stages": {
+        "frag": {
+          "spv_size": 9064,
+          "spv_instructions": 533
+        },
+        "vert": {
+          "spv_size": 2972,
+          "spv_instructions": 158
+        }
+      }
+    },
+    "skybox": {
+      "stages": {
+        "frag": {
+          "spv_size": 692,
+          "spv_instructions": 42
+        },
+        "vert": {
+          "spv_size": 1440,
+          "spv_instructions": 79
+        }
+      }
+    },
+    "tonemap": {
+      "stages": {
+        "frag": {
+          "spv_size": 1380,
+          "spv_instructions": 80
+        },
+        "vert": {
+          "spv_size": 1124,
+          "spv_instructions": 70
+        }
+      }
+    },
+    "spbrdf": {
+      "stages": {
+        "comp": {
+          "spv_size": 6936,
+          "spv_instructions": 428
+        }
+      }
+    }
+  },
+  "default": {
+    "pbr": {
+      "stages": {
+        "frag": {
+          "spv_size": 15144,
+          "spv_instructions": 845,
+          "reflection_instruction_count": 845,
+          "alu_ops": 148,
+          "texture_samples": 7,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        },
+        "vert": {
+          "spv_size": 3192,
+          "spv_instructions": 171,
+          "reflection_instruction_count": 171,
+          "alu_ops": 7,
+          "texture_samples": 0,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        }
+      }
+    },
+    "skybox": {
+      "stages": {
+        "frag": {
+          "spv_size": 852,
+          "spv_instructions": 49,
+          "reflection_instruction_count": 49,
+          "alu_ops": 0,
+          "texture_samples": 1,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "low"
+        },
+        "vert": {
+          "spv_size": 1584,
+          "spv_instructions": 85,
+          "reflection_instruction_count": 85,
+          "alu_ops": 1,
+          "texture_samples": 0,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "medium"
+        }
+      }
+    },
+    "tonemap": {
+      "stages": {
+        "frag": {
+          "spv_size": 1656,
+          "spv_instructions": 98,
+          "reflection_instruction_count": 98,
+          "alu_ops": 6,
+          "texture_samples": 1,
+          "branches": 1,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        },
+        "vert": {
+          "spv_size": 1488,
+          "spv_instructions": 90,
+          "reflection_instruction_count": 90,
+          "alu_ops": 0,
+          "texture_samples": 0,
+          "branches": 3,
+          "function_calls": 0,
+          "vgpr_estimate": "medium"
+        }
+      }
+    },
+    "spbrdf": {
+      "stages": {
+        "comp": {
+          "spv_size": 5956,
+          "spv_instructions": 357,
+          "reflection_instruction_count": 357,
+          "alu_ops": 44,
+          "texture_samples": 0,
+          "branches": 2,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        }
+      }
+    }
+  },
+  "opt-O": {
+    "pbr": {
+      "stages": {
+        "frag": {
+          "spv_size": 7932,
+          "spv_instructions": 379,
+          "reflection_instruction_count": 845,
+          "alu_ops": 148,
+          "texture_samples": 7,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        },
+        "vert": {
+          "spv_size": 2808,
+          "spv_instructions": 147,
+          "reflection_instruction_count": 171,
+          "alu_ops": 7,
+          "texture_samples": 0,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        }
+      }
+    },
+    "skybox": {
+      "stages": {
+        "frag": {
+          "spv_size": 792,
+          "spv_instructions": 45,
+          "reflection_instruction_count": 49,
+          "alu_ops": 0,
+          "texture_samples": 1,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "low"
+        },
+        "vert": {
+          "spv_size": 1568,
+          "spv_instructions": 84,
+          "reflection_instruction_count": 85,
+          "alu_ops": 1,
+          "texture_samples": 0,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "medium"
+        }
+      }
+    },
+    "tonemap": {
+      "stages": {
+        "frag": {
+          "spv_size": 1220,
+          "spv_instructions": 69,
+          "reflection_instruction_count": 98,
+          "alu_ops": 6,
+          "texture_samples": 1,
+          "branches": 1,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        },
+        "vert": {
+          "spv_size": 1456,
+          "spv_instructions": 88,
+          "reflection_instruction_count": 90,
+          "alu_ops": 0,
+          "texture_samples": 0,
+          "branches": 3,
+          "function_calls": 0,
+          "vgpr_estimate": "medium"
+        }
+      }
+    },
+    "spbrdf": {
+      "stages": {
+        "comp": {
+          "spv_size": 3500,
+          "spv_instructions": 191,
+          "reflection_instruction_count": 357,
+          "alu_ops": 44,
+          "texture_samples": 0,
+          "branches": 2,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        }
+      }
+    }
+  },
+  "perf": {
+    "pbr": {
+      "stages": {
+        "frag": {
+          "spv_size": 10988,
+          "spv_instructions": 596,
+          "reflection_instruction_count": 845,
+          "alu_ops": 148,
+          "texture_samples": 7,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        },
+        "vert": {
+          "spv_size": 2952,
+          "spv_instructions": 157,
+          "reflection_instruction_count": 171,
+          "alu_ops": 7,
+          "texture_samples": 0,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        }
+      }
+    },
+    "skybox": {
+      "stages": {
+        "frag": {
+          "spv_size": 836,
+          "spv_instructions": 48,
+          "reflection_instruction_count": 49,
+          "alu_ops": 0,
+          "texture_samples": 1,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "low"
+        },
+        "vert": {
+          "spv_size": 1568,
+          "spv_instructions": 84,
+          "reflection_instruction_count": 85,
+          "alu_ops": 1,
+          "texture_samples": 0,
+          "branches": 0,
+          "function_calls": 0,
+          "vgpr_estimate": "medium"
+        }
+      }
+    },
+    "tonemap": {
+      "stages": {
+        "frag": {
+          "spv_size": 1472,
+          "spv_instructions": 86,
+          "reflection_instruction_count": 98,
+          "alu_ops": 6,
+          "texture_samples": 1,
+          "branches": 1,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        },
+        "vert": {
+          "spv_size": 1456,
+          "spv_instructions": 88,
+          "reflection_instruction_count": 90,
+          "alu_ops": 0,
+          "texture_samples": 0,
+          "branches": 3,
+          "function_calls": 0,
+          "vgpr_estimate": "medium"
+        }
+      }
+    },
+    "spbrdf": {
+      "stages": {
+        "comp": {
+          "spv_size": 4796,
+          "spv_instructions": 282,
+          "reflection_instruction_count": 357,
+          "alu_ops": 44,
+          "texture_samples": 0,
+          "branches": 2,
+          "function_calls": 0,
+          "vgpr_estimate": "high"
+        }
+      }
+    }
+  }
+}

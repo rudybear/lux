@@ -6,7 +6,7 @@ from luxc.builtins.types import (
     LuxType, SCALAR, INT, UINT, BOOL, VOID,
     VEC2, VEC3, VEC4, MAT2, MAT3, MAT4, SAMPLER2D, SAMPLER_CUBE,
     SAMPLER_2D_ARRAY, SAMPLER_CUBE_ARRAY,
-    ACCELERATION_STRUCTURE, STORAGE_IMAGE, BINDLESS_TEXTURE_ARRAY, IVEC2, UVEC2,
+    ACCELERATION_STRUCTURE, STORAGE_IMAGE, BINDLESS_TEXTURE_ARRAY, IVEC2, IVEC3, UVEC2, UVEC3,
     VectorType, MatrixType, ScalarType,
 )
 
@@ -169,6 +169,20 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     add([FuncSig("image_store", (STORAGE_IMAGE, IVEC2, VEC4), VOID)])
     add([FuncSig("image_store", (STORAGE_IMAGE, VEC2, VEC4), VOID)])
     add([FuncSig("image_store", (STORAGE_IMAGE, UVEC2, VEC4), VOID)])
+    add([FuncSig("image_store", (STORAGE_IMAGE, IVEC3, VEC4), VOID)])
+    add([FuncSig("image_store", (STORAGE_IMAGE, UVEC3, VEC4), VOID)])
+
+    # image_size(image) -> ivec2 (OpImageQuerySize)
+    add([FuncSig("image_size", (STORAGE_IMAGE,), IVEC2)])
+
+    # texture_size(sampler, lod) -> ivec2 (OpImageQuerySizeLod)
+    add([FuncSig("texture_size", (SAMPLER2D, INT), IVEC2)])
+    add([FuncSig("texture_size", (SAMPLER2D, SCALAR), IVEC2)])
+    add([FuncSig("texture_size", (SAMPLER_CUBE, INT), IVEC2)])
+
+    # texture_levels(sampler) -> int (OpImageQueryLevels)
+    add([FuncSig("texture_levels", (SAMPLER2D,), INT)])
+    add([FuncSig("texture_levels", (SAMPLER_CUBE,), INT)])
 
     # --- Mesh shader instructions ---
     # set_mesh_outputs(vert_count, prim_count) -> void

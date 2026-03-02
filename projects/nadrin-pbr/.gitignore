@@ -1,0 +1,46 @@
+# Build artifacts
+lux-variant/build/
+upstream/build/
+
+# Binary files
+*.spv
+*.rdc
+*.exe
+*.lib
+*.dll
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# Screenshots and captures
+captures/
+
+# Vendored third-party libraries (clone Nadrin/PBR upstream separately)
+upstream/lib/
+upstream/data/
+upstream/src/d3d*
+upstream/src/opengl*
+upstream/projects/
+upstream/.git/
+upstream/.gitattributes
+upstream/.gitignore
+upstream/COPYING.txt
+
+# Logs
+*.log
+
+# Data assets (meshes, textures, HDR — too large for git)
+lux-variant/data/environment.hdr
+lux-variant/data/meshes
+lux-variant/data/textures/
+lux-variant/screenshot_*.png
+
+# Intermediate test results
+optimization/results/test_*/
+
+# Reference images
+validation/reference_images/
+
+# Windows artifacts
+NUL

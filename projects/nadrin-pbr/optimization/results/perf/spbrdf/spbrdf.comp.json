@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "source": "spbrdf.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 1,
+        "type": "storage_image",
+        "name": "LUT",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      32,
+      32,
+      1
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 357,
+    "alu_ops": 44,
+    "texture_samples": 0,
+    "branches": 2,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

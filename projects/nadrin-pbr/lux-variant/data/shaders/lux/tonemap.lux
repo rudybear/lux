@@ -1,0 +1,60 @@
+// Nadrin/PBR - Tonemapping + Gamma Correction
+// Lux native conversion of tonemap_vs.glsl + tonemap_fs.glsl
+// Copyright (c) 2017-2018 Michal Siejak (MIT License)
+//
+// NOTE: The original uses Vulkan subpass input (input_attachment_index=0).
+// Lux does not support subpass inputs, so this uses sampler2d instead.
+// The lux-variant renderer must be modified to pass scene color as a texture
+// rather than a subpass input attachment.
+
+const GAMMA: scalar = 2.2;
+const EXPOSURE: scalar = 1.0;
+const PURE_WHITE: scalar = 1.0;
+
+vertex {
+    out screen_uv: vec2;
+
+    fn main() {
+        // Full-screen triangle: 3 vertices cover the entire screen.
+        // Use separate if blocks to avoid nested if/else codegen bug.
+        // UV = 0.5 * position.xy + 0.5 (maps NDC [-1,1] to UV [0,1])
+        if (vertex_index == 0) {
+            builtin_position = vec4(-1.0, -1.0, 0.0, 1.0);
+            screen_uv = vec2(0.0, 0.0);
+        }
+        if (vertex_index == 1) {
+            builtin_position = vec4(-1.0, 3.0, 0.0, 1.0);
+            screen_uv = vec2(0.0, 2.0);
+        }
+        if (vertex_index == 2) {
+            builtin_position = vec4(3.0, -1.0, 0.0, 1.0);
+            screen_uv = vec2(2.0, 0.0);
+        }
+    }
+}
+
+fragment {
+    in screen_uv: vec2;
+
+    sampler2d sceneColor;
+
+    out outColor: vec4;
+
+    fn main() {
+        let hdr_color: vec3 = sample(sceneColor, screen_uv).rgb * EXPOSURE;
+
+        // Reinhard tonemapping operator.
+        let luminance: scalar = dot(hdr_color, vec3(0.2126, 0.7152, 0.0722));
+        let mapped_luminance: scalar = luminance * (1.0 + luminance / (PURE_WHITE * PURE_WHITE)) / (1.0 + luminance);
+
+        // Scale color by ratio of average luminances (guard against zero).
+        let mapped_color: vec3 = hdr_color;
+        if (luminance > 0.0001) {
+            mapped_color = mapped_luminance / luminance * hdr_color;
+        }
+
+        // Gamma correction.
+        let inv_gamma: scalar = 1.0 / GAMMA;
+        outColor = vec4(pow(mapped_color, vec3(inv_gamma)), 1.0);
+    }
+}

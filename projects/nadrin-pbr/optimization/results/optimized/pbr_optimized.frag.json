@@ -1,0 +1,222 @@
+{
+  "version": 1,
+  "source": "pbr_optimized.lux",
+  "stage": "fragment",
+  "execution_model": "Fragment",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [
+    {
+      "name": "world_position",
+      "type": "vec3",
+      "location": 0
+    },
+    {
+      "name": "frag_texcoord",
+      "type": "vec2",
+      "location": 1
+    },
+    {
+      "name": "tangent_basis_0",
+      "type": "vec3",
+      "location": 2
+    },
+    {
+      "name": "tangent_basis_1",
+      "type": "vec3",
+      "location": 3
+    },
+    {
+      "name": "tangent_basis_2",
+      "type": "vec3",
+      "location": 4
+    }
+  ],
+  "outputs": [
+    {
+      "name": "color",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "descriptor_sets": {
+    "1": [
+      {
+        "binding": 0,
+        "type": "uniform_buffer",
+        "name": "ShadingUniforms",
+        "fields": [
+          {
+            "name": "light0_direction",
+            "type": "vec4",
+            "offset": 0,
+            "size": 16
+          },
+          {
+            "name": "light0_radiance",
+            "type": "vec4",
+            "offset": 16,
+            "size": 16
+          },
+          {
+            "name": "light1_direction",
+            "type": "vec4",
+            "offset": 32,
+            "size": 16
+          },
+          {
+            "name": "light1_radiance",
+            "type": "vec4",
+            "offset": 48,
+            "size": 16
+          },
+          {
+            "name": "light2_direction",
+            "type": "vec4",
+            "offset": 64,
+            "size": 16
+          },
+          {
+            "name": "light2_radiance",
+            "type": "vec4",
+            "offset": 80,
+            "size": 16
+          },
+          {
+            "name": "eyePosition",
+            "type": "vec4",
+            "offset": 96,
+            "size": 16
+          }
+        ],
+        "size": 112,
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "sampler",
+        "name": "albedoTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "sampled_image",
+        "name": "albedoTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "sampler",
+        "name": "normalTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "sampled_image",
+        "name": "normalTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 5,
+        "type": "sampler",
+        "name": "metalnessTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 6,
+        "type": "sampled_image",
+        "name": "metalnessTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 7,
+        "type": "sampler",
+        "name": "roughnessTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 8,
+        "type": "sampled_image",
+        "name": "roughnessTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 9,
+        "type": "sampler",
+        "name": "specularTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 10,
+        "type": "sampled_cube_image",
+        "name": "specularTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 11,
+        "type": "sampler",
+        "name": "irradianceTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 12,
+        "type": "sampled_cube_image",
+        "name": "irradianceTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 13,
+        "type": "sampler",
+        "name": "specularBRDF_LUT",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 14,
+        "type": "sampled_image",
+        "name": "specularBRDF_LUT",
+        "stage_flags": [
+          "fragment"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "performance_hints": {
+    "instruction_count": 888,
+    "alu_ops": 160,
+    "texture_samples": 7,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

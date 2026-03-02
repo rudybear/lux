@@ -406,7 +406,26 @@ class LuxTransformer(Transformer):
         return AccelDecl(str(args[0]), loc=_tok_loc(args[0]))
 
     def storage_image_decl(self, args):
-        return StorageImageDecl(str(args[0]), loc=_tok_loc(args[0]))
+        name = str(args[0])
+        fmt = "rgba8"
+        set_num = None
+        binding_num = None
+        for a in args[1:]:
+            if isinstance(a, Token) and a.type == "IDENT":
+                fmt = str(a).lower()
+            elif isinstance(a, Tree):
+                val = int(str(a.children[0]))
+                if a.data == "storage_image_set":
+                    set_num = val
+                elif a.data == "storage_image_binding":
+                    binding_num = val
+        return StorageImageDecl(name, format=fmt, set_number=set_num, binding=binding_num, loc=_tok_loc(args[0]))
+
+    def storage_image_set(self, args):
+        return Tree("storage_image_set", args)
+
+    def storage_image_binding(self, args):
+        return Tree("storage_image_binding", args)
 
     def storage_buffer_decl(self, args):
         name = args[0]
@@ -617,6 +636,18 @@ class LuxTransformer(Transformer):
         return _left_assoc_ops(args)
 
     def additive_expr(self, args):
+        return _left_assoc_ops(args)
+
+    def shift_expr(self, args):
+        return _left_assoc_ops(args)
+
+    def bitwise_or_expr(self, args):
+        return _left_assoc_ops(args)
+
+    def bitwise_xor_expr(self, args):
+        return _left_assoc_ops(args)
+
+    def bitwise_and_expr(self, args):
         return _left_assoc_ops(args)
 
     def multiplicative_expr(self, args):

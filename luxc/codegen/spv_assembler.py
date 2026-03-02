@@ -36,7 +36,7 @@ def run_spirv_opt(spv_path: Path) -> bool:
     opt_path = spv_path.with_suffix(".opt.spv")
     try:
         result = subprocess.run(
-            [spirv_opt, "-O", str(spv_path), "-o", str(opt_path)],
+            [spirv_opt, "--target-env=vulkan1.2", "-O", str(spv_path), "-o", str(opt_path)],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
@@ -93,7 +93,7 @@ def run_spirv_opt_perf(spv_path: Path) -> bool:
     ]
     try:
         result = subprocess.run(
-            [spirv_opt] + passes + [str(spv_path), "-o", str(opt_path)],
+            [spirv_opt, "--target-env=vulkan1.2"] + passes + [str(spv_path), "-o", str(opt_path)],
             capture_output=True, text=True,
         )
         if result.returncode != 0:

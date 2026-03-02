@@ -135,6 +135,8 @@ class TypeChecker:
         # Register builtin_position for vertex shaders
         if stage.stage_type == "vertex":
             scope.define(Symbol("builtin_position", VEC4, "builtin_position"))
+            scope.define(Symbol("vertex_index", resolve_type("int"), "builtin"))
+            scope.define(Symbol("instance_index", resolve_type("int"), "builtin"))
 
         # Register uniform block fields as directly accessible
         for ub in stage.uniforms:
@@ -613,6 +615,14 @@ def _check_binary_op(op: str, left: LuxType, right: LuxType) -> LuxType:
     if op in ("&", "|", "^"):
         if isinstance(left, ScalarType) and isinstance(right, ScalarType):
             # Prefer uint if either operand is uint
+            if left.name == "uint" or right.name == "uint":
+                return resolve_type("uint")
+            return left
+        raise TypeCheckError(f"Cannot apply '{op}' to {left.name} and {right.name}")
+
+    # Shift operators: <<, >>
+    if op in ("<<", ">>"):
+        if isinstance(left, ScalarType) and isinstance(right, ScalarType):
             if left.name == "uint" or right.name == "uint":
                 return resolve_type("uint")
             return left

@@ -1,0 +1,55 @@
+{
+  "metadata": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "timestamp_period_ns": 1.0,
+    "frames_per_run": 1000,
+    "measured_frames": 900,
+    "warmup_frames": 100,
+    "date": "2026-03-02",
+    "renderer": "Lux-variant two-pass (main pass + tonemap)"
+  },
+  "variants": {
+    "lux_default": {
+      "description": "Lux compiler default output (no spirv-opt)",
+      "main_pass": {"mean": 0.038842, "min": 0.031328, "max": 0.475136, "p95": 0.037248},
+      "barrier":   {"mean": 0.001849, "min": 0.000608, "max": 0.311584, "p95": 0.000992},
+      "tonemap":   {"mean": 0.004159, "min": 0.002464, "max": 0.016800, "p95": 0.004448},
+      "total_frame": {"mean": 0.045047, "min": 0.036448, "max": 0.480384, "p95": 0.042752}
+    },
+    "lux_opt_O": {
+      "description": "Lux compiler + spirv-opt -O",
+      "main_pass": {"mean": 0.038410, "min": 0.031424, "max": 0.498048, "p95": 0.034944},
+      "barrier":   {"mean": 0.001714, "min": 0.000608, "max": 0.294752, "p95": 0.000992},
+      "tonemap":   {"mean": 0.004109, "min": 0.002400, "max": 0.005888, "p95": 0.004480},
+      "total_frame": {"mean": 0.044429, "min": 0.036288, "max": 0.503200, "p95": 0.040160}
+    },
+    "lux_perf": {
+      "description": "Lux compiler + spirv-opt performance passes",
+      "main_pass": {"mean": 0.037184, "min": 0.029088, "max": 0.431872, "p95": 0.037536},
+      "barrier":   {"mean": 0.001477, "min": 0.000608, "max": 0.286016, "p95": 0.001024},
+      "tonemap":   {"mean": 0.004032, "min": 0.002432, "max": 0.016288, "p95": 0.004384},
+      "total_frame": {"mean": 0.042888, "min": 0.034080, "max": 0.437056, "p95": 0.043072}
+    },
+    "lux_default_run2": {
+      "description": "Lux compiler default (verification re-run)",
+      "main_pass": {"mean": 0.038745, "min": 0.030400, "max": 0.421152, "p95": 0.037920},
+      "barrier":   {"mean": 0.001934, "min": 0.000608, "max": 0.295584, "p95": 0.000992},
+      "tonemap":   {"mean": 0.003866, "min": 0.002464, "max": 0.027584, "p95": 0.004448},
+      "total_frame": {"mean": 0.044735, "min": 0.035328, "max": 0.426400, "p95": 0.043392}
+    },
+    "lux_fresnel_opt_run1": {
+      "description": "Fresnel pow(x,5) -> multiply chain (run 1, low noise)",
+      "main_pass": {"mean": 0.033016, "min": 0.029536, "max": 0.046880, "p95": 0.034656},
+      "barrier":   {"mean": 0.000718, "min": 0.000608, "max": 0.002720, "p95": 0.000960},
+      "tonemap":   {"mean": 0.003845, "min": 0.002400, "max": 0.013984, "p95": 0.004416},
+      "total_frame": {"mean": 0.037762, "min": 0.034400, "max": 0.051712, "p95": 0.039808}
+    },
+    "lux_fresnel_opt_run2": {
+      "description": "Fresnel pow(x,5) -> multiply chain (run 2, typical noise)",
+      "main_pass": {"mean": 0.036743, "min": 0.028992, "max": 0.499520, "p95": 0.038080},
+      "barrier":   {"mean": 0.001637, "min": 0.000608, "max": 0.304160, "p95": 0.000992},
+      "tonemap":   {"mean": 0.003831, "min": 0.002432, "max": 0.017408, "p95": 0.004416},
+      "total_frame": {"mean": 0.042400, "min": 0.034112, "max": 0.504832, "p95": 0.043648}
+    }
+  }
+}

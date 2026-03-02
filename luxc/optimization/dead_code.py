@@ -46,6 +46,9 @@ def _dce_function(func: FunctionDef, stage: StageBlock | None) -> None:
     if func.name == "main" and stage is not None:
         for out in stage.outputs:
             protected_vars.add(out.name)
+        # Builtin variables that are implicitly outputs
+        if stage.stage_type == "vertex":
+            protected_vars.add("builtin_position")
 
     # Iterate until no changes
     for _ in range(20):  # safety bound

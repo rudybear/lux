@@ -368,6 +368,7 @@ class AccelDecl:
 @dataclass
 class StorageImageDecl:
     name: str
+    format: str = "rgba8"  # SPIR-V image format: rgba8, rgba16f, rg16f, r32f, etc.
     set_number: Optional[int] = None
     binding: Optional[int] = None
     loc: Optional[SourceLocation] = None

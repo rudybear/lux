@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "source": "skybox.lux",
+  "stage": "fragment",
+  "execution_model": "Fragment",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [
+    {
+      "name": "localPosition",
+      "type": "vec3",
+      "location": 0
+    }
+  ],
+  "outputs": [
+    {
+      "name": "color",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "descriptor_sets": {
+    "1": [
+      {
+        "binding": 0,
+        "type": "sampler",
+        "name": "envTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "sampled_cube_image",
+        "name": "envTexture",
+        "stage_flags": [
+          "fragment"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "performance_hints": {
+    "instruction_count": 49,
+    "alu_ops": 0,
+    "texture_samples": 1,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "low"
+  }
+}

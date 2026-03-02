@@ -143,7 +143,9 @@ ray_payload_decl: "ray_payload" IDENT ":" type ";"
 hit_attribute_decl: "hit_attribute" IDENT ":" type ";"
 callable_data_decl: "callable_data" IDENT ":" type ";"
 accel_decl: "acceleration_structure" IDENT ";"
-storage_image_decl: "storage_image" IDENT ";"
+storage_image_decl: "storage_image" IDENT (":" IDENT)? storage_image_layout* ";"
+storage_image_layout: "@" "set" "(" NUMBER ")" -> storage_image_set
+                    | "@" "binding" "(" NUMBER ")" -> storage_image_binding
 storage_buffer_decl: "storage_buffer" IDENT ":" type ";"
 
 // Mesh shader-specific stage items
@@ -225,15 +227,23 @@ TYPE_NAME: "scalar" | "int" | "uint" | "bool"
 ?ternary_expr: or_expr ("?" expr ":" ternary_expr)?
 
 ?or_expr: and_expr ("||" and_expr)*
-?and_expr: equality_expr ("&&" equality_expr)*
+?and_expr: bitwise_or_expr ("&&" bitwise_or_expr)*
+?bitwise_or_expr: bitwise_xor_expr (BITWISE_OR bitwise_xor_expr)*
+?bitwise_xor_expr: bitwise_and_expr (BITWISE_XOR bitwise_and_expr)*
+?bitwise_and_expr: equality_expr (BITWISE_AND equality_expr)*
+BITWISE_OR: /\|(?!\|)/
+BITWISE_XOR: "^"
+BITWISE_AND: /&(?!&)/
 ?equality_expr: comparison_expr (EQUALITY_OP comparison_expr)*
 ?comparison_expr: additive_expr (COMPARISON_OP additive_expr)*
-?additive_expr: multiplicative_expr (ADD_OP multiplicative_expr)*
+?additive_expr: shift_expr (ADD_OP shift_expr)*
+?shift_expr: multiplicative_expr (SHIFT_OP multiplicative_expr)*
 ?multiplicative_expr: unary_expr (MUL_OP unary_expr)*
 
 EQUALITY_OP: "==" | "!="
 COMPARISON_OP: "<=" | ">=" | "<" | ">"
 ADD_OP: "+" | "-"
+SHIFT_OP: "<<" | ">>"
 MUL_OP: "*" | "/" | "%"
 
 ?unary_expr: UNARY_OP unary_expr -> unary

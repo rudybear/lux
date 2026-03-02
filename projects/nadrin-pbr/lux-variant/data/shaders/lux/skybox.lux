@@ -1,0 +1,33 @@
+// Nadrin/PBR - Skybox Renderer
+// Lux native conversion of skybox_vs.glsl + skybox_fs.glsl
+// Copyright (c) 2017-2018 Michal Siejak (MIT License)
+
+vertex {
+    in position: vec3;
+
+    uniform TransformUniforms {
+        viewProjectionMatrix: mat4,
+        skyProjectionMatrix: mat4,
+        sceneRotationMatrix: mat4,
+    }
+
+    out localPosition: vec3;
+
+    fn main() {
+        localPosition = position;
+        builtin_position = skyProjectionMatrix * vec4(position, 1.0);
+    }
+}
+
+fragment {
+    in localPosition: vec3;
+
+    samplerCube envTexture;
+
+    out color: vec4;
+
+    fn main() {
+        let envVector: vec3 = normalize(localPosition);
+        color = sample_lod(envTexture, envVector, 0.0);
+    }
+}

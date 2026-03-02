@@ -1,0 +1,195 @@
+// Nadrin/PBR - Physically Based Rendering
+// Lux native conversion of pbr_vs.glsl + pbr_fs.glsl
+// Copyright (c) 2017-2018 Michal Siejak (MIT License)
+// Converted to Lux shader language
+
+const PI: scalar = 3.141592;
+const EPSILON: scalar = 0.00001;
+
+// GGX/Trowbridge-Reitz normal distribution function.
+// Uses Disney's reparametrization of alpha = roughness^2.
+fn ndf_ggx(cos_lh: scalar, roughness: scalar) -> scalar {
+    let alpha: scalar = roughness * roughness;
+    let alpha_sq: scalar = alpha * alpha;
+    let denom: scalar = cos_lh * cos_lh * (alpha_sq - 1.0) + 1.0;
+    return alpha_sq / (PI * denom * denom);
+}
+
+// Single term for separable Schlick-GGX.
+fn ga_schlick_g1(cos_theta: scalar, k: scalar) -> scalar {
+    return cos_theta / (cos_theta * (1.0 - k) + k);
+}
+
+// Schlick-GGX approximation of geometric attenuation using Smith's method.
+fn ga_schlick_ggx(cos_li: scalar, cos_lo: scalar, roughness: scalar) -> scalar {
+    let r: scalar = roughness + 1.0;
+    let k: scalar = r * r / 8.0;
+    return ga_schlick_g1(cos_li, k) * ga_schlick_g1(cos_lo, k);
+}
+
+// Schlick's approximation of the Fresnel factor.
+// Optimized: pow(x, 5.0) replaced with multiply chain (x*x)*(x*x)*x
+fn fresnel_schlick(f0: vec3, cos_theta: scalar) -> vec3 {
+    let t: scalar = 1.0 - cos_theta;
+    let t2: scalar = t * t;
+    return f0 + (vec3(1.0) - f0) * (t2 * t2 * t);
+}
+
+vertex {
+    in position: vec3;
+    in normal: vec3;
+    in tangent: vec3;
+    in bitangent: vec3;
+    in texcoord: vec2;
+
+    uniform TransformUniforms {
+        viewProjectionMatrix: mat4,
+        skyProjectionMatrix: mat4,
+        sceneRotationMatrix: mat4,
+    }
+
+    out world_position: vec3;
+    out frag_texcoord: vec2;
+    out tangent_basis_0: vec3;
+    out tangent_basis_1: vec3;
+    out tangent_basis_2: vec3;
+
+    fn main() {
+        world_position = (sceneRotationMatrix * vec4(position, 1.0)).xyz;
+        frag_texcoord = vec2(texcoord.x, 1.0 - texcoord.y);
+
+        // Pass tangent space basis vectors (for normal mapping).
+        // Manually apply scene rotation to each TBN vector since mat3(mat4) isn't directly supported.
+        let rot_tangent: vec3 = (sceneRotationMatrix * vec4(tangent, 0.0)).xyz;
+        let rot_bitangent: vec3 = (sceneRotationMatrix * vec4(bitangent, 0.0)).xyz;
+        let rot_normal: vec3 = (sceneRotationMatrix * vec4(normal, 0.0)).xyz;
+        tangent_basis_0 = rot_tangent;
+        tangent_basis_1 = rot_bitangent;
+        tangent_basis_2 = rot_normal;
+
+        builtin_position = viewProjectionMatrix * sceneRotationMatrix * vec4(position, 1.0);
+    }
+}
+
+fragment {
+    in world_position: vec3;
+    in frag_texcoord: vec2;
+    in tangent_basis_0: vec3;
+    in tangent_basis_1: vec3;
+    in tangent_basis_2: vec3;
+
+    uniform ShadingUniforms {
+        light0_direction: vec4,
+        light0_radiance: vec4,
+        light1_direction: vec4,
+        light1_radiance: vec4,
+        light2_direction: vec4,
+        light2_radiance: vec4,
+        eyePosition: vec4,
+    }
+
+    sampler2d albedoTexture;
+    sampler2d normalTexture;
+    sampler2d metalnessTexture;
+    sampler2d roughnessTexture;
+    samplerCube specularTexture;
+    samplerCube irradianceTexture;
+    sampler2d specularBRDF_LUT;
+
+    out color: vec4;
+
+    fn main() {
+        // Sample input textures to get shading model params.
+        let albedo: vec3 = sample(albedoTexture, frag_texcoord).rgb;
+        let metalness: scalar = sample(metalnessTexture, frag_texcoord).r;
+        let roughness: scalar = sample(roughnessTexture, frag_texcoord).r;
+
+        // Outgoing light direction (fragment to eye).
+        let Lo: vec3 = normalize(eyePosition.xyz - world_position);
+
+        // Get fragment normal and transform to world space.
+        let normal_sample: vec3 = normalize(2.0 * sample(normalTexture, frag_texcoord).rgb - vec3(1.0));
+        // Apply tangent basis manually: TBN * normal_sample
+        let N: vec3 = normalize(
+            tangent_basis_0 * normal_sample.x +
+            tangent_basis_1 * normal_sample.y +
+            tangent_basis_2 * normal_sample.z
+        );
+
+        // Angle between surface normal and outgoing light direction.
+        let cosLo: scalar = max(0.0, dot(N, Lo));
+
+        // Specular reflection vector.
+        let Lr: vec3 = 2.0 * cosLo * N - Lo;
+
+        // Fresnel reflectance at normal incidence (metals use albedo color).
+        let Fdielectric: vec3 = vec3(0.04);
+        let F0: vec3 = mix(Fdielectric, albedo, metalness);
+
+        // Direct lighting calculation for 3 analytical lights.
+        let direct_lighting: vec3 = vec3(0.0);
+
+        // Light 0
+        let Li0: vec3 = -light0_direction.xyz;
+        let Lh0: vec3 = normalize(Li0 + Lo);
+        let cosLi0: scalar = max(0.0, dot(N, Li0));
+        let cosLh0: scalar = max(0.0, dot(N, Lh0));
+        let F_0: vec3 = fresnel_schlick(F0, max(0.0, dot(Lh0, Lo)));
+        let D_0: scalar = ndf_ggx(cosLh0, roughness);
+        let G_0: scalar = ga_schlick_ggx(cosLi0, cosLo, roughness);
+        let kd0: vec3 = mix(vec3(1.0) - F_0, vec3(0.0), metalness);
+        let diffuse0: vec3 = kd0 * albedo;
+        let spec0: vec3 = F_0 * D_0 * G_0 / max(EPSILON, 4.0 * cosLi0 * cosLo);
+        direct_lighting = direct_lighting + (diffuse0 + spec0) * light0_radiance.xyz * cosLi0;
+
+        // Light 1
+        let Li1: vec3 = -light1_direction.xyz;
+        let Lh1: vec3 = normalize(Li1 + Lo);
+        let cosLi1: scalar = max(0.0, dot(N, Li1));
+        let cosLh1: scalar = max(0.0, dot(N, Lh1));
+        let F_1: vec3 = fresnel_schlick(F0, max(0.0, dot(Lh1, Lo)));
+        let D_1: scalar = ndf_ggx(cosLh1, roughness);
+        let G_1: scalar = ga_schlick_ggx(cosLi1, cosLo, roughness);
+        let kd1: vec3 = mix(vec3(1.0) - F_1, vec3(0.0), metalness);
+        let diffuse1: vec3 = kd1 * albedo;
+        let spec1: vec3 = F_1 * D_1 * G_1 / max(EPSILON, 4.0 * cosLi1 * cosLo);
+        direct_lighting = direct_lighting + (diffuse1 + spec1) * light1_radiance.xyz * cosLi1;
+
+        // Light 2
+        let Li2: vec3 = -light2_direction.xyz;
+        let Lh2: vec3 = normalize(Li2 + Lo);
+        let cosLi2: scalar = max(0.0, dot(N, Li2));
+        let cosLh2: scalar = max(0.0, dot(N, Lh2));
+        let F_2: vec3 = fresnel_schlick(F0, max(0.0, dot(Lh2, Lo)));
+        let D_2: scalar = ndf_ggx(cosLh2, roughness);
+        let G_2: scalar = ga_schlick_ggx(cosLi2, cosLo, roughness);
+        let kd2: vec3 = mix(vec3(1.0) - F_2, vec3(0.0), metalness);
+        let diffuse2: vec3 = kd2 * albedo;
+        let spec2: vec3 = F_2 * D_2 * G_2 / max(EPSILON, 4.0 * cosLi2 * cosLo);
+        direct_lighting = direct_lighting + (diffuse2 + spec2) * light2_radiance.xyz * cosLi2;
+
+        // Ambient lighting (IBL).
+        let irradiance: vec3 = sample(irradianceTexture, N).rgb;
+        let F_amb: vec3 = fresnel_schlick(F0, cosLo);
+        let kd_amb: vec3 = mix(vec3(1.0) - F_amb, vec3(0.0), metalness);
+        let diffuseIBL: vec3 = kd_amb * albedo * irradiance;
+
+        // Sample pre-filtered specular reflection environment at correct mipmap level.
+        let specTexLevels: int = texture_levels(specularTexture);
+        let spec_lod: scalar = roughness * specTexLevels;
+        let specularIrradiance: vec3 = sample_lod(specularTexture, Lr, spec_lod).rgb;
+
+        // Split-sum approximation factors for Cook-Torrance specular BRDF.
+        let brdf_uv: vec2 = vec2(cosLo, roughness);
+        let specularBRDF: vec2 = sample(specularBRDF_LUT, brdf_uv).rg;
+
+        // Total specular IBL contribution.
+        let specularIBL: vec3 = (F0 * specularBRDF.x + vec3(specularBRDF.y)) * specularIrradiance;
+
+        // Total ambient lighting contribution.
+        let ambientLighting: vec3 = diffuseIBL + specularIBL;
+
+        // Final fragment color.
+        color = vec4(direct_lighting + ambientLighting, 1.0);
+    }
+}

@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "source": "tonemap.lux",
+  "stage": "fragment",
+  "execution_model": "Fragment",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [
+    {
+      "name": "screen_uv",
+      "type": "vec2",
+      "location": 0
+    }
+  ],
+  "outputs": [
+    {
+      "name": "outColor",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "descriptor_sets": {
+    "1": [
+      {
+        "binding": 0,
+        "type": "sampler",
+        "name": "sceneColor",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "sampled_image",
+        "name": "sceneColor",
+        "stage_flags": [
+          "fragment"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "performance_hints": {
+    "instruction_count": 98,
+    "alu_ops": 6,
+    "texture_samples": 1,
+    "branches": 1,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

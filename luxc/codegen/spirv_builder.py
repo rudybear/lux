@@ -144,7 +144,9 @@ class SpvGenerator:
         self.var_map: dict[str, str] = {}        # lux name -> %id of variable (pointer)
         self.var_types: dict[str, str] = {}       # lux name -> lux type name
         self.var_storage: dict[str, str] = {}     # lux name -> storage class
+        self._storage_image_type_ids: dict[str, str] = {}  # image name -> SPIR-V image type id
         self.interface_ids: list[str] = []         # for OpEntryPoint
+        self.interface_storage: dict[str, str] = {}  # var_id -> storage class (Input/Output/Uniform/etc)
         self.glsl_ext_id: str | None = None
         self._label_counter = 0
 
@@ -186,6 +188,7 @@ class SpvGenerator:
         # DebugPrintf extension (NonSemantic.DebugPrintf)
         self._debug_printf_ext_id: str | None = None
         self._has_debug_printf: bool = False  # set to True if any debug_print/assert is found
+        self._needs_image_query: bool = False  # set to True if texture_levels/texture_size/image_size used
         self._debug_string_ids: dict[str, str] = {}  # format_string -> OpString %id
 
     def _next_label(self) -> str:
@@ -261,6 +264,16 @@ class SpvGenerator:
             lines.append("OpCapability RuntimeDescriptorArray")
             lines.append("OpCapability ShaderNonUniform")
             lines.append("OpCapability SampledImageArrayNonUniformIndexing")
+        if self._needs_image_query:
+            lines.append("OpCapability ImageQuery")
+        # StorageImageExtendedFormats needed for Rg16f, R32f, etc.
+        _EXTENDED_FMTS = {"Rg16f", "Rg32f", "R16f", "R32f", "R32i", "R32ui", "R11fG11fB10f"}
+        needs_ext_fmt = any(
+            getattr(si, 'format', 'rgba8').lower() not in ('rgba8', 'rgba16f', 'rgba32f')
+            for si in getattr(self.stage, 'storage_images', [])
+        )
+        if needs_ext_fmt:
+            lines.append("OpCapability StorageImageExtendedFormats")
         if has_storage_buffers:
             lines.append('OpExtension "SPV_KHR_storage_buffer_storage_class"')
         if is_rt:
@@ -287,6 +300,9 @@ class SpvGenerator:
             exec_model = "Vertex"
         else:
             exec_model = "Fragment"
+        # Include ALL global variables in OpEntryPoint interface.
+        # SPIR-V 1.4+ requires this, and spirv-opt/spirv-val enforce it
+        # even for earlier versions under vulkan1.2+ target environments.
         iface = " ".join(self.interface_ids)
         lines.append(f"OpEntryPoint {exec_model} %main \"main\" {iface}")
 
@@ -386,6 +402,7 @@ class SpvGenerator:
             self.var_types[inp.name] = inp.type_name
             self.var_storage[inp.name] = "Input"
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = "Input"
 
         # --- Output variables ---
         # mesh outputs are arrays, handled separately in the mesh-specific block
@@ -399,6 +416,7 @@ class SpvGenerator:
             self.var_types[out.name] = out.type_name
             self.var_storage[out.name] = "Output"
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = "Output"
 
         # --- gl_PerVertex for vertex shaders (builtin_position) ---
         if self.stage.stage_type == "vertex":
@@ -415,6 +433,7 @@ class SpvGenerator:
             self.global_vars.append(f"{var_id} = OpVariable {ptr_type} Output")
             self.per_vertex_var_id = var_id
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = "Output"
 
             # Decorations for gl_PerVertex
             self.decorations.append(f"OpDecorate {struct_id} Block")
@@ -426,6 +445,20 @@ class SpvGenerator:
             self.var_map["builtin_position"] = var_id
             self.var_types["builtin_position"] = "vec4"
             self.var_storage["builtin_position"] = "Output"
+
+        # --- vertex_index and instance_index builtins for vertex shaders ---
+        if self.stage.stage_type == "vertex":
+            for bi_name, bi_builtin in [("vertex_index", "VertexIndex"), ("instance_index", "InstanceIndex")]:
+                int_type = self.reg.int32()
+                ptr_type = self.reg.pointer("Input", int_type)
+                var_id = self.reg.next_id()
+                self.global_vars.append(f"{var_id} = OpVariable {ptr_type} Input")
+                self.decorations.append(f"OpDecorate {var_id} BuiltIn {bi_builtin}")
+                self.var_map[bi_name] = var_id
+                self.var_types[bi_name] = "int"
+                self.var_storage[bi_name] = "Input"
+                self.interface_ids.append(var_id)
+                self.interface_storage[var_id] = "Input"
 
         # --- Uniform blocks ---
         for ub in self.stage.uniforms:
@@ -444,6 +477,7 @@ class SpvGenerator:
             self.global_vars.append(f"{var_id} = OpVariable {ptr_type} Uniform")
             self.uniform_var_ids[ub.name] = var_id
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = "Uniform"
 
             # Decorations
             self.decorations.append(f"OpDecorate {struct_id} Block")
@@ -476,6 +510,7 @@ class SpvGenerator:
             self.global_vars.append(f"{var_id} = OpVariable {ptr_type} PushConstant")
             self.push_var_ids[pb.name] = var_id
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = "PushConstant"
 
             self.decorations.append(f"OpDecorate {struct_id} Block")
             offsets = compute_std140_offsets(pb.fields)
@@ -496,6 +531,7 @@ class SpvGenerator:
             self.decorations.append(f"OpDecorate {sampler_var} DescriptorSet {sam.set_number}")
             self.decorations.append(f"OpDecorate {sampler_var} Binding {sam.binding}")
             self.interface_ids.append(sampler_var)
+            self.interface_storage[sampler_var] = "UniformConstant"
 
             # Texture image variable (2D, Cube, 2DArray, or CubeArray depending on sampler type)
             sam_type_name = getattr(sam, 'type_name', 'sampler2d')
@@ -513,10 +549,12 @@ class SpvGenerator:
             self.decorations.append(f"OpDecorate {texture_var} DescriptorSet {sam.set_number}")
             self.decorations.append(f"OpDecorate {texture_var} Binding {sam.texture_binding}")
             self.interface_ids.append(texture_var)
+            self.interface_storage[texture_var] = "UniformConstant"
 
             # Store both var IDs for use in sample() codegen
             self.var_map[sam.name + ".__sampler"] = sampler_var
             self.var_map[sam.name + ".__texture"] = texture_var
+            self.var_map[sam.name + ".__image_type"] = image_type
             self.var_types[sam.name] = sam_type_name
             self.var_storage[sam.name] = "UniformConstant"
 
@@ -542,6 +580,7 @@ class SpvGenerator:
             self._payload_vars[loc] = var_id
             self.var_storage[rp.name] = storage
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = storage
 
         # --- RT: Hit attribute variables ---
         for ha in self.stage.hit_attributes:
@@ -554,6 +593,7 @@ class SpvGenerator:
             self.var_types[ha.name] = ha.type_name
             self.var_storage[ha.name] = storage
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = storage
 
         # --- RT: Callable data variables ---
         for i, cd in enumerate(self.stage.callable_data):
@@ -571,6 +611,7 @@ class SpvGenerator:
             self.var_types[cd.name] = cd.type_name
             self.var_storage[cd.name] = storage
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = storage
 
         # --- RT: Acceleration structure variables ---
         for accel in self.stage.accel_structs:
@@ -587,16 +628,25 @@ class SpvGenerator:
             self.var_types[accel.name] = "acceleration_structure"
             self.var_storage[accel.name] = storage
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = storage
 
         # --- RT: Storage image variables ---
+        # Map Lux format names to SPIR-V image format enums
+        _FMT_MAP = {
+            "rgba8": "Rgba8", "rgba16f": "Rgba16f", "rgba32f": "Rgba32f",
+            "rg16f": "Rg16f", "rg32f": "Rg32f",
+            "r16f": "R16f", "r32f": "R32f", "r32i": "R32i", "r32ui": "R32ui",
+            "r11g11b10f": "R11fG11fB10f",
+        }
         for si in getattr(self.stage, 'storage_images', []):
-            # R8G8B8A8 2D storage image (Rgba8)
+            fmt = getattr(si, 'format', 'rgba8') or 'rgba8'
+            spv_fmt = _FMT_MAP.get(fmt.lower(), "Rgba8")
             f32 = self.reg.float32()
-            img_type_key = "storage_image_2d"
+            img_type_key = f"storage_image_2d_{spv_fmt}"
             if img_type_key not in self.reg._types:
                 img_type_id = self.reg.next_id()
                 self.reg._types[img_type_key] = img_type_id
-                self.reg._decls.append(f"{img_type_id} = OpTypeImage {f32} 2D 0 0 0 2 Rgba8")
+                self.reg._decls.append(f"{img_type_id} = OpTypeImage {f32} 2D 0 0 0 2 {spv_fmt}")
             else:
                 img_type_id = self.reg._types[img_type_key]
             storage = "UniformConstant"
@@ -610,8 +660,10 @@ class SpvGenerator:
             self.decorations.append(f"OpDecorate {var_id} NonReadable")
             self.var_map[si.name] = var_id
             self.var_types[si.name] = "storage_image"
+            self._storage_image_type_ids[si.name] = img_type_id
             self.var_storage[si.name] = storage
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = storage
 
         # --- Storage buffer variables (runtime arrays) ---
         # Struct element type registry for BindlessMaterialData
@@ -684,6 +736,7 @@ class SpvGenerator:
             self.var_types[sb.name] = f"_rtarr_{sb.element_type}"
             self.var_storage[sb.name] = "StorageBuffer"
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = "StorageBuffer"
 
         # --- Bindless texture arrays (runtime array of combined image sampler) ---
         for bta in getattr(self.stage, 'bindless_texture_arrays', []):
@@ -701,6 +754,7 @@ class SpvGenerator:
             self.var_types[bta.name] = "_bindless_texture_array"
             self.var_storage[bta.name] = "UniformConstant"
             self.interface_ids.append(var_id)
+            self.interface_storage[var_id] = "UniformConstant"
 
         # --- RT: Built-in variables ---
         if self.stage.stage_type in _RT_STAGES:
@@ -723,6 +777,7 @@ class SpvGenerator:
                     self.var_types[builtin_name] = btype
                     self.var_storage[builtin_name] = "Input"
                     self.interface_ids.append(var_id)
+                    self.interface_storage[var_id] = "Input"
                     emitted_builtins[spv_builtin] = var_id
 
         # --- Workgroup built-in variables (mesh, task, compute) ---
@@ -745,6 +800,7 @@ class SpvGenerator:
                     self.var_types[builtin_name] = btype
                     self.var_storage[builtin_name] = "Input"
                     self.interface_ids.append(var_id)
+                    self.interface_storage[var_id] = "Input"
                     emitted_builtins[spv_builtin] = var_id
 
         # --- Shared memory variables (Workgroup storage class) ---
@@ -770,6 +826,7 @@ class SpvGenerator:
                 self.var_types[sd.name] = sd.type_name
                 self.var_storage[sd.name] = "Workgroup"
                 self.interface_ids.append(var_id)
+                self.interface_storage[var_id] = "Workgroup"
 
         # --- Mesh: Output arrays (gl_MeshPerVertexEXT, PrimitiveTriangleIndicesEXT) ---
         if self.stage.stage_type == "mesh":
@@ -787,6 +844,7 @@ class SpvGenerator:
             per_vert_var = self.reg.next_id()
             self.global_vars.append(f"{per_vert_var} = OpVariable {ptr_per_vert_arr} Output")
             self.interface_ids.append(per_vert_var)
+            self.interface_storage[per_vert_var] = "Output"
 
             self.decorations.append(f"OpDecorate {per_vert_struct} Block")
             self.decorations.append(f"OpMemberDecorate {per_vert_struct} 0 BuiltIn Position")
@@ -811,6 +869,7 @@ class SpvGenerator:
             self.global_vars.append(f"{tri_idx_var} = OpVariable {ptr_tri_idx_arr} Output")
             self.decorations.append(f"OpDecorate {tri_idx_var} BuiltIn PrimitiveTriangleIndicesEXT")
             self.interface_ids.append(tri_idx_var)
+            self.interface_storage[tri_idx_var] = "Output"
 
             self.var_map["gl_PrimitiveTriangleIndicesEXT"] = tri_idx_var
             self.var_types["gl_PrimitiveTriangleIndicesEXT"] = "uvec3_arr"
@@ -828,6 +887,7 @@ class SpvGenerator:
                 self.var_types[out.name] = out.type_name
                 self.var_storage[out.name] = "Output"
                 self.interface_ids.append(var_id)
+                self.interface_storage[var_id] = "Output"
 
         # --- Task: Task payload output variable ---
         if self.stage.stage_type == "task":
@@ -841,6 +901,7 @@ class SpvGenerator:
                 self.var_types[tp.name] = tp.type_name
                 self.var_storage[tp.name] = storage
                 self.interface_ids.append(var_id)
+                self.interface_storage[var_id] = storage
 
         # --- Specialization constants ---
         for i, sc in enumerate(self.module.spec_constants):
@@ -969,6 +1030,18 @@ class SpvGenerator:
 
         stride = (offset + 15) & ~15
         return struct_id, stride
+
+    def _sampler_image_type(self, sampler_arg) -> str:
+        """Return the OpTypeImage id for a sampler argument, for use with OpImage."""
+        sam_name = None
+        if isinstance(sampler_arg, VarRef):
+            sam_name = sampler_arg.name
+        if sam_name:
+            img_key = sam_name + ".__image_type"
+            if img_key in self.var_map:
+                return self.var_map[img_key]
+        # Fallback: use the default 2D image type
+        return self.reg.image_type()
 
     def _make_array_type(self, elem_type: str, length: int) -> str:
         length_id = self.reg.const_uint(length)
@@ -1522,7 +1595,11 @@ class SpvGenerator:
                 # Return the variable pointer so IndexAccess can use it.
                 return self.var_map[name], lines
             type_name = self.var_types[name]
-            type_id = self.reg.lux_type_to_spirv(type_name)
+            # Use per-variable image type for storage images (supports custom formats like Rg16f)
+            if name in self._storage_image_type_ids:
+                type_id = self._storage_image_type_ids[name]
+            else:
+                type_id = self.reg.lux_type_to_spirv(type_name)
             result = self.reg.next_id()
             lines.append(f"{result} = OpLoad {type_id} {self.var_map[name]}")
             return result, lines
@@ -1625,6 +1702,29 @@ class SpvGenerator:
                     lines.append(f"{conv} = OpConvertFToU {uint_t} {right_id}")
                     right_id = conv
             lines.append(f"{result} = {bitwise_ops[op]} {result_type} {left_id} {right_id}")
+            return result, lines
+
+        # Shift ops — operands must be integer type
+        if op in ("<<", ">>"):
+            shift_ops = {"<<": "OpShiftLeftLogical", ">>": "OpShiftRightLogical"}
+            uint_t = self.reg.uint32()
+            lt_resolved = resolve_alias_chain(lt)
+            rt_resolved = resolve_alias_chain(rt)
+            if lt_resolved == "scalar":
+                if isinstance(expr.left, NumberLit):
+                    left_id = self.reg.const_uint(int(float(expr.left.value)))
+                else:
+                    conv = self.reg.next_id()
+                    lines.append(f"{conv} = OpConvertFToU {uint_t} {left_id}")
+                    left_id = conv
+            if rt_resolved == "scalar":
+                if isinstance(expr.right, NumberLit):
+                    right_id = self.reg.const_uint(int(float(expr.right.value)))
+                else:
+                    conv = self.reg.next_id()
+                    lines.append(f"{conv} = OpConvertFToU {uint_t} {right_id}")
+                    right_id = conv
+            lines.append(f"{result} = {shift_ops[op]} {result_type} {left_id} {right_id}")
             return result, lines
 
         # Arithmetic ops
@@ -2020,6 +2120,57 @@ class SpvGenerator:
                 lines.append(f"{result} = OpImageSampleExplicitLod {result_type} {loaded} {uv_id} Lod {lod_id}")
             return result, lines
 
+        # texture_levels(sampler) -> int — handle before general arg generation
+        # since sampler is split into __sampler + __texture
+        if fname == "texture_levels":
+            self._needs_image_query = True
+            sampler_arg = expr.args[0]
+            result_type = self.reg.int32()
+            result = self.reg.next_id()
+            if isinstance(sampler_arg, VarRef) and sampler_arg.name + ".__texture" in self.var_map:
+                sam_name = sampler_arg.name
+                img_type = self._sampler_image_type(sampler_arg)
+                tex_loaded = self.reg.next_id()
+                lines.append(f"{tex_loaded} = OpLoad {img_type} {self.var_map[sam_name + '.__texture']}")
+                lines.append(f"{result} = OpImageQueryLevels {result_type} {tex_loaded}")
+            else:
+                # Fallback: try loading as combined image sampler
+                tex_id, tex_lines = self._gen_expr(sampler_arg)
+                lines.extend(tex_lines)
+                img_id = self.reg.next_id()
+                lines.append(f"{img_id} = OpImage {self._sampler_image_type(sampler_arg)} {tex_id}")
+                lines.append(f"{result} = OpImageQueryLevels {result_type} {img_id}")
+            return result, lines
+
+        # texture_size(sampler, lod) -> ivec2 — handle before general arg generation
+        if fname == "texture_size":
+            self._needs_image_query = True
+            sampler_arg = expr.args[0]
+            lod_id, lod_lines = self._gen_expr(expr.args[1])
+            lines.extend(lod_lines)
+            # Convert lod to int if needed
+            lod_resolved = resolve_alias_chain(getattr(expr.args[1], 'resolved_type', 'int'))
+            if lod_resolved == "scalar":
+                int_t = self.reg.int32()
+                conv = self.reg.next_id()
+                lines.append(f"{conv} = OpConvertFToS {int_t} {lod_id}")
+                lod_id = conv
+            ivec2_type = self.reg.vec(2, "int")
+            result = self.reg.next_id()
+            if isinstance(sampler_arg, VarRef) and sampler_arg.name + ".__texture" in self.var_map:
+                sam_name = sampler_arg.name
+                img_type = self._sampler_image_type(sampler_arg)
+                tex_loaded = self.reg.next_id()
+                lines.append(f"{tex_loaded} = OpLoad {img_type} {self.var_map[sam_name + '.__texture']}")
+                lines.append(f"{result} = OpImageQuerySizeLod {ivec2_type} {tex_loaded} {lod_id}")
+            else:
+                tex_id, tex_lines = self._gen_expr(sampler_arg)
+                lines.extend(tex_lines)
+                img_id = self.reg.next_id()
+                lines.append(f"{img_id} = OpImage {self._sampler_image_type(sampler_arg)} {tex_id}")
+                lines.append(f"{result} = OpImageQuerySizeLod {ivec2_type} {img_id} {lod_id}")
+            return result, lines
+
         # Generate arguments
         arg_ids = []
         for arg in expr.args:
@@ -2177,6 +2328,14 @@ class SpvGenerator:
                 coord_id = conv_id
             lines.append(f"OpImageWrite {img_loaded} {coord_id} {value_id}")
             result = self.reg.const_float(0.0)
+            return result, lines
+
+        # image_size(image) -> ivec2/ivec3 (OpImageQuerySize)
+        if fname == "image_size":
+            self._needs_image_query = True
+            img_loaded = arg_ids[0]
+            ivec2_type = self.reg.vec(2, "int")
+            lines.append(f"{result} = OpImageQuerySize {ivec2_type} {img_loaded}")
             return result, lines
 
         # mix/clamp/smoothstep: splat scalar args to vector when needed
