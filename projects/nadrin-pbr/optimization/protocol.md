@@ -105,7 +105,7 @@ The curated performance pass set (merge-blocks, scalar-replacement, SSA-rewrite,
 | Pass Set | Avg Instruction Reduction | Best Case | Worst Case |
 |----------|--------------------------|-----------|------------|
 | opt-O | **-40.8%** | -55.1% (PBR frag) | -14.0% (PBR vert) |
-| perf | **-16.5%** | -21.0% (spbrdf) | -1.2% (skybox vert) |
+| perf | **-10.9%** | -21.0% (spbrdf) | -1.2% (skybox vert) |
 
 ---
 

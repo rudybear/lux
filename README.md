@@ -429,7 +429,7 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 - **GLSL transpiler** — `--transpile` converts GLSL fragment shaders to Lux
 - **AI material authoring** — text-to-shader (`--ai`), image-to-material (`--ai-from-image`), style transfer (`--ai-modify`), scene batch generation (`--ai-batch`), video-to-animation (`--ai-from-video`), reference matching (`--ai-match-reference`), validation/critique (`--ai-critique`), and a skill system for domain expertise injection; 5 providers (Anthropic, OpenAI, Gemini, Ollama, LM Studio); 58-material PBR reference database; see [AI.md](AI.md)
 - **One file, multi-stage** — vertex, fragment, and RT stages in a single `.lux` file
-- **Hot reload** — `--watch` mode monitors `.lux` files (including transitive imports) for changes and recompiles automatically; writes `.reload` sentinel files for engine integration; `--watch-poll <ms>` configurable polling interval; error recovery preserves last-good `.spv` on failure
+- **Hot reload** — `--watch` mode monitors `.lux` files (including transitive imports) for changes and recompiles automatically; writes `.reload.json` sentinel files for engine integration; `--watch-poll <ms>` configurable polling interval; error recovery preserves last-good `.spv` on failure
 - **SPIR-V optimization** — `-O` flag runs `spirv-opt -O` (mem2reg, constant propagation, dead code elimination) for 60-65% smaller binaries; compile-time algebraic identity folding (`x*1.0→x`, `x+0.0→x`, `x*0.0→0`, `-(-x)→x`, `!(!x)→x`); validated against [Nadrin/PBR](https://github.com/Nadrin/PBR) Vulkan renderer: **27.8% fewer instructions** and **18.3% smaller binaries** than original GLSL with pixel-perfect visual parity; see [docs/optimization-features.md](docs/optimization-features.md) and [Optimization Wisdom](projects/nadrin-pbr/optimization/wisdom.md)
 - **Full SPIR-V output** — compiles to validated `.spv` binaries via `spirv-as` + `spirv-val`
 - **40+ built-in functions** — math, vector, matrix, texture sampling (2D + cubemap + explicit LOD), RT instructions, NaN/Inf detection
@@ -617,6 +617,8 @@ Options:
   -g, --debug         Enable debug instrumentation (OpLine, debug_print, assert, @[debug] blocks)
   --warn-nan          Static analysis warnings for risky float operations
   -O, --optimize      Run spirv-opt on output binaries
+  --perf              Run performance-oriented spirv-opt passes (loop unroll, strength reduction)
+  --analyze           Print per-stage instruction cost analysis after compilation
   --watch             Watch input file for changes and recompile
   --watch-poll MS     Polling interval in milliseconds (default: 500)
   --bindless          Emit bindless descriptor uber-shaders
@@ -627,7 +629,17 @@ Options:
   --ai-model MODEL    Model for AI generation (default: from config)
   --ai-base-url URL   Override AI provider base URL (OpenAI-compatible endpoints)
   --ai-no-verify      Skip compilation verification of AI output
+  --ai-retries N      Max retry attempts for AI generation (default: 2)
   --ai-from-image IMG Generate surface material from a reference image
+  --ai-modify TEXT    Modify existing material (e.g., --ai-modify "add weathering")
+  --ai-batch DESC     Generate batch of materials (e.g., --ai-batch "medieval tavern")
+  --ai-batch-count N  Number of materials in batch (default: AI decides)
+  --ai-from-video VID Generate animated shader from video
+  --ai-match-reference IMG  Iteratively match a reference image
+  --ai-match-iterations N   Max refinement iterations for reference matching (default: 5)
+  --ai-critique FILE  AI review of a .lux file
+  --ai-skills SKILL,... Load specific skills into the AI prompt
+  --ai-list-skills    List available AI skills and exit
   --version           Show version
 ```
 
@@ -1534,7 +1546,7 @@ Output: specular cubemap (6 faces x 5 mips), irradiance cubemap, and BRDF integr
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 542 tests
+# 893 tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.
