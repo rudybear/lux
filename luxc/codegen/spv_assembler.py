@@ -56,6 +56,62 @@ def run_spirv_opt(spv_path: Path) -> bool:
         return False
 
 
+def run_spirv_opt_perf(spv_path: Path) -> bool:
+    """Run performance-oriented spirv-opt passes on a .spv file in-place.
+
+    Uses a curated set of passes focused on runtime performance rather than
+    code size.  Adds loop-unrolling and strength-reduction on top of the
+    standard optimization set.
+
+    Returns True if optimization succeeded, False otherwise.
+    """
+    spirv_opt = shutil.which("spirv-opt")
+    if spirv_opt is None:
+        warnings.warn(
+            "spirv-opt not found on PATH; skipping SPIR-V performance optimization. "
+            "Install the Vulkan SDK or spirv-tools to enable optimization.",
+            stacklevel=2,
+        )
+        return False
+
+    opt_path = spv_path.with_suffix(".opt.spv")
+    passes = [
+        "--merge-blocks",
+        "--eliminate-dead-branches",
+        "--eliminate-dead-code-aggressive",
+        "--private-to-local",
+        "--scalar-replacement=100",
+        "--ssa-rewrite",
+        "--ccp",
+        "--simplify-instructions",
+        "--redundancy-elimination",
+        "--combine-access-chains",
+        "--vector-dce",
+        "--if-conversion",
+        "--loop-unroll",
+        "--strength-reduction",
+    ]
+    try:
+        result = subprocess.run(
+            [spirv_opt] + passes + [str(spv_path), "-o", str(opt_path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            warnings.warn(
+                f"spirv-opt (perf) failed (exit {result.returncode}): {result.stderr.strip()}",
+                stacklevel=2,
+            )
+            opt_path.unlink(missing_ok=True)
+            return False
+
+        opt_path.replace(spv_path)
+        return True
+    except Exception as exc:
+        warnings.warn(f"spirv-opt (perf) error: {exc}", stacklevel=2)
+        opt_path.unlink(missing_ok=True)
+        return False
+
+
 def assemble_and_validate(
     asm_text: str,
     output_path: Path,

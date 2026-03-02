@@ -6,8 +6,8 @@ from luxc.analysis.type_checker import type_check
 from luxc.optimization.const_fold import constant_fold
 from luxc.analysis.layout_assigner import assign_layouts
 from luxc.codegen.spirv_builder import generate_spirv
-from luxc.codegen.spv_assembler import assemble_and_validate, run_spirv_opt
-from luxc.codegen.reflection import generate_reflection, emit_reflection_json
+from luxc.codegen.spv_assembler import assemble_and_validate, run_spirv_opt, run_spirv_opt_perf
+from luxc.codegen.reflection import generate_reflection, emit_reflection_json, add_performance_hints
 from luxc.builtins.types import clear_type_aliases
 from luxc.features.evaluator import collect_feature_names, strip_features
 from luxc.parser.ast_nodes import (
@@ -150,6 +150,8 @@ def compile_source(
     bindless: bool = False,
     warn_nan: bool = False,
     optimize: bool = False,
+    perf_optimize: bool = False,
+    analyze: bool = False,
 ) -> None:
     # Clear type aliases from previous compilations
     clear_type_aliases()
@@ -191,6 +193,13 @@ def compile_source(
         strip_debug_stmts(module)
 
     constant_fold(module)
+
+    # Additional optimization passes
+    from luxc.optimization.dead_code import dead_code_elim
+    from luxc.optimization.cse import cse
+    dead_code_elim(module)
+    cse(module)
+
     assign_layouts(module)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -235,21 +244,32 @@ def compile_source(
         spv_path = output_dir / f"{out_stem}.{suffix}.spv"
         assemble_and_validate(asm_text, spv_path, validate=validate)
 
-        if optimize:
+        if perf_optimize:
+            run_spirv_opt_perf(spv_path)
+        elif optimize:
             run_spirv_opt(spv_path)
 
         print(f"Wrote {spv_path}")
 
-        if emit_reflection:
+        if emit_reflection or analyze:
             reflection = generate_reflection(
                 module, stage,
                 source_name=source_name or f"{stem}.lux",
                 features=all_features,
                 feature_suffix=feature_suffix,
             )
-            json_path = output_dir / f"{out_stem}.{suffix}.json"
-            json_path.write_text(emit_reflection_json(reflection), encoding="utf-8")
-            print(f"Wrote {json_path}")
+            # Add performance hints from SPIR-V analysis
+            add_performance_hints(reflection, asm_text)
+
+            if emit_reflection:
+                json_path = output_dir / f"{out_stem}.{suffix}.json"
+                json_path.write_text(emit_reflection_json(reflection), encoding="utf-8")
+                print(f"Wrote {json_path}")
+
+            if analyze:
+                from luxc.analysis.cost_estimator import format_cost_summary, estimate_cost
+                costs = estimate_cost(asm_text)
+                print(format_cost_summary(costs, stage_name))
 
 
 def _dump_ast(module):

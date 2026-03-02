@@ -5,7 +5,7 @@ from pathlib import Path
 from lark import Lark, Transformer, Token, Tree
 
 from luxc.parser.ast_nodes import (
-    Module, ConstDecl, StructDef, StructField, StageBlock,
+    Module, ConstDecl, SpecConstDecl, StructDef, StructField, StageBlock,
     VarDecl, UniformBlock, PushBlock, BlockField, SamplerDecl,
     FunctionDef, Param, LetStmt, AssignStmt, ReturnStmt, IfStmt, ExprStmt,
     NumberLit, BoolLit, VarRef, BinaryOp, UnaryOp, CallExpr,
@@ -97,6 +97,8 @@ class LuxTransformer(Transformer):
                 mod.features_decls.append(item)
             elif isinstance(item, ConditionalBlock):
                 mod._conditional_blocks.append(item)
+            elif isinstance(item, SpecConstDecl):
+                mod.spec_constants.append(item)
         return mod
 
     # --- Top-level declarations ---
@@ -104,6 +106,10 @@ class LuxTransformer(Transformer):
     def const_decl(self, args):
         name, type_node, value = args[0], args[1], args[2]
         return ConstDecl(str(name), _extract_type(type_node), value, _tok_loc(name))
+
+    def spec_const_decl(self, args):
+        name, type_node, value = args[0], args[1], args[2]
+        return SpecConstDecl(str(name), _extract_type(type_node), value, loc=_tok_loc(name))
 
     def struct_def(self, args):
         name = args[0]
@@ -439,6 +445,11 @@ class LuxTransformer(Transformer):
 
     def attribute(self, args):
         return _Attribute(str(args[0]))
+
+    def attribute_with_arg(self, args):
+        name = str(args[0])
+        arg = str(args[1])
+        return _Attribute(f"{name}({arg})")
 
     def function_def(self, args):
         attributes = []

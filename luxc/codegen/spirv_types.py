@@ -231,6 +231,10 @@ class TypeRegistry:
         }
         factory = mapping.get(resolved)
         if factory is None:
+            # Check if it's a registered struct type
+            struct_key = f"struct_{resolved}"
+            if struct_key in self._types:
+                return self._types[struct_key]
             raise ValueError(f"Unknown Lux type: {type_name} (resolved to: {resolved})")
         return factory()
 

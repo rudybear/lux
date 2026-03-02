@@ -15,7 +15,7 @@ import json
 from luxc.parser.ast_nodes import (
     Module, StageBlock, VarDecl, UniformBlock, PushBlock, BlockField,
     SamplerDecl, AccelDecl, StorageImageDecl, StorageBufferDecl,
-    BindlessTextureArrayDecl, SharedDecl,
+    BindlessTextureArrayDecl, SharedDecl, SpecConstDecl,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl,
     NumberLit, ConstructorExpr, UnaryOp,
 )
@@ -375,7 +375,41 @@ def generate_reflection(
         result["shared_memory"] = shared_list
         result["shared_memory_total_bytes"] = total_bytes
 
+    # --- Specialization constants ---
+    if module.spec_constants:
+        result["specialization_constants"] = [
+            {
+                "name": sc.name,
+                "type": sc.type_name,
+                "spec_id": sc.spec_id if sc.spec_id is not None else i,
+                "default_value": _eval_default_expr(sc.default_value),
+            }
+            for i, sc in enumerate(module.spec_constants)
+        ]
+
+    # --- Half-precision function count ---
+    half_count = sum(1 for fn in stage.functions if "precision(half)" in fn.attributes)
+    if half_count > 0:
+        result["half_precision_functions"] = half_count
+
     return result
+
+
+def add_performance_hints(reflection: dict, spv_asm: str) -> None:
+    """Add performance_hints section to reflection from SPIR-V assembly analysis.
+
+    Modifies the reflection dict in-place.
+    """
+    from luxc.analysis.cost_estimator import estimate_cost
+    costs = estimate_cost(spv_asm)
+    reflection["performance_hints"] = {
+        "instruction_count": costs["instruction_count"],
+        "alu_ops": costs["alu_ops"],
+        "texture_samples": costs["texture_samples"],
+        "branches": costs["branches"],
+        "function_calls": costs["function_calls"],
+        "vgpr_estimate": costs["vgpr_estimate"],
+    }
 
 
 def emit_reflection_json(reflection: dict) -> str:

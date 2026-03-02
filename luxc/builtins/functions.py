@@ -126,6 +126,10 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     add([FuncSig("sample_lod", (SAMPLER2D, VEC2, SCALAR), VEC4)])
     add([FuncSig("sample_lod", (SAMPLER_CUBE, VEC3, SCALAR), VEC4)])
 
+    # texture sampling with explicit gradients
+    add([FuncSig("sample_grad", (SAMPLER2D, VEC2, VEC2, VEC2), VEC4)])
+    add([FuncSig("sample_grad", (SAMPLER_CUBE, VEC3, VEC3, VEC3), VEC4)])
+
     # bindless texture sampling (array, index, uv)
     add([FuncSig("sample_bindless", (BINDLESS_TEXTURE_ARRAY, INT, VEC2), VEC4)])
     add([FuncSig("sample_bindless", (BINDLESS_TEXTURE_ARRAY, UINT, VEC2), VEC4)])

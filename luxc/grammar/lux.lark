@@ -3,6 +3,7 @@
 start: module_item*
 
 ?module_item: const_decl
+            | spec_const_decl
             | function_def
             | stage_block
             | struct_def
@@ -21,6 +22,7 @@ start: module_item*
 // --- Top-level declarations ---
 
 const_decl: "const" IDENT ":" type "=" expr ";"
+spec_const_decl: "spec_const" IDENT ":" type "=" expr ";"
 
 struct_def: "struct" IDENT "{" struct_field ("," struct_field)* ","? "}"
 
@@ -155,6 +157,7 @@ shared_decl: "shared" IDENT ":" type ";"
 
 function_def: attribute* "fn" IDENT "(" param_list? ")" ("->" type)? "{" statement* "}"
 attribute: "@" IDENT
+         | "@" IDENT "(" IDENT ")" -> attribute_with_arg
 
 param_list: param ("," param)*
 param: IDENT ":" type

@@ -50,6 +50,7 @@ class Module:
     procedurals: list[ProceduralDecl] = field(default_factory=list)
     lightings: list[LightingDecl] = field(default_factory=list)
     features_decls: list[FeaturesDecl] = field(default_factory=list)
+    spec_constants: list[SpecConstDecl] = field(default_factory=list)
 
 
 # --- Top-level declarations ---
@@ -59,6 +60,15 @@ class ConstDecl:
     name: str
     type_name: str
     value: Expr
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class SpecConstDecl:
+    name: str
+    type_name: str
+    default_value: Expr
+    spec_id: int | None = None  # assigned by layout_assigner
     loc: Optional[SourceLocation] = None
 
 

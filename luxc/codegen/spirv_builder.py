@@ -8,7 +8,7 @@ from luxc.parser.ast_nodes import (
     TernaryExpr, AssignTarget,
     RayPayloadDecl, HitAttributeDecl, CallableDataDecl, AccelDecl,
     StorageImageDecl, StorageBufferDecl, BindlessTextureArrayDecl,
-    SharedDecl,
+    SharedDecl, SpecConstDecl,
     DebugPrintStmt, AssertStmt, DebugBlock,
     ForStmt, WhileStmt, BreakStmt, ContinueStmt,
 )
@@ -169,6 +169,9 @@ class SpvGenerator:
         self.shared_element_types: dict[str, str] = {}     # shared var name -> element type name
         self.shared_array_sizes: dict[str, int | None] = {} # shared var name -> array size (None for scalar)
 
+        # Specialization constants
+        self.spec_const_ids: dict[str, str] = {}  # spec const name -> %id (OpSpecConstant result)
+
         # gl_PerVertex output block for vertex shader
         self.per_vertex_var_id: str | None = None
         self.per_vertex_struct_id: str | None = None
@@ -244,6 +247,13 @@ class SpvGenerator:
             lines.append("OpCapability RayTracingKHR")
         if is_mesh:
             lines.append("OpCapability MeshShadingEXT")
+        # Check for half precision attribute on any function
+        has_half_precision = any(
+            "precision(half)" in fn.attributes
+            for fn in self.stage.functions
+        )
+        if has_half_precision:
+            lines.append("OpCapability Float16")
         has_storage_buffers = bool(getattr(self.stage, 'storage_buffers', []))
         has_bindless = bool(getattr(self.stage, 'bindless_texture_arrays', []))
         # All OpCapability instructions must come before any OpExtension
@@ -832,14 +842,42 @@ class SpvGenerator:
                 self.var_storage[tp.name] = storage
                 self.interface_ids.append(var_id)
 
+        # --- Specialization constants ---
+        for i, sc in enumerate(self.module.spec_constants):
+            spec_id = sc.spec_id if sc.spec_id is not None else i
+            type_id = self.reg.lux_type_to_spirv(sc.type_name)
+            var_id = self.reg.next_id()
+            # Evaluate default value for the OpSpecConstant
+            default_val = self._eval_spec_const_default(sc)
+            self.reg._decls.append(f"{var_id} = OpSpecConstant {type_id} {default_val}")
+            self.decorations.append(f"OpDecorate {var_id} SpecId {spec_id}")
+            self.spec_const_ids[sc.name] = var_id
+            self.var_types[sc.name] = sc.type_name
+
+    def _eval_spec_const_default(self, sc: SpecConstDecl) -> str:
+        """Evaluate the default value of a specialization constant to a literal."""
+        expr = sc.default_value
+        if isinstance(expr, NumberLit):
+            if sc.type_name in ("int", "uint"):
+                return str(int(float(expr.value)))
+            return str(float(expr.value))
+        if isinstance(expr, UnaryOp) and expr.op == "-" and isinstance(expr.operand, NumberLit):
+            if sc.type_name in ("int", "uint"):
+                return str(-int(float(expr.operand.value)))
+            return str(-float(expr.operand.value))
+        if isinstance(expr, BoolLit):
+            return "1" if expr.value else "0"
+        # Fallback: 0
+        return "0"
+
     def _declare_bindless_material_struct(self) -> tuple[str, int]:
         """Declare the BindlessMaterialData struct type in SPIR-V.
 
         Returns (struct_type_id, stride_in_bytes).
         """
         key = "BindlessMaterialData"
-        if key in self.reg._types:
-            return self.reg._types[key], 128  # cached
+        if f"struct_{key}" in self.reg._types:
+            return self.reg._types[f"struct_{key}"], 128  # cached
 
         # Build member types
         member_types = []
@@ -871,8 +909,8 @@ class SpvGenerator:
         Returns (struct_type_id, stride_in_bytes).
         """
         key = "LightData"
-        if key in self.reg._types:
-            return self.reg._types[key], 64  # cached
+        if f"struct_{key}" in self.reg._types:
+            return self.reg._types[f"struct_{key}"], 64  # cached
 
         member_types = []
         for fname, ftype in _LIGHT_DATA_FIELDS:
@@ -904,8 +942,8 @@ class SpvGenerator:
         Returns (struct_type_id, stride_in_bytes).
         """
         key = "ShadowEntry"
-        if key in self.reg._types:
-            return self.reg._types[key], 80  # cached
+        if f"struct_{key}" in self.reg._types:
+            return self.reg._types[f"struct_{key}"], 80  # cached
 
         member_types = []
         for fname, ftype in _SHADOW_ENTRY_FIELDS:
@@ -1489,6 +1527,10 @@ class SpvGenerator:
             lines.append(f"{result} = OpLoad {type_id} {self.var_map[name]}")
             return result, lines
 
+        # Check specialization constants (their IDs are already OpSpecConstant results)
+        if name in self.spec_const_ids:
+            return self.spec_const_ids[name], lines
+
         # Check module constants
         for c in self.module.constants:
             if c.name == name:
@@ -1836,6 +1878,36 @@ class SpvGenerator:
                 tex_id, tex_lines = self._gen_expr(sampler_arg)
                 lines.extend(tex_lines)
                 lines.append(f"{result} = OpImageSampleExplicitLod {result_type} {tex_id} {coords_id} Lod {lod_id}")
+            return result, lines
+
+        # sample_grad(tex, coords, ddx, ddy) — explicit gradient sampling
+        if fname == "sample_grad":
+            sampler_arg = expr.args[0]
+            # Generate coords, ddx, ddy arguments
+            coords_id, coords_lines = self._gen_expr(expr.args[1])
+            lines.extend(coords_lines)
+            ddx_id, ddx_lines = self._gen_expr(expr.args[2])
+            lines.extend(ddx_lines)
+            ddy_id, ddy_lines = self._gen_expr(expr.args[3])
+            lines.extend(ddy_lines)
+            result_type = self.reg.lux_type_to_spirv(expr.resolved_type)
+            result = self.reg.next_id()
+            if isinstance(sampler_arg, VarRef) and sampler_arg.name + ".__sampler" in self.var_map:
+                sam_name = sampler_arg.name
+                sam_type = self.var_types.get(sam_name, "sampler2d")
+                img_type, sampled_img_type = self._resolve_sampler_types(sam_type)
+                tex_loaded = self.reg.next_id()
+                lines.append(f"{tex_loaded} = OpLoad {img_type} {self.var_map[sam_name + '.__texture']}")
+                samp_type = self.reg.sampler_type()
+                samp_loaded = self.reg.next_id()
+                lines.append(f"{samp_loaded} = OpLoad {samp_type} {self.var_map[sam_name + '.__sampler']}")
+                combined = self.reg.next_id()
+                lines.append(f"{combined} = OpSampledImage {sampled_img_type} {tex_loaded} {samp_loaded}")
+                lines.append(f"{result} = OpImageSampleExplicitLod {result_type} {combined} {coords_id} Grad {ddx_id} {ddy_id}")
+            else:
+                tex_id, tex_lines = self._gen_expr(sampler_arg)
+                lines.extend(tex_lines)
+                lines.append(f"{result} = OpImageSampleExplicitLod {result_type} {tex_id} {coords_id} Grad {ddx_id} {ddy_id}")
             return result, lines
 
         # sample_compare(shadow_tex, vec3(uv, layer), depth_ref) → scalar
@@ -2452,9 +2524,29 @@ class SpvGenerator:
         # Default: struct.field via composite extract
         obj_id, obj_lines = self._gen_expr(expr.object)
         lines.extend(obj_lines)
-        result_type = self.reg.float32()  # simplified
+
+        # Resolve correct field index and type from struct metadata
+        field_idx = 0
+        result_type = self.reg.float32()
+        struct_type_name = self._resolve_expr_lux_type(expr.object)
+        # Also check local_types for VarRef to CSE-generated struct locals
+        if struct_type_name == "scalar" and isinstance(expr.object, VarRef):
+            struct_type_name = self.local_types.get(expr.object.name, struct_type_name)
+        struct_fields_map = {
+            "LightData": _LIGHT_DATA_FIELDS,
+            "BindlessMaterialData": _BINDLESS_MATERIAL_FIELDS,
+            "ShadowEntry": _SHADOW_ENTRY_FIELDS,
+        }
+        fields = struct_fields_map.get(struct_type_name)
+        if fields:
+            for i, (fname, ftype) in enumerate(fields):
+                if fname == expr.field:
+                    field_idx = i
+                    result_type = self.reg.lux_type_to_spirv(ftype)
+                    break
+
         result = self.reg.next_id()
-        lines.append(f"{result} = OpCompositeExtract {result_type} {obj_id} 0")
+        lines.append(f"{result} = OpCompositeExtract {result_type} {obj_id} {field_idx}")
         return result, lines
 
     def _gen_index_access(self, expr: IndexAccess, lines: list[str]) -> tuple[str, list[str]]:

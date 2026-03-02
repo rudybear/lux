@@ -95,6 +95,86 @@ def _make_number(val: float, resolved_type: str | None = None) -> NumberLit:
     return NumberLit(_format_float(val), resolved_type=resolved_type or "scalar")
 
 
+def _exprs_equal(a, b) -> bool:
+    """Check if two expression trees are structurally equal."""
+    if type(a) != type(b):
+        return False
+    if isinstance(a, VarRef):
+        return a.name == b.name
+    if isinstance(a, NumberLit):
+        return a.value == b.value
+    if isinstance(a, BoolLit):
+        return a.value == b.value
+    if isinstance(a, BinaryOp):
+        return a.op == b.op and _exprs_equal(a.left, b.left) and _exprs_equal(a.right, b.right)
+    if isinstance(a, UnaryOp):
+        return a.op == b.op and _exprs_equal(a.operand, b.operand)
+    if isinstance(a, CallExpr):
+        if not _exprs_equal(a.func, b.func):
+            return False
+        if len(a.args) != len(b.args):
+            return False
+        return all(_exprs_equal(x, y) for x, y in zip(a.args, b.args))
+    if isinstance(a, ConstructorExpr):
+        if a.type_name != b.type_name or len(a.args) != len(b.args):
+            return False
+        return all(_exprs_equal(x, y) for x, y in zip(a.args, b.args))
+    if isinstance(a, SwizzleAccess):
+        return a.components == b.components and _exprs_equal(a.object, b.object)
+    if isinstance(a, FieldAccess):
+        return a.field == b.field and _exprs_equal(a.object, b.object)
+    if isinstance(a, IndexAccess):
+        return _exprs_equal(a.object, b.object) and _exprs_equal(a.index, b.index)
+    return False
+
+
+def _try_strength_reduce_call(expr: CallExpr):
+    """Try to strength-reduce a builtin call to simpler operations.
+
+    Returns the reduced expression, or None if no reduction applies.
+    """
+    if not isinstance(expr.func, VarRef):
+        return None
+    fname = expr.func.name
+    args = expr.args
+    rtype = expr.resolved_type
+
+    if fname == "pow" and len(args) == 2:
+        exp_val = _as_float(args[1])
+        if exp_val is not None:
+            x = args[0]
+            # pow(x, 0.0) -> 1.0
+            if exp_val == 0.0:
+                return NumberLit("1.0", resolved_type=rtype)
+            # pow(x, 1.0) -> x
+            if exp_val == 1.0:
+                return x
+            # pow(x, 2.0) -> x * x
+            if exp_val == 2.0:
+                result = BinaryOp("*", x, x)
+                result.resolved_type = rtype
+                return result
+            # pow(x, 3.0) -> x * x * x
+            if exp_val == 3.0:
+                inner = BinaryOp("*", x, x)
+                inner.resolved_type = rtype
+                result = BinaryOp("*", inner, x)
+                result.resolved_type = rtype
+                return result
+            # pow(x, 0.5) -> sqrt(x)
+            if exp_val == 0.5:
+                result = CallExpr(VarRef("sqrt"), [x])
+                result.resolved_type = rtype
+                return result
+            # pow(x, -0.5) -> inversesqrt(x)
+            if exp_val == -0.5:
+                result = CallExpr(VarRef("inversesqrt"), [x])
+                result.resolved_type = rtype
+                return result
+
+    return None
+
+
 def constant_fold(module: Module) -> None:
     """Run constant folding on all functions in the module."""
     # Build const environment from module-level constants
@@ -212,6 +292,10 @@ def _try_fold_expr(expr, const_env: dict):
     if isinstance(expr, CallExpr):
         if isinstance(expr.func, VarRef):
             expr.args = [_try_fold_expr(a, const_env) for a in expr.args]
+            # Try strength reduction before constant folding
+            reduced = _try_strength_reduce_call(expr)
+            if reduced is not None:
+                return reduced
             fname = expr.func.name
             float_args = [_as_float(a) for a in expr.args]
             if all(v is not None for v in float_args):
@@ -274,6 +358,16 @@ def _try_fold_algebraic(expr: BinaryOp, lval: float | None, rval: float | None):
         # 0.0 * x -> 0.0
         if lval is not None and lval == 0.0:
             return _make_number(0.0, expr.resolved_type or expr.left.resolved_type)
+        # length(v) * length(v) -> dot(v, v)
+        if (isinstance(expr.left, CallExpr) and isinstance(expr.right, CallExpr)
+                and isinstance(expr.left.func, VarRef) and isinstance(expr.right.func, VarRef)
+                and expr.left.func.name == "length" and expr.right.func.name == "length"
+                and len(expr.left.args) == 1 and len(expr.right.args) == 1
+                and _exprs_equal(expr.left.args[0], expr.right.args[0])):
+            v = expr.left.args[0]
+            result = CallExpr(VarRef("dot"), [v, v])
+            result.resolved_type = expr.resolved_type
+            return result
 
     # Division identity
     if op == "/":

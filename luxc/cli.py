@@ -141,6 +141,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Run spirv-opt -O on generated SPIR-V binaries (requires spirv-opt on PATH)",
     )
     parser.add_argument(
+        "--perf", action="store_true", default=False,
+        help="Run performance-oriented spirv-opt passes (loop unroll, strength reduction)",
+    )
+    parser.add_argument(
+        "--analyze", action="store_true", default=False,
+        help="Print per-stage instruction cost analysis after compilation",
+    )
+    parser.add_argument(
         "--watch", action="store_true",
         help="Watch source files for changes and recompile automatically",
     )
@@ -479,6 +487,8 @@ def main(argv: list[str] | None = None) -> None:
                     defines=defines, bindless=args.bindless,
                     warn_nan=args.warn_nan,
                     optimize=args.optimize,
+                    perf_optimize=args.perf,
+                    analyze=args.analyze,
                 )
             except Exception as e:
                 print(f"Error: {e}", file=sys.stderr)
@@ -510,6 +520,8 @@ def main(argv: list[str] | None = None) -> None:
                     features=perm, defines=defines, bindless=args.bindless,
                     warn_nan=args.warn_nan,
                     optimize=args.optimize,
+                    perf_optimize=args.perf,
+                    analyze=args.analyze,
                 )
             except Exception as e:
                 print(f"Error (features={sorted(perm)}): {e}", file=sys.stderr)
@@ -543,6 +555,8 @@ def main(argv: list[str] | None = None) -> None:
             bindless=args.bindless,
             warn_nan=args.warn_nan,
             optimize=args.optimize,
+            perf_optimize=args.perf,
+            analyze=args.analyze,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
