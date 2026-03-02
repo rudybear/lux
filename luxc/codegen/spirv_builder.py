@@ -337,6 +337,11 @@ class SpvGenerator:
         if self._has_debug_printf:
             self._debug_printf_ext_id = self.reg.next_id()
 
+        # Pre-allocate debug source ID so _emit_debug_line can reference it
+        # during function body generation (before the header is assembled)
+        if self.debug and self.source_name:
+            self._debug_source_id = self.reg.next_id()
+
         # Pre-declare types we'll need
         self._declare_globals()
 
@@ -439,8 +444,7 @@ class SpvGenerator:
             lines.append(f"OpExecutionMode %main LocalSize {wg_x} {wg_y} {wg_z}")
 
         # Debug source info (OpString / OpSource) — must come after OpEntryPoint/OpExecutionMode
-        if self.debug and self.source_name:
-            self._debug_source_id = self.reg.next_id()
+        if self._debug_source_id is not None:
             lines.append(f'{self._debug_source_id} = OpString "{self.source_name}"')
             lines.append(f"OpSource GLSL 450 {self._debug_source_id}")
 

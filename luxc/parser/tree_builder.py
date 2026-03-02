@@ -54,6 +54,31 @@ def _tok_loc(tok: Token) -> SourceLocation | None:
     return None
 
 
+def _node_loc(node) -> SourceLocation | None:
+    """Extract a SourceLocation from any AST node or Token by searching the leftmost leaf."""
+    if node is None:
+        return None
+    if isinstance(node, Token) and hasattr(node, "line"):
+        return SourceLocation(node.line, node.column)
+    loc = getattr(node, "loc", None)
+    if loc is not None:
+        return loc
+    # Drill into leftmost child to find a leaf with loc
+    for attr in ("expr", "left", "operand", "func", "object", "condition", "value"):
+        child = getattr(node, attr, None)
+        if child is not None:
+            result = _node_loc(child)
+            if result is not None:
+                return result
+    # Check first element of args/list children
+    args = getattr(node, "args", None)
+    if args and isinstance(args, list) and args:
+        result = _node_loc(args[0])
+        if result is not None:
+            return result
+    return None
+
+
 class _Attribute:
     """Sentinel for parsed @attribute annotations."""
     def __init__(self, name: str):
@@ -508,10 +533,10 @@ class LuxTransformer(Transformer):
 
     def assign_stmt(self, args):
         target, value = args[0], args[1]
-        return AssignStmt(target, value)
+        return AssignStmt(target, value, loc=_node_loc(target))
 
     def return_stmt(self, args):
-        return ReturnStmt(args[0])
+        return ReturnStmt(args[0], loc=_node_loc(args[0]))
 
     def if_stmt(self, args):
         condition = args[0]
@@ -531,10 +556,10 @@ class LuxTransformer(Transformer):
                     then_body.append(a)
                 else:
                     else_body.append(a)
-        return IfStmt(condition, then_body, else_body)
+        return IfStmt(condition, then_body, else_body, loc=_node_loc(condition))
 
     def expr_stmt(self, args):
-        return ExprStmt(args[0])
+        return ExprStmt(args[0], loc=_node_loc(args[0]))
 
     # --- Debug statements ---
 
@@ -542,17 +567,19 @@ class LuxTransformer(Transformer):
         # args[0] is the STRING token (with quotes), rest are exprs
         fmt_str = str(args[0])[1:-1]  # strip quotes
         exprs = list(args[1:])
-        return DebugPrintStmt(fmt_str, exprs)
+        return DebugPrintStmt(fmt_str, exprs, loc=_tok_loc(args[0]))
 
     def assert_stmt(self, args):
         condition = args[0]
         message = None
         if len(args) > 1 and isinstance(args[1], Token) and args[1].type == "STRING":
             message = str(args[1])[1:-1]  # strip quotes
-        return AssertStmt(condition, message)
+        return AssertStmt(condition, message, loc=_node_loc(condition))
 
     def debug_block(self, args):
-        return DebugBlock(list(args))
+        body = list(args)
+        loc = _node_loc(body[0]) if body else None
+        return DebugBlock(body, loc=loc)
 
     def for_stmt(self, args):
         # args: optional loop_annotation, IDENT, type, init_expr, cond_expr, assign_target, update_expr, body stmts...
@@ -581,7 +608,7 @@ class LuxTransformer(Transformer):
             idx += 1
         condition = args[idx]; idx += 1
         body = list(args[idx:])
-        return WhileStmt(condition, body, unroll=unroll, unroll_count=unroll_count)
+        return WhileStmt(condition, body, unroll=unroll, unroll_count=unroll_count, loc=_node_loc(condition))
 
     def break_stmt(self, args):
         return BreakStmt()
