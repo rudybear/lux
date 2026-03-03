@@ -152,6 +152,9 @@ def compile_source(
     optimize: bool = False,
     perf_optimize: bool = False,
     analyze: bool = False,
+    debug_print: bool = False,
+    assert_kill: bool = False,
+    rich_debug: bool = False,
 ) -> None:
     # Clear type aliases from previous compilations
     clear_type_aliases()
@@ -189,7 +192,8 @@ def compile_source(
         check_nan_warnings(module)
 
     # Strip debug statements in release mode (after type checking so errors are caught)
-    if not debug:
+    # --debug-print preserves debug_print/assert without full debug mode
+    if not debug and not debug_print:
         strip_debug_stmts(module)
 
     constant_fold(module)
@@ -239,7 +243,9 @@ def compile_source(
         suffix = _SUFFIX_MAP[stage_name]
         out_stem = f"{stem}{feature_suffix}"
 
-        asm_text = generate_spirv(module, stage, debug=debug, source_name=source_name or f"{stem}.lux")
+        asm_text = generate_spirv(module, stage, debug=debug, source_name=source_name or f"{stem}.lux",
+                                  assert_kill=assert_kill, source_text=source if debug else "",
+                                  rich_debug=rich_debug)
 
         if emit_asm:
             asm_path = output_dir / f"{out_stem}.{suffix}.spvasm"

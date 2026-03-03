@@ -416,7 +416,9 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 - **Compile-time features** — `features { has_normal_map: bool }` with `if` guards on any declaration; `--features` and `--all-permutations` for shader permutation generation; per-material permutation selection via manifest across all engines
 - **Material property pipeline** — `properties` block in surface declarations abstracts runtime material data; compiler generates std140 UBO + reflection JSON with defaults; qualified `Material.field` access in layer expressions; all engines wire glTF material properties automatically
 - **Bindless rendering** — `--bindless` uber-shaders with runtime descriptor arrays, materials SSBO, `nonuniformEXT` texture indexing, and per-geometry `gl_GeometryIndexEXT` for RT; single pipeline per mode eliminates per-material descriptor switching (C++ and Rust, requires descriptor indexing)
-- **Debug instrumentation** — `debug_print("x={}", x)` via `NonSemantic.DebugPrintf`, `assert(cond, "msg")` with conditional failure output, `@[debug] { ... }` blocks — all stripped to zero instructions in release builds; `--warn-nan` static analysis flags unguarded division, sqrt, normalize, pow, log
+- **Debug instrumentation** — `debug_print("x={}", x)` via `NonSemantic.DebugPrintf`, `assert(cond, "msg")` with conditional failure output, `@[debug] { ... }` blocks — all stripped to zero instructions in release builds; `--debug-print` preserves printf/assert without full debug mode; `--assert-kill` demotes fragment invocation on failure (`OpDemoteToHelperInvocation`); `--warn-nan` static analysis flags unguarded division, sqrt, normalize, pow, log
+- **CPU shader debugger** — `--debug-run` launches a CPU-side AST interpreter with gdb-style REPL: `step`/`next`/`continue`/`break`/`print`/`locals` commands; breakpoints at any source line; NaN/Inf detection with exact source location; batch mode (`--batch`) outputs JSON for automation; `--dump-vars` traces every intermediate value; `--check-nan` pinpoints where bad values originate; custom inputs via `--input <json>` for simulating specific pixels/materials; 44+ math builtins matching GLSL.std.450 semantics; no GPU required; see [docs/debugger-guide.md](docs/debugger-guide.md)
+- **Rich debug info** — `--rich-debug` emits NonSemantic.Shader.DebugInfo.100 metadata for RenderDoc step-through: `DebugSource`, `DebugLine`, `DebugFunction`, `DebugLocalVariable`, `DebugDeclare`, `DebugLexicalBlock`; dual emission (OpLine + DebugLine) for broad tool support; `-g` emits `OpName` for local variables
 - **Semantic types** — `type strict WorldPos = vec3;` prevents mixing coordinate spaces at compile time (WorldPos vs ViewPos) with zero runtime cost; builtins like `normalize` and `dot` accept semantic types transparently
 - **Algorithm/schedule separation** — swap BRDF variants and tonemapping without touching material code
 - **Math-first syntax** — `scalar` not `float`, `builtin_position` not `gl_Position`
@@ -615,8 +617,23 @@ Options:
   --list-features       List available features and exit
   --define KEY=VALUE  Set compile-time parameter (e.g., --define max_vertices=64)
   --no-reflection     Skip .lux.json reflection metadata
-  -g, --debug         Enable debug instrumentation (OpLine, debug_print, assert, @[debug] blocks)
+  -g, --debug         Enable debug instrumentation (OpLine, OpName on locals, debug_print, assert, @[debug] blocks)
+  --rich-debug        Emit NonSemantic.Shader.DebugInfo.100 for RenderDoc step-through (implies -g)
+  --debug-print       Preserve debug_print/assert without full debug mode
+  --assert-kill       Demote fragment invocation on assert failure (OpDemoteToHelperInvocation)
   --warn-nan          Static analysis warnings for risky float operations
+  --debug-run         Launch CPU-side shader debugger (interactive REPL, no GPU required)
+  --stage STAGE       Stage to debug with --debug-run (default: fragment)
+  --batch             Batch mode for --debug-run (JSON output to stdout)
+  --dump-vars         Trace all variable assignments (--batch)
+  --check-nan         Detect NaN/Inf with source location (--batch)
+  --break LINE        Set breakpoint at source line (repeatable, --batch)
+  --dump-at-break     Dump all variables at breakpoint hits (--batch)
+  --input FILE        Load custom input values from JSON for --debug-run
+  --pixel X,Y         Debug a specific pixel (auto-computes uv, position, normal)
+  --resolution WxH    Screen resolution for --pixel (default: 1920x1080)
+  --set VAR=VALUE     Override a single input inline (repeatable)
+  --export-inputs FILE  Export default input values to JSON
   -O, --optimize      Run spirv-opt on output binaries
   --perf              Run performance-oriented spirv-opt passes (loop unroll, strength reduction)
   --analyze           Print per-stage instruction cost analysis after compilation
@@ -1087,9 +1104,76 @@ luxc debug_features_demo.lux --debug -o shadercache/
 # Release mode: debug_print, assert, @[debug] blocks all stripped
 luxc debug_features_demo.lux -o shadercache/
 
+# Keep debug_print/assert in release (no full debug overhead)
+luxc debug_features_demo.lux --debug-print -o shadercache/
+
+# Assert kills fragment invocation on failure
+luxc debug_features_demo.lux --debug --assert-kill -o shadercache/
+
 # Static analysis: warns about unguarded division, sqrt, normalize, pow, log
 luxc debug_features_demo.lux --warn-nan -o shadercache/
 ```
+
+### CPU Shader Debugger
+
+Step through shader code on the CPU with no GPU required. Inspect every variable, detect NaN/Inf sources, and simulate different pixels with custom inputs.
+
+```bash
+# Interactive debugging (gdb-style REPL)
+python -m luxc examples/debug_playground.lux --debug-run --stage fragment
+
+# Batch mode: detect NaN/Inf and report exact source line
+python -m luxc examples/debug_playground.lux --debug-run --stage fragment --batch --check-nan
+# {
+#   "status": "completed",
+#   "nan_detected": true,
+#   "nan_events": [{"line": 55, "variable": "dir", "operation": "let", ...}],
+#   "output": {"type": "vec4", "value": [0.403, 0.381, 0.345, 1.0]}
+# }
+
+# Trace every intermediate value
+python -m luxc examples/debug_playground.lux --debug-run --stage fragment --batch --dump-vars
+
+# Breakpoint inspection — dump full scope at specific lines
+python -m luxc examples/debug_playground.lux --debug-run --stage fragment --batch --break 100 --break 113 --dump-at-break
+
+# Debug a specific pixel (auto-computes uv, position, normal from coords)
+python -m luxc examples/debug_playground.lux --debug-run --stage fragment --pixel 960,540 --batch --check-nan
+
+# Quick inline overrides (no JSON file needed)
+python -m luxc examples/debug_playground.lux --debug-run --stage fragment --set roughness=0.01 --set metallic=1.0 --batch
+
+# Custom inputs from JSON file
+python -m luxc examples/debug_playground.lux --debug-run --stage fragment --input examples/debug_playground_inputs.json --batch --check-nan
+```
+
+Interactive session:
+```
+$ python -m luxc examples/debug_playground.lux --debug-run --stage fragment
+
+lux-debug> start
+Stopped at line 87
+ >   87 |         let albedo: vec3 = sample(albedo_tex, uv).rgb;
+lux-debug> step
+  + albedo = vec3(0.800, 0.800, 0.800) (vec3)
+Stopped at line 88
+ >   88 |         let n: vec3 = normalize(world_normal);
+lux-debug> step
+  + n = vec3(0.000, 0.000, 1.000) (vec3)
+lux-debug> break 113
+lux-debug> continue
+Hit breakpoint 1 at line 113
+lux-debug> print d
+  d = 0.141471 (scalar)
+lux-debug> locals
+  albedo = vec3(0.800, ...) roughness = 0.500 n_dot_l = 0.333 ...
+lux-debug> continue
+Output: vec4(0.403, 0.381, 0.345, 1.000)
+```
+
+Commands: `start`, `run`, `step`, `next`, `continue`, `finish`, `break <line>`, `delete <id>`, `print <var>`, `locals`, `list`, `source`, `output`, `quit`
+
+See [docs/debugger-guide.md](docs/debugger-guide.md) for the full reference and [docs/debug-session-transcript.md](docs/debug-session-transcript.md) for a complete debugging walkthrough.
 
 ### Ray Tracing Stages (Manual)
 
@@ -1244,11 +1328,19 @@ input.lux
   -> Debug Stripper       (remove debug_print/assert/@[debug] in release)
   -> NaN Checker          (static warnings for risky float ops, --warn-nan)
   -> Constant Folder      (compile-time evaluation)
+  -> Function Inliner     (AST-level inlining, release mode only)
+  -> Dead Code Eliminator (remove unused variables/functions)
+  -> CSE                  (common subexpression elimination)
   -> Layout Assigner      (auto-assign location/set/binding)
   -> SPIR-V Builder       (emit .spvasm text per stage)
   -> spirv-as             (assemble to .spv binary)
   -> spirv-val            (validate)
   -> output: name.{vert,frag,rgen,rchit,rmiss,mesh,task,...}.spv
+
+Alternative path (--debug-run):
+  -> ... same up to Constant Folder ...
+  -> CPU Interpreter      (tree-walking AST evaluator, 44+ math builtins)
+  -> output: interactive REPL or JSON (--batch)
 ```
 
 ## Project Structure
@@ -1284,6 +1376,15 @@ luxc/
         spirv_types.py       # type registry + deduplication
         glsl_ext.py          # GLSL.std.450 instruction mappings
         spv_assembler.py     # spirv-as / spirv-val invocation
+        debug_info.py        # NonSemantic.Shader.DebugInfo.100 emission (--rich-debug)
+    debug/
+        values.py            # LuxScalar, LuxVec, LuxMat, LuxInt, LuxBool, LuxStruct
+        interpreter.py       # tree-walking AST evaluator (44+ builtins)
+        environment.py       # scoped variable storage with parent chain
+        builtins.py          # GLSL.std.450 math builtins in Python
+        debugger.py          # breakpoints, stepping, NaN/Inf detection
+        cli.py               # interactive REPL + batch mode
+        io.py                # input loading (JSON, semantic defaults)
     expansion/
         surface_expander.py  # surface/geometry/pipeline expansion
     features/
@@ -1343,6 +1444,8 @@ examples/
     viz_furnace_test.lux     # white furnace test (energy conservation)
     viz_layer_energy.lux     # per-layer energy breakdown (stacked area)
     debug_features_demo.lux  # debug_print, assert, @[debug], semantic types, any_nan/any_inf
+    debug_playground.lux     # CPU debugger playground: PBR + NaN trap, breakpoint exploration
+    debug_playground_inputs.json  # custom input values for debug_playground
 playground/
     engine.py                # unified rendering engine (scene/pipeline separation)
     reflected_pipeline.py    # reflection-driven descriptor binding
@@ -1391,6 +1494,7 @@ tests/
     test_lighting_block.py      # P17.1 lighting block tests (21 tests)
     test_multi_light.py         # P17.2 multi-light + shadow tests (40 tests)
     test_debug_features.py      # P20 debug instrumentation + semantic types (22 tests)
+    test_debugger.py            # CPU shader debugger tests (40 tests: values, builtins, interpreter, batch mode)
 tools/
     generate_training_data.py
     visualize_brdf.py        # BRDF visualization CLI (compile + render + composite)
@@ -1431,6 +1535,7 @@ tools/
 | `compute_histogram.lux` | Shared memory: per-workgroup histogram with `shared uint[256]` + `atomic_add` |
 | `compute_reduction.lux` | Parallel reduction: barrier-synchronized tree sum with shared memory |
 | `debug_features_demo.lux` | Debug instrumentation: `debug_print`, `assert`, `@[debug]` blocks, semantic types, `any_nan`/`any_inf` |
+| `debug_playground.lux` | CPU debugger playground: PBR with intentional NaN trap, 8 labeled stages for breakpoint exploration |
 
 ## Screenshot Tests
 

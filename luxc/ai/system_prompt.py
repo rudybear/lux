@@ -491,7 +491,7 @@ def build_critique_prompt() -> str:
     Automatically loads the ``debugging`` and ``pbr-authoring`` skills
     and instructs the AI to output a structured JSON list of issues.
     """
-    base = build_system_prompt(skills=["debugging", "pbr-authoring"])
+    base = build_system_prompt(skills=["debugging", "pbr-authoring", "shader-debugger"])
     return base + "\n\n" + _CRITIQUE_INSTRUCTIONS
 
 

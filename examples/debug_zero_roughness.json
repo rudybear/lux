@@ -1,0 +1,7 @@
+{
+    "world_normal": [0.0, 0.0, 1.0],
+    "world_position": [0.0, 0.0, 0.0],
+    "roughness": 0.0,
+    "metallic": 0.0,
+    "exposure": 1.0
+}

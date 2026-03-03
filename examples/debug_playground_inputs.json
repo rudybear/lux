@@ -1,0 +1,11 @@
+{
+    "_comment": "Custom input values for debug_playground.lux",
+    "_usage": "python -m luxc examples/debug_playground.lux --debug-run --stage fragment --input examples/debug_playground_inputs.json --batch --dump-vars",
+
+    "world_normal": [0.0, 1.0, 0.0],
+    "world_position": [1.0, 0.0, -2.0],
+    "uv": [0.5, 0.5],
+    "roughness": 0.35,
+    "metallic": 0.0,
+    "exposure": 1.5
+}

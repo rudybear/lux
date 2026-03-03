@@ -14,7 +14,7 @@ from luxc.ai.system_prompt import build_system_prompt
 _SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
 # The built-in skills shipped with the project
-_BUILTIN_SKILL_NAMES = {"pbr-authoring", "layer-composition", "optimization", "debugging", "gpu-performance", "cpu-guidance"}
+_BUILTIN_SKILL_NAMES = {"pbr-authoring", "layer-composition", "optimization", "debugging", "gpu-performance", "cpu-guidance", "shader-debugger"}
 
 
 class TestLoadSkill:

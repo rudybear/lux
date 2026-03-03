@@ -125,8 +125,13 @@ _SHADOW_ENTRY_FIELDS = [
 ]
 
 
-def generate_spirv(module: Module, stage: StageBlock, debug: bool = False, source_name: str = "") -> str:
+def generate_spirv(module: Module, stage: StageBlock, debug: bool = False, source_name: str = "",
+                    assert_kill: bool = False, source_text: str = "",
+                    rich_debug: bool = False) -> str:
     gen = SpvGenerator(module, stage, debug=debug, source_name=source_name)
+    gen.assert_kill = assert_kill
+    gen._dbg_source_text = source_text
+    gen._enable_nonsemantic_debug = rich_debug
     return gen.generate()
 
 
@@ -194,6 +199,17 @@ class SpvGenerator:
         # SSA value forwarding for mem2reg (populated per-function in _gen_function)
         self._ssa_values: dict[str, str] = {}      # name -> SSA ID (single-assignment lets)
         self._mutable_vars: set[str] = set()        # names that need OpVariable
+
+        # Local variable names for OpName emission in debug mode
+        self._all_local_names: list[tuple[str, str]] = []  # (name, var_id)
+
+        # Assert kill mode: emit OpDemoteToHelperInvocation on assertion failure
+        self.assert_kill: bool = False
+
+        # NonSemantic.Shader.DebugInfo.100 emitter (initialized in generate() if debug)
+        self._dbg_emitter: object | None = None  # DebugInfoEmitter
+        self._dbg_source_text: str = ""  # full source for embedding
+        self._enable_nonsemantic_debug: bool = False  # opt-in for NonSemantic debug info
 
     def _next_label(self) -> str:
         self._label_counter += 1
@@ -342,8 +358,22 @@ class SpvGenerator:
         if self.debug and self.source_name:
             self._debug_source_id = self.reg.next_id()
 
+        # Initialize NonSemantic debug info emitter for RenderDoc support
+        # Activated by passing source_text to generate_spirv (only when debug=True)
+        if self.debug and self._dbg_source_text and self._enable_nonsemantic_debug:
+            from luxc.codegen.debug_info import DebugInfoEmitter
+            void_type = self.reg.void()
+            self._dbg_emitter = DebugInfoEmitter(self.reg, self.source_name, self._dbg_source_text)
+            self._dbg_emitter.init(void_type)
+
         # Pre-declare types we'll need
         self._declare_globals()
+
+        # Initialize NonSemantic debug info declarations before function generation
+        # (DebugFunction uses debug type IDs that must exist first)
+        self._dbg_pre_fn_lines: list[str] = []
+        if self._dbg_emitter:
+            self._dbg_pre_fn_lines = self._dbg_emitter.emit_pre_function_decls()
 
         # Generate function bodies
         fn_code = []
@@ -379,6 +409,8 @@ class SpvGenerator:
             lines.append("OpCapability SampledImageArrayNonUniformIndexing")
         if self._needs_image_query:
             lines.append("OpCapability ImageQuery")
+        if self.assert_kill and self.stage.stage_type == "fragment" and self._has_debug_printf:
+            lines.append("OpCapability DemoteToHelperInvocationEXT")
         # StorageImageExtendedFormats needed for Rg16f, R32f, etc.
         _EXTENDED_FMTS = {"Rg16f", "Rg32f", "R16f", "R32f", "R32i", "R32ui", "R11fG11fB10f"}
         needs_ext_fmt = any(
@@ -395,11 +427,17 @@ class SpvGenerator:
             lines.append('OpExtension "SPV_EXT_mesh_shader"')
         if has_bindless:
             lines.append('OpExtension "SPV_EXT_descriptor_indexing"')
-        if self._has_debug_printf:
+        if self.assert_kill and self.stage.stage_type == "fragment" and self._has_debug_printf:
+            lines.append('OpExtension "SPV_EXT_demote_to_helper_invocation"')
+        if self._has_debug_printf or self._dbg_emitter:
             lines.append('OpExtension "SPV_KHR_non_semantic_info"')
         lines.append(f"{self.glsl_ext_id} = OpExtInstImport \"GLSL.std.450\"")
         if self._has_debug_printf:
             lines.append(f'{self._debug_printf_ext_id} = OpExtInstImport "NonSemantic.DebugPrintf"')
+        if self._dbg_emitter:
+            lines.append(
+                f'{self._dbg_emitter.ext_id} = OpExtInstImport "NonSemantic.Shader.DebugInfo.100"'
+            )
         lines.append("OpMemoryModel Logical GLSL450")
 
         # Entry point
@@ -460,6 +498,10 @@ class SpvGenerator:
             lines.append(f'OpName {sid} "{bname}"')
         for bname, sid in self.push_struct_ids.items():
             lines.append(f'OpName {sid} "{bname}"')
+        # Local variable OpNames (debug mode only)
+        if self.debug:
+            for name, var_id in self._all_local_names:
+                lines.append(f'OpName {var_id} "{name}"')
         if self.per_vertex_struct_id:
             lines.append(f'OpName {self.per_vertex_struct_id} "gl_PerVertex"')
             lines.append(f'OpName {self.per_vertex_var_id} ""')
@@ -494,6 +536,10 @@ class SpvGenerator:
 
         # Global variables
         lines.extend(self.global_vars)
+
+        # NonSemantic debug info declarations (after types/globals, before functions)
+        if self._dbg_emitter:
+            lines.extend(self._dbg_pre_fn_lines)
 
         # Functions
         lines.extend(fn_code)
@@ -1185,12 +1231,41 @@ class SpvGenerator:
         self._pre_declare_locals(fn.body)
 
         body_lines = []
+
+        # NonSemantic debug info: emit DebugFunction + DebugFunctionDefinition + DebugScope
+        if self._dbg_emitter:
+            fn_line = fn.loc.line if fn.loc else 1
+            dbg_fn_id, dbg_fn_lines = self._dbg_emitter.emit_debug_function(fn.name, fn_line)
+            body_lines.extend(dbg_fn_lines)
+            body_lines.append(self._dbg_emitter.emit_function_definition(dbg_fn_id, "%main"))
+            body_lines.append(self._dbg_emitter.emit_debug_scope(dbg_fn_id))
+
         for stmt in fn.body:
             body_lines.extend(self._gen_stmt(stmt))
 
         # Emit variable declarations first, then body
         lines.extend(self._var_decls)
+
+        # NonSemantic debug info: emit DebugLocalVariable + DebugDeclare for each local
+        if self._dbg_emitter:
+            for name, var_id in self.local_vars.items():
+                lux_type = self.local_types.get(name, "scalar")
+                loc_line = 0
+                # Try to find the LetStmt that defines this variable for line info
+                for stmt in fn.body:
+                    if isinstance(stmt, LetStmt) and stmt.name == name:
+                        loc_line = stmt.loc.line if stmt.loc else 0
+                        break
+                dbg_var_id, dbg_var_instr = self._dbg_emitter.emit_local_variable(name, lux_type, loc_line)
+                lines.append(dbg_var_instr)
+                lines.append(self._dbg_emitter.emit_debug_declare(dbg_var_id, var_id))
+
         lines.extend(body_lines)
+
+        # Collect local variable names for debug OpName emission
+        if self.debug:
+            for name, var_id in self.local_vars.items():
+                self._all_local_names.append((name, var_id))
 
         # If this is main and no explicit return, add OpReturn
         lines.append("OpReturn")
@@ -1238,6 +1313,9 @@ class SpvGenerator:
             self._debug_current_line = loc.line
             col = loc.column if loc.column else 0
             lines.append(f"OpLine {self._debug_source_id} {loc.line} {col}")
+            # Dual emission: also emit NonSemantic DebugLine for RenderDoc
+            if self._dbg_emitter:
+                lines.append(self._dbg_emitter.emit_debug_line(loc.line, col))
 
     def _gen_stmt(self, stmt) -> list[str]:
         lines = []
@@ -1288,13 +1366,31 @@ class SpvGenerator:
             else:
                 lines.append(f"OpBranchConditional {cond_id} {then_label} {merge_label}")
             lines.append(f"{then_label} = OpLabel")
+            # DebugLexicalBlock for then body
+            saved_scope = None
+            if self._dbg_emitter:
+                saved_scope = self._dbg_emitter._current_scope_id
+                line_num = stmt.loc.line if stmt.loc else 1
+                blk_id, blk_instr = self._dbg_emitter.emit_lexical_block(line_num)
+                lines.append(blk_instr)
+                lines.append(self._dbg_emitter.emit_debug_scope(blk_id))
             for s in stmt.then_body:
                 lines.extend(self._gen_stmt(s))
+            if self._dbg_emitter and saved_scope:
+                lines.append(self._dbg_emitter.emit_debug_scope(saved_scope))
             lines.append(f"OpBranch {merge_label}")
             if stmt.else_body:
                 lines.append(f"{else_label} = OpLabel")
+                if self._dbg_emitter:
+                    saved_scope2 = self._dbg_emitter._current_scope_id
+                    line_num = stmt.loc.line if stmt.loc else 1
+                    blk_id2, blk_instr2 = self._dbg_emitter.emit_lexical_block(line_num)
+                    lines.append(blk_instr2)
+                    lines.append(self._dbg_emitter.emit_debug_scope(blk_id2))
                 for s in stmt.else_body:
                     lines.extend(self._gen_stmt(s))
+                if self._dbg_emitter:
+                    lines.append(self._dbg_emitter.emit_debug_scope(saved_scope2))
                 lines.append(f"OpBranch {merge_label}")
             lines.append(f"{merge_label} = OpLabel")
 
@@ -1476,6 +1572,9 @@ class SpvGenerator:
         void_type = self.reg.void()
         result = self.reg.next_id()
         lines.append(f"{result} = OpExtInst {void_type} {self._debug_printf_ext_id} 1 {fmt_id}")
+        # Assert kill mode: demote the invocation on failure (fragment only)
+        if self.assert_kill and self.stage.stage_type == "fragment":
+            lines.append("OpDemoteToHelperInvocation")
         lines.append(f"OpBranch {merge_label}")
 
         # OK block

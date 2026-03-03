@@ -109,6 +109,18 @@ def main(argv: list[str] | None = None) -> None:
         help="Emit OpLine/OpSource debug info in SPIR-V",
     )
     parser.add_argument(
+        "--rich-debug", action="store_true",
+        help="Emit NonSemantic.Shader.DebugInfo.100 for RenderDoc variable inspection (requires -g)",
+    )
+    parser.add_argument(
+        "--debug-print", action="store_true",
+        help="Preserve debug_print/assert in release mode (without full -g debug info)",
+    )
+    parser.add_argument(
+        "--assert-kill", action="store_true",
+        help="Demote fragment invocation on assertion failure (OpDemoteToHelperInvocation)",
+    )
+    parser.add_argument(
         "--pipeline", type=str, metavar="NAME",
         help="Compile only the named pipeline (e.g., --pipeline GltfForward)",
     )
@@ -147,6 +159,54 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--analyze", action="store_true", default=False,
         help="Print per-stage instruction cost analysis after compilation",
+    )
+    parser.add_argument(
+        "--debug-run", action="store_true",
+        help="Run the shader in the CPU-side AST debugger (no GPU required)",
+    )
+    parser.add_argument(
+        "--stage", type=str, default="fragment", metavar="STAGE",
+        help="Stage to debug with --debug-run (default: fragment)",
+    )
+    parser.add_argument(
+        "--batch", action="store_true",
+        help="Run debugger in batch mode (JSON output)",
+    )
+    parser.add_argument(
+        "--dump-vars", action="store_true",
+        help="Dump all variable assignments in batch mode",
+    )
+    parser.add_argument(
+        "--check-nan", action="store_true",
+        help="Check for NaN/Inf values in batch mode",
+    )
+    parser.add_argument(
+        "--break", type=int, action="append", metavar="LINE", dest="break_lines",
+        help="Set breakpoint at line (batch mode)",
+    )
+    parser.add_argument(
+        "--dump-at-break", action="store_true",
+        help="Dump variables at each breakpoint hit (batch mode)",
+    )
+    parser.add_argument(
+        "--input", type=Path, metavar="JSON", dest="debug_input",
+        help="Input values JSON file for --debug-run",
+    )
+    parser.add_argument(
+        "--pixel", type=str, metavar="X,Y",
+        help="Debug a specific pixel (e.g., --pixel 320,240). Sets uv from pixel coords.",
+    )
+    parser.add_argument(
+        "--resolution", type=str, metavar="WxH", default="1920x1080",
+        help="Screen resolution for --pixel (default: 1920x1080)",
+    )
+    parser.add_argument(
+        "--set", type=str, action="append", metavar="VAR=VALUE", dest="debug_set",
+        help="Override a single input variable (e.g., --set roughness=0.1 --set \"normal=0,1,0\")",
+    )
+    parser.add_argument(
+        "--export-inputs", type=Path, metavar="JSON",
+        help="Export default shader inputs to JSON for --debug-run replay",
     )
     parser.add_argument(
         "--watch", action="store_true",
@@ -445,6 +505,128 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(1)
         return
 
+    # --- Export inputs mode ---
+    if args.export_inputs:
+        from luxc.parser.tree_builder import parse_lux
+        from luxc.analysis.type_checker import type_check
+        from luxc.debug.io import build_default_inputs, export_inputs_to_json
+        try:
+            module = parse_lux(source)
+            if module.surfaces or module.pipelines or module.environments or module.procedurals:
+                from luxc.expansion.surface_expander import expand_surfaces
+                expand_surfaces(module)
+            type_check(module)
+            stage = None
+            for s in module.stages:
+                if s.stage_type == args.stage:
+                    stage = s
+                    break
+            if stage is None:
+                print(f"Error: stage '{args.stage}' not found", file=sys.stderr)
+                sys.exit(1)
+            inputs = build_default_inputs(stage)
+            export_inputs_to_json(inputs, args.export_inputs)
+            print(f"Exported inputs to {args.export_inputs}")
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # --- Debug run mode ---
+    if args.debug_run:
+        from luxc.debug.cli import run_interactive, run_batch
+
+        # Build inline overrides from --pixel and --set
+        inline_overrides: dict[str, object] = {}
+
+        if args.pixel:
+            try:
+                px, py = (int(x) for x in args.pixel.split(","))
+                rw, rh = (int(x) for x in args.resolution.split("x"))
+                u = (px + 0.5) / rw
+                v = (py + 0.5) / rh
+                inline_overrides["uv"] = [u, v]
+                inline_overrides["texcoord"] = [u, v]
+                # Synthesize a world position on a unit quad centered at origin
+                # Maps pixel (0,0)=top-left to (-1,1,0), (W,H)=bottom-right to (1,-1,0)
+                wx = u * 2.0 - 1.0
+                wy = 1.0 - v * 2.0
+                inline_overrides["world_position"] = [wx, wy, 0.0]
+                inline_overrides["position"] = [wx, wy, 0.0]
+                # Derive a normal from screen position (hemisphere for visual variety)
+                import math
+                r2 = wx * wx + wy * wy
+                if r2 < 1.0:
+                    nz = math.sqrt(1.0 - r2)
+                    inline_overrides["normal"] = [wx, wy, nz]
+                    inline_overrides["world_normal"] = [wx, wy, nz]
+                print(f"Pixel ({px}, {py}) @ {rw}x{rh} -> uv=({u:.4f}, {v:.4f}), world=({wx:.3f}, {wy:.3f}, 0.0)")
+            except ValueError:
+                print(f"Error: invalid --pixel format '{args.pixel}'. Use: --pixel X,Y", file=sys.stderr)
+                sys.exit(1)
+
+        if args.debug_set:
+            for assignment in args.debug_set:
+                if "=" not in assignment:
+                    print(f"Error: --set requires VAR=VALUE format, got '{assignment}'", file=sys.stderr)
+                    sys.exit(1)
+                name, val_str = assignment.split("=", 1)
+                name = name.strip()
+                val_str = val_str.strip()
+                # Parse value: number, comma-separated vector, or bool
+                if "," in val_str:
+                    inline_overrides[name] = [float(x) for x in val_str.split(",")]
+                elif val_str.lower() in ("true", "false"):
+                    inline_overrides[name] = val_str.lower() == "true"
+                else:
+                    try:
+                        inline_overrides[name] = float(val_str)
+                    except ValueError:
+                        print(f"Error: cannot parse value '{val_str}' for --set {name}", file=sys.stderr)
+                        sys.exit(1)
+
+        # Write inline overrides to a temp JSON file if any
+        debug_input = args.debug_input
+        if inline_overrides:
+            import tempfile, json as json_mod
+            # If there's also a --input file, merge with it
+            merged = {}
+            if args.debug_input:
+                with open(args.debug_input, "r") as f:
+                    merged = json_mod.load(f)
+            merged.update(inline_overrides)
+            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+            json_mod.dump(merged, tmp, indent=2)
+            tmp.close()
+            debug_input = Path(tmp.name)
+
+        try:
+            if args.batch:
+                result = run_batch(
+                    source=source,
+                    stage_name=args.stage,
+                    source_name=input_path.name,
+                    input_path=debug_input,
+                    dump_vars=args.dump_vars,
+                    check_nan=args.check_nan,
+                    break_lines=args.break_lines,
+                    dump_at_break=args.dump_at_break,
+                )
+                import json
+                print(json.dumps(result, indent=2))
+            else:
+                run_interactive(
+                    source=source,
+                    stage_name=args.stage,
+                    source_name=input_path.name,
+                    input_path=debug_input,
+                    source_lines=source.splitlines(),
+                )
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
     # --- Normal compilation ---
     from luxc.compiler import compile_source
 
@@ -489,6 +671,9 @@ def main(argv: list[str] | None = None) -> None:
                     optimize=args.optimize,
                     perf_optimize=args.perf,
                     analyze=args.analyze,
+                    debug_print=args.debug_print,
+                    assert_kill=args.assert_kill,
+                    rich_debug=args.rich_debug,
                 )
             except Exception as e:
                 print(f"Error: {e}", file=sys.stderr)
@@ -522,6 +707,9 @@ def main(argv: list[str] | None = None) -> None:
                     optimize=args.optimize,
                     perf_optimize=args.perf,
                     analyze=args.analyze,
+                    debug_print=args.debug_print,
+                    assert_kill=args.assert_kill,
+                    rich_debug=args.rich_debug,
                 )
             except Exception as e:
                 print(f"Error (features={sorted(perm)}): {e}", file=sys.stderr)
@@ -557,6 +745,9 @@ def main(argv: list[str] | None = None) -> None:
             optimize=args.optimize,
             perf_optimize=args.perf,
             analyze=args.analyze,
+            debug_print=args.debug_print,
+            assert_kill=args.assert_kill,
+            rich_debug=args.rich_debug,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
