@@ -433,6 +433,7 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 - **AI material authoring** — text-to-shader (`--ai`), image-to-material (`--ai-from-image`), style transfer (`--ai-modify`), scene batch generation (`--ai-batch`), video-to-animation (`--ai-from-video`), reference matching (`--ai-match-reference`), validation/critique (`--ai-critique`), and a skill system for domain expertise injection; 5 providers (Anthropic, OpenAI, Gemini, Ollama, LM Studio); 58-material PBR reference database; see [AI.md](AI.md)
 - **One file, multi-stage** — vertex, fragment, and RT stages in a single `.lux` file
 - **Hot reload** — `--watch` mode monitors `.lux` files (including transitive imports) for changes and recompiles automatically; writes `.reload.json` sentinel files for engine integration; `--watch-poll <ms>` configurable polling interval; error recovery preserves last-good `.spv` on failure
+- **Auto-Type precision optimization** — `--auto-type=report` analyzes variable ranges and classifies each as fp16-safe or fp32-required; `--auto-type=relaxed` emits `OpDecorate RelaxedPrecision` on qualifying variables for 2x throughput on mobile GPUs and AMD RDNA; three-signal architecture: dynamic range tracing (AST interpreter with 60+ diverse inputs), static interval analysis (forward dataflow through 30+ expression types), and name/usage heuristics; conservative-union-with-veto logic (any doubt defaults to fp32); no AST coupling — uses sidecar `precision_map` passed to codegen
 - **SPIR-V optimization** — built-in optimizer produces **21.7% fewer instructions than hand-written GLSL** out of the box: mem2reg SSA value forwarding eliminates redundant OpVariable/OpLoad/OpStore, AST-level function inlining exposes cross-function CSE, constant vector hoisting replaces runtime OpCompositeConstruct with compile-time OpConstantComposite; PBR fragment shader: 845→424 instructions (**-49.8%**); optional `-O` flag runs external `spirv-opt` but finds nothing left to optimize; validated against [Nadrin/PBR](https://github.com/Nadrin/PBR) Vulkan renderer with pixel-perfect visual parity; see [docs/optimization-features.md](docs/optimization-features.md) and [Optimization Wisdom](projects/nadrin-pbr/optimization/wisdom.md)
 - **Full SPIR-V output** — compiles to validated `.spv` binaries via `spirv-as` + `spirv-val`
 - **40+ built-in functions** — math, vector, matrix, texture sampling (2D + cubemap + explicit LOD), RT instructions, NaN/Inf detection
@@ -531,6 +532,25 @@ python -m luxc examples/pbr_surface.lux --watch --watch-poll 200
 python -m luxc examples/hello_triangle.lux -O
 # Wrote examples/hello_triangle.vert.spv (optimized)
 # Wrote examples/hello_triangle.frag.spv (optimized)
+```
+
+### Auto-type precision analysis
+
+```bash
+# Analyze variable precision (report only, no code changes)
+python -m luxc examples/pbr_surface.lux --auto-type=report
+# === Fragment Stage: Auto-Type Precision Report ===
+# Variable              Type    Decision  Confidence  Reason
+# ----------------------------------------------------------------
+# roughness             scalar  fp16      1.00        both dynamic and static ranges fit fp16
+# world_position        vec3    fp32      1.00        heuristic: name heuristic: position value
+# ----------------------------------------------------------------
+# Summary: 12/18 variables safe for fp16 (66.7%)
+
+# Emit RelaxedPrecision decorations for fp16-safe variables
+python -m luxc examples/pbr_surface.lux --auto-type=relaxed
+# Wrote examples/pbr_surface.vert.spv
+# Wrote examples/pbr_surface.frag.spv  (with OpDecorate RelaxedPrecision)
 ```
 
 ### Compile a specific pipeline
@@ -637,6 +657,7 @@ Options:
   -O, --optimize      Run spirv-opt on output binaries
   --perf              Run performance-oriented spirv-opt passes (loop unroll, strength reduction)
   --analyze           Print per-stage instruction cost analysis after compilation
+  --auto-type MODE    Auto precision optimization (report=analyze only, relaxed=emit RelaxedPrecision)
   --watch             Watch input file for changes and recompile
   --watch-poll MS     Polling interval in milliseconds (default: 500)
   --bindless          Emit bindless descriptor uber-shaders
@@ -1331,8 +1352,9 @@ input.lux
   -> Function Inliner     (AST-level inlining, release mode only)
   -> Dead Code Eliminator (remove unused variables/functions)
   -> CSE                  (common subexpression elimination)
+  -> Auto-Type Analyzer   (fp16 range analysis: dynamic trace + static intervals + heuristics)
   -> Layout Assigner      (auto-assign location/set/binding)
-  -> SPIR-V Builder       (emit .spvasm text per stage)
+  -> SPIR-V Builder       (emit .spvasm text per stage, +RelaxedPrecision decorations)
   -> spirv-as             (assemble to .spv binary)
   -> spirv-val            (validate)
   -> output: name.{vert,frag,rgen,rchit,rmiss,mesh,task,...}.spv
@@ -1361,6 +1383,13 @@ luxc/
             anthropic.py     # Anthropic (Claude)
             openai_compat.py # OpenAI + Ollama + LM Studio + custom endpoints
             gemini.py        # Google Gemini
+    autotype/
+        types.py             # Interval, VarRange, PrecisionMap, Precision enum
+        tracer.py            # dynamic range profiling via AST interpreter
+        range_analysis.py    # static forward-dataflow interval propagation
+        heuristics.py        # name/usage pattern classification
+        classifier.py        # 3-signal precision classifier + run_auto_type_analysis()
+        report.py            # text + JSON report formatting
     analysis/
         symbols.py           # symbol table, scopes
         type_checker.py      # type checking + overload resolution
@@ -1495,6 +1524,7 @@ tests/
     test_multi_light.py         # P17.2 multi-light + shadow tests (40 tests)
     test_debug_features.py      # P20 debug instrumentation + semantic types (22 tests)
     test_debugger.py            # CPU shader debugger tests (40 tests: values, builtins, interpreter, batch mode)
+    test_autotype.py            # auto-type precision optimization tests (50 tests: intervals, heuristics, classifier, SPIR-V emission)
 tools/
     generate_training_data.py
     visualize_brdf.py        # BRDF visualization CLI (compile + render + composite)

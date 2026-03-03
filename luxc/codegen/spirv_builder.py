@@ -127,11 +127,14 @@ _SHADOW_ENTRY_FIELDS = [
 
 def generate_spirv(module: Module, stage: StageBlock, debug: bool = False, source_name: str = "",
                     assert_kill: bool = False, source_text: str = "",
-                    rich_debug: bool = False) -> str:
+                    rich_debug: bool = False,
+                    precision_map: dict[str, str] | None = None) -> str:
     gen = SpvGenerator(module, stage, debug=debug, source_name=source_name)
     gen.assert_kill = assert_kill
     gen._dbg_source_text = source_text
     gen._enable_nonsemantic_debug = rich_debug
+    if precision_map:
+        gen._precision_map = precision_map
     return gen.generate()
 
 
@@ -205,6 +208,9 @@ class SpvGenerator:
 
         # Assert kill mode: emit OpDemoteToHelperInvocation on assertion failure
         self.assert_kill: bool = False
+
+        # Auto-type precision map: var_name -> "fp16" for RelaxedPrecision decoration
+        self._precision_map: dict[str, str] = {}
 
         # NonSemantic.Shader.DebugInfo.100 emitter (initialized in generate() if debug)
         self._dbg_emitter: object | None = None  # DebugInfoEmitter
@@ -1280,6 +1286,8 @@ class SpvGenerator:
         self._var_decls.append(f"{var_id} = OpVariable {ptr_type} Function")
         self.local_vars[name] = var_id
         self.local_types[name] = type_name
+        if self._precision_map.get(name) == "fp16":
+            self.decorations.append(f"OpDecorate {var_id} RelaxedPrecision")
         return var_id
 
     def _pre_declare_locals(self, stmts: list):
@@ -1330,6 +1338,8 @@ class SpvGenerator:
             if not self.debug and stmt.name not in self._mutable_vars:
                 # SSA path: forward value directly, no OpVariable/OpStore
                 self._ssa_values[stmt.name] = val_id
+                if self._precision_map.get(stmt.name) == "fp16":
+                    self.decorations.append(f"OpDecorate {val_id} RelaxedPrecision")
             else:
                 # Variable already declared in _pre_declare_locals
                 var_id = self.local_vars[stmt.name]
@@ -1812,6 +1822,8 @@ class SpvGenerator:
             type_id = self.reg.lux_type_to_spirv(type_name)
             result = self.reg.next_id()
             lines.append(f"{result} = OpLoad {type_id} {self.local_vars[name]}")
+            if self._precision_map.get(name) == "fp16":
+                self.decorations.append(f"OpDecorate {result} RelaxedPrecision")
             return result, lines
 
         # Check global vars (inputs/outputs) - skip storage buffers and shared arrays (accessed via index)

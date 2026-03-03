@@ -155,6 +155,7 @@ def compile_source(
     debug_print: bool = False,
     assert_kill: bool = False,
     rich_debug: bool = False,
+    auto_type: str | None = None,
 ) -> None:
     # Clear type aliases from previous compilations
     clear_type_aliases()
@@ -209,6 +210,17 @@ def compile_source(
     dead_code_elim(module)
     cse(module)
 
+    # Auto-type precision analysis
+    precision_maps = {}
+    if auto_type:
+        from luxc.autotype.classifier import run_auto_type_analysis
+        from luxc.autotype.types import PrecisionMap
+        for idx, stage in enumerate(module.stages):
+            precision_maps[idx] = run_auto_type_analysis(module, stage)
+        if auto_type == "report":
+            from luxc.autotype.report import format_report
+            print(format_report(precision_maps))
+
     assign_layouts(module)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -238,14 +250,24 @@ def compile_source(
         ) if active else ""
         all_features = {name: name in active for name in all_feature_names}
 
-    for stage in module.stages:
+    for idx, stage in enumerate(module.stages):
         stage_name = stage.stage_type
         suffix = _SUFFIX_MAP[stage_name]
         out_stem = f"{stem}{feature_suffix}"
 
+        # Build precision_map for this stage if auto_type=relaxed
+        stage_precision_map = None
+        if auto_type == "relaxed" and idx in precision_maps:
+            from luxc.autotype.types import Precision
+            stage_precision_map = {
+                name: d.precision.value
+                for name, d in precision_maps[idx].decisions.items()
+                if d.precision == Precision.FP16
+            }
+
         asm_text = generate_spirv(module, stage, debug=debug, source_name=source_name or f"{stem}.lux",
                                   assert_kill=assert_kill, source_text=source if debug else "",
-                                  rich_debug=rich_debug)
+                                  rich_debug=rich_debug, precision_map=stage_precision_map)
 
         if emit_asm:
             asm_path = output_dir / f"{out_stem}.{suffix}.spvasm"

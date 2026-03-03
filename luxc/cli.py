@@ -161,6 +161,10 @@ def main(argv: list[str] | None = None) -> None:
         help="Print per-stage instruction cost analysis after compilation",
     )
     parser.add_argument(
+        "--auto-type", choices=["report", "relaxed"], default=None,
+        help="Auto precision: report=analyze only, relaxed=emit OpDecorate RelaxedPrecision",
+    )
+    parser.add_argument(
         "--debug-run", action="store_true",
         help="Run the shader in the CPU-side AST debugger (no GPU required)",
     )
@@ -674,6 +678,7 @@ def main(argv: list[str] | None = None) -> None:
                     debug_print=args.debug_print,
                     assert_kill=args.assert_kill,
                     rich_debug=args.rich_debug,
+                    auto_type=args.auto_type,
                 )
             except Exception as e:
                 print(f"Error: {e}", file=sys.stderr)
@@ -710,6 +715,7 @@ def main(argv: list[str] | None = None) -> None:
                     debug_print=args.debug_print,
                     assert_kill=args.assert_kill,
                     rich_debug=args.rich_debug,
+                    auto_type=args.auto_type,
                 )
             except Exception as e:
                 print(f"Error (features={sorted(perm)}): {e}", file=sys.stderr)
@@ -748,6 +754,7 @@ def main(argv: list[str] | None = None) -> None:
             debug_print=args.debug_print,
             assert_kill=args.assert_kill,
             rich_debug=args.rich_debug,
+            auto_type=args.auto_type,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
