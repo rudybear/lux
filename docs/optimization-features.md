@@ -41,6 +41,9 @@ Source (.lux)
   cse()                    -- Common subexpression elimination: cse.py
     |
     v
+  auto_type_analysis()     -- fp16 precision classification (--auto-type): autotype/classifier.py
+    |
+    v
   assign_layouts()         -- Descriptor set/binding assignment: layout_assigner.py
     |
     v
@@ -175,7 +178,43 @@ Two-phase approach for performance:
 
 ---
 
-## 4. AST-Level Function Inlining
+## 4. Auto-Type Precision Optimization
+
+**Source**: `luxc/autotype/`
+
+Automatically classifies each variable as fp16-safe or fp32-required and optionally emits `OpDecorate RelaxedPrecision` on qualifying variables. Runs between CSE and layout assignment.
+
+### CLI Modes
+
+| Flag | Behavior |
+|------|----------|
+| `--auto-type=report` | Analyze precision, print text report — no code changes |
+| `--auto-type=relaxed` | Emit `OpDecorate RelaxedPrecision` on fp16-safe variables |
+
+### Three-Signal Architecture
+
+| Signal | Source | Method |
+|--------|--------|--------|
+| Dynamic range tracing | `tracer.py` | Runs the AST interpreter with 60+ diverse inputs to profile actual value ranges |
+| Static interval analysis | `range_analysis.py` | Forward dataflow propagation of [lo, hi] intervals through 30+ expression types |
+| Name/usage heuristics | `heuristics.py` | Pattern matching: `position` → fp32, `roughness` → fp16, etc. |
+
+The classifier (`classifier.py`) combines all three signals with conservative-union-with-veto logic: any doubt defaults to fp32. The result is a sidecar `precision_map` (dict of variable name → precision) passed to `generate_spirv()` — no AST coupling.
+
+### SPIR-V Emission
+
+In codegen, `SpvGenerator._precision_map` decorates:
+- SSA values (direct computation results)
+- `OpVariable` declarations
+- `OpLoad` results from decorated variables
+
+### Impact
+
+Typical PBR shader: 60-70% of variables classified as fp16-safe, enabling 2x throughput on mobile GPUs (Adreno, Mali) and AMD RDNA architectures.
+
+---
+
+## 5. AST-Level Function Inlining
 
 **Source**: `luxc/optimization/inline.py`
 
@@ -207,7 +246,7 @@ On a PBR fragment shader: enables CSE to deduplicate ~15-25 expressions from inl
 
 ---
 
-## 5. Mem2Reg — SSA Value Forwarding
+## 6. Mem2Reg — SSA Value Forwarding
 
 **Source**: `luxc/codegen/spirv_builder.py` (codegen-time optimization)
 
@@ -241,7 +280,7 @@ On a PBR fragment shader: ~125 `OpVariable` → ~20 (only loop vars, accumulator
 
 ---
 
-## 6. Constant Vector Hoisting
+## 7. Constant Vector Hoisting
 
 **Source**: `luxc/codegen/spirv_builder.py` (`_gen_constructor`)
 
@@ -277,7 +316,7 @@ On a PBR fragment shader: 11 runtime `OpCompositeConstruct` → 2 deduplicated c
 
 ---
 
-## 7. Cost Estimator & VGPR Analysis
+## 8. Cost Estimator & VGPR Analysis
 
 **Source**: `luxc/analysis/cost_estimator.py`
 
@@ -311,7 +350,7 @@ fragment: 312 instr, 89 ALU, 4 tex, VGPR: medium
 
 ---
 
-## 8. SPIR-V Optimization Profiles
+## 9. SPIR-V Optimization Profiles
 
 **Source**: `luxc/codegen/spv_assembler.py`
 
@@ -354,7 +393,7 @@ Both profiles operate in-place on the `.spv` binary. If spirv-opt fails, the ori
 
 ---
 
-## 9. CLI Flags
+## 10. CLI Flags
 
 **Source**: `luxc/cli.py`
 
@@ -366,6 +405,8 @@ Both profiles operate in-place on the `.spv` binary. If spirv-opt fails, the ori
 | `--perf` | Run performance-oriented spirv-opt passes (loop unroll, strength reduction) |
 | `--analyze` | Print per-stage instruction cost analysis after compilation |
 | `--warn-nan` | Enable static analysis warnings for potential NaN/Inf operations |
+| `--auto-type=report` | Analyze variable precision, print report (no code changes) |
+| `--auto-type=relaxed` | Emit `OpDecorate RelaxedPrecision` on fp16-safe variables |
 
 ### Debug & Inspection Flags
 
@@ -417,7 +458,7 @@ luxc shader.lux --perf --watch
 
 ---
 
-## 10. Reflection & Performance Hints
+## 11. Reflection & Performance Hints
 
 **Source**: `luxc/codegen/reflection.py`
 
@@ -485,7 +526,7 @@ The `performance_hints` section is populated by `add_performance_hints()`, which
 
 ---
 
-## 8. NaN/Inf Static Analysis
+## 12. NaN/Inf Static Analysis
 
 **Source**: `luxc/analysis/nan_checker.py`
 
@@ -500,7 +541,7 @@ Warnings are emitted via Python's `warnings` module so they don't block compilat
 
 ---
 
-## 9. Benchmark Suite
+## 13. Benchmark Suite
 
 **Source**: `tools/benchmark_suite.py`
 
@@ -521,7 +562,7 @@ Each benchmark defines a shader path, target stage, and soft instruction ceiling
 
 ---
 
-## 10. Shader Bottleneck Analyzer
+## 14. Shader Bottleneck Analyzer
 
 **Source**: `tools/shader_analysis.py`
 
@@ -541,7 +582,7 @@ Produces `Finding` objects with severity (`info`, `warning`, `critical`), catego
 
 ---
 
-## 11. A/B Performance Experiment Runner
+## 15. A/B Performance Experiment Runner
 
 **Source**: `tools/perf_experiment.py`
 
@@ -564,7 +605,7 @@ For each variant:
 
 ---
 
-## 12. Image Quality Metrics
+## 16. Image Quality Metrics
 
 **Source**: `tools/quality_metrics.py`
 
@@ -591,7 +632,7 @@ The `--diff` flag writes a per-pixel difference heatmap PNG for visual inspectio
 
 ---
 
-## 13. CPU-Side Rendering Analysis
+## 17. CPU-Side Rendering Analysis
 
 **Source**: `tools/cpu_analysis.py`
 
@@ -645,7 +686,7 @@ python tools/benchmark_suite.py --json > benchmark_results.json
 python tools/shader_analysis.py reflection.json
 
 # Full test suite
-pytest tests/  # 891 tests
+pytest tests/  # 981+ tests
 ```
 
 ### What the Optimizer Does (AST Level)

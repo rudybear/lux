@@ -37,6 +37,9 @@ python -m luxc examples/debug_playground.lux --debug-run --stage fragment --inpu
 | `--resolution WxH` | Screen resolution for `--pixel` (default: 1920x1080) |
 | `--set VAR=VALUE` | Override a single input (repeatable, e.g. `--set roughness=0.1`) |
 | `--export-inputs <file.json>` | Export default input values to JSON for editing |
+| `--debug-print` | Preserve `debug_print`/`assert` without full `-g` debug mode |
+| `--assert-kill` | Demote fragment invocation on assert failure (`OpDemoteToHelperInvocation`) |
+| `--rich-debug` | Emit NonSemantic.Shader.DebugInfo.100 for RenderDoc step-through (implies `-g`) |
 
 ## Interactive Commands
 
@@ -336,7 +339,7 @@ The debugger supports the full Lux language except GPU-specific intrinsics:
 - Swizzle access: `.xyz`, `.rgb`, `.xy`, single component `.x`
 - Index access: `v[0]`, `m[col][row]`
 - Struct field access
-- 44+ math builtins matching GLSL.std.450 semantics
+- 47 math builtins matching GLSL.std.450 semantics
 - `debug_print()` and `assert()` statements
 - Module-level constants
 - Texture `sample()` (returns mock data)
@@ -355,7 +358,7 @@ The debugger supports the full Lux language except GPU-specific intrinsics:
 luxc/debug/
     values.py        — Value types (LuxScalar, LuxVec, LuxMat, LuxInt, LuxBool, LuxStruct)
     environment.py   — Scoped variable storage with parent chain lookup
-    builtins.py      — 44+ math builtins (sin, cos, normalize, dot, cross, mix, ...)
+    builtins.py      — 47 math builtins (sin, cos, normalize, dot, cross, mix, ...)
     interpreter.py   — Tree-walking AST evaluator (exec_stmt, eval_expr)
     debugger.py      — Breakpoints, stepping modes (step/next/continue), NaN detection
     io.py            — Input loading (JSON files, semantic defaults, reflection)
