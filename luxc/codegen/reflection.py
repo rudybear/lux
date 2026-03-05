@@ -261,7 +261,8 @@ def generate_reflection(
                 }
                 break
         texture_array = bindless_arrays[0]
-        result["bindless"] = {
+
+        bindless_meta = {
             "enabled": True,
             "materials_ssbo": materials_ssbo,
             "texture_array": {
@@ -270,6 +271,48 @@ def generate_reflection(
                 "max_count": texture_array.max_count,
             },
         }
+
+        # Add struct field layout info
+        from luxc.codegen.spirv_builder import _BINDLESS_MATERIAL_FIELDS
+        base_fields = list(_BINDLESS_MATERIAL_FIELDS)
+        extra = getattr(stage, '_bindless_extra_properties', None)
+        if extra:
+            for name, type_name in extra:
+                if type_name == "vec3":
+                    base_fields.append((f"_pad_{name}", "scalar"))
+                base_fields.append((name, type_name))
+
+        struct_fields = []
+        offset = 0
+        _STD430_SIZE = {
+            "scalar": (4, 4), "int": (4, 4), "uint": (4, 4),
+            "vec2": (8, 8), "vec3": (12, 16), "vec4": (16, 16),
+            "mat4": (64, 16),
+        }
+        for fname, ftype in base_fields:
+            size, align = _STD430_SIZE.get(ftype, (4, 4))
+            offset = (offset + align - 1) & ~(align - 1)
+            struct_fields.append({
+                "name": fname,
+                "type": ftype,
+                "offset": offset,
+                "size": size,
+            })
+            offset += size
+
+        # Round up to 16-byte alignment
+        struct_size = (offset + 15) & ~15
+        bindless_meta["struct_size"] = struct_size
+        bindless_meta["struct_fields"] = struct_fields
+
+        # List custom properties (non-core fields)
+        if extra:
+            bindless_meta["custom_properties"] = [
+                {"name": name, "type": type_name}
+                for name, type_name in extra
+            ]
+
+        result["bindless"] = bindless_meta
 
     # --- Push constants ---
     result["push_constants"] = []

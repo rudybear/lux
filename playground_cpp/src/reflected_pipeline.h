@@ -80,6 +80,17 @@ struct ReflectionData {
 
     // Bindless descriptor support
     bool bindlessEnabled = false;
+
+    // Dynamic bindless struct layout (from reflection "bindless" section)
+    uint32_t bindlessStructSize = 128;  // default to core 128-byte struct
+    bool bindlessHasCustomProperties = false;
+    struct BindlessFieldMeta {
+        std::string name;
+        std::string type;
+        uint32_t offset = 0;
+        uint32_t size = 0;
+    };
+    std::vector<BindlessFieldMeta> bindlessStructFields;
 };
 
 /**

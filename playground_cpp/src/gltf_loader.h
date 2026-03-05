@@ -10,6 +10,8 @@
 #include <glm/glm.hpp>
 #include <string>
 #include <vector>
+#include <array>
+#include <unordered_map>
 #include <cstdint>
 
 // ===========================================================================
@@ -87,6 +89,10 @@ struct GltfMaterial {
     UVTransform base_color_uv_xform;
     UVTransform normal_uv_xform;
     UVTransform metallic_roughness_uv_xform;
+
+    // Custom properties from glTF extras (for extended bindless structs)
+    std::unordered_map<std::string, float> custom_float_properties;
+    std::unordered_map<std::string, std::array<float, 4>> custom_vec_properties;
 };
 
 struct GltfNode {

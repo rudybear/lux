@@ -2532,10 +2532,30 @@ _BINDLESS_TEX_INDEX_FIELDS = [
     "transmission_tex_index",
 ]
 
+# Map surface property names to BindlessMaterialData SSBO field names
+_PROPERTY_TO_BINDLESS = {
+    "base_color": "baseColorFactor",
+    "roughness": "roughnessFactor",
+    "metallic": "metallicFactor",
+    "emissive": "emissiveFactor",
+    "emission_strength": "emissionStrength",
+    "ior": "ior",
+    "clearcoat": "clearcoatFactor",
+    "clearcoat_roughness": "clearcoatRoughness",
+    "transmission": "transmissionFactor",
+    "sheen_color": "sheenColorFactor",
+    "sheen_roughness": "sheenRoughness",
+}
 
-def _build_bindless_material_struct_fields() -> list[BlockField]:
-    """Return the fields for BindlessMaterialData (std430 SSBO layout)."""
-    return [
+
+def _build_bindless_material_struct_fields(extra_properties=None) -> list[BlockField]:
+    """Return the fields for BindlessMaterialData (std430 SSBO layout).
+
+    If extra_properties is provided (list of (name, type) tuples for properties
+    NOT in _PROPERTY_TO_BINDLESS), they are appended after the core 128-byte struct
+    with proper std430 alignment padding.
+    """
+    fields = [
         # PBR factors
         BlockField("baseColorFactor", "vec4"),
         BlockField("emissiveFactor", "vec3"),
@@ -2567,6 +2587,23 @@ def _build_bindless_material_struct_fields() -> list[BlockField]:
         BlockField("_pad3", "uint"),
     ]
 
+    if extra_properties:
+        # Add padding if needed for alignment after the core struct
+        # Core struct ends at 128 bytes (32 x 4-byte fields)
+        for name, type_name in extra_properties:
+            # vec3 fields need 16-byte alignment in std430
+            if type_name == "vec3":
+                fields.append(BlockField(f"_pad_{name}", "scalar"))
+            fields.append(BlockField(name, type_name))
+        # Pad to 16-byte alignment
+        # Count total field slots to check alignment
+        total_slots = len(fields)
+        if total_slots % 4 != 0:
+            for i in range(4 - (total_slots % 4)):
+                fields.append(BlockField(f"_pad_end_{i}", "scalar"))
+
+    return fields
+
 
 def _emit_bindless_layer_body(
     surface: SurfaceDecl,
@@ -2575,6 +2612,7 @@ def _emit_bindless_layer_body(
     is_rt: bool = False,
     lighting: LightingDecl | None = None,
     pos_var: str = "world_pos",
+    properties=None,
 ) -> tuple[list, str]:
     """Generate shared uber-shader body for bindless mode.
 
@@ -2603,6 +2641,17 @@ def _emit_bindless_layer_body(
     body.append(_mat_field("mat_roughness", "roughnessFactor", "scalar"))
     body.append(_mat_field("mat_emissionStrength", "emissionStrength", "scalar"))
     body.append(_mat_field("mat_flags", "material_flags", "uint"))
+
+    # --- Load custom properties from SSBO ---
+    if properties and hasattr(properties, 'fields') and properties.fields:
+        for prop in properties.fields:
+            prop_name = prop.name
+            ssbo_field = _PROPERTY_TO_BINDLESS.get(prop_name)
+            if ssbo_field:
+                # Property maps to existing SSBO field — already loaded above
+                continue
+            # Custom property — load from extended SSBO
+            body.append(_mat_field(prop_name, prop_name, prop.type_name))
 
     # --- Texture index loads ---
     body.append(_mat_field("tex_baseColor", "base_color_tex_index", "int"))
@@ -3041,10 +3090,23 @@ def _expand_bindless_fragment(
         NumberLit("0.001"),
     ])))
 
+    # Collect custom properties for extended struct
+    _bl_frag_props = getattr(surface, 'properties', None)
+    extra_props = []
+    if _bl_frag_props and hasattr(_bl_frag_props, 'fields') and _bl_frag_props.fields:
+        for prop in _bl_frag_props.fields:
+            if prop.name not in _PROPERTY_TO_BINDLESS:
+                extra_props.append((prop.name, prop.type_name))
+
+    # Build struct with extra fields
+    if extra_props:
+        stage._bindless_extra_properties = extra_props
+
     # Bindless uber-shader body (material_index from push constant)
     uber_body, output_var = _emit_bindless_layer_body(
         surface, VarRef("material_index"), schedule, is_rt=False,
-        lighting=lighting, pos_var=pos_var)
+        lighting=lighting, pos_var=pos_var,
+        properties=getattr(surface, 'properties', None))
     body.extend(uber_body)
 
     # Output final color
@@ -3158,10 +3220,23 @@ def _expand_bindless_closest_hit(
         NumberLit("0.001"),
     ])))
 
+    # Collect custom properties for extended struct
+    _bl_rt_props = getattr(surface, 'properties', None)
+    extra_props = []
+    if _bl_rt_props and hasattr(_bl_rt_props, 'fields') and _bl_rt_props.fields:
+        for prop in _bl_rt_props.fields:
+            if prop.name not in _PROPERTY_TO_BINDLESS:
+                extra_props.append((prop.name, prop.type_name))
+
+    # Build struct with extra fields
+    if extra_props:
+        stage._bindless_extra_properties = extra_props
+
     # Bindless uber-shader body (material index from gl_GeometryIndexEXT)
     uber_body, output_var = _emit_bindless_layer_body(
         surface, VarRef("geometry_index"), schedule, is_rt=True,
-        lighting=lighting, pos_var="hit_pos")
+        lighting=lighting, pos_var="hit_pos",
+        properties=getattr(surface, 'properties', None))
     body.extend(uber_body)
 
     # Write to payload

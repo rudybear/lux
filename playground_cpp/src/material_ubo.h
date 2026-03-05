@@ -8,6 +8,8 @@
 
 #include <glm/glm.hpp>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 struct MaterialUBOData {
     glm::vec4 baseColorFactor{1.0f, 1.0f, 1.0f, 1.0f};  // offset  0, size 16
@@ -75,3 +77,26 @@ struct BindlessMaterialData {
     uint32_t _padding = 0;                                  // offset 124
 };  // total = 128 bytes
 static_assert(sizeof(BindlessMaterialData) == 128, "BindlessMaterialData must be 128 bytes (std430)");
+
+// Dynamic bindless material field descriptor (loaded from reflection JSON)
+struct BindlessFieldInfo {
+    std::string name;
+    std::string type;
+    uint32_t offset;
+    uint32_t size;
+};
+
+// Dynamic struct layout from reflection
+struct BindlessStructLayout {
+    std::vector<BindlessFieldInfo> fields;
+    uint32_t struct_size = 128; // Default to core size
+    bool has_custom_properties = false;
+
+    // Find field by name, returns nullptr if not found
+    const BindlessFieldInfo* findField(const std::string& name) const {
+        for (auto& f : fields) {
+            if (f.name == name) return &f;
+        }
+        return nullptr;
+    }
+};

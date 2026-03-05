@@ -70,7 +70,83 @@ class LuxStruct:
         return f"{self.type_name}{{{inner}}}"
 
 
-LuxValue = Union[LuxScalar, LuxInt, LuxBool, LuxVec, LuxMat, LuxStruct]
+@dataclass
+class LuxImage:
+    """Loaded texture image for CPU-side sampling."""
+    data: object  # numpy ndarray (H, W, 4) uint8 RGBA — typed as object to avoid hard numpy dep
+    width: int
+    height: int
+    name: str = ""
+    wrap: str = "repeat"  # repeat | clamp
+
+    def sample_bilinear(self, u: float, v: float) -> 'LuxVec':
+        """Bilinear-filtered texture lookup, returns vec4 in [0,1]."""
+        # Apply wrap mode
+        if self.wrap == "repeat":
+            u = u % 1.0
+            v = v % 1.0
+        else:
+            u = max(0.0, min(1.0, u))
+            v = max(0.0, min(1.0, v))
+
+        # Pixel coordinates (flip V for OpenGL convention: 0=bottom)
+        x = u * (self.width - 1)
+        y = v * (self.height - 1)
+
+        x0 = int(x)
+        y0 = int(y)
+        x1 = min(x0 + 1, self.width - 1)
+        y1 = min(y0 + 1, self.height - 1)
+        fx = x - x0
+        fy = y - y0
+
+        # Fetch 4 corners
+        c00 = self.data[y0, x0]
+        c10 = self.data[y0, x1]
+        c01 = self.data[y1, x0]
+        c11 = self.data[y1, x1]
+
+        # Bilinear interpolation, normalize to [0,1]
+        components = []
+        for ch in range(4):
+            val = (
+                c00[ch] * (1 - fx) * (1 - fy)
+                + c10[ch] * fx * (1 - fy)
+                + c01[ch] * (1 - fx) * fy
+                + c11[ch] * fx * fy
+            ) / 255.0
+            components.append(float(val))
+
+        return LuxVec(components)
+
+    def __repr__(self) -> str:
+        return f"LuxImage({self.name!r}, {self.width}x{self.height})"
+
+
+def load_image(path: str, wrap: str = "repeat") -> LuxImage:
+    """Load a texture image from disk via Pillow. Returns LuxImage."""
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError:
+        raise ImportError("Pillow and numpy are required for texture loading: pip install Pillow numpy")
+
+    img = Image.open(path).convert("RGBA")
+    data = np.array(img, dtype=np.uint8)
+    return LuxImage(data=data, width=img.width, height=img.height, name=path, wrap=wrap)
+
+
+def make_solid_image(r: int, g: int, b: int, a: int = 255, size: int = 1) -> LuxImage:
+    """Create a solid-color LuxImage (e.g. for default textures)."""
+    try:
+        import numpy as np
+    except ImportError:
+        raise ImportError("numpy is required: pip install numpy")
+    data = np.full((size, size, 4), [r, g, b, a], dtype=np.uint8)
+    return LuxImage(data=data, width=size, height=size, name=f"solid({r},{g},{b},{a})")
+
+
+LuxValue = Union[LuxScalar, LuxInt, LuxBool, LuxVec, LuxMat, LuxStruct, LuxImage]
 
 
 def is_nan(val: LuxValue) -> bool:

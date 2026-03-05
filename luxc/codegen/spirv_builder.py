@@ -529,9 +529,11 @@ class SpvGenerator:
             lines.append(f'OpMemberName {self.per_vertex_struct_id} 2 "gl_ClipDistance"')
             lines.append(f'OpMemberName {self.per_vertex_struct_id} 3 "gl_CullDistance"')
         # Bindless material struct member names
-        if "BindlessMaterialData" in self.reg._types:
-            bms_id = self.reg._types["BindlessMaterialData"]
-            for i, (fname, _) in enumerate(_BINDLESS_MATERIAL_FIELDS):
+        if "struct_BindlessMaterialData" in self.reg._types:
+            bms_id = self.reg._types["struct_BindlessMaterialData"]
+            bms_fields = getattr(self, '_bindless_material_dynamic_fields',
+                                 _BINDLESS_MATERIAL_FIELDS)
+            for i, (fname, _) in enumerate(bms_fields):
                 lines.append(f'OpMemberName {bms_id} {i} "{fname}"')
 
         # Decorations
@@ -838,7 +840,8 @@ class SpvGenerator:
             # Check if element type is a known struct
             if sb.element_type == "BindlessMaterialData":
                 elem_type_id, stride = self._declare_bindless_material_struct()
-                self._ssbo_struct_fields[sb.name] = _BINDLESS_MATERIAL_FIELDS
+                self._ssbo_struct_fields[sb.name] = getattr(
+                    self, '_bindless_material_dynamic_fields', _BINDLESS_MATERIAL_FIELDS)
             elif sb.element_type == "LightData":
                 elem_type_id, stride = self._declare_light_data_struct()
                 self._ssbo_struct_fields[sb.name] = _LIGHT_DATA_FIELDS
@@ -1102,11 +1105,30 @@ class SpvGenerator:
         """
         key = "BindlessMaterialData"
         if f"struct_{key}" in self.reg._types:
-            return self.reg._types[f"struct_{key}"], 128  # cached
+            # Return cached — stride depends on whether extra properties were added
+            cached_stride = getattr(self, '_bindless_material_stride', 128)
+            return self.reg._types[f"struct_{key}"], cached_stride
+
+        # Start with base fields
+        fields = list(_BINDLESS_MATERIAL_FIELDS)
+
+        # Append extra properties if present (from surface properties)
+        extra = getattr(self.stage, '_bindless_extra_properties', None)
+        if extra:
+            for name, type_name in extra:
+                if type_name == "vec3":
+                    fields.append((f"_pad_{name}", "scalar"))
+                fields.append((name, type_name))
+            # Pad to 16-byte alignment
+            while len(fields) % 4 != 0:
+                fields.append((f"_pad_end_{len(fields)}", "scalar"))
+
+        # Store the dynamic fields list for OpMemberName emission
+        self._bindless_material_dynamic_fields = fields
 
         # Build member types
         member_types = []
-        for fname, ftype in _BINDLESS_MATERIAL_FIELDS:
+        for fname, ftype in fields:
             tid = self.reg.lux_type_to_spirv(ftype)
             member_types.append(tid)
 
@@ -1119,7 +1141,7 @@ class SpvGenerator:
             "vec2": (8, 8), "vec3": (12, 16), "vec4": (16, 16),
             "mat4": (64, 16),
         }
-        for i, (fname, ftype) in enumerate(_BINDLESS_MATERIAL_FIELDS):
+        for i, (fname, ftype) in enumerate(fields):
             size, align = _STD430.get(ftype, (4, 4))
             offset = (offset + align - 1) & ~(align - 1)
             self.decorations.append(f"OpMemberDecorate {struct_id} {i} Offset {offset}")
@@ -1127,6 +1149,7 @@ class SpvGenerator:
 
         # Stride = round up to largest alignment (16 for vec4)
         stride = (offset + 15) & ~15
+        self._bindless_material_stride = stride
         return struct_id, stride
 
     def _declare_light_data_struct(self) -> tuple[str, int]:
@@ -2973,7 +2996,8 @@ class SpvGenerator:
             struct_type_name = self.local_types.get(expr.object.name, struct_type_name)
         struct_fields_map = {
             "LightData": _LIGHT_DATA_FIELDS,
-            "BindlessMaterialData": _BINDLESS_MATERIAL_FIELDS,
+            "BindlessMaterialData": getattr(self, '_bindless_material_dynamic_fields',
+                                            _BINDLESS_MATERIAL_FIELDS),
             "ShadowEntry": _SHADOW_ENTRY_FIELDS,
         }
         fields = struct_fields_map.get(struct_type_name)

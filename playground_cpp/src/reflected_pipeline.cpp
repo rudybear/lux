@@ -315,6 +315,30 @@ ReflectionData jsonToReflection(const JsonValue& root) {
         if (enabledIt != bless.end() && enabledIt->second.type == JsonValue::Bool) {
             data.bindlessEnabled = enabledIt->second.boolean;
         }
+
+        // Parse dynamic struct layout for extended bindless structs
+        auto sizeIt = bless.find("struct_size");
+        if (sizeIt != bless.end()) {
+            data.bindlessStructSize = static_cast<uint32_t>(sizeIt->second.asInt());
+        }
+
+        auto fieldsIt = bless.find("struct_fields");
+        if (fieldsIt != bless.end() && fieldsIt->second.type == JsonValue::Array) {
+            data.bindlessHasCustomProperties = true;
+            for (auto& fieldVal : fieldsIt->second.array) {
+                if (fieldVal.type != JsonValue::Object) continue;
+                ReflectionData::BindlessFieldMeta meta;
+                auto fi = fieldVal.object.find("name");
+                if (fi != fieldVal.object.end()) meta.name = fi->second.asString();
+                fi = fieldVal.object.find("type");
+                if (fi != fieldVal.object.end()) meta.type = fi->second.asString();
+                fi = fieldVal.object.find("offset");
+                if (fi != fieldVal.object.end()) meta.offset = static_cast<uint32_t>(fi->second.asInt());
+                fi = fieldVal.object.find("size");
+                if (fi != fieldVal.object.end()) meta.size = static_cast<uint32_t>(fi->second.asInt());
+                data.bindlessStructFields.push_back(meta);
+            }
+        }
     }
 
     // Parse mesh_output metadata if present

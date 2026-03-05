@@ -316,6 +316,8 @@ class Interpreter:
             elif isinstance(obj, LuxMat) and 0 <= idx < len(obj.columns):
                 if isinstance(value, LuxVec):
                     obj.columns[idx] = list(value.components)
+            elif isinstance(obj, list) and 0 <= idx < len(obj):
+                obj[idx] = value
 
     def eval_expr(self, expr) -> LuxValue:
         """Evaluate an expression and return its value."""
@@ -388,6 +390,8 @@ class Interpreter:
                 return LuxScalar(obj.components[i])
             if isinstance(obj, LuxMat):
                 return LuxVec(list(obj.columns[i]))
+            if isinstance(obj, list) and 0 <= i < len(obj):
+                return obj[i]
             raise TypeError(f"Cannot index {type(obj).__name__}")
 
         if isinstance(expr, TernaryExpr):

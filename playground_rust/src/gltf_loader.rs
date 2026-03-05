@@ -106,6 +106,10 @@ pub struct GltfMaterial {
     pub base_color_uv_xform: UvTransform,
     pub normal_uv_xform: UvTransform,
     pub metallic_roughness_uv_xform: UvTransform,
+
+    // Custom properties (from glTF extras, for extended bindless structs)
+    pub custom_float_properties: std::collections::BTreeMap<String, f32>,
+    pub custom_vec4_properties: std::collections::BTreeMap<String, [f32; 4]>,
 }
 
 impl Default for GltfMaterial {
@@ -142,6 +146,8 @@ impl Default for GltfMaterial {
             base_color_uv_xform: UvTransform::default(),
             normal_uv_xform: UvTransform::default(),
             metallic_roughness_uv_xform: UvTransform::default(),
+            custom_float_properties: std::collections::BTreeMap::new(),
+            custom_vec4_properties: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -555,7 +561,23 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
             base_color_uv_xform,
             normal_uv_xform,
             metallic_roughness_uv_xform,
+            custom_float_properties: std::collections::BTreeMap::new(),
+            custom_vec4_properties: std::collections::BTreeMap::new(),
         });
+
+        // Load custom properties from glTF extras
+        if let Some(raw_extras) = mat.extras().as_ref() {
+            if let Ok(extras_json) = serde_json::from_str::<serde_json::Value>(raw_extras.get()) {
+                if let Some(lux_props) = extras_json.get("lux_properties").and_then(|v| v.as_object()) {
+                    let current_mat = scene.materials.last_mut().unwrap();
+                    for (key, val) in lux_props {
+                        if let Some(f) = val.as_f64() {
+                            current_mat.custom_float_properties.insert(key.clone(), f as f32);
+                        }
+                    }
+                }
+            }
+        }
     }
     if scene.materials.is_empty() {
         scene.materials.push(GltfMaterial::default());

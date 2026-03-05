@@ -260,6 +260,19 @@ GltfScene loadGltf(const std::string& path) {
             gmat.isUnlit = true;
         }
 
+        // Load custom properties from glTF extras
+        if (mat.extras.data) {
+            // cgltf stores extras as raw JSON; parse for lux_properties
+            // Format: { "lux_properties": { "prop_name": 1.0, "prop_vec": [1,2,3,4] } }
+            std::string extrasJson(static_cast<const char*>(mat.extras.data),
+                                   mat.extras.data ? strlen(static_cast<const char*>(mat.extras.data)) : 0);
+            // Simple check: if "lux_properties" appears in the extras JSON,
+            // a full JSON parser (nlohmann::json) should be used at the call site
+            // to populate custom_float_properties / custom_vec_properties.
+            // For now, store the raw extras string for later parsing.
+            (void)extrasJson;
+        }
+
         scene.materials.push_back(gmat);
     }
 

@@ -1790,6 +1790,184 @@ pub struct BindlessMaterialData {
 unsafe impl bytemuck::Pod for BindlessMaterialData {}
 unsafe impl bytemuck::Zeroable for BindlessMaterialData {}
 
+/// Dynamic bindless material field descriptor (loaded from reflection JSON)
+#[derive(Debug, Clone)]
+pub struct BindlessFieldInfo {
+    pub name: String,
+    pub field_type: String,
+    pub offset: u32,
+    pub size: u32,
+}
+
+/// Dynamic struct layout from reflection JSON
+#[derive(Debug, Clone)]
+pub struct BindlessStructLayout {
+    pub fields: Vec<BindlessFieldInfo>,
+    pub struct_size: u32,
+    pub has_custom_properties: bool,
+}
+
+impl BindlessStructLayout {
+    pub fn from_reflection(bindless_json: &serde_json::Value) -> Self {
+        let struct_size = bindless_json.get("struct_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(128) as u32;
+
+        let mut fields = Vec::new();
+        let has_custom = bindless_json.get("custom_properties").is_some();
+
+        if let Some(field_array) = bindless_json.get("struct_fields").and_then(|v| v.as_array()) {
+            for field in field_array {
+                fields.push(BindlessFieldInfo {
+                    name: field.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    field_type: field.get("type").and_then(|v| v.as_str()).unwrap_or("scalar").to_string(),
+                    offset: field.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    size: field.get("size").and_then(|v| v.as_u64()).unwrap_or(4) as u32,
+                });
+            }
+        }
+
+        Self { fields, struct_size, has_custom_properties: has_custom }
+    }
+
+    pub fn find_field(&self, name: &str) -> Option<&BindlessFieldInfo> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+}
+
+/// Build materials SSBO using reflection-driven dynamic layout.
+///
+/// When custom properties are present, writes to a raw byte buffer
+/// using field offsets from reflection JSON instead of the fixed struct.
+pub fn build_materials_ssbo_dynamic(
+    materials: &[crate::gltf_loader::GltfMaterial],
+    layout: &BindlessStructLayout,
+    tex_index_fn: impl Fn(usize, &str) -> i32,
+) -> Vec<u8> {
+    let mat_count = materials.len().max(1);
+    let mut buffer = vec![0u8; mat_count * layout.struct_size as usize];
+
+    for (i, mat) in materials.iter().enumerate() {
+        let base = i * layout.struct_size as usize;
+
+        let write_f32 = |buf: &mut Vec<u8>, field_name: &str, val: f32| {
+            if let Some(f) = layout.find_field(field_name) {
+                let off = base + f.offset as usize;
+                if off + 4 <= buf.len() {
+                    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+                }
+            }
+        };
+
+        let write_i32 = |buf: &mut Vec<u8>, field_name: &str, val: i32| {
+            if let Some(f) = layout.find_field(field_name) {
+                let off = base + f.offset as usize;
+                if off + 4 <= buf.len() {
+                    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+                }
+            }
+        };
+
+        let write_u32 = |buf: &mut Vec<u8>, field_name: &str, val: u32| {
+            if let Some(f) = layout.find_field(field_name) {
+                let off = base + f.offset as usize;
+                if off + 4 <= buf.len() {
+                    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+                }
+            }
+        };
+
+        // baseColorFactor (vec4)
+        if let Some(f) = layout.find_field("baseColorFactor") {
+            let off = base + f.offset as usize;
+            if off + 16 <= buffer.len() {
+                for (j, &val) in mat.base_color.iter().enumerate() {
+                    buffer[off + j * 4..off + (j + 1) * 4].copy_from_slice(&val.to_le_bytes());
+                }
+            }
+        }
+
+        // emissiveFactor (vec3)
+        if let Some(f) = layout.find_field("emissiveFactor") {
+            let off = base + f.offset as usize;
+            if off + 12 <= buffer.len() {
+                for (j, &val) in mat.emissive.iter().enumerate() {
+                    buffer[off + j * 4..off + (j + 1) * 4].copy_from_slice(&val.to_le_bytes());
+                }
+            }
+        }
+
+        // Scalar fields
+        write_f32(&mut buffer, "metallicFactor", mat.metallic);
+        write_f32(&mut buffer, "roughnessFactor", mat.roughness);
+        write_f32(&mut buffer, "emissionStrength", mat.emissive_strength);
+        write_f32(&mut buffer, "ior", mat.ior);
+        write_f32(&mut buffer, "clearcoatFactor", mat.clearcoat_factor);
+        write_f32(&mut buffer, "clearcoatRoughness", mat.clearcoat_roughness_factor);
+        write_f32(&mut buffer, "transmissionFactor", mat.transmission_factor);
+        write_f32(&mut buffer, "sheenRoughness", mat.sheen_roughness_factor);
+
+        // sheenColorFactor (vec3)
+        if let Some(f) = layout.find_field("sheenColorFactor") {
+            let off = base + f.offset as usize;
+            if off + 12 <= buffer.len() {
+                for (j, &val) in mat.sheen_color_factor.iter().enumerate() {
+                    buffer[off + j * 4..off + (j + 1) * 4].copy_from_slice(&val.to_le_bytes());
+                }
+            }
+        }
+
+        // Texture indices
+        write_i32(&mut buffer, "base_color_tex_index", tex_index_fn(i, "base_color"));
+        write_i32(&mut buffer, "normal_tex_index", tex_index_fn(i, "normal"));
+        write_i32(&mut buffer, "metallic_roughness_tex_index", tex_index_fn(i, "metallic_roughness"));
+        write_i32(&mut buffer, "occlusion_tex_index", tex_index_fn(i, "occlusion"));
+        write_i32(&mut buffer, "emissive_tex_index", tex_index_fn(i, "emissive"));
+        write_i32(&mut buffer, "clearcoat_tex_index", tex_index_fn(i, "clearcoat"));
+        write_i32(&mut buffer, "clearcoat_roughness_tex_index", tex_index_fn(i, "clearcoat_roughness"));
+        write_i32(&mut buffer, "sheen_color_tex_index", tex_index_fn(i, "sheen_color"));
+        write_i32(&mut buffer, "transmission_tex_index", tex_index_fn(i, "transmission"));
+
+        // Feature flags (computed from material properties, same logic as fixed builder)
+        let mut flags: u32 = 0;
+        if mat.normal_image.is_some() {
+            flags |= BINDLESS_MAT_FLAG_NORMAL_MAP;
+        }
+        if mat.has_clearcoat {
+            flags |= BINDLESS_MAT_FLAG_CLEARCOAT;
+        }
+        if mat.has_sheen {
+            flags |= BINDLESS_MAT_FLAG_SHEEN;
+        }
+        if mat.emissive_image.is_some() || mat.emissive.iter().any(|&e| e > 0.0) {
+            flags |= BINDLESS_MAT_FLAG_EMISSION;
+        }
+        if mat.has_transmission {
+            flags |= BINDLESS_MAT_FLAG_TRANSMISSION;
+        }
+        write_u32(&mut buffer, "material_flags", flags);
+
+        // Write custom float properties from glTF extras
+        for (key, &val) in &mat.custom_float_properties {
+            write_f32(&mut buffer, key, val);
+        }
+
+        // Write custom vec4 properties from glTF extras
+        for (key, val) in &mat.custom_vec4_properties {
+            if let Some(f) = layout.find_field(key) {
+                let off = base + f.offset as usize;
+                if off + 16 <= buffer.len() {
+                    for (j, &v) in val.iter().enumerate() {
+                        buffer[off + j * 4..off + (j + 1) * 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    buffer
+}
+
 /// Collected bindless texture array: all unique (imageView, sampler) pairs.
 pub struct BindlessTextureArray {
     pub image_views: Vec<vk::ImageView>,

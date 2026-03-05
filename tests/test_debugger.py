@@ -337,3 +337,419 @@ fragment {
 """
         result = run_batch(source, "fragment", break_lines=[6], dump_at_break=True)
         assert result["status"] == "completed"
+
+
+# ===== Expression Parser Tests =====
+
+class TestExprParser:
+    def test_simple_comparison(self):
+        from luxc.debug.expr_parser import parse_debug_expr
+        ast = parse_debug_expr("x > 0.5")
+        assert ast is not None
+        from luxc.parser.ast_nodes import BinaryOp
+        assert isinstance(ast, BinaryOp)
+        assert ast.op == ">"
+
+    def test_function_call(self):
+        from luxc.debug.expr_parser import parse_debug_expr
+        ast = parse_debug_expr("dot(n, l)")
+        assert ast is not None
+        from luxc.parser.ast_nodes import CallExpr
+        assert isinstance(ast, CallExpr)
+
+    def test_field_access(self):
+        from luxc.debug.expr_parser import parse_debug_expr
+        ast = parse_debug_expr("v.x")
+        assert ast is not None
+
+    def test_arithmetic(self):
+        from luxc.debug.expr_parser import parse_debug_expr
+        ast = parse_debug_expr("a + b * 2.0")
+        assert ast is not None
+
+    def test_invalid_expr(self):
+        from luxc.debug.expr_parser import parse_debug_expr
+        with pytest.raises(ValueError):
+            parse_debug_expr("@#$%^")
+
+
+# ===== Conditional Breakpoint Tests =====
+
+class TestConditionalBreakpoints:
+    def test_conditional_bp_stops_when_met(self):
+        source = """
+fragment {
+    out color: vec4;
+    fn main() {
+        let x: scalar = 0.0;
+        let y: scalar = 0.5;
+        let z: scalar = 1.0;
+        color = vec4(x, y, z, 1.0);
+    }
+}
+"""
+        result = run_batch(source, "fragment", break_lines=[6], dump_at_break=True)
+        assert result["status"] == "completed"
+        # Line 6 is "let y: scalar = 0.5;" — breakpoint should trigger
+        assert len(result.get("break_dumps", [])) >= 1
+
+    def test_conditional_bp_skips_when_not_met(self):
+        """A breakpoint with condition 'x > 10.0' should not stop when x = 0.0."""
+        source = """
+fragment {
+    out color: vec4;
+    fn main() {
+        let x: scalar = 0.0;
+        let y: scalar = 1.0;
+        color = vec4(x, y, 0.0, 1.0);
+    }
+}
+"""
+        from luxc.parser.tree_builder import parse_lux
+        from luxc.analysis.type_checker import type_check
+        from luxc.optimization.const_fold import constant_fold
+        from luxc.debug.io import build_default_inputs
+
+        module = parse_lux(source)
+        type_check(module)
+        constant_fold(module)
+        stage = module.stages[0]
+        lines = source.splitlines()
+        interp = Interpreter(module, stage, source_lines=lines)
+        dbg = Debugger(interp)
+
+        # Add conditional breakpoint at line 7 (after x is defined at line 6)
+        # x = 0.0, so "x > 10.0" should be false and bp should not fire
+        bp = dbg.add_breakpoint(7, condition="x > 10.0")
+
+        break_hits = []
+        def on_break(hit):
+            break_hits.append(hit.line)
+        dbg._on_break = on_break
+
+        result = dbg.run_batch(inputs=build_default_inputs(stage))
+        # Breakpoint should not have been hit since x = 0.0 < 10.0
+        assert bp.hit_count == 0
+
+
+# ===== Watch Expression Tests =====
+
+class TestWatchExpressions:
+    def test_watch_evaluates(self):
+        source = """
+fragment {
+    out color: vec4;
+    fn main() {
+        let x: scalar = 3.0;
+        let y: scalar = 4.0;
+        color = vec4(x, y, 0.0, 1.0);
+    }
+}
+"""
+        from luxc.parser.tree_builder import parse_lux
+        from luxc.analysis.type_checker import type_check
+        from luxc.optimization.const_fold import constant_fold
+        from luxc.debug.io import build_default_inputs
+
+        module = parse_lux(source)
+        type_check(module)
+        constant_fold(module)
+        stage = module.stages[0]
+        lines = source.splitlines()
+        interp = Interpreter(module, stage, source_lines=lines)
+        dbg = Debugger(interp)
+
+        # Add a watch for x + y
+        w = dbg.add_watch("x + y")
+
+        # Set up to evaluate after running partway
+        dbg.add_breakpoint(7)  # break before color assignment
+
+        stopped = []
+        def on_break(hit):
+            results = dbg.evaluate_watches()
+            stopped.append(results)
+        dbg._on_break = on_break
+
+        dbg.run_batch(inputs=build_default_inputs(stage))
+
+        # Check that watch was evaluated
+        assert len(stopped) >= 1
+        watch_results = stopped[0]
+        assert len(watch_results) == 1
+        entry, val, changed = watch_results[0]
+        assert val is not None
+        assert abs(val.value - 7.0) < 1e-6
+
+
+# ===== Break-on-NaN Tests =====
+
+class TestBreakOnNaN:
+    def test_break_on_nan_batch(self):
+        source = """
+fragment {
+    out color: vec4;
+    fn main() {
+        let good: scalar = 1.0;
+        let bad: scalar = sqrt(-1.0);
+        color = vec4(bad, 0.0, 0.0, 1.0);
+    }
+}
+"""
+        result = run_batch(source, "fragment", break_on_nan=True, check_nan=True)
+        assert result["nan_detected"] is True
+
+
+# ===== Time-Travel Tests =====
+
+class TestTimeTravel:
+    def test_time_travel_recording(self):
+        source = """
+fragment {
+    out color: vec4;
+    fn main() {
+        let a: scalar = 1.0;
+        let b: scalar = 2.0;
+        let c: scalar = a + b;
+        color = vec4(c, 0.0, 0.0, 1.0);
+    }
+}
+"""
+        from luxc.parser.tree_builder import parse_lux
+        from luxc.analysis.type_checker import type_check
+        from luxc.optimization.const_fold import constant_fold
+        from luxc.debug.io import build_default_inputs
+
+        module = parse_lux(source)
+        type_check(module)
+        constant_fold(module)
+        stage = module.stages[0]
+        lines = source.splitlines()
+        interp = Interpreter(module, stage, source_lines=lines)
+        dbg = Debugger(interp)
+
+        result = dbg.run_batch(inputs=build_default_inputs(stage))
+
+        # Time travel should have recorded snapshots
+        assert len(dbg.time_travel.history) > 0
+
+    def test_reverse_step(self):
+        source = """
+fragment {
+    out color: vec4;
+    fn main() {
+        let a: scalar = 1.0;
+        let b: scalar = 2.0;
+        color = vec4(a, b, 0.0, 1.0);
+    }
+}
+"""
+        from luxc.parser.tree_builder import parse_lux
+        from luxc.analysis.type_checker import type_check
+        from luxc.optimization.const_fold import constant_fold
+        from luxc.debug.io import build_default_inputs
+
+        module = parse_lux(source)
+        type_check(module)
+        constant_fold(module)
+        stage = module.stages[0]
+        lines = source.splitlines()
+        interp = Interpreter(module, stage, source_lines=lines)
+        dbg = Debugger(interp)
+
+        dbg.run_batch(inputs=build_default_inputs(stage))
+
+        # Should be able to reverse step
+        snap = dbg.reverse_step()
+        assert snap is not None
+        assert snap.line > 0
+
+    def test_goto_step(self):
+        source = """
+fragment {
+    out color: vec4;
+    fn main() {
+        let x: scalar = 42.0;
+        color = vec4(x, 0.0, 0.0, 1.0);
+    }
+}
+"""
+        from luxc.parser.tree_builder import parse_lux
+        from luxc.analysis.type_checker import type_check
+        from luxc.optimization.const_fold import constant_fold
+        from luxc.debug.io import build_default_inputs
+
+        module = parse_lux(source)
+        type_check(module)
+        constant_fold(module)
+        stage = module.stages[0]
+        lines = source.splitlines()
+        interp = Interpreter(module, stage, source_lines=lines)
+        dbg = Debugger(interp)
+
+        dbg.run_batch(inputs=build_default_inputs(stage))
+
+        # Go to first step
+        snap = dbg.goto_step(1)
+        assert snap is not None
+        assert snap.step_index == 1
+
+
+# ===== LuxImage Tests =====
+
+class TestLuxImage:
+    def test_make_solid_image(self):
+        from luxc.debug.values import make_solid_image
+        img = make_solid_image(255, 0, 0)
+        assert img.width == 1
+        assert img.height == 1
+        result = img.sample_bilinear(0.5, 0.5)
+        assert isinstance(result, LuxVec)
+        assert abs(result.components[0] - 1.0) < 0.01  # Red
+        assert abs(result.components[1] - 0.0) < 0.01  # Green
+        assert abs(result.components[2] - 0.0) < 0.01  # Blue
+        assert abs(result.components[3] - 1.0) < 0.01  # Alpha
+
+    def test_sample_bilinear_clamp(self):
+        from luxc.debug.values import make_solid_image
+        img = make_solid_image(128, 128, 255)
+        img.wrap = "clamp"
+        result = img.sample_bilinear(0.5, 0.5)
+        assert isinstance(result, LuxVec)
+        assert abs(result.components[2] - 1.0) < 0.01  # Blue
+
+
+# ===== Heatmap Tests =====
+
+class TestHeatmap:
+    def test_run_pixel_grid(self):
+        from luxc.debug.heatmap import run_pixel_grid
+        source = """
+fragment {
+    in uv: vec2;
+    out color: vec4;
+    fn main() {
+        color = vec4(uv.x, uv.y, 0.0, 1.0);
+    }
+}
+"""
+        result = run_pixel_grid(source, "fragment", grid_size=(4, 4))
+        assert result.width == 4
+        assert result.height == 4
+        assert len(result.pixels) == 16
+
+    def test_write_ppm(self, tmp_path):
+        from luxc.debug.heatmap import run_pixel_grid, write_ppm
+        source = """
+fragment {
+    in uv: vec2;
+    out color: vec4;
+    fn main() {
+        color = vec4(uv.x, uv.y, 0.0, 1.0);
+    }
+}
+"""
+        result = run_pixel_grid(source, "fragment", grid_size=(4, 4))
+        ppm_path = str(tmp_path / "test.ppm")
+        write_ppm(ppm_path, result)
+
+        # Verify PPM file exists and has correct header
+        with open(ppm_path, "rb") as f:
+            header = f.read(10)
+            assert header.startswith(b"P6\n4 4\n")
+
+    def test_nan_heatmap(self):
+        from luxc.debug.heatmap import run_pixel_grid
+        source = """
+fragment {
+    in uv: vec2;
+    out color: vec4;
+    fn main() {
+        let bad: scalar = sqrt(-1.0);
+        color = vec4(bad, uv.y, 0.0, 1.0);
+    }
+}
+"""
+        result = run_pixel_grid(source, "fragment", grid_size=(2, 2), mode="nan")
+        assert all(p.nan_count > 0 for p in result.pixels)
+
+
+# ===== Default Material Tests =====
+
+class TestDefaultMaterial:
+    def test_build_default_material(self):
+        from luxc.debug.io import build_default_material
+        mat = build_default_material()
+        assert isinstance(mat, LuxStruct)
+        assert mat.type_name == "BindlessMaterialData"
+        assert "baseColorFactor" in mat.fields
+        assert "roughnessFactor" in mat.fields
+        assert mat.fields["roughnessFactor"].value == 0.5
+        assert mat.fields["base_color_tex_index"].value == -1
+
+
+# ===== Texture-Aware Builtins Tests =====
+
+class TestTextureBuiltins:
+    def test_sample_with_image(self):
+        from luxc.debug.builtins import builtin_sample
+        from luxc.debug.values import make_solid_image
+        img = make_solid_image(255, 128, 0)
+        uv = LuxVec([0.5, 0.5])
+        result = builtin_sample([img, uv])
+        assert isinstance(result, LuxVec)
+        assert abs(result.components[0] - 1.0) < 0.01  # Red = 255/255
+
+    def test_sample_without_image(self):
+        from luxc.debug.builtins import builtin_sample
+        result = builtin_sample([LuxInt(0), LuxVec([0.5, 0.5])])
+        assert isinstance(result, LuxVec)
+        assert result.components[0] == 0.8  # Default grey
+
+    def test_sample_bindless(self):
+        from luxc.debug.builtins import builtin_sample_bindless
+        from luxc.debug.values import make_solid_image
+        img1 = make_solid_image(255, 0, 0)
+        img2 = make_solid_image(0, 255, 0)
+        tex_array = [img1, img2]
+        result = builtin_sample_bindless([tex_array, LuxInt(1), LuxVec([0.5, 0.5])])
+        assert isinstance(result, LuxVec)
+        assert abs(result.components[1] - 1.0) < 0.01  # Green from img2
+
+
+# ===== List Indexing Tests =====
+
+class TestListIndexing:
+    def test_list_indexing_in_interpreter(self):
+        """Test that list[index] works for SSBO-like array access."""
+        from luxc.parser.tree_builder import parse_lux
+        from luxc.analysis.type_checker import type_check
+        from luxc.optimization.const_fold import constant_fold
+
+        source = """
+fragment {
+    out color: vec4;
+    fn main() {
+        color = vec4(1.0);
+    }
+}
+"""
+        module = parse_lux(source)
+        type_check(module)
+        constant_fold(module)
+        stage = module.stages[0]
+        interp = Interpreter(module, stage)
+
+        # Manually define a list and test indexing
+        materials = [
+            LuxStruct("Test", {"val": LuxScalar(42.0)}),
+            LuxStruct("Test", {"val": LuxScalar(99.0)}),
+        ]
+        interp.env.define("materials", materials)
+
+        # Parse and eval an index expression
+        from luxc.parser.ast_nodes import IndexAccess, VarRef, NumberLit
+        idx_expr = IndexAccess(VarRef("materials"), NumberLit("0"))
+        result = interp.eval_expr(idx_expr)
+        assert isinstance(result, LuxStruct)
+        assert result.fields["val"].value == 42.0

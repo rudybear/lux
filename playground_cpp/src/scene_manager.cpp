@@ -1,4 +1,5 @@
 #include "scene_manager.h"
+#include "reflected_pipeline.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <iostream>
@@ -1293,6 +1294,175 @@ BindlessMaterialsSSBO SceneManager::buildMaterialsSSBOByGeometry(VulkanContext& 
               << " entries, " << bufSize << " bytes" << std::endl;
 
     return result;
+}
+
+// --------------------------------------------------------------------------
+// Dynamic bindless: convert ReflectionData bindless layout to BindlessStructLayout
+// --------------------------------------------------------------------------
+
+BindlessStructLayout buildBindlessLayout(const ReflectionData& reflection) {
+    BindlessStructLayout layout;
+    layout.struct_size = reflection.bindlessStructSize;
+    layout.has_custom_properties = reflection.bindlessHasCustomProperties;
+    for (auto& fm : reflection.bindlessStructFields) {
+        BindlessFieldInfo info;
+        info.name = fm.name;
+        info.type = fm.type;
+        info.offset = fm.offset;
+        info.size = fm.size;
+        layout.fields.push_back(info);
+    }
+    return layout;
+}
+
+// --------------------------------------------------------------------------
+// Dynamic bindless: write typed values into a byte buffer at a field offset
+// --------------------------------------------------------------------------
+
+static void writeFieldToBuffer(
+    std::vector<uint8_t>& buffer,
+    size_t base_offset,
+    const BindlessFieldInfo& field,
+    float value)
+{
+    if (base_offset + field.offset + sizeof(float) <= buffer.size()) {
+        memcpy(buffer.data() + base_offset + field.offset, &value, sizeof(float));
+    }
+}
+
+static void writeFieldToBuffer(
+    std::vector<uint8_t>& buffer,
+    size_t base_offset,
+    const BindlessFieldInfo& field,
+    const float* values, uint32_t count)
+{
+    uint32_t bytes = count * sizeof(float);
+    if (base_offset + field.offset + bytes <= buffer.size()) {
+        memcpy(buffer.data() + base_offset + field.offset, values, bytes);
+    }
+}
+
+static void writeFieldToBuffer(
+    std::vector<uint8_t>& buffer,
+    size_t base_offset,
+    const BindlessFieldInfo& field,
+    int32_t value)
+{
+    if (base_offset + field.offset + sizeof(int32_t) <= buffer.size()) {
+        memcpy(buffer.data() + base_offset + field.offset, &value, sizeof(int32_t));
+    }
+}
+
+static void writeFieldToBuffer(
+    std::vector<uint8_t>& buffer,
+    size_t base_offset,
+    const BindlessFieldInfo& field,
+    uint32_t value)
+{
+    if (base_offset + field.offset + sizeof(uint32_t) <= buffer.size()) {
+        memcpy(buffer.data() + base_offset + field.offset, &value, sizeof(uint32_t));
+    }
+}
+
+// --------------------------------------------------------------------------
+// Dynamic bindless: reflection-driven SSBO builder for extended bindless structs
+// --------------------------------------------------------------------------
+
+static std::vector<uint8_t> buildMaterialsSSBODynamic(
+    const std::vector<GltfMaterial>& materials,
+    const BindlessStructLayout& layout,
+    const std::unordered_map<std::string, int>& textureMap)
+{
+    std::vector<uint8_t> buffer(materials.size() * layout.struct_size, 0);
+
+    for (size_t i = 0; i < materials.size(); i++) {
+        auto& mat = materials[i];
+        size_t offset = i * layout.struct_size;
+
+        // Shorthand lambdas for writing into this material's slot
+        auto writeScalar = [&](const char* name, float val) {
+            if (auto* f = layout.findField(name))
+                writeFieldToBuffer(buffer, offset, *f, val);
+        };
+        auto writeInt = [&](const char* name, int32_t val) {
+            if (auto* f = layout.findField(name))
+                writeFieldToBuffer(buffer, offset, *f, val);
+        };
+        auto writeUint = [&](const char* name, uint32_t val) {
+            if (auto* f = layout.findField(name))
+                writeFieldToBuffer(buffer, offset, *f, val);
+        };
+
+        // PBR vector factors
+        if (auto* f = layout.findField("baseColorFactor")) {
+            float bc[4] = {mat.baseColor[0], mat.baseColor[1], mat.baseColor[2], mat.baseColor[3]};
+            writeFieldToBuffer(buffer, offset, *f, bc, 4);
+        }
+        if (auto* f = layout.findField("emissiveFactor")) {
+            float em[3] = {mat.emissive[0], mat.emissive[1], mat.emissive[2]};
+            writeFieldToBuffer(buffer, offset, *f, em, 3);
+        }
+        if (auto* f = layout.findField("sheenColorFactor")) {
+            float sc[3] = {mat.sheenColorFactor[0], mat.sheenColorFactor[1], mat.sheenColorFactor[2]};
+            writeFieldToBuffer(buffer, offset, *f, sc, 3);
+        }
+
+        // PBR scalar factors
+        writeScalar("metallicFactor", mat.metallic);
+        writeScalar("roughnessFactor", mat.roughness);
+        writeScalar("emissionStrength", mat.emissiveStrength);
+        writeScalar("ior", mat.ior);
+        writeScalar("clearcoatFactor", mat.clearcoatFactor);
+        writeScalar("clearcoatRoughness", mat.clearcoatRoughnessFactor);
+        writeScalar("transmissionFactor", mat.transmissionFactor);
+        writeScalar("sheenRoughness", mat.sheenRoughnessFactor);
+
+        // Texture indices
+        auto lookupTex = [&](const std::string& key) -> int32_t {
+            auto it = textureMap.find(key);
+            return (it != textureMap.end()) ? it->second : -1;
+        };
+
+        writeInt("base_color_tex_index", lookupTex(mat.name + "_base_color"));
+        writeInt("normal_tex_index", lookupTex(mat.name + "_normal"));
+        writeInt("metallic_roughness_tex_index", lookupTex(mat.name + "_metallic_roughness"));
+        writeInt("occlusion_tex_index", lookupTex(mat.name + "_occlusion"));
+        writeInt("emissive_tex_index", lookupTex(mat.name + "_emissive"));
+        writeInt("clearcoat_tex_index", lookupTex(mat.name + "_clearcoat"));
+        writeInt("clearcoat_roughness_tex_index", lookupTex(mat.name + "_clearcoat_roughness"));
+        writeInt("sheen_color_tex_index", lookupTex(mat.name + "_sheen_color"));
+        writeInt("transmission_tex_index", lookupTex(mat.name + "_transmission"));
+
+        // Material flags
+        uint32_t flags = 0;
+        if (mat.normal_tex.valid())
+            flags |= BINDLESS_MAT_FLAG_NORMAL_MAP;
+        if (mat.hasClearcoat)
+            flags |= BINDLESS_MAT_FLAG_CLEARCOAT;
+        if (mat.hasSheen)
+            flags |= BINDLESS_MAT_FLAG_SHEEN;
+        if (mat.emissive_tex.valid() || glm::length(mat.emissive) > 0.0f)
+            flags |= BINDLESS_MAT_FLAG_EMISSION;
+        if (mat.hasTransmission)
+            flags |= BINDLESS_MAT_FLAG_TRANSMISSION;
+        writeUint("material_flags", flags);
+
+        // Write custom float properties (from glTF extras) into their reflection-mapped fields
+        for (auto& [propName, propVal] : mat.custom_float_properties) {
+            writeScalar(propName.c_str(), propVal);
+        }
+
+        // Write custom vec properties
+        for (auto& [propName, propVec] : mat.custom_vec_properties) {
+            if (auto* f = layout.findField(propName)) {
+                uint32_t count = f->size / sizeof(float);
+                if (count > 4) count = 4;
+                writeFieldToBuffer(buffer, offset, *f, propVec.data(), count);
+            }
+        }
+    }
+
+    return buffer;
 }
 
 // --------------------------------------------------------------------------

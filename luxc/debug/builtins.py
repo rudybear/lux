@@ -339,7 +339,46 @@ def builtin_inverse(args: list[LuxValue]) -> LuxValue:
 # --- Special builtins ---
 
 def builtin_sample(args: list[LuxValue]) -> LuxValue:
-    """Mock texture sample — returns a neutral grey."""
+    """Texture sample — uses real image data if available, else neutral grey."""
+    from luxc.debug.values import LuxImage
+    tex = args[0]
+    if isinstance(tex, LuxImage) and len(args) >= 2:
+        uv = args[1]
+        if isinstance(uv, LuxVec) and uv.size >= 2:
+            return tex.sample_bilinear(uv.components[0], uv.components[1])
+    return LuxVec([0.8, 0.8, 0.8, 1.0])
+
+def builtin_sample_bindless(args: list[LuxValue]) -> LuxValue:
+    """Bindless texture array sample: sample_bindless(textures, index, uv)."""
+    from luxc.debug.values import LuxImage
+    tex_array, idx_val, uv_val = args[0], args[1], args[2]
+    idx = int(_to_float(idx_val))
+    if isinstance(tex_array, list) and 0 <= idx < len(tex_array):
+        tex = tex_array[idx]
+        if isinstance(tex, LuxImage) and isinstance(uv_val, LuxVec) and uv_val.size >= 2:
+            return tex.sample_bilinear(uv_val.components[0], uv_val.components[1])
+    return LuxVec([0.8, 0.8, 0.8, 1.0])
+
+def builtin_sample_bindless_lod(args: list[LuxValue]) -> LuxValue:
+    """Bindless texture array sample with LOD: sample_bindless_lod(textures, index, uv, lod)."""
+    from luxc.debug.values import LuxImage
+    tex_array, idx_val, uv_val = args[0], args[1], args[2]
+    # LOD is ignored in CPU debugger (always mip 0)
+    idx = int(_to_float(idx_val))
+    if isinstance(tex_array, list) and 0 <= idx < len(tex_array):
+        tex = tex_array[idx]
+        if isinstance(tex, LuxImage) and isinstance(uv_val, LuxVec) and uv_val.size >= 2:
+            return tex.sample_bilinear(uv_val.components[0], uv_val.components[1])
+    return LuxVec([0.8, 0.8, 0.8, 1.0])
+
+def builtin_sample_lod(args: list[LuxValue]) -> LuxValue:
+    """Texture sample with LOD — uses real image data if available."""
+    from luxc.debug.values import LuxImage
+    tex = args[0]
+    uv_or_dir = args[1] if len(args) >= 2 else None
+    # LOD is ignored in CPU debugger
+    if isinstance(tex, LuxImage) and isinstance(uv_or_dir, LuxVec) and uv_or_dir.size >= 2:
+        return tex.sample_bilinear(uv_or_dir.components[0], uv_or_dir.components[1])
     return LuxVec([0.8, 0.8, 0.8, 1.0])
 
 def builtin_image_size(args: list[LuxValue]) -> LuxValue:
@@ -404,6 +443,9 @@ BUILTIN_FUNCTIONS: dict[str, callable] = {
     "determinant": builtin_determinant,
     "inverse": builtin_inverse,
     "sample": builtin_sample,
+    "sample_bindless": builtin_sample_bindless,
+    "sample_bindless_lod": builtin_sample_bindless_lod,
+    "sample_lod": builtin_sample_lod,
     "image_size": builtin_image_size,
     "texture_size": builtin_texture_size,
     "texture_levels": builtin_texture_levels,

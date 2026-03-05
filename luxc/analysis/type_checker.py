@@ -479,6 +479,16 @@ class TypeChecker:
                         result = SCALAR
                     expr.resolved_type = result.name
                     return result
+                # Check custom properties from bindless expansion
+                extra_props = getattr(self.current_stage, '_bindless_extra_properties', None)
+                if extra_props:
+                    for ep_name, ep_type in extra_props:
+                        if ep_name == expr.field:
+                            result = resolve_type(ep_type)
+                            if result is None:
+                                result = SCALAR
+                            expr.resolved_type = result.name
+                            return result
                 # Unknown field — fallback to scalar
             if obj_type.name == "LightData":
                 field_types = _LIGHT_DATA_FIELD_TYPES.get(expr.field)

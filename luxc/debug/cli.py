@@ -121,7 +121,8 @@ def run_interactive(source: str, stage_name: str, source_name: str = "<input>",
             if dbg.breakpoints:
                 for bp in dbg.breakpoints.values():
                     status = "enabled" if bp.enabled else "disabled"
-                    print(f"  Breakpoint {bp.id}: line {bp.line} [{status}] (hits: {bp.hit_count})")
+                    cond_str = f" when {bp.condition}" if bp.condition else ""
+                    print(f"  Breakpoint {bp.id}: line {bp.line} [{status}] (hits: {bp.hit_count}){cond_str}")
             else:
                 print("No breakpoints set")
             return True
@@ -145,6 +146,19 @@ def run_interactive(source: str, stage_name: str, source_name: str = "<input>",
                 print(f"{marker}{ln:4d} | {line_text}")
             return True
 
+        elif command in ("eval", "e"):
+            if not arg:
+                print("Usage: eval <expression>")
+            else:
+                try:
+                    from luxc.debug.expr_parser import parse_debug_expr
+                    ast_node = parse_debug_expr(arg)
+                    val = interp.eval_expr(ast_node)
+                    _print_value(arg, val)
+                except Exception as ex:
+                    print(f"Error: {ex}")
+            return True
+
         elif command in ("help", "h"):
             _print_help()
             return True
@@ -158,10 +172,22 @@ def run_interactive(source: str, stage_name: str, source_name: str = "<input>",
         step/next/continue to resume execution.
         """
         if hit.breakpoint.id > 0:
-            print(f"Hit breakpoint {hit.breakpoint.id} at line {hit.line}")
+            cond_str = f" (when {hit.breakpoint.condition})" if hit.breakpoint.condition else ""
+            print(f"Hit breakpoint {hit.breakpoint.id} at line {hit.line}{cond_str}")
         else:
             print(f"Stopped at line {hit.line}")
         _show_source_context(lines, hit.line)
+
+        # Evaluate and display watches
+        watch_results = dbg.evaluate_watches()
+        if watch_results:
+            for entry, val, changed in watch_results:
+                marker = "~" if changed else " "
+                if val is not None:
+                    type_str = value_type_name(val)
+                    print(f"  {marker} watch {entry.id} ({entry.expression}) = {val!r} ({type_str})")
+                else:
+                    print(f"    watch {entry.id} ({entry.expression}) = <error>")
 
         # Nested command loop — runs until user resumes execution
         while True:
@@ -198,17 +224,64 @@ def run_interactive(source: str, stage_name: str, source_name: str = "<input>",
                 dbg._step_depth = dbg._current_depth
                 return
 
+            # Reverse navigation (time-travel)
+            elif command in ("reverse-step", "rs"):
+                snap = dbg.reverse_step()
+                if snap:
+                    print(f"Reversed to step {snap.step_index}, line {snap.line}")
+                    _show_source_context(lines, snap.line)
+                else:
+                    print("No previous step in history")
+
+            elif command in ("reverse-continue", "rc"):
+                snap = dbg.reverse_continue()
+                if snap:
+                    print(f"Reversed to step {snap.step_index}, line {snap.line}")
+                    _show_source_context(lines, snap.line)
+                else:
+                    print("No previous breakpoint in history")
+
+            elif command in ("goto", "g"):
+                if not arg:
+                    print("Usage: goto <step_number>")
+                else:
+                    try:
+                        step_n = int(arg)
+                        snap = dbg.goto_step(step_n)
+                        if snap:
+                            print(f"Jumped to step {snap.step_index}, line {snap.line}")
+                            _show_source_context(lines, snap.line)
+                        else:
+                            print(f"Step {step_n} not found in history")
+                    except ValueError:
+                        print(f"Invalid step number: {arg}")
+
+            elif command in ("history", "hist"):
+                count = 10
+                if arg:
+                    try:
+                        count = int(arg)
+                    except ValueError:
+                        pass
+                recent = dbg.time_travel.get_recent(count)
+                if recent:
+                    for snap in recent:
+                        marker = " > " if snap.step_index == dbg.time_travel.history[dbg.time_travel.current_index].step_index else "   "
+                        print(f"{marker}step {snap.step_index}: line {snap.line}")
+                else:
+                    print("No history recorded")
+
             # Break/delete — modify breakpoints mid-run
             elif command in ("break", "b"):
                 if not arg:
-                    print("Usage: break <line_number>")
+                    print("Usage: break <line_number> [if <condition>]")
                 else:
-                    try:
-                        line = int(arg)
-                        bp = dbg.add_breakpoint(line)
-                        print(f"Breakpoint {bp.id} at line {line}")
-                    except ValueError:
-                        print(f"Invalid line number: {arg}")
+                    _handle_break_command(dbg, arg)
+
+            elif command in ("break-nan", "bn"):
+                dbg.break_on_nan = not dbg.break_on_nan
+                status = "enabled" if dbg.break_on_nan else "disabled"
+                print(f"Break-on-NaN: {status}")
 
             elif command in ("delete", "d"):
                 if not arg:
@@ -232,6 +305,12 @@ def run_interactive(source: str, stage_name: str, source_name: str = "<input>",
 
     dbg._on_break = on_break
 
+    # NaN break notification
+    def on_nan_break(events):
+        for ev in events:
+            print(f"NaN detected: {ev.variable} = {ev.value!r} at line {ev.line}")
+    dbg._on_nan_break = on_nan_break
+
     # Track variable state between steps to show what changed
     _prev_vars: dict[str, LuxValue] = {}
 
@@ -240,17 +319,14 @@ def run_interactive(source: str, stage_name: str, source_name: str = "<input>",
         nonlocal _prev_vars
         for name, val in sorted(current_vars.items()):
             if name not in _prev_vars:
-                # New variable
                 _print_value(f"+ {name}", val)
             elif repr(val) != repr(_prev_vars.get(name)):
-                # Changed variable
                 _print_value(f"~ {name}", val)
         _prev_vars = {k: v for k, v in current_vars.items()}
 
     # Monkey-patch on_break to include change tracking
     _orig_on_break = on_break
     def on_break_with_changes(hit: BreakpointHit):
-        # Show what changed since last stop (only in step mode, not first stop)
         if _prev_vars and dbg._step_mode == StepMode.STEP:
             _show_changes(hit.variables)
         else:
@@ -264,16 +340,12 @@ def run_interactive(source: str, stage_name: str, source_name: str = "<input>",
     finished = False
 
     def _run_shader(step_mode: StepMode):
-        """Execute the shader with given step mode, handling results."""
         nonlocal finished, interp, dbg
-
         if finished:
-            # Reset for re-run
             interp = Interpreter(module, stage, source_lines=lines)
             dbg = Debugger(interp)
             dbg._on_break = on_break
             finished = False
-
         dbg._step_mode = step_mode
         try:
             result = interp.run(inputs=inputs, trace_all=False)
@@ -293,7 +365,6 @@ def run_interactive(source: str, stage_name: str, source_name: str = "<input>",
             print(f"Runtime error: {e}")
             finished = True
 
-    # Main command loop (pre-run)
     while True:
         try:
             cmd = input("lux-debug> ").strip()
@@ -310,37 +381,29 @@ def run_interactive(source: str, stage_name: str, source_name: str = "<input>",
 
         if command in ("quit", "q", "exit"):
             break
-
         elif command in ("run", "r"):
             _run_shader(StepMode.RUN)
-
         elif command in ("start",):
             _run_shader(StepMode.STEP)
-
         elif command in ("step", "s"):
             if finished:
-                # Fresh start in step mode
                 _run_shader(StepMode.STEP)
             else:
                 print("Not running. Use 'start' to begin stepping, or 'run' to run.")
-
         elif command in ("next", "n"):
             if finished:
                 _run_shader(StepMode.STEP)
             else:
                 print("Not running. Use 'start' to begin stepping, or 'run' to run.")
-
         elif command in ("break", "b"):
             if not arg:
-                print("Usage: break <line_number>")
+                print("Usage: break <line_number> [if <condition>]")
                 continue
-            try:
-                line = int(arg)
-                bp = dbg.add_breakpoint(line)
-                print(f"Breakpoint {bp.id} at line {line}")
-            except ValueError:
-                print(f"Invalid line number: {arg}")
-
+            _handle_break_command(dbg, arg)
+        elif command in ("break-nan", "bn"):
+            dbg.break_on_nan = not dbg.break_on_nan
+            status = "enabled" if dbg.break_on_nan else "disabled"
+            print(f"Break-on-NaN: {status}")
         elif command in ("delete", "d"):
             if not arg:
                 print("Usage: delete <breakpoint_id>")
@@ -353,7 +416,6 @@ def run_interactive(source: str, stage_name: str, source_name: str = "<input>",
                     print(f"No breakpoint with id {bp_id}")
             except ValueError:
                 print(f"Invalid id: {arg}")
-
         elif not _handle_inspect_command(command, arg):
             print(f"Unknown command: '{command}'. Type 'help' for commands.")
 
@@ -362,7 +424,8 @@ def run_batch(source: str, stage_name: str, source_name: str = "<input>",
               input_path: Path | None = None,
               dump_vars: bool = False, check_nan: bool = False,
               break_lines: list[int] | None = None,
-              dump_at_break: bool = False) -> dict:
+              dump_at_break: bool = False,
+              break_on_nan: bool = False) -> dict:
     """Run the debugger in batch mode, returning JSON output."""
     from luxc.analysis.type_checker import type_check
     from luxc.optimization.const_fold import constant_fold
@@ -397,7 +460,28 @@ def run_batch(source: str, stage_name: str, source_name: str = "<input>",
         check_nan=check_nan,
         break_lines=break_lines,
         dump_at_break=dump_at_break,
+        break_on_nan=break_on_nan,
     )
+
+
+def _handle_break_command(dbg, arg: str) -> None:
+    """Parse 'break <line> [if <condition>]' and set breakpoint."""
+    if " if " in arg:
+        parts = arg.split(" if ", 1)
+        try:
+            line = int(parts[0].strip())
+            condition = parts[1].strip()
+            bp = dbg.add_breakpoint(line, condition=condition)
+            print(f"Breakpoint {bp.id} at line {line} (when {condition})")
+        except ValueError:
+            print(f"Invalid line number: {parts[0].strip()}")
+    else:
+        try:
+            line = int(arg.strip())
+            bp = dbg.add_breakpoint(line)
+            print(f"Breakpoint {bp.id} at line {line}")
+        except ValueError:
+            print(f"Invalid line number: {arg}")
 
 
 def _show_source_context(lines: list[str], current_line: int, context: int = 3) -> None:
@@ -419,23 +503,42 @@ def _print_help() -> None:
   continue / c         Continue to next breakpoint
   finish / f           Run until current function returns
   break / b <line>     Set breakpoint at line
+  break <line> if <cond>  Set conditional breakpoint
+  break-nan / bn       Toggle break-on-NaN
   delete / d <id>      Delete breakpoint
   print / p <var>      Print variable value
+  eval / e <expr>      Evaluate expression in current scope
   locals / l           Show all variables in scope
   list                 Show full shader with cursor (>) and breakpoints (*)
   watch / w [expr]     Add/list watches
   source / src [line]  Show source context (5 lines)
   output               Show current output
-  breakpoints / info   List breakpoints
+  breakpoints / info   List breakpoints (with conditions and hit counts)
   backtrace / bt       Show current position
+
+Time-travel:
+  reverse-step / rs    Step backwards one statement
+  reverse-continue / rc  Run backwards to previous breakpoint
+  goto / g <step>      Jump to a specific step in history
+  history / hist [N]   Show recent N execution steps (default 10)
+
+General:
   quit / q             Exit debugger
   help / h             Show this help
 
 Workflow:
   start              -> stops at first statement, then use step/next/continue
   break 42 + run     -> runs until line 42, then use step/next/continue
+  break 42 if x > 1  -> conditional breakpoint (stops only when condition is true)
+  break-nan + run    -> stops when a NaN value is first produced
   run                -> runs to completion (stops only at breakpoints)
 
 When stepping, new/changed variables are shown automatically:
   + albedo  = vec3(0.800, ...)    <- new variable
-  ~ n_dot_l = 0.333 (scalar)     <- value changed""")
+  ~ n_dot_l = 0.333 (scalar)     <- value changed
+
+Time-travel lets you navigate execution history after stopping:
+  rs                 -> go back one step
+  rc                 -> go back to previous breakpoint
+  goto 42            -> jump to step 42
+  hist 20            -> show last 20 steps""")
