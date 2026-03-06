@@ -22,6 +22,20 @@ bool SceneManager::isGltfFile(const std::string& source) {
 }
 
 // --------------------------------------------------------------------------
+// Gaussian splatting renderer initialization
+// --------------------------------------------------------------------------
+
+void SceneManager::initSplatRenderer(VulkanContext& ctx, const std::string& shaderBase,
+                                      uint32_t width, uint32_t height) {
+    if (!hasSplatData()) return;
+
+    std::cout << "[info] Initializing splat renderer for " << m_gltfScene.splat_data.num_splats
+              << " gaussian splats" << std::endl;
+    splat_renderer_ = std::make_unique<SplatRenderer>();
+    splat_renderer_->init(ctx, m_gltfScene.splat_data, shaderBase, width, height);
+}
+
+// --------------------------------------------------------------------------
 // Load scene geometry (CPU-side)
 // --------------------------------------------------------------------------
 
@@ -66,6 +80,13 @@ void SceneManager::loadScene(VulkanContext& ctx, const std::string& sceneSource)
         // Populate SceneLights from glTF lights (after flattenScene extracted world transforms)
         populateLightsFromGltf(m_gltfScene);
         std::cout << "[info] Scene lights: " << m_lights.size() << std::endl;
+
+        // Detect gaussian splatting data
+        if (m_gltfScene.splat_data.has_splats) {
+            std::cout << "[info] Scene contains gaussian splat data: "
+                      << m_gltfScene.splat_data.num_splats << " splats (SH degree "
+                      << m_gltfScene.splat_data.sh_degree << ")" << std::endl;
+        }
     } else if (sceneSource == "sphere" || sceneSource == "triangle" ||
                sceneSource == "fullscreen") {
         // For sphere, generate geometry; for triangle/fullscreen, vertices may be empty
@@ -1611,6 +1632,11 @@ std::set<std::string> SceneManager::detectSceneFeatures() const {
         }
     }
 
+    // Detect gaussian splatting data
+    if (m_gltfScene.splat_data.has_splats) {
+        features.insert("has_gaussian_splatting");
+    }
+
     if (!features.empty()) {
         std::cout << "[info] Detected scene features:";
         for (auto& f : features) std::cout << " " << f;
@@ -1746,4 +1772,10 @@ void SceneManager::cleanup(VulkanContext& ctx) {
     Scene::destroyTexture(ctx.allocator, ctx.device, m_defaultNormalTexture);
 
     Scene::destroyMesh(ctx.allocator, m_mesh);
+
+    // Cleanup splat renderer
+    if (splat_renderer_) {
+        splat_renderer_->cleanup(ctx);
+        splat_renderer_.reset();
+    }
 }

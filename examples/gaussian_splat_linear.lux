@@ -1,0 +1,14 @@
+// Gaussian Splatting — linear color space (no sRGB conversion)
+
+splat GaussianCloud {
+    sh_degree: 0,
+    kernel: ellipse,
+    color_space: linear,
+    sort: camera_distance,
+    alpha_cutoff: 0.004,
+}
+
+pipeline SplatViewer {
+    mode: gaussian_splat,
+    splat: GaussianCloud,
+}

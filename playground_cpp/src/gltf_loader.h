@@ -129,6 +129,17 @@ struct GltfLight {
     glm::vec3 direction{0.0f, 0.0f, -1.0f};
 };
 
+struct GaussianSplatData {
+    std::vector<float> positions;    // xyz packed as vec4 (w=1)
+    std::vector<float> rotations;    // xyzw quaternion per splat
+    std::vector<float> scales;       // log-space xyz per splat
+    std::vector<float> opacities;    // logit-space per splat
+    std::vector<std::vector<float>> sh_coefficients; // per-degree SH coefficients
+    uint32_t sh_degree = 0;
+    uint32_t num_splats = 0;
+    bool has_splats = false;
+};
+
 struct GltfScene {
     std::vector<GltfMesh> meshes;
     std::vector<GltfMaterial> materials;
@@ -138,6 +149,8 @@ struct GltfScene {
     std::vector<int> rootNodes;
     // Maps glTF mesh index -> (start, count) in meshes vec (one entry per primitive)
     std::vector<std::pair<size_t, size_t>> meshPrimitiveRanges;
+    // KHR_gaussian_splatting data (populated when extension is present)
+    GaussianSplatData splat_data;
 };
 
 struct DrawItem {

@@ -24,7 +24,9 @@ from luxc.parser.ast_nodes import (
     RayPayloadDecl, HitAttributeDecl, AccelDecl, StorageImageDecl,
     StorageBufferDecl, BindlessTextureArrayDecl, IndexAccess, FieldAccess,
     IfStmt, TaskPayloadDecl, PropertiesBlock,
+    SplatDecl,
 )
+from luxc.expansion.splat_expander import expand_splat_pipeline
 
 
 # --- Schedule strategy tables ---
@@ -85,6 +87,7 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
     environments = {e.name: e for e in module.environments}
     procedurals = {p.name: p for p in module.procedurals}
     lightings = {l.name: l for l in module.lightings}
+    splats = {s.name: s for s in getattr(module, 'splats', [])}
 
     for pipeline in module.pipelines:
         # Filter: skip pipelines that don't match the filter
@@ -92,6 +95,7 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
             continue
         geo_name = None
         surf_name = None
+        splat_name = None
         schedule_name = None
         env_name = None
         lighting_name = None
@@ -124,6 +128,9 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
             elif member.name == "lighting":
                 if isinstance(member.value, VarRef):
                     lighting_name = member.value.name
+            elif member.name == "splat":
+                if isinstance(member.value, VarRef):
+                    splat_name = member.value.name
             elif member.name == "use_task_shader":
                 if isinstance(member.value, VarRef) and member.value.name == "true":
                     use_task_shader = True
@@ -154,6 +161,16 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
                 surface, geometry, module, schedule, pipeline, use_task_shader,
                 bindless=bindless, lighting=lighting,
             )
+            module.stages.extend(stages)
+        elif mode == "gaussian_splat":
+            # Gaussian splatting pipeline expansion
+            splat = splats.get(splat_name) if splat_name else None
+            if splat is None:
+                raise ValueError(
+                    f"Pipeline '{pipeline.name}' has mode: gaussian_splat but no "
+                    f"splat declaration found (splat: {splat_name})"
+                )
+            stages = expand_splat_pipeline(splat, pipeline, module)
             module.stages.extend(stages)
         elif mode == "compute":
             pass  # Compute stages are written directly, no expansion needed

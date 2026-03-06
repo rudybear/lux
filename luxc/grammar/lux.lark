@@ -18,6 +18,7 @@ start: module_item*
             | lighting_decl
             | features_decl
             | conditional_block
+            | splat_decl
 
 // --- Top-level declarations ---
 
@@ -66,6 +67,12 @@ layer_arg: IDENT ":" expr
 
 surface_properties: "properties" IDENT "{" properties_field ("," properties_field)* ","? "}"
 properties_field: IDENT ":" TYPE_NAME ("=" expr)?
+
+// --- Splat declarations (Gaussian splatting) ---
+
+splat_decl: "splat" IDENT "{" splat_item ("," splat_item)* ","? "}"
+?splat_item: splat_member | surface_properties
+splat_member: IDENT ":" expr
 
 // --- Geometry declarations ---
 

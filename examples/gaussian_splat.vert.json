@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "source": "gaussian_splat.lux",
+  "stage": "vertex",
+  "execution_model": "Vertex",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [
+    {
+      "name": "frag_conic",
+      "type": "vec3",
+      "location": 0
+    },
+    {
+      "name": "frag_color",
+      "type": "vec4",
+      "location": 1
+    },
+    {
+      "name": "frag_center",
+      "type": "vec2",
+      "location": 2
+    },
+    {
+      "name": "frag_offset",
+      "type": "vec2",
+      "location": 3
+    }
+  ],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "projected_center",
+        "element_type": "vec4",
+        "stage_flags": [
+          "vertex"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "projected_conic",
+        "element_type": "vec4",
+        "stage_flags": [
+          "vertex"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_buffer",
+        "name": "projected_color",
+        "element_type": "vec4",
+        "stage_flags": [
+          "vertex"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "storage_buffer",
+        "name": "sorted_indices",
+        "element_type": "uint",
+        "stage_flags": [
+          "vertex"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "push",
+      "fields": [
+        {
+          "name": "screen_size",
+          "type": "vec2",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "visible_count",
+          "type": "uint",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "alpha_cutoff",
+          "type": "scalar",
+          "offset": 12,
+          "size": 4
+        }
+      ],
+      "size": 16,
+      "stage_flags": [
+        "vertex"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "gaussian_splatting": {
+    "splat_name": "GaussianCloud"
+  },
+  "performance_hints": {
+    "instruction_count": 185,
+    "alu_ops": 25,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

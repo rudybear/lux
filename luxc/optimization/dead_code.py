@@ -49,6 +49,9 @@ def _dce_function(func: FunctionDef, stage: StageBlock | None) -> None:
         # Builtin variables that are implicitly outputs
         if stage.stage_type == "vertex":
             protected_vars.add("builtin_position")
+        # Storage buffer writes are side effects — protect from DCE
+        for sb in stage.storage_buffers:
+            protected_vars.add(sb.name)
 
     # Iterate until no changes
     for _ in range(20):  # safety bound

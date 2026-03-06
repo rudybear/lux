@@ -79,6 +79,7 @@ if(Vulkan_FOUND)
         src/gltf_loader.cpp
         src/mesh_renderer.cpp
         src/meshlet.cpp
+        src/splat_renderer.cpp
     )
 
     add_executable(${PROJECT_NAME} ${SOURCES})

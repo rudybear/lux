@@ -435,6 +435,31 @@ def generate_reflection(
     if half_count > 0:
         result["half_precision_functions"] = half_count
 
+    # --- Gaussian splatting metadata ---
+    splat_config = getattr(stage, '_splat_config', None)
+    if splat_config is not None:
+        gs_meta = {
+            "splat_name": getattr(stage, '_splat_name', ''),
+            "sh_degree": splat_config.get("sh_degree", 0),
+            "kernel": splat_config.get("kernel", "ellipse"),
+            "color_space": splat_config.get("color_space", "srgb"),
+            "sort": splat_config.get("sort", "camera_distance"),
+            "alpha_cutoff": splat_config.get("alpha_cutoff", 0.004),
+        }
+        if stage.stage_type == "compute":
+            gs_meta["workgroup_size"] = [256, 1, 1]
+            # List buffer names for engine binding
+            gs_meta["input_buffers"] = [sb.name for sb in stage.storage_buffers
+                                        if sb.name.startswith("splat_")]
+            gs_meta["output_buffers"] = [sb.name for sb in stage.storage_buffers
+                                         if sb.name.startswith("projected_") or
+                                         sb.name in ("sort_keys", "visible_count")]
+        result["gaussian_splatting"] = gs_meta
+    elif getattr(stage, '_splat_name', None):
+        result["gaussian_splatting"] = {
+            "splat_name": stage._splat_name,
+        }
+
     return result
 
 

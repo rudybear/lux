@@ -46,19 +46,20 @@ See [full gallery](docs/gallery.md) for all demos: mesh shaders, compute, SDF, n
 
 **Language**
 - Declarative `surface` + `geometry` + `pipeline` blocks expand to full shader stages
+- `splat` declarations for Gaussian splatting — one block generates compute preprocess + instanced vertex/fragment
 - Layered surfaces with `layers [base, normal_map, sheen, coat, emission]` — automatic energy conservation, raster + RT from one declaration
 - `lighting` blocks separate illumination from material response; multi-light with shadows
 - Custom `@layer` functions, compile-time `features` with `if` guards, material `properties` UBO pipeline
 - Semantic types (`type strict WorldPos = vec3`) prevent coordinate-space mixing at compile time
 - Algorithm/schedule separation, math-first syntax (`scalar` not `float`), auto-layout
 - `for`/`while` loops, `break`/`continue`, `@[unroll]` hints, native integer arithmetic
-- 90+ stdlib functions across 12 modules: BRDF, SDF, noise, color, IBL, lighting, shadow, toon, debug...
+- 90+ stdlib functions across 13 modules: BRDF, SDF, noise, color, IBL, lighting, shadow, toon, Gaussian, debug...
 
 **Compiler**
 - Built-in optimizer: mem2reg, AST-level inlining, CSE, constant vector hoisting — **21.7% fewer instructions than hand-written GLSL** out of the box
 - Auto-type precision: `--auto-type=relaxed` emits RelaxedPrecision for 2x mobile throughput
 - `@differentiable` automatic differentiation, GLSL transpiler (`--transpile`)
-- Ray tracing (`mode: raytrace`), mesh shaders (`mode: mesh_shader`), compute shaders
+- Ray tracing (`mode: raytrace`), mesh shaders (`mode: mesh_shader`), compute shaders, Gaussian splatting (`mode: gaussian_splat`)
 - Bindless rendering (`--bindless`), hot reload (`--watch`), feature permutations (`--all-permutations`)
 - 39 GLSL.std.450 builtins + texture sampling (7 variants) + image queries + RT/mesh/compute intrinsics
 
@@ -221,7 +222,7 @@ Alternative path (--debug-run):
 luxc/            Compiler (parser, type checker, codegen, optimizer, autotype, debug)
 docs/            Documentation (language ref, gallery, usage, rendering engines)
 examples/        Example .lux shaders
-tests/           Test suite (981+ tests)
+tests/           Test suite (1036+ tests)
 playground/      Python/wgpu rendering engine + screenshot tests
 playground_cpp/  C++/Vulkan + Metal rendering engines
 playground_rust/ Rust/Vulkan rendering engine
@@ -264,6 +265,7 @@ See [full project structure](docs/project-structure.md) for the complete directo
 | `compute_histogram.lux` | Shared memory: per-workgroup histogram with `shared uint[256]` + `atomic_add` |
 | `compute_reduction.lux` | Parallel reduction: barrier-synchronized tree sum with shared memory |
 | `debug_features_demo.lux` | Debug instrumentation: `debug_print`, `assert`, `@[debug]` blocks, semantic types, `any_nan`/`any_inf` |
+| `gaussian_splat.lux` | Gaussian splatting: `splat` declaration, 3-stage pipeline (compute + vertex + fragment) |
 | `debug_playground.lux` | CPU debugger playground: PBR with intentional NaN trap, 8 labeled stages for breakpoint exploration |
 
 ## Running Tests
@@ -271,7 +273,7 @@ See [full project structure](docs/project-structure.md) for the complete directo
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 981+ tests
+# 1036+ tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.

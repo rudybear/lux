@@ -352,6 +352,80 @@ GltfScene loadGltf(const std::string& path) {
         scene.meshPrimitiveRanges.push_back({primStart, scene.meshes.size() - primStart});
     }
 
+    // --- KHR_gaussian_splatting ---
+    // Scan primitives for POINTS topology with gaussian splatting attributes.
+    // The KHR_gaussian_splatting extension encodes splat data as POINTS primitives
+    // with custom attributes: POSITION (vec3), _ROTATION (vec4 quaternion),
+    // _SCALE (vec3 log-space), _OPACITY (scalar logit-space), and
+    // _SH_0.._SH_N for spherical harmonics coefficients.
+    for (size_t mi = 0; mi < data->meshes_count; mi++) {
+        auto& mesh = data->meshes[mi];
+        for (size_t pi = 0; pi < mesh.primitives_count; pi++) {
+            auto& prim = mesh.primitives[pi];
+            if (prim.type != cgltf_primitive_type_points) continue;
+
+            // Check for gaussian splatting attributes (_ROTATION or _SCALE)
+            bool hasRotation = false, hasScale = false;
+            for (size_t ai = 0; ai < prim.attributes_count; ai++) {
+                if (prim.attributes[ai].name) {
+                    std::string attrName(prim.attributes[ai].name);
+                    if (attrName == "_ROTATION") hasRotation = true;
+                    if (attrName == "_SCALE") hasScale = true;
+                }
+            }
+
+            if (!hasRotation && !hasScale) continue;
+
+            std::cout << "[info] Detected KHR_gaussian_splatting primitive in mesh: "
+                      << (mesh.name ? mesh.name : "unnamed") << std::endl;
+
+            // Parse all gaussian splatting attributes
+            for (size_t ai = 0; ai < prim.attributes_count; ai++) {
+                auto& attr = prim.attributes[ai];
+                if (!attr.name || !attr.data) continue;
+                std::string attrName(attr.name);
+
+                if (attr.type == cgltf_attribute_type_position) {
+                    // Pack positions as vec4 (xyz, w=1)
+                    auto pos3 = readFloatAccessor(attr.data);
+                    scene.splat_data.num_splats = static_cast<uint32_t>(attr.data->count);
+                    scene.splat_data.positions.resize(attr.data->count * 4);
+                    for (size_t si = 0; si < attr.data->count; si++) {
+                        scene.splat_data.positions[si * 4 + 0] = pos3[si * 3 + 0];
+                        scene.splat_data.positions[si * 4 + 1] = pos3[si * 3 + 1];
+                        scene.splat_data.positions[si * 4 + 2] = pos3[si * 3 + 2];
+                        scene.splat_data.positions[si * 4 + 3] = 1.0f;
+                    }
+                } else if (attrName == "_ROTATION") {
+                    scene.splat_data.rotations = readFloatAccessor(attr.data);
+                } else if (attrName == "_SCALE") {
+                    scene.splat_data.scales = readFloatAccessor(attr.data);
+                } else if (attrName == "_OPACITY") {
+                    scene.splat_data.opacities = readFloatAccessor(attr.data);
+                } else if (attrName.rfind("_SH_", 0) == 0) {
+                    // Spherical harmonics: _SH_0, _SH_1, ... _SH_N
+                    int degree = std::stoi(attrName.substr(4));
+                    if (degree >= static_cast<int>(scene.splat_data.sh_coefficients.size())) {
+                        scene.splat_data.sh_coefficients.resize(degree + 1);
+                    }
+                    scene.splat_data.sh_coefficients[degree] = readFloatAccessor(attr.data);
+                    // sh_degree tracks the max degree (0=DC only, 1=degree 1, etc.)
+                    if (static_cast<uint32_t>(degree) > scene.splat_data.sh_degree) {
+                        scene.splat_data.sh_degree = static_cast<uint32_t>(degree);
+                    }
+                }
+            }
+
+            scene.splat_data.has_splats = true;
+            std::cout << "[info] Gaussian splats: " << scene.splat_data.num_splats
+                      << " splats, SH degree " << scene.splat_data.sh_degree << std::endl;
+
+            // Only process the first gaussian splatting primitive
+            break;
+        }
+        if (scene.splat_data.has_splats) break;
+    }
+
     // --- Nodes ---
     for (size_t ni = 0; ni < data->nodes_count; ni++) {
         auto& node = data->nodes[ni];

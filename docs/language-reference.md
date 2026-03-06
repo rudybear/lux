@@ -450,6 +450,38 @@ compute {
 
 Supported formats: `rgba8`, `rgba16f`, `rgba32f`, `rg16f`, `rg32f`, `r16f`, `r32f`, `r32i`, `r32ui`, `r11g11b10f`.
 
+### Gaussian Splatting
+
+First-class 3D Gaussian splatting via the `splat` declaration. One block generates a complete 3-stage pipeline: compute preprocess (projection, covariance, SH evaluation, sort keys), instanced vertex shader (sorted quad rendering), and fragment shader (2D Gaussian evaluation with alpha compositing).
+
+```
+splat GaussianCloud {
+    sh_degree: 0,        // SH bands: 0 (DC only), 1, 2, or 3
+    kernel: ellipse,     // Gaussian kernel shape
+    color_space: srgb,   // Output color space
+    sort: camera_distance,  // Sorting method
+    alpha_cutoff: 0.004, // Minimum alpha threshold (OpKill below this)
+}
+
+pipeline SplatViewer {
+    mode: gaussian_splat,
+    splat: GaussianCloud,
+}
+```
+
+The compiler generates:
+- **Compute shader** (workgroup 256): transforms splat positions to screen space, computes 3D→2D covariance matrices via Jacobian projection, evaluates spherical harmonics for view-dependent color, and writes sort keys for depth ordering
+- **Vertex shader**: reads sorted splat data and emits instanced screen-space quads (6 vertices per splat) sized by the 2D Gaussian radius
+- **Fragment shader**: evaluates the 2D Gaussian kernel, applies alpha cutoff with `discard` (OpKill), and outputs premultiplied alpha for back-to-front compositing
+
+Push constants provide camera matrices, screen dimensions, focal lengths, splat count, and SH degree. SSBOs carry per-splat input data (positions, rotations, scales, opacities, SH coefficients) and intermediate projected data.
+
+SH degrees 0–3 are supported (1/4/9/16 coefficient buffers). The stdlib module `gaussian.lux` provides quaternion-to-rotation, 3D/2D covariance, Gaussian evaluation, and quad radius helpers.
+
+Reflection JSON includes a `gaussian_splatting` section with SH degree, kernel type, color space, and input/output buffer lists for engine integration.
+
+All three rendering engines (C++/Vulkan, Rust/ash, Python/numpy) support Gaussian splat rendering with CPU-side depth sorting and instanced draw.
+
 ### Bindless Rendering
 
 The `--bindless` flag enables uber-shaders with runtime descriptor arrays, eliminating per-material descriptor switching:
@@ -715,6 +747,7 @@ Import modules with `import <name>;` — functions are inlined at the call site.
 | `shadow` | 4 | Basic shadow sampling, PCF4 shadow filtering, cascade selection, shadow UV computation |
 | `toon` | 1 | Cartoon cel-shading with quantized NdotL + rim lighting (`@layer` function) |
 | `compositing` | 2 | IBL multi-scattering (Fdez-Aguera 2019), layer compositing helpers |
+| `gaussian` | 6 | SH constants (degrees 0–3), quaternion-to-rotation, 3D/2D covariance, Gaussian 2D eval, quad radius |
 | `debug` | 5 | Normal visualization, depth grayscale, scalar heatmap, index coloring, UV checkerboard |
 
 ### Built-in Functions

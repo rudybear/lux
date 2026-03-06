@@ -20,6 +20,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <chrono>
+#include <fstream>
 
 namespace fs = std::filesystem;
 
@@ -365,9 +366,27 @@ static std::string resolveDefaultPipeline(const std::string& scene) {
     return "examples/pbr_basic";
 }
 
+static bool hasGaussianSplattingKey(const std::string& base) {
+    // Check for compute shader presence (.comp.spv) as splat render indicator
+    if (fs::exists(base + ".comp.spv")) return true;
+    // Check reflection JSON for gaussian_splatting key
+    std::string jsonPath = base + ".reflect.json";
+    if (fs::exists(jsonPath)) {
+        std::ifstream f(jsonPath);
+        if (f.is_open()) {
+            std::string content((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+            if (content.find("gaussian_splatting") != std::string::npos) return true;
+        }
+    }
+    return false;
+}
+
 static std::string detectRenderPath(const std::string& base, const std::string& forceMode = "") {
     if (forceMode == "rt" && fs::exists(base + ".rgen.spv")) return "rt";
     if (forceMode == "mesh" && fs::exists(base + ".mesh.spv") && fs::exists(base + ".frag.spv")) return "mesh";
+    // Detect gaussian splatting compute pipeline
+    if (hasGaussianSplattingKey(base)) return "splat";
     // Prefer raster over RT when both exist (raster supports per-material draw calls)
     if (fs::exists(base + ".vert.spv") && fs::exists(base + ".frag.spv")) return "raster";
     if (fs::exists(base + ".mesh.spv") && fs::exists(base + ".frag.spv")) return "mesh";
@@ -384,9 +403,11 @@ static int runHeadless(const CLIOptions& opts) {
     std::string renderPath = detectRenderPath(opts.shaderBase, opts.forceMode);
     bool needRT = (renderPath == "rt");
     bool needMesh = (renderPath == "mesh");
+    bool needSplat = (renderPath == "splat");
     VkPipelineStageFlags dstStage = needRT
         ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
-        : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        : (needSplat ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                     : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
     std::cout << "[info] Headless render: scene=\"" << opts.sceneSource
               << "\" pipeline=\"" << opts.shaderBase
@@ -494,30 +515,46 @@ static int runHeadless(const CLIOptions& opts) {
             // (renderers handle per-material permutation selection internally)
         }
 
-        std::unique_ptr<IRenderer> renderer;
-        if (needRT) {
-            auto rt = std::make_unique<RTRenderer>();
-            rt->init(ctx, resolvedBase + ".rgen.spv", resolvedBase + ".rmiss.spv",
-                     resolvedBase + ".rchit.spv", opts.width, opts.height, scene);
-            renderer = std::move(rt);
-        } else if (needMesh) {
-            auto meshR = std::make_unique<MeshRenderer>();
-            meshR->init(ctx, scene, resolvedBase, opts.width, opts.height);
-            renderer = std::move(meshR);
-        } else {
-            auto raster = std::make_unique<RasterRenderer>();
-            raster->init(ctx, scene, opts.shaderBase, renderPath, opts.width, opts.height);
-            renderer = std::move(raster);
+        // Initialize splat renderer if scene has gaussian splat data
+        if (needSplat && scene.hasSplatData()) {
+            scene.initSplatRenderer(ctx, resolvedBase, opts.width, opts.height);
         }
 
-        renderer->render(ctx);
+        std::unique_ptr<IRenderer> renderer;
+        if (needSplat && scene.getSplatRenderer()) {
+            // Gaussian splatting compute path: use SplatRenderer directly
+            auto* splatR = scene.getSplatRenderer();
+            splatR->render(ctx);
 
-        Screenshot::saveImageToPNG(ctx, renderer->getOutputImage(), renderer->getOutputFormat(),
-                                    renderer->getWidth(), renderer->getHeight(),
-                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, opts.output);
+            Screenshot::saveImageToPNG(ctx, splatR->getOutputImage(), splatR->getOutputFormat(),
+                                        splatR->getWidth(), splatR->getHeight(),
+                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, opts.output);
+            scene.cleanup(ctx);
+        } else {
+            if (needRT) {
+                auto rt = std::make_unique<RTRenderer>();
+                rt->init(ctx, resolvedBase + ".rgen.spv", resolvedBase + ".rmiss.spv",
+                         resolvedBase + ".rchit.spv", opts.width, opts.height, scene);
+                renderer = std::move(rt);
+            } else if (needMesh) {
+                auto meshR = std::make_unique<MeshRenderer>();
+                meshR->init(ctx, scene, resolvedBase, opts.width, opts.height);
+                renderer = std::move(meshR);
+            } else {
+                auto raster = std::make_unique<RasterRenderer>();
+                raster->init(ctx, scene, opts.shaderBase, renderPath, opts.width, opts.height);
+                renderer = std::move(raster);
+            }
 
-        renderer->cleanup(ctx);
-        scene.cleanup(ctx);
+            renderer->render(ctx);
+
+            Screenshot::saveImageToPNG(ctx, renderer->getOutputImage(), renderer->getOutputFormat(),
+                                        renderer->getWidth(), renderer->getHeight(),
+                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, opts.output);
+
+            renderer->cleanup(ctx);
+            scene.cleanup(ctx);
+        }
     } catch (const std::exception& e) {
         std::cerr << "[error] Rendering failed: " << e.what() << std::endl;
         ctx.cleanup();
@@ -542,9 +579,11 @@ static int runInteractive(CLIOptions opts) {
     std::string renderPath = detectRenderPath(opts.shaderBase, opts.forceMode);
     bool needRT = (renderPath == "rt");
     bool needMesh = (renderPath == "mesh");
+    bool needSplat = (renderPath == "splat");
     VkPipelineStageFlags dstStage = needRT
         ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
-        : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        : (needSplat ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                     : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
     std::cout << "[info] Interactive render: scene=\"" << opts.sceneSource
               << "\" pipeline=\"" << opts.shaderBase
@@ -627,6 +666,7 @@ static int runInteractive(CLIOptions opts) {
     std::unique_ptr<IRenderer> renderer;
     bool useRT = needRT;
     bool useMesh = needMesh;
+    bool useSplat = needSplat;
 
     // Track whether this is a Sponza scene for torch animation
     bool useSponzaLights = opts.sponzaLights;
@@ -699,6 +739,11 @@ static int runInteractive(CLIOptions opts) {
             }
         }
 
+        // Initialize splat renderer if scene has gaussian splat data
+        if (useSplat && scene.hasSplatData()) {
+            scene.initSplatRenderer(ctx, resolvedBase, opts.width, opts.height);
+        }
+
         if (useRT) {
             auto rt = std::make_unique<RTRenderer>();
             std::string rgenPath = resolvedBase + ".rgen.spv";
@@ -712,7 +757,7 @@ static int runInteractive(CLIOptions opts) {
             meshR->init(ctx, scene, resolvedBase,
                         opts.width, opts.height);
             renderer = std::move(meshR);
-        } else {
+        } else if (!useSplat) {
             auto raster = std::make_unique<RasterRenderer>();
             raster->init(ctx, scene, opts.shaderBase, renderPath,
                          opts.width, opts.height);
@@ -816,12 +861,43 @@ static int runInteractive(CLIOptions opts) {
         {
             float aspect = static_cast<float>(ctx.swapchainExtent.width) /
                            static_cast<float>(ctx.swapchainExtent.height);
-            renderer->updateCamera(ctx, g_orbit.getEye(), g_orbit.target,
-                                   g_orbit.up, g_orbit.fovY, aspect,
-                                   g_orbit.nearPlane, g_orbit.farPlane);
+            if (renderer) {
+                renderer->updateCamera(ctx, g_orbit.getEye(), g_orbit.target,
+                                       g_orbit.up, g_orbit.fovY, aspect,
+                                       g_orbit.nearPlane, g_orbit.farPlane);
+            }
+            if (useSplat && scene.getSplatRenderer()) {
+                scene.getSplatRenderer()->updateCamera(g_orbit.getEye(), g_orbit.target,
+                                                        g_orbit.up, g_orbit.fovY, aspect,
+                                                        g_orbit.nearPlane, g_orbit.farPlane);
+            }
         }
 
-        if (useRT) {
+        if (useSplat && scene.getSplatRenderer()) {
+            // Gaussian splatting compute path: render to storage image and blit to swapchain
+            scene.getSplatRenderer()->render(ctx);
+
+            rtBlitCmd = ctx.beginSingleTimeCommands();
+            VkCommandBuffer cmd = rtBlitCmd;
+
+            scene.getSplatRenderer()->blitToSwapchain(ctx, cmd,
+                ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
+
+            vkEndCommandBuffer(cmd);
+
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSubmitInfo submitInfo = {};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.waitSemaphoreCount = 1;
+            submitInfo.pWaitSemaphores = &imageAvailableSem;
+            submitInfo.pWaitDstStageMask = &waitStage;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &cmd;
+            submitInfo.signalSemaphoreCount = 1;
+            submitInfo.pSignalSemaphores = &renderFinishedSem;
+
+            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, inFlightFence);
+        } else if (useRT) {
             // RT rendering: render to storage image (synchronous)
             renderer->render(ctx);
 
@@ -892,7 +968,9 @@ static int runInteractive(CLIOptions opts) {
     // Cleanup
     vkDeviceWaitIdle(ctx.device);
 
-    renderer->cleanup(ctx);
+    if (renderer) {
+        renderer->cleanup(ctx);
+    }
     scene.cleanup(ctx);
 
     vkDestroySemaphore(ctx.device, imageAvailableSem, nullptr);

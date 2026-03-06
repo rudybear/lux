@@ -12,7 +12,7 @@ from luxc.parser.ast_nodes import (
     SurfaceDecl, GeometryDecl, PipelineDecl, ScheduleDecl,
     EnvironmentDecl, LightingDecl, ProceduralDecl,
     ConstDecl, FunctionDef, StructDef, TypeAlias, ImportDecl,
-    StageBlock,
+    StageBlock, SplatDecl,
 )
 
 
@@ -191,6 +191,8 @@ def _process_conditional_blocks(module: Module, active: set[str]) -> None:
                     module.lightings.append(item)
                 elif isinstance(item, FeaturesDecl):
                     module.features_decls.append(item)
+                elif isinstance(item, SplatDecl):
+                    module.splats.append(item)
 
     # Clear the conditional blocks list
     module._conditional_blocks = []

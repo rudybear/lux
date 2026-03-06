@@ -9,7 +9,7 @@ from luxc.parser.ast_nodes import (
     TypeAlias, ImportDecl, SurfaceDecl, GeometryDecl, PipelineDecl,
     DebugPrintStmt, AssertStmt, DebugBlock,
     ForStmt, WhileStmt, BreakStmt, ContinueStmt,
-    SharedDecl,
+    SharedDecl, DiscardStmt,
 )
 from luxc.builtins.types import (
     LuxType, resolve_type, TYPE_MAP, SCALAR, BOOL, VOID,
@@ -135,8 +135,8 @@ class TypeChecker:
         # Register builtin_position for vertex shaders
         if stage.stage_type == "vertex":
             scope.define(Symbol("builtin_position", VEC4, "builtin_position"))
-            scope.define(Symbol("vertex_index", resolve_type("int"), "builtin"))
-            scope.define(Symbol("instance_index", resolve_type("int"), "builtin"))
+            scope.define(Symbol("vertex_index", resolve_type("uint"), "builtin"))
+            scope.define(Symbol("instance_index", resolve_type("uint"), "builtin"))
 
         # Register uniform block fields as directly accessible
         for ub in stage.uniforms:
@@ -307,9 +307,13 @@ class TypeChecker:
                     )
 
         elif isinstance(stmt, ReturnStmt):
-            vt = self._check_expr(stmt.value, scope)
-            if ret_type != VOID and vt.name != ret_type.name:
-                raise TypeCheckError(f"Return type mismatch: expected {ret_type.name}, got {vt.name}")
+            if stmt.value is not None:
+                vt = self._check_expr(stmt.value, scope)
+                if ret_type != VOID and vt.name != ret_type.name:
+                    raise TypeCheckError(f"Return type mismatch: expected {ret_type.name}, got {vt.name}")
+
+        elif isinstance(stmt, DiscardStmt):
+            pass  # Fragment shader discard — no type checking needed
 
         elif isinstance(stmt, IfStmt):
             ct = self._check_expr(stmt.condition, scope)

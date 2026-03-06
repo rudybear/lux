@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from luxc.parser.ast_nodes import (
     Module, FunctionDef, ConstDecl,
-    LetStmt, AssignStmt, ReturnStmt, IfStmt, ExprStmt,
+    LetStmt, AssignStmt, ReturnStmt, IfStmt, ExprStmt, DiscardStmt,
     NumberLit, BoolLit, VarRef, BinaryOp, UnaryOp, CallExpr,
     ConstructorExpr, FieldAccess, SwizzleAccess, IndexAccess, TernaryExpr,
     ForStmt, WhileStmt,
@@ -206,6 +206,8 @@ def _fold_stmts(stmts: list, const_env: dict) -> list:
             result.append(stmt)
         elif isinstance(stmt, ReturnStmt):
             stmt.value = _try_fold_expr(stmt.value, const_env)
+            result.append(stmt)
+        elif isinstance(stmt, DiscardStmt):
             result.append(stmt)
         elif isinstance(stmt, ExprStmt):
             stmt.expr = _try_fold_expr(stmt.expr, const_env)

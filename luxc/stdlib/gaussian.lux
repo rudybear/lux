@@ -1,0 +1,178 @@
+// Lux Standard Library: Gaussian Splatting
+// Mathematical building blocks for 3D Gaussian splatting renderers
+
+// --- Constants ---
+const PI: scalar = 3.14159265358979;
+const SQRT_PI: scalar = 1.77245385090552;
+
+// --- Spherical Harmonics Constants (Condon-Shortley phase) ---
+// Degree 0
+const SH_C0: scalar = 0.28209479177388;
+
+// Degree 1
+const SH_C1: scalar = 0.48860251190292;
+
+// Degree 2
+const SH_C2_0: scalar = 1.09254843059208;
+const SH_C2_1: scalar = 1.09254843059208;
+const SH_C2_2: scalar = 0.31539156525252;
+const SH_C2_3: scalar = 1.09254843059208;
+const SH_C2_4: scalar = 0.54627421529604;
+
+// Degree 3
+const SH_C3_0: scalar = 0.59004358992664;
+const SH_C3_1: scalar = 2.89061144264055;
+const SH_C3_2: scalar = 0.45704579946447;
+const SH_C3_3: scalar = 0.37317633259012;
+const SH_C3_4: scalar = 0.45704579946447;
+const SH_C3_5: scalar = 1.44530572132028;
+const SH_C3_6: scalar = 0.59004358992664;
+
+// --- SH Evaluation Functions ---
+
+fn eval_sh_degree_0(sh0: vec3) -> vec3 {
+    return SH_C0 * sh0;
+}
+
+fn eval_sh_degree_1(dir: vec3, sh1: vec3, sh2: vec3, sh3: vec3) -> vec3 {
+    let x: scalar = dir.x;
+    let y: scalar = dir.y;
+    let z: scalar = dir.z;
+    return SH_C1 * (-y * sh1 + z * sh2 - x * sh3);
+}
+
+fn eval_sh_degree_2(dir: vec3, sh4: vec3, sh5: vec3, sh6: vec3, sh7: vec3, sh8: vec3) -> vec3 {
+    let x: scalar = dir.x;
+    let y: scalar = dir.y;
+    let z: scalar = dir.z;
+    let xx: scalar = x * x;
+    let yy: scalar = y * y;
+    let zz: scalar = z * z;
+    return SH_C2_0 * x * y * sh4
+         + SH_C2_1 * y * z * sh5
+         + SH_C2_2 * (2.0 * zz - xx - yy) * sh6
+         + SH_C2_3 * x * z * sh7
+         + SH_C2_4 * (xx - yy) * sh8;
+}
+
+fn eval_sh_degree_3(dir: vec3, sh9: vec3, sh10: vec3, sh11: vec3, sh12: vec3, sh13: vec3, sh14: vec3, sh15: vec3) -> vec3 {
+    let x: scalar = dir.x;
+    let y: scalar = dir.y;
+    let z: scalar = dir.z;
+    let xx: scalar = x * x;
+    let yy: scalar = y * y;
+    let zz: scalar = z * z;
+    return SH_C3_0 * y * (3.0 * xx - yy) * sh9
+         + SH_C3_1 * x * y * z * sh10
+         + SH_C3_2 * y * (4.0 * zz - xx - yy) * sh11
+         + SH_C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * sh12
+         + SH_C3_4 * x * (4.0 * zz - xx - yy) * sh13
+         + SH_C3_5 * z * (xx - yy) * sh14
+         + SH_C3_6 * x * (xx - 3.0 * yy) * sh15;
+}
+
+// --- Quaternion to Rotation Matrix ---
+
+fn quat_to_rotation(q: vec4) -> mat3 {
+    let r: scalar = q.x;
+    let i: scalar = q.y;
+    let j: scalar = q.z;
+    let k: scalar = q.w;
+    let ii: scalar = i * i;
+    let jj: scalar = j * j;
+    let kk: scalar = k * k;
+    let ij: scalar = i * j;
+    let ik: scalar = i * k;
+    let jk: scalar = j * k;
+    let ri: scalar = r * i;
+    let rj: scalar = r * j;
+    let rk: scalar = r * k;
+    let c0: vec3 = vec3(1.0 - 2.0 * (jj + kk), 2.0 * (ij + rk), 2.0 * (ik - rj));
+    let c1: vec3 = vec3(2.0 * (ij - rk), 1.0 - 2.0 * (ii + kk), 2.0 * (jk + ri));
+    let c2: vec3 = vec3(2.0 * (ik + rj), 2.0 * (jk - ri), 1.0 - 2.0 * (ii + jj));
+    return mat3(c0, c1, c2);
+}
+
+// --- 3D Covariance from Rotation + Scale ---
+// Returns 6 unique elements of symmetric 3x3 cov matrix as two vec3:
+//   cov_upper = (Σ00, Σ01, Σ02), cov_lower = (Σ11, Σ12, Σ22)
+
+fn compute_cov3d_upper(rot_c0: vec3, rot_c1: vec3, rot_c2: vec3, scale: vec3) -> vec3 {
+    // M = [rot_c0*sx, rot_c1*sy, rot_c2*sz], Σ = M*Mᵀ
+    let m0: vec3 = rot_c0 * scale.x;
+    let m1: vec3 = rot_c1 * scale.y;
+    let m2: vec3 = rot_c2 * scale.z;
+    // Σ00, Σ01, Σ02
+    return vec3(m0.x * m0.x + m1.x * m1.x + m2.x * m2.x,
+                m0.x * m0.y + m1.x * m1.y + m2.x * m2.y,
+                m0.x * m0.z + m1.x * m1.z + m2.x * m2.z);
+}
+
+fn compute_cov3d_lower(rot_c0: vec3, rot_c1: vec3, rot_c2: vec3, scale: vec3) -> vec3 {
+    let m0: vec3 = rot_c0 * scale.x;
+    let m1: vec3 = rot_c1 * scale.y;
+    let m2: vec3 = rot_c2 * scale.z;
+    // Σ11, Σ12, Σ22
+    return vec3(m0.y * m0.y + m1.y * m1.y + m2.y * m2.y,
+                m0.y * m0.z + m1.y * m1.z + m2.y * m2.z,
+                m0.z * m0.z + m1.z * m1.z + m2.z * m2.z);
+}
+
+// --- Project 3D Covariance to 2D Screen Space ---
+// cov_upper = (Σ00, Σ01, Σ02), cov_lower = (Σ11, Σ12, Σ22)
+// Returns vec3(a, b, c) = upper triangle of 2x2 screen covariance
+
+fn project_cov3d_to_cov2d(cov_upper: vec3, cov_lower: vec3, view_pos: vec3,
+                           focal_x: scalar, focal_y: scalar) -> vec3 {
+    let tx: scalar = view_pos.x / view_pos.z;
+    let ty: scalar = view_pos.y / view_pos.z;
+    let tz: scalar = view_pos.z;
+    let j00: scalar = focal_x / tz;
+    let j02: scalar = -focal_x * tx / tz;
+    let j11: scalar = focal_y / tz;
+    let j12: scalar = -focal_y * ty / tz;
+    // Σ is symmetric: Σ00=cu.x, Σ01=cu.y, Σ02=cu.z, Σ11=cl.x, Σ12=cl.y, Σ22=cl.z
+    // Row 0 of J*Σ: (j00*Σ00+j02*Σ02, j00*Σ01+j02*Σ12, j00*Σ02+j02*Σ22)
+    let t0: vec3 = vec3(j00 * cov_upper.x + j02 * cov_upper.z,
+                        j00 * cov_upper.y + j02 * cov_lower.y,
+                        j00 * cov_upper.z + j02 * cov_lower.z);
+    // Row 1 of J*Σ: (j11*Σ01+j12*Σ02, j11*Σ11+j12*Σ12, j11*Σ12+j12*Σ22)
+    let t1: vec3 = vec3(j11 * cov_upper.y + j12 * cov_upper.z,
+                        j11 * cov_lower.x + j12 * cov_lower.y,
+                        j11 * cov_lower.y + j12 * cov_lower.z);
+    // (J*Σ*Jᵀ) upper triangle
+    let a: scalar = t0.x * j00 + t0.z * j02;
+    let b: scalar = t0.x * 0.0 + t0.y * j11 + t0.z * j12;
+    let c: scalar = t1.y * j11 + t1.z * j12;
+    return vec3(a, b, c);
+}
+
+// --- Evaluate 2D Gaussian ---
+// cov2d stores upper triangle (a, b, c) of the 2x2 covariance matrix.
+
+fn eval_gaussian_2d(offset: vec2, cov2d: vec3) -> scalar {
+    let a: scalar = cov2d.x;
+    let b: scalar = cov2d.y;
+    let c: scalar = cov2d.z;
+    let det: scalar = a * c - b * b;
+    let inv_det: scalar = 1.0 / max(det, 0.000001);
+    let dx: scalar = offset.x;
+    let dy: scalar = offset.y;
+    let power: scalar = -0.5 * (c * dx * dx - 2.0 * b * dx * dy + a * dy * dy) * inv_det;
+    return exp(power);
+}
+
+// --- Screen-Space Quad Radius from 2D Covariance Eigenvalues ---
+// Returns the radius covering n_sigma standard deviations (typically 3).
+
+fn gaussian_quad_radius(cov2d: vec3, n_sigma: scalar) -> scalar {
+    let a: scalar = cov2d.x;
+    let b: scalar = cov2d.y;
+    let c: scalar = cov2d.z;
+    let trace: scalar = a + c;
+    let det: scalar = a * c - b * b;
+    let disc: scalar = max(trace * trace * 0.25 - det, 0.0);
+    let half_trace: scalar = trace * 0.5;
+    let lambda_max: scalar = half_trace + sqrt(disc);
+    return n_sigma * sqrt(max(lambda_max, 0.0));
+}

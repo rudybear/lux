@@ -49,6 +49,7 @@ luxc/
         io.py                # input loading (JSON, semantic defaults)
     expansion/
         surface_expander.py  # surface/geometry/pipeline expansion
+        splat_expander.py    # splat/gaussian_splat pipeline expansion (3-stage)
     features/
         __init__.py
         evaluator.py             # compile-time feature stripping
@@ -73,6 +74,7 @@ luxc/
         toon.lux             # @layer cartoon cel-shading + rim lighting
         compositing.lux      # IBL multi-scattering, layer compositing helpers
         debug.lux            # debug visualization helpers (normal, depth, heatmap, checkerboard)
+        gaussian.lux         # Gaussian splatting helpers (SH, covariance, quad radius)
     transpiler/
         glsl_ast.py          # GLSL AST nodes
         glsl_parser.py       # GLSL subset parser
@@ -109,6 +111,7 @@ examples/
     compute_histogram.lux    # shared memory: histogram + atomics
     compute_reduction.lux    # parallel reduction: barrier-synchronized sum
     debug_features_demo.lux  # debug_print, assert, @[debug], semantic types
+    gaussian_splat.lux       # Gaussian splatting: splat decl + 3-stage pipeline
     debug_playground.lux     # CPU debugger playground: PBR + NaN trap
     debug_playground_inputs.json  # custom input values for debug_playground
 playground/
@@ -120,10 +123,12 @@ playground/
     test_*.py                # screenshot tests (15 tests)
 assets/                      # glTF models, IBL maps (downloaded separately, gitignored)
 playground_cpp/
-    src/                     # native Vulkan C++ renderer (raster + RT + mesh, GLFW)
+    src/                     # native Vulkan C++ renderer (raster + RT + mesh + splat, GLFW)
+    src/splat_renderer.cpp/h # Gaussian splat renderer (compute + instanced draw)
     src/metal_*.cpp/h/mm     # native Metal renderer (raster + mesh, macOS, SPIRV-Cross)
 playground_rust/
-    src/                     # native Vulkan Rust renderer (ash, winit, raster + RT + mesh)
+    src/                     # native Vulkan Rust renderer (ash, winit, raster + RT + mesh + splat)
+    src/splat_renderer.rs    # Gaussian splat renderer (compute + instanced draw)
 run_interactive_cpp.bat      # launch interactive C++ raster viewer
 run_interactive_rust.bat     # launch interactive Rust raster viewer
 run_interactive_cpp_rt.bat   # launch interactive C++ RT viewer
@@ -135,6 +140,9 @@ run_mesh_headless_*.bat      # headless mesh shader rendering (C++ + Rust)
 run_mesh_headless_metal.sh   # headless Metal mesh shader rendering (macOS)
 run_mesh_interactive_*.bat   # interactive mesh shader viewers (C++ + Rust)
 run_mesh_interactive_metal.sh  # interactive Metal mesh shader viewer (macOS)
+run_splat_cpp.bat            # Gaussian splat viewer (C++)
+run_splat_rust.bat           # Gaussian splat viewer (Rust)
+run_splat_python.bat         # Gaussian splat viewer (Python)
 compile_gltf_*.bat           # compile + render glTF pipelines (forward, RT, layered)
 screenshots/                 # rendered gallery screenshots
 shadercache/                 # compiled SPV + reflection JSON (generated, gitignored)
@@ -159,9 +167,13 @@ tests/
     test_lighting_block.py      # P17.1 lighting block tests (21 tests)
     test_multi_light.py         # P17.2 multi-light + shadow tests (40 tests)
     test_debug_features.py      # P20 debug instrumentation + semantic types (22 tests)
-    test_debugger.py            # CPU shader debugger tests (40 tests: values, builtins, interpreter, batch mode)
-    test_autotype.py            # auto-type precision optimization tests (50 tests: intervals, heuristics, classifier, SPIR-V emission)
+    test_debugger.py            # CPU shader debugger tests (62 tests)
+    test_autotype.py            # auto-type precision optimization tests (50 tests)
+    test_gaussian_splatting.py  # Gaussian splatting tests (33 tests: parser, config, expansion, compilation)
 tools/
     generate_training_data.py
+    generate_test_splats.py  # generate test Gaussian splat .glb files (KHR_gaussian_splatting)
+    ply_to_gltf.py           # convert .ply splat files to glTF with KHR_gaussian_splatting
+    glb_to_ply.py            # convert KHR_gaussian_splatting .glb to standard .ply for external viewers
     visualize_brdf.py        # BRDF visualization CLI (compile + render + composite)
 ```

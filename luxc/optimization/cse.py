@@ -15,7 +15,7 @@ from typing import Any
 
 from luxc.parser.ast_nodes import (
     Module, FunctionDef, StageBlock,
-    LetStmt, AssignStmt, ReturnStmt, IfStmt, ExprStmt,
+    LetStmt, AssignStmt, ReturnStmt, IfStmt, ExprStmt, DiscardStmt,
     NumberLit, BoolLit, VarRef, BinaryOp, UnaryOp, CallExpr,
     ConstructorExpr, FieldAccess, SwizzleAccess, IndexAccess, TernaryExpr,
     ForStmt, WhileStmt, DebugPrintStmt, AssertStmt, DebugBlock,

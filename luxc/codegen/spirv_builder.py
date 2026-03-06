@@ -11,6 +11,7 @@ from luxc.parser.ast_nodes import (
     SharedDecl, SpecConstDecl,
     DebugPrintStmt, AssertStmt, DebugBlock,
     ForStmt, WhileStmt, BreakStmt, ContinueStmt,
+    DiscardStmt,
 )
 from luxc.codegen.spirv_types import TypeRegistry
 from luxc.codegen.glsl_ext import GLSL_STD_450, LUX_TO_GLSL
@@ -220,6 +221,27 @@ class SpvGenerator:
     def _next_label(self) -> str:
         self._label_counter += 1
         return f"%label_{self._label_counter}"
+
+    @staticmethod
+    def _block_terminated(lines: list[str]) -> bool:
+        """Check if a list of SPIR-V lines ends with a block terminator."""
+        _TERMINATORS = ("OpReturn", "OpReturnValue", "OpKill",
+                        "OpBranch", "OpBranchConditional", "OpUnreachable",
+                        "OpDemoteToHelperInvocation")
+        for line in reversed(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            for t in _TERMINATORS:
+                if stripped.startswith(t):
+                    return True
+            # Skip debug/decoration lines
+            if stripped.startswith("OpLine") or stripped.startswith("OpNoLine"):
+                continue
+            if "DebugScope" in stripped or "DebugNoScope" in stripped:
+                continue
+            return False
+        return False
 
     def _scan_for_debug_stmts(self, stmts: list) -> bool:
         """Check if any debug_print or assert statements exist in the function bodies."""
@@ -615,13 +637,13 @@ class SpvGenerator:
         # --- vertex_index and instance_index builtins for vertex shaders ---
         if self.stage.stage_type == "vertex":
             for bi_name, bi_builtin in [("vertex_index", "VertexIndex"), ("instance_index", "InstanceIndex")]:
-                int_type = self.reg.int32()
-                ptr_type = self.reg.pointer("Input", int_type)
+                uint_type = self.reg.uint32()
+                ptr_type = self.reg.pointer("Input", uint_type)
                 var_id = self.reg.next_id()
                 self.global_vars.append(f"{var_id} = OpVariable {ptr_type} Input")
                 self.decorations.append(f"OpDecorate {var_id} BuiltIn {bi_builtin}")
                 self.var_map[bi_name] = var_id
-                self.var_types[bi_name] = "int"
+                self.var_types[bi_name] = "uint"
                 self.var_storage[bi_name] = "Input"
                 self.interface_ids.append(var_id)
                 self.interface_storage[var_id] = "Input"
@@ -1383,9 +1405,15 @@ class SpvGenerator:
             lines.append(f"OpStore {ptr_id} {val_id}")
 
         elif isinstance(stmt, ReturnStmt):
-            val_id, val_lines = self._gen_expr(stmt.value)
-            lines.extend(val_lines)
-            lines.append(f"OpReturnValue {val_id}")
+            if stmt.value is None:
+                lines.append("OpReturn")
+            else:
+                val_id, val_lines = self._gen_expr(stmt.value)
+                lines.extend(val_lines)
+                lines.append(f"OpReturnValue {val_id}")
+
+        elif isinstance(stmt, DiscardStmt):
+            lines.append("OpKill")
 
         elif isinstance(stmt, IfStmt):
             cond_id, cond_lines = self._gen_expr(stmt.condition)
@@ -1407,11 +1435,15 @@ class SpvGenerator:
                 blk_id, blk_instr = self._dbg_emitter.emit_lexical_block(line_num)
                 lines.append(blk_instr)
                 lines.append(self._dbg_emitter.emit_debug_scope(blk_id))
+            then_lines = []
             for s in stmt.then_body:
-                lines.extend(self._gen_stmt(s))
+                then_lines.extend(self._gen_stmt(s))
             if self._dbg_emitter and saved_scope:
-                lines.append(self._dbg_emitter.emit_debug_scope(saved_scope))
-            lines.append(f"OpBranch {merge_label}")
+                then_lines.append(self._dbg_emitter.emit_debug_scope(saved_scope))
+            lines.extend(then_lines)
+            # Skip OpBranch if then-body already terminates (OpReturn/OpReturnValue/OpKill)
+            if not self._block_terminated(then_lines):
+                lines.append(f"OpBranch {merge_label}")
             if stmt.else_body:
                 lines.append(f"{else_label} = OpLabel")
                 if self._dbg_emitter:
@@ -1420,11 +1452,14 @@ class SpvGenerator:
                     blk_id2, blk_instr2 = self._dbg_emitter.emit_lexical_block(line_num)
                     lines.append(blk_instr2)
                     lines.append(self._dbg_emitter.emit_debug_scope(blk_id2))
+                else_lines = []
                 for s in stmt.else_body:
-                    lines.extend(self._gen_stmt(s))
+                    else_lines.extend(self._gen_stmt(s))
                 if self._dbg_emitter:
-                    lines.append(self._dbg_emitter.emit_debug_scope(saved_scope2))
-                lines.append(f"OpBranch {merge_label}")
+                    else_lines.append(self._dbg_emitter.emit_debug_scope(saved_scope2))
+                lines.extend(else_lines)
+                if not self._block_terminated(else_lines):
+                    lines.append(f"OpBranch {merge_label}")
             lines.append(f"{merge_label} = OpLabel")
 
         elif isinstance(stmt, ExprStmt):

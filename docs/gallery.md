@@ -80,6 +80,32 @@ luxc gltf_pbr_layered.lux --pipeline GltfMesh --features has_emission \
     --define max_vertices=64 --define max_primitives=124 --define workgroup_size=32
 ```
 
+### Gaussian Splatting — 3D Gaussian Splat Rendering
+
+First-class Gaussian splatting via the `splat` declaration — one block generates a complete 3-stage pipeline: compute preprocess (projection, covariance, SH evaluation), instanced vertex shader (sorted quad rendering), and fragment shader (2D Gaussian evaluation with alpha compositing). Supports SH degrees 0–3, CPU depth sorting, and `KHR_gaussian_splatting` glTF extension. All three engines (C++/Vulkan, Rust/ash, Python/numpy) render Gaussian splats.
+
+```lux
+splat GaussianCloud {
+    sh_degree: 0,
+    kernel: ellipse,
+    color_space: srgb,
+    sort: camera_distance,
+    alpha_cutoff: 0.004,
+}
+
+pipeline SplatViewer {
+    mode: gaussian_splat,
+    splat: GaussianCloud,
+}
+```
+
+```bash
+# Compile + render
+python -m luxc examples/gaussian_splat.lux
+python -m tools.generate_test_splats tests/assets/test_splats.glb
+playground_cpp/build/Release/lux-playground.exe --scene tests/assets/test_splats.glb --pipeline examples/gaussian_splat --interactive
+```
+
 ### Compute Shaders — GPU General-Purpose Computation
 
 Standalone `compute` stage for data-parallel GPU work — `for`/`while` loops with `break`/`continue`, native integer arithmetic, workgroup shared memory with atomic operations, SSBO read/write, storage image output, configurable workgroup sizes, and `barrier()` synchronization.
@@ -365,6 +391,7 @@ All four engines support reflection-driven descriptor binding, glTF loading, cub
 | **Compute shaders** | yes | yes | yes | yes |
 | **Mesh shaders** | — | yes | yes (Metal 3) | yes |
 | **Ray tracing** | — | yes | — | yes |
+| **Gaussian splatting** | yes (CPU) | yes | — | yes |
 | **Bindless descriptors** | — | yes | — | yes |
 | **glTF 2.0 loading** | yes | yes | yes | yes |
 | **IBL (specular + irradiance)** | yes | yes | yes | yes |

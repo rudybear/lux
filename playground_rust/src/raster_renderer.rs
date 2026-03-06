@@ -1462,6 +1462,7 @@ fn render_pbr_scene_bindless(
             meshes: Vec::new(), materials: Vec::new(), nodes: Vec::new(),
             cameras: Vec::new(), lights: Vec::new(), root_nodes: Vec::new(),
             mesh_primitive_ranges: Vec::new(),
+            splat_data: crate::gltf_loader::GaussianSplatData::default(),
         };
         scene_manager::build_materials_ssbo(
             device, ctx.allocator_mut(), &default_scene, &dedup, &per_material_textures,

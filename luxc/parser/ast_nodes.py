@@ -51,6 +51,7 @@ class Module:
     lightings: list[LightingDecl] = field(default_factory=list)
     features_decls: list[FeaturesDecl] = field(default_factory=list)
     spec_constants: list[SpecConstDecl] = field(default_factory=list)
+    splats: list[SplatDecl] = field(default_factory=list)
 
 
 # --- Top-level declarations ---
@@ -159,6 +160,22 @@ class SurfaceDecl:
 
 @dataclass
 class SurfaceMember:
+    name: str
+    value: Expr
+
+
+# --- Splat declarations (Gaussian splatting) ---
+
+@dataclass
+class SplatDecl:
+    name: str
+    members: list[SplatMember]
+    properties: Optional[PropertiesBlock] = None
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class SplatMember:
     name: str
     value: Expr
 
@@ -459,6 +476,12 @@ class AssignStmt:
 @dataclass
 class ReturnStmt:
     value: Expr
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class DiscardStmt:
+    """Fragment shader discard (OpKill in SPIR-V)."""
     loc: Optional[SourceLocation] = None
 
 

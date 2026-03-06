@@ -14,6 +14,7 @@ from luxc.parser.ast_nodes import (
     TypeAlias, ImportDecl,
     SurfaceDecl, SurfaceMember, SurfaceSampler, LayerCall, LayerArg,
     PropertiesField, PropertiesBlock,
+    SplatDecl, SplatMember,
     GeometryDecl, GeometryField, GeometryTransform, GeometryOutputs, OutputBinding,
     PipelineDecl, PipelineMember,
     ScheduleDecl, ScheduleMember,
@@ -124,6 +125,8 @@ class LuxTransformer(Transformer):
                 mod._conditional_blocks.append(item)
             elif isinstance(item, SpecConstDecl):
                 mod.spec_constants.append(item)
+            elif isinstance(item, SplatDecl):
+                mod.splats.append(item)
         return mod
 
     # --- Top-level declarations ---
@@ -248,6 +251,20 @@ class LuxTransformer(Transformer):
         type_name = str(args[1])
         default = args[2] if len(args) > 2 else None
         return PropertiesField(field_name, type_name, default=default)
+
+    # --- Splat declarations ---
+
+    def splat_decl(self, args):
+        name = args[0]
+        members = [a for a in args[1:] if isinstance(a, SplatMember)]
+        properties = None
+        for a in args[1:]:
+            if isinstance(a, PropertiesBlock):
+                properties = a
+        return SplatDecl(str(name), members, properties=properties, loc=_tok_loc(name))
+
+    def splat_member(self, args):
+        return SplatMember(str(args[0]), args[1])
 
     # --- Geometry declarations ---
 

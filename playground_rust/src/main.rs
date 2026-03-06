@@ -12,6 +12,7 @@ pub mod reflected_pipeline;
 mod rt_renderer;
 mod scene;
 pub mod scene_manager;
+mod splat_renderer;
 mod screenshot;
 mod spv_loader;
 mod vulkan_context;
@@ -110,7 +111,12 @@ fn resolve_default_pipeline(scene: &str) -> Result<String, String> {
 /// Auto-detect the render path from which .spv files exist for a pipeline base.
 /// Prefers raster over RT when both exist (raster supports per-material draw calls).
 /// Pass force_mode="rt" to override and use RT path.
+/// Returns "splat" when KHR_gaussian_splatting data is detected in the scene
+/// (caller must check scene data and override the result).
 fn detect_render_path(pipeline_base: &str, force_mode: &str) -> &'static str {
+    if force_mode == "splat" {
+        return "splat";
+    }
     if force_mode == "rt" && Path::new(&format!("{}.rgen.spv", pipeline_base)).exists() {
         return "rt";
     }
@@ -119,6 +125,14 @@ fn detect_render_path(pipeline_base: &str, force_mode: &str) -> &'static str {
         && Path::new(&format!("{}.frag.spv", pipeline_base)).exists()
     {
         return "mesh";
+    }
+    // Check for gaussian splat compute shader (comp + vert + frag)
+    if Path::new(&format!("{}.comp.spv", pipeline_base)).exists()
+        && Path::new(&format!("{}.vert.spv", pipeline_base)).exists()
+        && Path::new(&format!("{}.frag.spv", pipeline_base)).exists()
+    {
+        // comp + vert + frag = gaussian splat pipeline
+        return "splat";
     }
     // Prefer raster over RT when both exist (raster supports per-material draw calls)
     if Path::new(&format!("{}.vert.spv", pipeline_base)).exists()
@@ -170,7 +184,26 @@ fn run(args: Args) -> Result<(), String> {
         Some("mesh") => "mesh",
         _ => "",
     };
-    let render_path = detect_render_path(&pipeline_base, force_mode);
+    let mut render_path = detect_render_path(&pipeline_base, force_mode);
+
+    // Pre-scan glTF files for KHR_gaussian_splatting data to override render path.
+    // This allows automatic splat rendering when a .glb contains gaussian splats.
+    if (scene_source.ends_with(".glb") || scene_source.ends_with(".gltf"))
+        && (force_mode.is_empty() || force_mode == "splat")
+    {
+        if let Ok((document, _buffers, _images)) = gltf::import(Path::new(&scene_source)) {
+            let has_splats = document.meshes().any(|mesh| {
+                mesh.primitives().any(|prim| {
+                    prim.mode() == gltf::mesh::Mode::Points
+                        && prim.extension_value("KHR_gaussian_splatting").is_some()
+                })
+            });
+            if has_splats {
+                info!("Detected KHR_gaussian_splatting in scene, switching to splat render path");
+                render_path = "splat";
+            }
+        }
+    }
 
     info!("Scene: {}", scene_source);
     info!("Pipeline: {}", pipeline_base);
@@ -361,6 +394,81 @@ fn run_headless(
             info!("Rendering mesh shader scene '{}' with pipeline '{}'...", scene_source, pipeline_base);
             render_mesh_headless(&mut ctx, pipeline_base, scene_source, width, height, output_path, ibl_name, demo_lights)
         }
+        "splat" => {
+            use scene_manager::Renderer;
+
+            info!(
+                "Rendering gaussian splats: scene='{}' pipeline='{}'",
+                scene_source, pipeline_base
+            );
+
+            let mut renderer = splat_renderer::GaussianSplatRenderer::new(
+                &mut ctx, scene_source, pipeline_base, width, height,
+            )?;
+
+            // Render frame
+            let cmd = renderer.render(&ctx)?;
+
+            // End command buffer and submit
+            unsafe {
+                ctx.device
+                    .end_command_buffer(cmd)
+                    .map_err(|e| format!("Failed to end splat command buffer: {:?}", e))?;
+            }
+
+            let cmd_bufs = [cmd];
+            let submit_info = ash::vk::SubmitInfo::default().command_buffers(&cmd_bufs);
+
+            let fence_info = ash::vk::FenceCreateInfo::default();
+            let fence = unsafe {
+                ctx.device
+                    .create_fence(&fence_info, None)
+                    .map_err(|e| format!("Failed to create fence: {:?}", e))?
+            };
+
+            unsafe {
+                ctx.device
+                    .queue_submit(ctx.graphics_queue, &[submit_info], fence)
+                    .map_err(|e| format!("Failed to submit splat command buffer: {:?}", e))?;
+                ctx.device
+                    .wait_for_fences(&[fence], true, u64::MAX)
+                    .map_err(|e| format!("Failed to wait for fence: {:?}", e))?;
+                ctx.device.destroy_fence(fence, None);
+                ctx.device.free_command_buffers(ctx.command_pool, &cmd_bufs);
+            }
+
+            // Read back pixels from offscreen image
+            let device_clone = ctx.device.clone();
+            let cmd2 = ctx.begin_single_commands()?;
+
+            let mut staging = screenshot::StagingBuffer::new(
+                &device_clone,
+                ctx.allocator_mut(),
+                width,
+                height,
+            )?;
+
+            screenshot::cmd_copy_image_to_buffer(
+                &device_clone,
+                cmd2,
+                renderer.output_image(),
+                staging.buffer,
+                width,
+                height,
+            );
+
+            ctx.end_single_commands(cmd2)?;
+
+            let pixels = staging.read_pixels(width, height)?;
+            screenshot::save_png(&pixels, width, height, output_path)?;
+
+            info!("Saved splat render to {:?}", output_path);
+
+            staging.destroy(&device_clone, ctx.allocator_mut());
+            renderer.destroy(&mut ctx);
+
+            Ok(())
+        }
         _ => Err(format!("Unknown render path: {}", render_path)),
     };
 
@@ -548,6 +656,7 @@ fn run_interactive(
 
     let use_rt = render_path == "rt";
     let use_mesh = render_path == "mesh";
+    let use_splat = render_path == "splat";
 
     struct App {
         window: Option<Window>,
@@ -557,6 +666,7 @@ fn run_interactive(
         height: u32,
         use_rt: bool,
         use_mesh: bool,
+        use_splat: bool,
         ibl_name: String,
         force_validation: bool,
         demo_lights: bool,
@@ -605,7 +715,16 @@ fn run_interactive(
             };
 
             // Create the renderer (unified via Renderer trait)
-            let renderer_result: Result<Box<dyn Renderer>, String> = if self.use_rt {
+            let renderer_result: Result<Box<dyn Renderer>, String> = if self.use_splat {
+                info!("Initializing gaussian splat renderer...");
+                splat_renderer::GaussianSplatRenderer::new(
+                    &mut ctx,
+                    &self.scene_source,
+                    &self.pipeline_base,
+                    self.width,
+                    self.height,
+                ).map(|r| Box::new(r) as Box<dyn Renderer>)
+            } else if self.use_rt {
                 info!("Initializing RT renderer...");
                 rt_renderer::RTRenderer::new(
                     &mut ctx,
@@ -913,6 +1032,7 @@ fn run_interactive(
         height,
         use_rt,
         use_mesh,
+        use_splat,
         ibl_name: ibl_name.to_string(),
         force_validation,
         demo_lights,

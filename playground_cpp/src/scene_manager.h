@@ -11,7 +11,9 @@
 #include <map>
 #include <unordered_map>
 #include "material_ubo.h"
+#include "splat_renderer.h"
 #include <glm/glm.hpp>
+#include <memory>
 
 // GPU-compatible scene light representation (64 bytes per light, std430 layout)
 struct SceneLight {
@@ -189,6 +191,11 @@ public:
 
     static bool isGltfFile(const std::string& source);
 
+    // Gaussian splatting support
+    bool hasSplatData() const { return m_hasGltfScene && m_gltfScene.splat_data.has_splats; }
+    SplatRenderer* getSplatRenderer() { return splat_renderer_.get(); }
+    void initSplatRenderer(VulkanContext& ctx, const std::string& shaderBase, uint32_t width, uint32_t height);
+
 private:
     std::string m_sceneSource;
 
@@ -229,6 +236,9 @@ private:
 
     // Bindless texture dedup map: VkImage -> index in bindless texture array
     std::unordered_map<uint64_t, int32_t> m_bindlessTexDedup;
+
+    // Gaussian splatting renderer (created when scene has splat data)
+    std::unique_ptr<SplatRenderer> splat_renderer_;
 
     void createDefaultTextures(VulkanContext& ctx);
     void uploadGltfTextures(VulkanContext& ctx);

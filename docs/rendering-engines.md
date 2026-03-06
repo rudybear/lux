@@ -63,6 +63,24 @@ playground_rust/target/release/lux-playground.exe --scene assets/DamagedHelmet.g
 playground_rust/target/release/lux-playground.exe --scene assets/DamagedHelmet.glb --pipeline shadercache/gltf_pbr_rt --ibl pisa --interactive
 ```
 
+**Gaussian splatting (all engines):**
+```bash
+# Compile splat shaders + generate test data
+python -m luxc examples/gaussian_splat.lux
+python -m tools.generate_test_splats tests/assets/test_splats.glb
+
+# C++ (Vulkan) — interactive
+playground_cpp/build/Release/lux-playground.exe --scene tests/assets/test_splats.glb --pipeline examples/gaussian_splat --interactive
+
+# Rust (ash) — interactive
+cd playground_rust && cargo run --release -- --scene ../tests/assets/test_splats.glb --pipeline ../examples/gaussian_splat --interactive
+
+# Python (CPU rasterizer) — headless PNG
+python -m playground.render_harness --splat-scene tests/assets/test_splats.glb -o splat_render.png
+```
+
+The splat pipeline uses CPU-side depth sorting and instanced quad drawing. Input data is loaded from glTF files with the `KHR_gaussian_splatting` extension. The `tools/glb_to_ply.py` converter exports `.glb` splat data to standard `.ply` format for validation in external viewers (SuperSplat, gsplat.tech).
+
 **Batch/shell scripts for quick launch:**
 ```bash
 run_interactive_cpp.bat     # Interactive C++ raster viewer
@@ -74,6 +92,9 @@ run_mesh_interactive_metal.sh  # Interactive Metal mesh shader viewer (macOS)
 compile_gltf_rt.bat         # Compile + render glTF RT (headless, both engines)
 compile_gltf_forward.bat    # Compile + render glTF raster (all 3 engines)
 compile_gltf_all.bat        # Compile + render all pipeline variants
+run_splat_cpp.bat            # Compile + render Gaussian splats (C++)
+run_splat_rust.bat           # Compile + render Gaussian splats (Rust)
+run_splat_python.bat         # Compile + render Gaussian splats (Python)
 compile_mesh.bat            # Compile mesh shader pipeline
 run_mesh_headless_cpp.bat   # Render mesh shaders headless (C++)
 run_mesh_headless_rust.bat  # Render mesh shaders headless (Rust)

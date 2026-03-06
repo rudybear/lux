@@ -87,10 +87,37 @@ pub const MAX_SHADOW_MAPS: usize = 8;
 /// Shadow map resolution (width and height).
 pub const SHADOW_MAP_RESOLUTION: u32 = 2048;
 
+/// Placeholder for a future gaussian splat renderer.
+///
+/// When a glTF scene contains KHR_gaussian_splatting data, the scene manager
+/// can hold an optional `SplatRenderer` to handle the splat render path.
+pub struct SplatRenderer {
+    pub num_splats: u32,
+    pub sh_degree: u32,
+    // Future: GPU buffers for positions, rotations, scales, opacities, SH coeffs
+}
+
+impl SplatRenderer {
+    /// Create a splat renderer from loaded gaussian splat data.
+    pub fn new(splat_data: &crate::gltf_loader::GaussianSplatData) -> Self {
+        info!(
+            "SplatRenderer: initialized with {} splats, SH degree {}",
+            splat_data.num_splats, splat_data.sh_degree
+        );
+        Self {
+            num_splats: splat_data.num_splats,
+            sh_degree: splat_data.sh_degree,
+        }
+    }
+}
+
 /// Central scene manager: holds lights and provides buffer packing for GPU upload.
 pub struct SceneManager {
     pub lights: Vec<SceneLight>,
     pub shadow_entries: Vec<ShadowEntry>,
+    /// Optional gaussian splat renderer, initialized when the scene contains
+    /// KHR_gaussian_splatting data.
+    pub splat_renderer: Option<SplatRenderer>,
 }
 
 impl SceneManager {
@@ -98,7 +125,20 @@ impl SceneManager {
         Self {
             lights: Vec::new(),
             shadow_entries: Vec::new(),
+            splat_renderer: None,
         }
+    }
+
+    /// Initialize the splat renderer if the loaded glTF scene has gaussian splat data.
+    pub fn init_splat_renderer_if_needed(&mut self, scene: &crate::gltf_loader::GltfScene) {
+        if scene.splat_data.has_splats {
+            self.splat_renderer = Some(SplatRenderer::new(&scene.splat_data));
+        }
+    }
+
+    /// Returns true if this scene manager has an active splat renderer.
+    pub fn has_splat_renderer(&self) -> bool {
+        self.splat_renderer.is_some()
     }
 
     /// Pack all lights into a flat f32 buffer for GPU SSBO upload.
@@ -681,6 +721,10 @@ pub fn detect_scene_features(scene: &crate::gltf_loader::GltfScene, lights: &[Sc
     // Detect shadow support
     if lights.iter().any(|l| l.casts_shadow) {
         features.insert("has_shadows".to_string());
+    }
+    // Detect gaussian splat data
+    if scene.splat_data.has_splats {
+        features.insert("has_gaussian_splats".to_string());
     }
     if !features.is_empty() {
         info!("Detected material features: {:?}", features);

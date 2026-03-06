@@ -172,8 +172,8 @@ def compile_source(
     # Resolve imports before type checking
     _resolve_imports(module, source_dir)
 
-    # Expand surface/geometry/pipeline declarations into stage blocks
-    if module.surfaces or module.pipelines or module.environments or module.procedurals:
+    # Expand surface/geometry/pipeline/splat declarations into stage blocks
+    if module.surfaces or module.pipelines or module.environments or module.procedurals or getattr(module, 'splats', []):
         from luxc.expansion.surface_expander import expand_surfaces
         expand_surfaces(module, pipeline_filter=pipeline, bindless=bindless)
 
