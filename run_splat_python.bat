@@ -1,5 +1,5 @@
 @echo off
-REM Gaussian splat headless render — Python wgpu harness
+REM Gaussian splat headless render — Python CPU rasterizer
 REM Outputs a PNG screenshot of the splat scene.
 
 REM --- Compile splat shaders if needed ---
@@ -12,21 +12,20 @@ if not exist examples\gaussian_splat.comp.spv (
     )
 )
 
-REM --- Scene: use provided .glb or download luigi test asset ---
+REM --- Scene: use provided .glb or default to test_splats ---
 set SCENE=%1
-if "%SCENE%"=="" (
-    if not exist tests\assets\luigi.glb (
-        echo Downloading luigi.ply from HuggingFace...
-        if not exist tests\assets mkdir tests\assets
-        curl -L -o tests\assets\luigi.ply "https://huggingface.co/datasets/dylanebert/3dgs/resolve/main/luigi/luigi.ply?download=true"
-        echo Converting PLY to glTF...
-        python -m tools.ply_to_gltf tests/assets/luigi.ply tests/assets/luigi.glb
-    )
-    set SCENE=tests/assets/luigi.glb
-)
+if not "%SCENE%"=="" goto :have_scene
 
+if not exist tests\assets\test_splats.glb (
+    echo Generating test splats...
+    if not exist tests\assets mkdir tests\assets
+    python -m tools.generate_test_splats tests/assets/test_splats.glb
+)
+set SCENE=tests/assets/test_splats.glb
+
+:have_scene
 echo === Python Gaussian Splat Renderer ===
 echo   Scene: %SCENE%
 echo.
 
-python -m playground.render_harness --splat-comp examples/gaussian_splat.comp.spv --splat-vert examples/gaussian_splat.vert.spv --splat-frag examples/gaussian_splat.frag.spv --splat-scene %SCENE% -o splat_render.png
+python -m playground.render_harness --splat-scene %SCENE% -o splat_render.png
