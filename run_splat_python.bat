@@ -1,7 +1,8 @@
 @echo off
-REM Gaussian splat headless render - Python CPU rasterizer
+REM Interactive Gaussian splat viewer - Python CPU rasterizer
+REM Controls: drag to orbit, scroll to zoom, ESC/Q to exit
 
-echo === Python Gaussian Splat Renderer ===
+echo === Python Gaussian Splat Viewer ===
 
 REM --- Check python is available ---
 python --version >nul 2>&1
@@ -9,17 +10,6 @@ if errorlevel 1 (
     echo ERROR: python not found on PATH
     pause
     exit /b 1
-)
-
-REM --- Compile splat shaders if needed ---
-if not exist examples\gaussian_splat.comp.spv (
-    echo Compiling gaussian_splat.lux...
-    python -m luxc examples\gaussian_splat.lux
-    if errorlevel 1 (
-        echo Shader compilation failed.
-        pause
-        exit /b 1
-    )
 )
 
 REM --- Scene: use provided .glb or default to test_splats ---
@@ -40,16 +30,13 @@ set SCENE=tests\assets\test_splats.glb
 
 :have_scene
 echo Scene: %SCENE%
+echo Controls: drag to orbit, scroll to zoom, ESC/Q to exit
 echo.
 
-python -m playground.render_harness --splat-scene "%SCENE%" -o splat_render.png
+python -m playground.render_harness --splat-scene "%SCENE%" --interactive
 if errorlevel 1 (
     echo.
-    echo Render failed with error above.
+    echo Viewer exited with error.
     pause
     exit /b 1
 )
-
-echo.
-echo Done. Output: splat_render.png
-pause

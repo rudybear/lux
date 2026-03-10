@@ -469,6 +469,8 @@ def render_splats(
     splat_glb_path: Path,
     width: int = 512,
     height: int = 512,
+    eye: np.ndarray = None,
+    target: np.ndarray = None,
 ) -> np.ndarray:
     """Render gaussian splats and return an (H, W, 4) uint8 RGBA array.
 
@@ -476,15 +478,24 @@ def render_splats(
     compute projection → CPU depth sort → rasterize 2D Gaussians.
     """
     splat = load_splat_glb(splat_glb_path)
+    return render_splats_from_data(splat, width, height, eye=eye, target=target)
+
+
+def render_splats_from_data(
+    splat: dict,
+    width: int = 512,
+    height: int = 512,
+    eye: np.ndarray = None,
+    target: np.ndarray = None,
+) -> np.ndarray:
+    """Render preloaded splat data and return an (H, W, 4) uint8 RGBA array."""
     n = splat['num_splats']
-    print(f"Loaded {n} splats (SH degree {splat['sh_degree']})")
 
     positions = splat['positions']      # (N, 3)
     rotations = splat['rotations']      # (N, 4) XYZW
     scales_log = splat['scales']        # (N, 3) log-space
     opacities_logit = splat['opacities']  # (N,) logit-space
     sh_coeffs = splat['sh_coeffs']      # list of (N, 3) arrays
-    sh_degree = splat['sh_degree']
 
     # --- Camera setup (matches C++/Rust auto-camera) ---
     bb_min, bb_max = positions.min(axis=0), positions.max(axis=0)
@@ -492,21 +503,23 @@ def render_splats(
     radius = float(np.linalg.norm(bb_max - bb_min)) * 0.5
     if radius < 0.001:
         radius = 1.0
-    eye = center + np.array([0.0, radius * 0.5, radius * 2.5], dtype=np.float32)
+
+    if target is None:
+        target = center
+    if eye is None:
+        eye = center + np.array([0.0, radius * 0.5, radius * 2.5], dtype=np.float32)
+
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
     fov_y = math.radians(45.0)
     aspect = width / height
     near_plane = 0.01
     far_plane = radius * 10.0
 
-    view = _look_at(eye, center, up)
+    view = _look_at(eye, target, up)
     proj = _perspective(fov_y, aspect, near_plane, far_plane)
 
     focal_y = 0.5 * height / math.tan(fov_y / 2.0)
     focal_x = focal_y  # square pixels
-
-    print(f"Camera: eye=({eye[0]:.3f},{eye[1]:.3f},{eye[2]:.3f}) "
-          f"focal=({focal_x:.1f},{focal_y:.1f})")
 
     # --- Preprocess each splat (CPU equivalent of compute shader) ---
     # Arrays for projected splat data
@@ -676,6 +689,109 @@ def render_splats(
     return result
 
 
+def interactive_splat_viewer(
+    splat_glb_path: Path,
+    width: int = 512,
+    height: int = 512,
+) -> None:
+    """Open an interactive matplotlib window for orbiting around a splat scene.
+
+    Controls: drag to orbit, scroll to zoom, ESC/Q to exit.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.backend_bases import MouseButton
+
+    splat = load_splat_glb(splat_glb_path)
+    n = splat['num_splats']
+    print(f"Loaded {n} splats (SH degree {splat['sh_degree']})")
+
+    positions = splat['positions']
+    bb_min, bb_max = positions.min(axis=0), positions.max(axis=0)
+    center = (bb_min + bb_max) / 2.0
+    radius = float(np.linalg.norm(bb_max - bb_min)) * 0.5
+    if radius < 0.001:
+        radius = 1.0
+
+    # Orbit camera state: azimuth, elevation, distance
+    state = {
+        'azimuth': 0.0,       # radians
+        'elevation': 0.2,     # radians
+        'distance': radius * 3.0,
+        'dragging': False,
+        'last_x': 0,
+        'last_y': 0,
+    }
+
+    def _eye_from_orbit():
+        az, el, dist = state['azimuth'], state['elevation'], state['distance']
+        x = dist * math.cos(el) * math.sin(az)
+        y = dist * math.sin(el)
+        z = dist * math.cos(el) * math.cos(az)
+        return center + np.array([x, y, z], dtype=np.float32)
+
+    def _render():
+        eye = _eye_from_orbit()
+        return render_splats_from_data(splat, width, height, eye=eye, target=center)
+
+    # Initial render
+    print("Rendering initial view...")
+    pixels = _render()
+
+    fig, ax = plt.subplots(1, 1, figsize=(width / 100, height / 100), dpi=100)
+    fig.canvas.manager.set_window_title('Lux Gaussian Splat Viewer')
+    ax.set_axis_off()
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    img_plot = ax.imshow(pixels)
+
+    def _refresh():
+        print("Re-rendering...", end=' ', flush=True)
+        pixels = _render()
+        img_plot.set_data(pixels)
+        fig.canvas.draw_idle()
+        print("done.")
+
+    def on_press(event):
+        if event.button == MouseButton.LEFT:
+            state['dragging'] = True
+            state['last_x'] = event.x
+            state['last_y'] = event.y
+
+    def on_release(event):
+        if event.button == MouseButton.LEFT and state['dragging']:
+            state['dragging'] = False
+            _refresh()
+
+    def on_motion(event):
+        if not state['dragging'] or event.x is None or event.y is None:
+            return
+        dx = event.x - state['last_x']
+        dy = event.y - state['last_y']
+        state['last_x'] = event.x
+        state['last_y'] = event.y
+        state['azimuth'] -= dx * 0.01
+        state['elevation'] = max(-math.pi / 2 + 0.01,
+                                  min(math.pi / 2 - 0.01,
+                                      state['elevation'] + dy * 0.01))
+
+    def on_scroll(event):
+        factor = 0.9 if event.step > 0 else 1.1
+        state['distance'] = max(radius * 0.5, state['distance'] * factor)
+        _refresh()
+
+    def on_key(event):
+        if event.key in ('escape', 'q'):
+            plt.close(fig)
+
+    fig.canvas.mpl_connect('button_press_event', on_press)
+    fig.canvas.mpl_connect('button_release_event', on_release)
+    fig.canvas.mpl_connect('motion_notify_event', on_motion)
+    fig.canvas.mpl_connect('scroll_event', on_scroll)
+    fig.canvas.mpl_connect('key_press_event', on_key)
+
+    print("Interactive viewer: drag to orbit, scroll to zoom, ESC/Q to exit")
+    plt.show()
+
+
 def save_png(pixels: np.ndarray, output_path: Path) -> None:
     """Save an (H, W, 4) uint8 RGBA array as a PNG file."""
     img = Image.fromarray(pixels, "RGBA")
@@ -703,6 +819,8 @@ def main() -> None:
     parser.add_argument("--splat-vert", type=Path, help="Vertex shader .vert.spv")
     parser.add_argument("--splat-frag", type=Path, help="Fragment shader .frag.spv")
     parser.add_argument("--splat-scene", type=Path, help="Splat scene .glb file")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Open interactive orbit viewer (splat mode only)")
     # Fullscreen mode
     parser.add_argument("--fullscreen", type=Path,
                         help="Fragment shader for fullscreen quad mode")
@@ -714,6 +832,10 @@ def main() -> None:
         if not args.splat_scene.exists():
             print(f"Error: --splat-scene not found: {args.splat_scene}", file=sys.stderr)
             sys.exit(1)
+        if args.interactive:
+            interactive_splat_viewer(
+                args.splat_scene, width=args.width, height=args.height)
+            sys.exit(0)
         print(f"Splat mode (CPU): scene={args.splat_scene.name}")
         pixels = render_splats(
             args.splat_comp, args.splat_vert, args.splat_frag, args.splat_scene,
