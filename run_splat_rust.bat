@@ -1,5 +1,5 @@
 @echo off
-REM Interactive Gaussian splat viewer — Rust Vulkan engine
+REM Interactive Gaussian splat viewer - Rust Vulkan engine
 REM Controls: mouse drag to orbit, scroll to zoom, ESC to exit
 
 REM --- Compile splat shaders if needed ---

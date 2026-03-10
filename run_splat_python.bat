@@ -1,5 +1,5 @@
 @echo off
-REM Gaussian splat headless render — Python CPU rasterizer
+REM Gaussian splat headless render - Python CPU rasterizer
 REM Outputs a PNG screenshot of the splat scene.
 
 REM --- Compile splat shaders if needed ---

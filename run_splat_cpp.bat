@@ -1,5 +1,5 @@
 @echo off
-REM Interactive Gaussian splat viewer — C++ Vulkan engine
+REM Interactive Gaussian splat viewer - C++ Vulkan engine
 REM Controls: mouse drag to orbit, scroll to zoom, ESC to exit
 
 if not exist playground_cpp\build\Release\lux-playground.exe (
