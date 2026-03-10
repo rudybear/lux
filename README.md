@@ -31,6 +31,12 @@ The compiler expands this into fully typed vertex + fragment SPIR-V — no manua
 
 ## Gallery
 
+<p align="center">
+<img src="screenshots/gaussian_splat_python.png" width="250">
+<img src="screenshots/gaussian_splat_debug.png" width="250">
+</p>
+<p align="center"><em>Gaussian Splatting — first-class <code>splat</code> declaration compiles to compute + vertex + fragment pipeline, SH color, 2D Gaussian alpha compositing, interactive orbit viewer</em></p>
+
 <p align="center"><img src="screenshots/test_gltf_rt_cpp.png" width="300"></p>
 <p align="center"><em>glTF PBR with IBL — ray traced, tangent-space normal mapping, metallic-roughness, single surface declaration compiles to raster + RT</em></p>
 
@@ -40,7 +46,7 @@ The compiler expands this into fully typed vertex + fragment SPIR-V — no manua
 <p align="center"><img src="screenshots/ai_gallery.png" width="500"></p>
 <p align="center"><em>AI-generated materials — text-to-shader, image-to-material, 5 providers, 58-material PBR reference database</em></p>
 
-See [full gallery](docs/gallery.md) for all demos: mesh shaders, compute, SDF, noise, autodiff, BRDF visualization, Nadrin/PBR validation, and more.
+See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shaders, compute, SDF, noise, autodiff, BRDF visualization, Nadrin/PBR validation, and more.
 
 ## Features
 
@@ -113,6 +119,9 @@ python -m luxc examples/pbr_surface.lux --auto-type=report
 # Generate a shader with AI
 python -m luxc --ai "frosted glass with subsurface scattering" -o generated.lux
 
+# Compile a Gaussian splat pipeline (compute + vertex + fragment)
+python -m luxc examples/gaussian_splat.lux
+
 # Optimize with spirv-opt
 python -m luxc examples/hello_triangle.lux -O
 ```
@@ -182,7 +191,7 @@ Options:
 
 ## Language Reference
 
-Types, stage blocks, declarative materials, layered surfaces, compile-time features, ray tracing, mesh shaders, compute, debug instrumentation, auto-type, and all 39+ built-in functions.
+Types, stage blocks, declarative materials, layered surfaces, Gaussian splatting, compile-time features, ray tracing, mesh shaders, compute, debug instrumentation, auto-type, and all 39+ built-in functions.
 
 See [full language reference](docs/language-reference.md).
 
@@ -195,6 +204,7 @@ input.lux
   -> Feature Stripping    (compile-time conditional removal)
   -> Import Resolver      (stdlib + local .lux modules)
   -> Surface Expander     (surface/geometry/pipeline -> stage blocks)
+  -> Splat Expander       (splat/gaussian_splat -> compute + vertex + fragment)
   -> Autodiff Expander    (@differentiable -> gradient functions)
   -> Type Checker         (resolve types, check operators, validate semantic types)
   -> Debug Stripper       (remove debug_print/assert/@[debug] in release)
@@ -317,6 +327,7 @@ The `assets/` directory contains glTF 2.0 sample models and HDR environment maps
 | Function inlining | No SPIR-V OpFunctionCall | Simplifies codegen, stdlib works everywhere |
 | Forward-mode autodiff | `@differentiable` annotation | Natural for shader parameter gradients |
 | Structured loops | `for`/`while` with `OpLoopMerge` | `@[unroll]` hint for GPU-friendly unrolling, `break`/`continue` for early exit |
+| First-class `splat` | `splat` + `mode: gaussian_splat` | 3DGS is a rendering primitive, not a hack — one declaration, three stages |
 | Direct AST to SPIR-V | No IR | Simpler, faster path to working output |
 
 ## License

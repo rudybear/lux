@@ -24,6 +24,10 @@ screenshots/
 assets/Sponza.glb
 assets/sponza_gltf/
 
+# Temporary render outputs
+splat_*.png
+output.png
+
 # C++/Rust build artifacts
 playground_cpp/build/
 playground_cpp/build-metal/

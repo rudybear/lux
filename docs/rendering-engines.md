@@ -75,6 +75,9 @@ playground_cpp/build/Release/lux-playground.exe --scene tests/assets/test_splats
 # Rust (ash) — interactive
 cd playground_rust && cargo run --release -- --scene ../tests/assets/test_splats.glb --pipeline ../examples/gaussian_splat --interactive
 
+# Python (CPU rasterizer) — interactive orbit viewer
+python -m playground.render_harness --splat-scene tests/assets/test_splats.glb --interactive
+
 # Python (CPU rasterizer) — headless PNG
 python -m playground.render_harness --splat-scene tests/assets/test_splats.glb -o splat_render.png
 ```
