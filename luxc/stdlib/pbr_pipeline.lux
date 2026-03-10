@@ -1,0 +1,40 @@
+// Lux Standard Library: PBR Pipeline Orchestration
+// Unified entry point for PBR shading used by both bindless and
+// non-bindless surface expander paths.
+
+import compositing;
+import ibl;
+
+// Compute full PBR shading from pre-sampled values.
+// Call after direct lighting and IBL texture sampling.
+// Set factor=0 / color=vec3(0) to disable optional layers.
+fn pbr_shade(
+    direct_lit: vec3,
+    n: vec3, v: vec3, l: vec3,
+    albedo: vec3, roughness: scalar, metallic: scalar,
+    // Pre-sampled IBL textures
+    prefiltered: vec3, irradiance: vec3, brdf_sample: vec2,
+    // Transmission (factor=0 to disable)
+    trans_factor: scalar, trans_ior: scalar,
+    trans_thickness: scalar, trans_atten_color: vec3, trans_atten_dist: scalar,
+    // Sheen (color=vec3(0) to disable)
+    sheen_color: vec3, sheen_roughness: scalar,
+    // Coat (factor=0 to disable)
+    coat_factor: scalar, coat_roughness: scalar,
+    coat_ibl_contrib: vec3,
+    // Emission (vec3(0) to disable)
+    emission: vec3
+) -> vec3 {
+    let n_dot_v: scalar = max(dot(n, v), 0.001);
+    let ambient: vec3 = ibl_contribution(
+        albedo, roughness, metallic, n_dot_v,
+        prefiltered, irradiance, brdf_sample);
+    return compose_pbr_layers(
+        direct_lit, n, v, l, albedo, roughness,
+        trans_factor, trans_ior, trans_thickness, trans_atten_color, trans_atten_dist,
+        ambient,
+        sheen_color, sheen_roughness,
+        coat_factor, coat_roughness,
+        coat_ibl_contrib,
+        emission);
+}

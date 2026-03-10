@@ -819,6 +819,53 @@ def _emit_multi_light_loop(
 
 # --- Shared helper functions for code deduplication ---
 
+
+def _emit_multi_light_from_lighting(body, lighting, pos_var):
+    """Extract multi-light args from lighting block and emit unrolled loop.
+
+    Assumes layer_albedo, layer_roughness, layer_metallic, n, v are in scope.
+    Returns result_var name ("total_direct"), or None if no multi_light layer.
+    """
+    if not (lighting and lighting.layers):
+        return None
+    ml_layer = None
+    for layer in lighting.layers:
+        if layer.name == "multi_light":
+            ml_layer = layer
+            break
+    if ml_layer is None:
+        return None
+
+    ml_args = _get_layer_args(ml_layer)
+    max_lights = 16
+    if "max_lights" in ml_args and isinstance(ml_args["max_lights"], NumberLit):
+        max_lights = int(float(ml_args["max_lights"].value))
+    _has_shadow_map = "shadow_map" in ml_args
+    _shadow_filter = "pcf"
+    if "shadow_filter" in ml_args:
+        sf_val = ml_args["shadow_filter"]
+        if isinstance(sf_val, VarRef):
+            _shadow_filter = sf_val.name
+    count_expr = ml_args.get("count", NumberLit(str(max_lights)))
+    body.append(LetStmt("_ml_light_count", "scalar",
+        BinaryOp("*", count_expr, NumberLit("1.0"))))
+    return _emit_multi_light_loop(
+        body, max_lights,
+        pos_var=pos_var, normal_var="n", view_var="v",
+        albedo_var="layer_albedo", roughness_var="layer_roughness",
+        metallic_var="layer_metallic",
+        has_shadows=_has_shadow_map,
+        shadow_filter=_shadow_filter,
+    )
+
+
+def _detect_multi_light(lighting):
+    """Return True if lighting block has a multi_light layer."""
+    if not (lighting and lighting.layers):
+        return False
+    return any(layer.name == "multi_light" for layer in lighting.layers)
+
+
 def _emit_barycentric_interpolation(body, index_offset_expr=None):
     """Emit barycentric interpolation for RT closest-hit shaders.
 
@@ -962,10 +1009,10 @@ def _generate_layered_main(
             ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("0.0"), NumberLit("1.0")]),
         ])))
     # Detect multi_light vs directional lighting mode
-    _has_multi_light = False
+    _has_multi_light = _detect_multi_light(lighting)
+    lighting_by_name = {}
     if lighting and lighting.layers:
         lighting_by_name = {layer.name: layer for layer in lighting.layers}
-        _has_multi_light = "multi_light" in lighting_by_name
 
     # Light direction: from lighting block (directional/multi_light) or legacy uniform
     if _has_multi_light:
@@ -1017,31 +1064,8 @@ def _generate_layered_main(
         body.append(LetStmt("layer_metallic", "scalar", metallic_expr))
 
         if _has_multi_light:
-            # Multi-light path: unroll N iterations from SSBO
-            ml_args = _get_layer_args(lighting_by_name["multi_light"])
-            max_lights = 16  # default
-            if "max_lights" in ml_args and isinstance(ml_args["max_lights"], NumberLit):
-                max_lights = int(float(ml_args["max_lights"].value))
-            _has_shadow_map = "shadow_map" in ml_args
-            _shadow_filter = "pcf"  # default
-            if "shadow_filter" in ml_args:
-                sf_val = ml_args["shadow_filter"]
-                if isinstance(sf_val, VarRef):
-                    _shadow_filter = sf_val.name
-            # Emit light_count from count arg (e.g. SceneLight.light_count)
-            count_expr = ml_args.get("count", NumberLit(str(max_lights)))
-            # Multiply by 1.0 to ensure float type (count may come from int uniform).
-            # Use _ml_ prefix to avoid clashing with uniform field names.
-            body.append(LetStmt("_ml_light_count", "scalar",
-                BinaryOp("*", count_expr, NumberLit("1.0"))))
-            result_var = _emit_multi_light_loop(
-                body, max_lights,
-                pos_var=pos_var, normal_var="n", view_var="v",
-                albedo_var="layer_albedo", roughness_var="layer_roughness",
-                metallic_var="layer_metallic",
-                has_shadows=_has_shadow_map,
-                shadow_filter=_shadow_filter,
-            )
+            result_var = _emit_multi_light_from_lighting(
+                body, lighting, pos_var)
         else:
             # Single directional light path
             # Direct lighting via gltf_pbr (includes N-dot-L)
@@ -1056,35 +1080,13 @@ def _generate_layered_main(
             )))
             result_var = "direct_lit"
 
-    # --- Transmission layer (replaces diffuse proportionally) ---
-    if "transmission" in layers_by_name:
-        trans_args = _get_layer_args(layers_by_name["transmission"])
-        factor_expr = trans_args.get("factor", NumberLit("0.0"))
-        ior_expr = trans_args.get("ior", NumberLit("1.5"))
-        thickness_expr = trans_args.get("thickness", NumberLit("0.0"))
-        atten_color_expr = trans_args.get("attenuation_color",
-            ConstructorExpr("vec3", [NumberLit("1.0")]))
-        atten_dist_expr = trans_args.get("attenuation_distance",
-            NumberLit("1000000.0"))
+    # --- Detect which optional layers are present ---
+    _has_transmission = "transmission" in layers_by_name
+    _has_sheen = "sheen" in layers_by_name
+    _has_coat = "coat" in layers_by_name
+    _has_emission = "emission" in layers_by_name
 
-        body.append(LetStmt("trans_factor", "scalar", factor_expr))
-        body.append(LetStmt("trans_ior", "scalar", ior_expr))
-        body.append(LetStmt("trans_thickness", "scalar", thickness_expr))
-        body.append(LetStmt("trans_atten_color", "vec3", atten_color_expr))
-        body.append(LetStmt("trans_atten_dist", "scalar", atten_dist_expr))
-
-        body.append(LetStmt("transmitted", "vec3", CallExpr(
-            VarRef("transmission_replace"), [
-                VarRef(result_var), VarRef("layer_albedo"),
-                VarRef("layer_roughness"),
-                VarRef("trans_factor"), VarRef("trans_ior"),
-                VarRef("n"), VarRef("v"), VarRef("l"),
-                VarRef("trans_thickness"), VarRef("trans_atten_color"),
-                VarRef("trans_atten_dist"),
-            ])))
-        result_var = "transmitted"
-
-    # --- IBL layer: image-based lighting (check lighting block first, then surface) ---
+    # IBL detection (check lighting block first, then surface)
     ibl_args = None
     if lighting and lighting.layers:
         _lighting_by_name = {layer.name: layer for layer in lighting.layers}
@@ -1092,134 +1094,186 @@ def _generate_layered_main(
             ibl_args = _get_layer_args(_lighting_by_name["ibl"])
     if ibl_args is None and "ibl" in layers_by_name:
         ibl_args = _get_layer_args(layers_by_name["ibl"])
+    _has_ibl = ibl_args is not None
 
-    if ibl_args is not None:
-        specular_map = ibl_args.get("specular_map")
-        irradiance_map = ibl_args.get("irradiance_map")
-        brdf_lut_ref = ibl_args.get("brdf_lut")
-
-        # Reflection vector
-        body.append(LetStmt("r", "vec3", CallExpr(VarRef("reflect"), [
-            BinaryOp("*", VarRef("v"), UnaryOp("-", NumberLit("1.0"))),
-            VarRef("n"),
-        ])))
-
-        # Sample IBL textures (surface expander's job)
-        body.append(LetStmt("prefiltered", "vec3", SwizzleAccess(
-            CallExpr(VarRef("sample_lod"), [
-                specular_map, VarRef("r"),
-                BinaryOp("*", VarRef("layer_roughness"), NumberLit("8.0")),
-            ]),
-            "xyz",
-        )))
-        body.append(LetStmt("irradiance", "vec3", SwizzleAccess(
-            CallExpr(VarRef("sample"), [irradiance_map, VarRef("n")]),
-            "xyz",
-        )))
-        body.append(LetStmt("brdf_sample", "vec2", SwizzleAccess(
-            CallExpr(VarRef("sample"), [
-                brdf_lut_ref,
-                ConstructorExpr("vec2", [
-                    VarRef("n_dot_v"), VarRef("layer_roughness"),
-                ]),
-            ]),
-            "xy",
-        )))
-
-        # Delegate math to compositing.lux::ibl_contribution()
-        body.append(LetStmt("ambient", "vec3", CallExpr(
-            VarRef("ibl_contribution"), [
-                VarRef("layer_albedo"), VarRef("layer_roughness"),
-                VarRef("layer_metallic"),
-                VarRef("n_dot_v"), VarRef("prefiltered"), VarRef("irradiance"),
-                VarRef("brdf_sample"),
-            ])))
-
-        # Coat IBL contribution (if coat layer present)
-        if "coat" in layers_by_name:
-            coat_args = _get_layer_args(layers_by_name["coat"])
-            coat_factor_expr = coat_args.get("factor", NumberLit("1.0"))
-            coat_rough_expr = coat_args.get("roughness", NumberLit("0.0"))
-            body.append(LetStmt("coat_ibl_factor", "scalar", coat_factor_expr))
-            body.append(LetStmt("coat_ibl_roughness", "scalar", coat_rough_expr))
-            body.append(LetStmt("prefiltered_coat", "vec3", SwizzleAccess(
-                CallExpr(VarRef("sample_lod"), [
-                    specular_map, VarRef("r"),
-                    BinaryOp("*", VarRef("coat_ibl_roughness"),
-                             NumberLit("8.0")),
-                ]),
-                "xyz",
-            )))
-            body.append(LetStmt("coat_ibl_contrib", "vec3", CallExpr(
-                VarRef("coat_ibl"), [
-                    VarRef("coat_ibl_factor"), VarRef("coat_ibl_roughness"),
-                    VarRef("n"), VarRef("v"), VarRef("prefiltered_coat"),
-                ])))
-            body.append(LetStmt("ambient_with_coat", "vec3",
-                BinaryOp("+", VarRef("ambient"), VarRef("coat_ibl_contrib"))))
-            body.append(LetStmt("hdr_partial", "vec3",
-                BinaryOp("+", VarRef(result_var),
-                         VarRef("ambient_with_coat"))))
-        else:
-            body.append(LetStmt("hdr_partial", "vec3",
-                BinaryOp("+", VarRef(result_var), VarRef("ambient"))))
-        result_var = "hdr_partial"
-
-    # --- Sheen layer (additive with energy conservation) ---
-    if "sheen" in layers_by_name:
-        sheen_args = _get_layer_args(layers_by_name["sheen"])
-        color_expr = sheen_args.get("color",
-            ConstructorExpr("vec3", [NumberLit("0.0")]))
-        rough_expr = sheen_args.get("roughness", NumberLit("0.5"))
-
-        body.append(LetStmt("sheen_color_val", "vec3", color_expr))
-        body.append(LetStmt("sheen_roughness_val", "scalar", rough_expr))
-
-        body.append(LetStmt("sheened", "vec3", CallExpr(
-            VarRef("sheen_over"), [
-                VarRef(result_var), VarRef("n"), VarRef("v"), VarRef("l"),
-                VarRef("sheen_color_val"), VarRef("sheen_roughness_val"),
-            ])))
-        result_var = "sheened"
-
-    # --- Coat layer (outermost, attenuates everything + adds specular) ---
-    if "coat" in layers_by_name:
-        coat_args = _get_layer_args(layers_by_name["coat"])
-        factor_expr = coat_args.get("factor", NumberLit("1.0"))
-        rough_expr = coat_args.get("roughness", NumberLit("0.0"))
-        coat_normal = coat_args.get("normal", None)
-
-        body.append(LetStmt("coat_factor", "scalar", factor_expr))
-        body.append(LetStmt("coat_roughness", "scalar", rough_expr))
-        coat_n = VarRef("coat_n") if coat_normal else VarRef("n")
-        if coat_normal:
-            body.append(LetStmt("coat_n", "vec3", coat_normal))
-
-        body.append(LetStmt("coated", "vec3", CallExpr(
-            VarRef("coat_over"), [
-                VarRef(result_var), coat_n, VarRef("v"), VarRef("l"),
-                VarRef("coat_factor"), VarRef("coat_roughness"),
-            ])))
-        result_var = "coated"
-
-    # --- Custom @layer functions (declaration order, after coat, before emission) ---
+    # Custom @layer functions
+    _custom_layer_list = []
     if module is not None:
         layer_fns = _collect_layer_functions(module)
-        for layer in surface.layers:
-            if layer.name in layer_fns:
-                result_var = _emit_custom_layer(
-                    layer, layer_fns[layer.name], result_var, body,
-                    prefix=f"custom_{layer.name}", rewrite_for_rt=False)
+        _custom_layer_list = [
+            (layer, layer_fns[layer.name])
+            for layer in surface.layers if layer.name in layer_fns
+        ]
+    _has_custom_layers = len(_custom_layer_list) > 0
 
-    # --- Emission layer (additive) ---
-    if "emission" in layers_by_name:
-        em_args = _get_layer_args(layers_by_name["emission"])
-        em_expr = em_args.get("color",
-            ConstructorExpr("vec3", [NumberLit("0.0")]))
-        body.append(LetStmt("emission_color", "vec3", em_expr))
-        body.append(LetStmt("hdr", "vec3",
-            BinaryOp("+", VarRef(result_var), VarRef("emission_color"))))
-        result_var = "hdr"
+    # Use compose_pbr_layers when any compositing-specific layer is active
+    # (transmission, sheen, coat, IBL — these require stdlib/compositing.lux).
+    # Emission is simple additive and handled inline without compose.
+    _use_compose = (_has_transmission or _has_sheen or _has_coat or _has_ibl)
+
+    if _use_compose:
+        # --- Initialize optional layer params (defaults = layer disabled) ---
+        body.append(LetStmt("bl_trans_factor", "scalar", NumberLit("0.0")))
+        body.append(LetStmt("bl_trans_ior", "scalar", NumberLit("1.5")))
+        body.append(LetStmt("bl_trans_thickness", "scalar", NumberLit("0.0")))
+        body.append(LetStmt("bl_trans_atten_color", "vec3",
+            ConstructorExpr("vec3", [NumberLit("1.0")])))
+        body.append(LetStmt("bl_trans_atten_dist", "scalar",
+            NumberLit("1000000.0")))
+        body.append(LetStmt("bl_sheen_color", "vec3",
+            ConstructorExpr("vec3", [NumberLit("0.0")])))
+        body.append(LetStmt("bl_sheen_roughness", "scalar", NumberLit("0.0")))
+        body.append(LetStmt("bl_coat_factor", "scalar", NumberLit("0.0")))
+        body.append(LetStmt("bl_coat_roughness", "scalar", NumberLit("0.0")))
+        body.append(LetStmt("bl_emission", "vec3",
+            ConstructorExpr("vec3", [NumberLit("0.0")])))
+
+        # --- Load transmission params from layer args ---
+        if _has_transmission:
+            trans_args = _get_layer_args(layers_by_name["transmission"])
+            body.append(AssignStmt(AssignTarget(VarRef("bl_trans_factor")),
+                trans_args.get("factor", NumberLit("0.0"))))
+            body.append(AssignStmt(AssignTarget(VarRef("bl_trans_ior")),
+                trans_args.get("ior", NumberLit("1.5"))))
+            body.append(AssignStmt(AssignTarget(VarRef("bl_trans_thickness")),
+                trans_args.get("thickness", NumberLit("0.0"))))
+            body.append(AssignStmt(AssignTarget(VarRef("bl_trans_atten_color")),
+                trans_args.get("attenuation_color",
+                    ConstructorExpr("vec3", [NumberLit("1.0")]))))
+            body.append(AssignStmt(AssignTarget(VarRef("bl_trans_atten_dist")),
+                trans_args.get("attenuation_distance",
+                    NumberLit("1000000.0"))))
+
+        # --- Load sheen params from layer args ---
+        if _has_sheen:
+            sheen_args = _get_layer_args(layers_by_name["sheen"])
+            body.append(AssignStmt(AssignTarget(VarRef("bl_sheen_color")),
+                sheen_args.get("color",
+                    ConstructorExpr("vec3", [NumberLit("0.0")]))))
+            body.append(AssignStmt(AssignTarget(VarRef("bl_sheen_roughness")),
+                sheen_args.get("roughness", NumberLit("0.5"))))
+
+        # --- Load coat params from layer args ---
+        if _has_coat:
+            coat_args = _get_layer_args(layers_by_name["coat"])
+            body.append(AssignStmt(AssignTarget(VarRef("bl_coat_factor")),
+                coat_args.get("factor", NumberLit("1.0"))))
+            body.append(AssignStmt(AssignTarget(VarRef("bl_coat_roughness")),
+                coat_args.get("roughness", NumberLit("0.0"))))
+
+        # --- Load emission from layer args ---
+        if _has_emission:
+            em_args = _get_layer_args(layers_by_name["emission"])
+            body.append(AssignStmt(AssignTarget(VarRef("bl_emission")),
+                em_args.get("color",
+                    ConstructorExpr("vec3", [NumberLit("0.0")]))))
+
+        # --- IBL sampling (path-specific: uses layer arg texture expressions) ---
+        body.append(LetStmt("bl_ambient", "vec3",
+            ConstructorExpr("vec3", [NumberLit("0.0")])))
+        body.append(LetStmt("bl_coat_ibl", "vec3",
+            ConstructorExpr("vec3", [NumberLit("0.0")])))
+
+        if _has_ibl:
+            specular_map = ibl_args.get("specular_map")
+            irradiance_map = ibl_args.get("irradiance_map")
+            brdf_lut_ref = ibl_args.get("brdf_lut")
+
+            body.append(LetStmt("r", "vec3", CallExpr(VarRef("reflect"), [
+                BinaryOp("*", VarRef("v"), UnaryOp("-", NumberLit("1.0"))),
+                VarRef("n"),
+            ])))
+            body.append(LetStmt("prefiltered", "vec3", SwizzleAccess(
+                CallExpr(VarRef("sample_lod"), [
+                    specular_map, VarRef("r"),
+                    BinaryOp("*", VarRef("layer_roughness"),
+                             NumberLit("8.0")),
+                ]), "xyz")))
+            body.append(LetStmt("irradiance", "vec3", SwizzleAccess(
+                CallExpr(VarRef("sample"), [irradiance_map, VarRef("n")]),
+                "xyz")))
+            body.append(LetStmt("brdf_sample", "vec2", SwizzleAccess(
+                CallExpr(VarRef("sample"), [
+                    brdf_lut_ref,
+                    ConstructorExpr("vec2", [
+                        VarRef("n_dot_v"), VarRef("layer_roughness"),
+                    ]),
+                ]), "xy")))
+
+            body.append(AssignStmt(AssignTarget(VarRef("bl_ambient")),
+                CallExpr(VarRef("ibl_contribution"), [
+                    VarRef("layer_albedo"), VarRef("layer_roughness"),
+                    VarRef("layer_metallic"),
+                    VarRef("n_dot_v"), VarRef("prefiltered"),
+                    VarRef("irradiance"), VarRef("brdf_sample"),
+                ])))
+
+            # Coat IBL contribution (if coat layer present)
+            if _has_coat:
+                body.append(LetStmt("prefiltered_coat", "vec3", SwizzleAccess(
+                    CallExpr(VarRef("sample_lod"), [
+                        specular_map, VarRef("r"),
+                        BinaryOp("*", VarRef("bl_coat_roughness"),
+                                 NumberLit("8.0")),
+                    ]), "xyz")))
+                body.append(AssignStmt(
+                    AssignTarget(VarRef("bl_coat_ibl")),
+                    CallExpr(VarRef("coat_ibl"), [
+                        VarRef("bl_coat_factor"),
+                        VarRef("bl_coat_roughness"),
+                        VarRef("n"), VarRef("v"),
+                        VarRef("prefiltered_coat"),
+                    ])))
+
+        # --- Compose via compose_pbr_layers (stdlib) ---
+        def _emit_compose_call(emission_expr):
+            return LetStmt("composed", "vec3", CallExpr(
+                VarRef("compose_pbr_layers"), [
+                    VarRef(result_var),
+                    VarRef("n"), VarRef("v"), VarRef("l"),
+                    VarRef("layer_albedo"), VarRef("layer_roughness"),
+                    VarRef("bl_trans_factor"), VarRef("bl_trans_ior"),
+                    VarRef("bl_trans_thickness"),
+                    VarRef("bl_trans_atten_color"),
+                    VarRef("bl_trans_atten_dist"),
+                    VarRef("bl_ambient"),
+                    VarRef("bl_sheen_color"), VarRef("bl_sheen_roughness"),
+                    VarRef("bl_coat_factor"), VarRef("bl_coat_roughness"),
+                    VarRef("bl_coat_ibl"),
+                    emission_expr,
+                ]))
+
+        if _has_custom_layers:
+            # Compose WITHOUT emission (custom layers run before emission)
+            body.append(_emit_compose_call(
+                ConstructorExpr("vec3", [NumberLit("0.0")])))
+            result_var = "composed"
+            for layer, fn in _custom_layer_list:
+                result_var = _emit_custom_layer(
+                    layer, fn, result_var, body,
+                    prefix=f"custom_{layer.name}", rewrite_for_rt=False)
+            body.append(LetStmt("hdr", "vec3",
+                BinaryOp("+", VarRef(result_var), VarRef("bl_emission"))))
+            result_var = "hdr"
+        else:
+            body.append(_emit_compose_call(VarRef("bl_emission")))
+            result_var = "composed"
+
+    else:
+        # No compositing layers — apply custom @layer functions + emission inline
+        if _has_custom_layers:
+            for layer, fn in _custom_layer_list:
+                result_var = _emit_custom_layer(
+                    layer, fn, result_var, body,
+                    prefix=f"custom_{layer.name}", rewrite_for_rt=False)
+        if _has_emission:
+            em_args = _get_layer_args(layers_by_name["emission"])
+            em_expr = em_args.get("color",
+                ConstructorExpr("vec3", [NumberLit("0.0")]))
+            body.append(LetStmt("emission_color", "vec3", em_expr))
+            body.append(LetStmt("hdr", "vec3",
+                BinaryOp("+", VarRef(result_var), VarRef("emission_color"))))
+            result_var = "hdr"
 
     # --- Tonemap + gamma ---
     output_var = _emit_tonemap_output(body, result_var, schedule)
@@ -1760,10 +1814,10 @@ def _expand_layered_closest_hit(
         UnaryOp("-", VarRef("world_ray_direction"))])))
 
     # Detect multi_light vs directional lighting mode
-    _rt_has_multi_light = False
+    _rt_has_multi_light = _detect_multi_light(lighting)
+    rt_lighting_by_name = {}
     if lighting and lighting.layers:
         rt_lighting_by_name = {layer.name: layer for layer in lighting.layers}
-        _rt_has_multi_light = "multi_light" in rt_lighting_by_name
 
     # Light direction: from lighting block (directional/multi_light) or legacy uniform
     if _rt_has_multi_light:
@@ -1817,31 +1871,8 @@ def _expand_layered_closest_hit(
         body.append(LetStmt("layer_metallic", "scalar", metallic_expr))
 
         if _rt_has_multi_light:
-            # Multi-light path: unroll N iterations from SSBO
-            ml_args = _get_layer_args(rt_lighting_by_name["multi_light"])
-            max_lights = 16  # default
-            if "max_lights" in ml_args and isinstance(ml_args["max_lights"], NumberLit):
-                max_lights = int(float(ml_args["max_lights"].value))
-            _has_shadow_map = "shadow_map" in ml_args
-            _shadow_filter = "pcf"  # default
-            if "shadow_filter" in ml_args:
-                sf_val = ml_args["shadow_filter"]
-                if isinstance(sf_val, VarRef):
-                    _shadow_filter = sf_val.name
-            # Emit light_count from count arg (e.g. SceneLight.light_count)
-            count_expr = ml_args.get("count", NumberLit(str(max_lights)))
-            # Multiply by 1.0 to ensure float type (count may come from int uniform).
-            # Use _ml_ prefix to avoid clashing with uniform field names.
-            body.append(LetStmt("_ml_light_count", "scalar",
-                BinaryOp("*", count_expr, NumberLit("1.0"))))
-            result_var = _emit_multi_light_loop(
-                body, max_lights,
-                pos_var="hit_pos", normal_var="n", view_var="v",
-                albedo_var="layer_albedo", roughness_var="layer_roughness",
-                metallic_var="layer_metallic",
-                has_shadows=_has_shadow_map,
-                shadow_filter=_shadow_filter,
-            )
+            result_var = _emit_multi_light_from_lighting(
+                body, lighting, "hit_pos")
         else:
             # Single directional light path
             body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
@@ -2742,40 +2773,11 @@ def _emit_bindless_layer_body(
     ))
 
     # --- Direct lighting ---
-    # Check if lighting has multi_light layer
-    _bl_has_multi_light = False
-    if lighting and lighting.layers:
-        for _bl_layer in lighting.layers:
-            if _bl_layer.name == "multi_light":
-                _bl_has_multi_light = True
-                break
+    _bl_has_multi_light = _detect_multi_light(lighting)
 
     if _bl_has_multi_light:
-        # Multi-light path: unroll N iterations from SSBO
-        ml_args = _get_layer_args(
-            next(la for la in lighting.layers if la.name == "multi_light"))
-        max_lights = 16  # default
-        if "max_lights" in ml_args and isinstance(ml_args["max_lights"], NumberLit):
-            max_lights = int(float(ml_args["max_lights"].value))
-        _has_shadow_map = "shadow_map" in ml_args
-        _shadow_filter = "pcf"  # default
-        if "shadow_filter" in ml_args:
-            sf_val = ml_args["shadow_filter"]
-            if isinstance(sf_val, VarRef):
-                _shadow_filter = sf_val.name
-        count_expr = ml_args.get("count", NumberLit(str(max_lights)))
-        # Multiply by 1.0 to ensure float type (count may come from int uniform).
-        # Use _ml_ prefix to avoid clashing with uniform field names.
-        body.append(LetStmt("_ml_light_count", "scalar",
-            BinaryOp("*", count_expr, NumberLit("1.0"))))
-        result_var = _emit_multi_light_loop(
-            body, max_lights,
-            pos_var=pos_var, normal_var="n", view_var="v",
-            albedo_var="layer_albedo", roughness_var="layer_roughness",
-            metallic_var="layer_metallic",
-            has_shadows=_has_shadow_map,
-            shadow_filter=_shadow_filter,
-        )
+        result_var = _emit_multi_light_from_lighting(
+            body, lighting, pos_var)
     else:
         body.append(LetStmt("direct", "vec3", CallExpr(VarRef("gltf_pbr"), [
             VarRef("n"), VarRef("v"), VarRef("l"),
@@ -2936,6 +2938,33 @@ def _emit_bindless_layer_body(
             VarRef("brdf_sample"),
         ])))
 
+    # --- Coat IBL (flag-gated: only when clearcoat is active) ---
+    body.append(LetStmt("bl_coat_ibl", "vec3",
+        ConstructorExpr("vec3", [NumberLit("0.0")])))
+    coat_ibl_body = []
+    if is_rt:
+        coat_ibl_body.append(LetStmt("prefiltered_coat", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_specular"), VarRef("r"),
+                BinaryOp("*", VarRef("bl_coat_roughness"), NumberLit("8.0")),
+            ]), "xyz")))
+    else:
+        coat_ibl_body.append(LetStmt("prefiltered_coat", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_specular"), VarRef("r"),
+                BinaryOp("*", VarRef("bl_coat_roughness"), NumberLit("8.0")),
+            ]), "xyz")))
+    coat_ibl_body.append(AssignStmt(AssignTarget(VarRef("bl_coat_ibl")),
+        CallExpr(VarRef("coat_ibl"), [
+            VarRef("bl_coat_factor"), VarRef("bl_coat_roughness"),
+            VarRef("n"), VarRef("v"), VarRef("prefiltered_coat"),
+        ])))
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_CLEARCOAT))),
+            NumberLit("0")),
+        coat_ibl_body, []))
+
     # --- Unified composition via compose_pbr_layers (stdlib) ---
     body.append(LetStmt("composed", "vec3", CallExpr(
         VarRef("compose_pbr_layers"), [
@@ -2953,8 +2982,8 @@ def _emit_bindless_layer_body(
             VarRef("bl_sheen_color"), VarRef("bl_sheen_roughness"),
             # Coat
             VarRef("bl_coat_factor"), VarRef("bl_coat_roughness"),
-            # Coat IBL (not computed in bindless)
-            ConstructorExpr("vec3", [NumberLit("0.0")]),
+            # Coat IBL (now properly computed)
+            VarRef("bl_coat_ibl"),
             # Emission
             VarRef("bl_emission"),
         ])))
@@ -3081,12 +3110,7 @@ def _expand_bindless_fragment(
     )
 
     # Detect multi_light mode for bindless raster
-    _bl_raster_has_multi_light = False
-    if lighting and lighting.layers:
-        for _bl_rl in lighting.layers:
-            if _bl_rl.name == "multi_light":
-                _bl_raster_has_multi_light = True
-                break
+    _bl_raster_has_multi_light = _detect_multi_light(lighting)
 
     # n, v, l setup
     body.append(LetStmt("n", "vec3", CallExpr(VarRef("normalize"), [VarRef(normal_var)])))
@@ -3213,12 +3237,7 @@ def _expand_bindless_closest_hit(
     _emit_barycentric_interpolation(body, VarRef("geo_index_offset"))
 
     # Detect multi_light mode for bindless RT
-    _bl_rt_has_multi_light = False
-    if lighting and lighting.layers:
-        for _bl_rtl in lighting.layers:
-            if _bl_rtl.name == "multi_light":
-                _bl_rt_has_multi_light = True
-                break
+    _bl_rt_has_multi_light = _detect_multi_light(lighting)
 
     # View and light directions (RT-specific)
     body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [

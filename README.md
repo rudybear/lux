@@ -34,17 +34,15 @@ The compiler expands this into fully typed vertex + fragment SPIR-V — no manua
 <p align="center">
 <img src="screenshots/gaussian_splat_python.png" width="250">
 <img src="screenshots/gaussian_splat_debug.png" width="250">
+<img src="screenshots/test_gltf_rt_cpp.png" width="250">
 </p>
-<p align="center"><em>Gaussian Splatting — first-class <code>splat</code> declaration compiles to compute + vertex + fragment pipeline, SH color, 2D Gaussian alpha compositing, interactive orbit viewer</em></p>
+<p align="center"><em>Left/center: Gaussian splatting — first-class <code>splat</code> declaration, 3-stage pipeline (compute + vertex + fragment), SH color, 2D Gaussian alpha compositing, interactive orbit camera in C++/Rust/Python. Right: glTF PBR ray tracing — one surface declaration generates both raster and RT pipelines.</em></p>
 
-<p align="center"><img src="screenshots/test_gltf_rt_cpp.png" width="300"></p>
-<p align="center"><em>glTF PBR with IBL — ray traced, tangent-space normal mapping, metallic-roughness, single surface declaration compiles to raster + RT</em></p>
-
-<p align="center"><img src="screenshots/hello_triangle_cpp.png" width="300"></p>
-<p align="center"><em>Hello Triangle — 15-line shader, per-vertex colors, zero boilerplate</em></p>
-
-<p align="center"><img src="screenshots/ai_gallery.png" width="500"></p>
-<p align="center"><em>AI-generated materials — text-to-shader, image-to-material, 5 providers, 58-material PBR reference database</em></p>
+<p align="center">
+<img src="screenshots/hello_triangle_cpp.png" width="250">
+<img src="screenshots/ai_gallery.png" width="500">
+</p>
+<p align="center"><em>Hello Triangle (15 lines, zero boilerplate) and AI-generated materials (text-to-shader, image-to-material, 5 providers)</em></p>
 
 See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shaders, compute, SDF, noise, autodiff, BRDF visualization, Nadrin/PBR validation, and more.
 
@@ -52,14 +50,14 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 
 **Language**
 - Declarative `surface` + `geometry` + `pipeline` blocks expand to full shader stages
-- `splat` declarations for Gaussian splatting — one block generates compute preprocess + instanced vertex/fragment
-- Layered surfaces with `layers [base, normal_map, sheen, coat, emission]` — automatic energy conservation, raster + RT from one declaration
+- **Gaussian splatting**: first-class `splat` declaration — one block generates a complete 3-stage pipeline (compute preprocess, instanced vertex, alpha-composited fragment), SH degrees 0–3, CPU depth sorting, glTF `KHR_gaussian_splatting`, interactive orbit viewers in all 3 engines
+- Layered surfaces with `layers [base, normal_map, sheen, coat, emission, ibl]` — unified `compose_pbr_layers` compositing, energy conservation, raster + RT from one declaration
 - `lighting` blocks separate illumination from material response; multi-light with shadows
 - Custom `@layer` functions, compile-time `features` with `if` guards, material `properties` UBO pipeline
 - Semantic types (`type strict WorldPos = vec3`) prevent coordinate-space mixing at compile time
 - Algorithm/schedule separation, math-first syntax (`scalar` not `float`), auto-layout
 - `for`/`while` loops, `break`/`continue`, `@[unroll]` hints, native integer arithmetic
-- 90+ stdlib functions across 13 modules: BRDF, SDF, noise, color, IBL, lighting, shadow, toon, Gaussian, debug...
+- 90+ stdlib functions across 14 modules: BRDF, SDF, noise, color, IBL, lighting, shadow, toon, compositing, PBR pipeline, Gaussian, debug...
 
 **Compiler**
 - Built-in optimizer: mem2reg, AST-level inlining, CSE, constant vector hoisting — **21.7% fewer instructions than hand-written GLSL** out of the box
@@ -232,7 +230,7 @@ Alternative path (--debug-run):
 luxc/            Compiler (parser, type checker, codegen, optimizer, autotype, debug)
 docs/            Documentation (language ref, gallery, usage, rendering engines)
 examples/        Example .lux shaders
-tests/           Test suite (1036+ tests)
+tests/           Test suite (1049+ tests)
 playground/      Python/wgpu rendering engine + screenshot tests
 playground_cpp/  C++/Vulkan + Metal rendering engines
 playground_rust/ Rust/Vulkan rendering engine
@@ -283,7 +281,7 @@ See [full project structure](docs/project-structure.md) for the complete directo
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 1036+ tests
+# 1049+ tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.

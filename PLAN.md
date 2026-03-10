@@ -1115,19 +1115,207 @@ Extended the shadow infrastructure with sampling functions, shader permutation s
 
 ---
 
-### Phase 21: Shared Stdlib Refactoring
+### Phase 21: Shared Stdlib Refactoring [DONE]
 
-The bindless uber-shader's PBR orchestration logic (`_emit_bindless_layer_body()` in `surface_expander.py`) duplicates the same material pipeline that the non-bindless path builds declaratively from `.lux` surface layers. While the math functions (`gltf_pbr`, `ibl_contribution`, `tonemap_aces`, etc.) are correctly in stdlib, the orchestration — sRGB-to-linear conversions, optional layer branching, texture sampling, and final composition — is hardcoded in the expander.
+The bindless uber-shader's PBR orchestration logic (`_emit_bindless_layer_body()` in `surface_expander.py`, ~340 lines) duplicates the same material pipeline that the non-bindless path (`_generate_layered_main()`, ~330 lines) builds declaratively from `.lux` surface layers. While the math functions (`gltf_pbr`, `ibl_contribution`, `tonemap_aces`, etc.) are correctly in stdlib, the orchestration — geometric preamble, direct lighting dispatch, IBL sampling, optional layer composition, tonemapping — is hardcoded in the expander with two divergent implementations.
 
-**Goal:** Unify both paths so the stdlib owns the full PBR pipeline, not just individual math functions.
+**Goal:** Unify both paths so the stdlib owns the full PBR pipeline, the expander shares Python-side helpers, and a known rendering gap (coat IBL in bindless) is fixed.
 
-| Item | Description |
-|------|-------------|
-| `stdlib/pbr_pipeline.lux` | Top-level orchestration function: takes `BindlessMaterialData` + UVs + view/normal vectors, returns final `vec4` color. Handles sRGB-to-linear, optional layer branching via material flags, texture sampling, IBL contribution, tonemapping, and linear-to-sRGB output. |
-| Unify bindless + non-bindless | Both code paths call the same stdlib pipeline. Non-bindless wraps per-material UBO data into the same struct interface. Eliminates duplicated orchestration in `surface_expander.py`. |
-| Surface expander simplification | `_emit_bindless_layer_body()` reduces to: load material data, call `pbr_pipeline()`, store output. No more hardcoded PBR logic in the expander. |
-| Optional layer functions | `stdlib/pbr_layers.lux` — individual layer application functions (`apply_normal_map`, `apply_clearcoat`, `apply_sheen`, `apply_emission`, `apply_transmission`) that the pipeline function calls conditionally based on `material_flags`. |
-| Backward compatibility | Existing `.lux` files with explicit `layers [...]` syntax continue to work unchanged. The stdlib pipeline is an alternative for bindless/uber-shader use cases. |
+**Current state of duplication (from deep research):**
+
+| Component | Non-bindless (`_generate_layered_main`) | Bindless (`_emit_bindless_layer_body`) | Already shared? |
+|-----------|----------------------------------------|----------------------------------------|-----------------|
+| n/v/l/n_dot_v geometric setup | Lines 937-1001 | Lines 3091-3108 + external caller | **No** — duplicated |
+| Multi-light detection + arg extraction | Lines 965-1044 | Lines 2746-2778 | **Partially** — both call `_emit_multi_light_loop()` but duplicate detection/setup |
+| Single-light fallback (`gltf_pbr` + tint) | Lines 1046-1057 | Lines 2780-2791 | **No** — duplicated |
+| IBL sampling (reflect, sample, ibl_contribution) | Lines 1096-1137 | Lines 2893-2937 | **No** — duplicated |
+| Coat IBL computation | Lines 1139-1162 (proper) | Line 2957: `vec3(0.0)` placeholder | **BUG** — bindless is broken |
+| Optional layer composition | Lines 1059-1222 (manual chaining) | Lines 2793-2960 (via `compose_pbr_layers`) | **No** — non-bindless duplicates stdlib |
+| Tonemap + output | Line 1225 | Line 2964 | **Yes** — `_emit_tonemap_output()` |
+| `compose_pbr_layers()` stdlib | Not called (manual chaining) | Called at line 2940 | **Gap** — non-bindless should use it |
+
+**Texture sampling is path-specific and CANNOT be unified:**
+- Non-bindless: `sample(albedo_tex, uv)` — texture bound per-draw
+- Bindless: `sample_bindless(textures, tex_idx, uv)` — SSBO index + texture array
+- sRGB conversion: bindless does explicit `srgb_to_linear()`, non-bindless assumes decoded textures
+
+The multi-light loop is compile-time unrolled (N iterations with unique variable suffixes) and must remain in the Python expander.
+
+---
+
+#### P21.1: Non-bindless Uses `compose_pbr_layers()`
+
+**Problem:** `_generate_layered_main()` manually chains `transmission_replace()` → `+= ambient` → `sheen_over()` → `coat_over()` → `+= emission` (lines 1059-1222), duplicating what `compose_pbr_layers()` already does. The bindless path correctly calls `compose_pbr_layers()` (line 2940).
+
+**Change:** Replace the manual chaining in `_generate_layered_main()` with:
+1. Collect optional layer values into standardized variables (same names as bindless: `bl_trans_factor`, `bl_sheen_color`, etc.)
+2. Set disabled layers to zero/default (factor=0.0, color=vec3(0.0))
+3. Call `compose_pbr_layers()` with the collected values
+4. Remove ~80 lines of manual `transmission_replace` → `sheen_over` → `coat_over` → emission chaining
+
+**Diff sketch** (Python AST in `surface_expander.py`):
+```python
+# BEFORE (lines 1059-1222): ~160 lines of manual chaining
+if "transmission" in layers_by_name:
+    # ... 20 lines: extract args, call transmission_replace ...
+if ibl_args is not None:
+    # ... 50 lines: sample IBL, call ibl_contribution, coat IBL ...
+if "sheen" in layers_by_name:
+    # ... 15 lines: extract args, call sheen_over ...
+if "coat" in layers_by_name:
+    # ... 18 lines: extract args, call coat_over ...
+if "emission" in layers_by_name:
+    # ... 8 lines: add emission ...
+
+# AFTER: ~40 lines — collect values, single compose call
+# Initialize defaults (disabled = zero)
+body.append(LetStmt("bl_trans_factor", "scalar", NumberLit("0.0")))
+# ... (same pattern as bindless lines 2793-2802)
+# Conditionally load from layer args
+if "transmission" in layers_by_name:
+    # ... extract factor/ior from layer args, assign to bl_trans_* vars
+# Sample IBL → ambient (shared helper, see P21.2)
+# Compute coat IBL if both coat + ibl present
+# Call compose_pbr_layers() — exactly as bindless does at line 2940
+body.append(LetStmt("composed", "vec3", CallExpr(VarRef("compose_pbr_layers"), [...])))
+```
+
+**Files:** `luxc/expansion/surface_expander.py` (modify `_generate_layered_main()`)
+**Net effect:** ~80 lines removed, non-bindless and bindless share identical composition logic
+**Risk:** Low — mathematical equivalence guaranteed (stdlib functions are the same)
+
+---
+
+#### P21.2: Extract Shared Expander Helpers
+
+**Problem:** Both paths duplicate Python AST-generation code for geometric setup, direct lighting dispatch, and IBL sampling.
+
+**New private functions in `surface_expander.py`:**
+
+**`_emit_geometric_preamble(body, frag_inputs, lighting, pos_var)`** → returns `(result_var_for_l)`
+- Normalize `n` from world_normal (with TBN option for non-bindless)
+- Compute `v` from `view_pos - pos` (or fallback `vec3(0,0,1)`)
+- Detect multi_light from lighting block
+- Emit `l` (dummy for multi-light, directional otherwise)
+- Emit `n_dot_v = max(dot(n, v), 0.001)`
+- Replaces: lines 937-1001 (non-bindless) and 3091-3108 (bindless fragment caller)
+
+**`_emit_direct_lighting(body, lighting, pos_var)`** → returns `result_var`
+- Detect multi_light layer, extract max_lights, shadow args
+- Emit `_ml_light_count` if multi-light
+- Call `_emit_multi_light_loop()` or emit single-light `gltf_pbr()` + tint
+- Replaces: lines 1003-1057 (non-bindless) and 2744-2791 (bindless)
+
+**`_emit_ibl_sampling(body, is_bindless, is_rt, ibl_args=None)`** → appends `ambient` variable
+- Emit reflection vector `r`
+- Sample IBL textures (specular, irradiance, BRDF LUT)
+  - Bindless: uses `env_specular`/`env_irradiance`/`brdf_lut` uniform names
+  - Non-bindless: uses `ibl_args` expressions (from lighting/surface layer)
+  - RT: all `sample_lod` calls; raster: `sample_lod` for cubemaps, `sample` for 2D BRDF LUT
+- Call `ibl_contribution()`
+- Replaces: lines 1096-1137 (non-bindless) and 2893-2937 (bindless)
+
+**`_emit_coat_ibl(body, coat_factor_var, coat_roughness_var, specular_map, is_bindless)`** → appends `coat_ibl_contrib` variable
+- Emit `prefiltered_coat = sample_lod(specular, r, coat_rough * 8.0)`
+- Emit `coat_ibl_contrib = coat_ibl(factor, roughness, n, v, prefiltered_coat)`
+- Used by both non-bindless (already works) and bindless (new — fixes P21.3)
+
+**Files:** `luxc/expansion/surface_expander.py`
+**Net effect:** Each helper called 2-3x (raster, RT, mesh × bindless/non-bindless). Estimated ~200 lines of duplication removed.
+
+---
+
+#### P21.3: Fix Coat IBL Gap in Bindless
+
+**Problem:** `_emit_bindless_layer_body()` line 2957 passes `vec3(0.0)` for `coat_ibl_val` to `compose_pbr_layers()`. The non-bindless path correctly computes `coat_ibl()` (lines 1139-1162). This means bindless scenes with clearcoat materials are missing coat IBL specular reflection — a visible rendering quality gap.
+
+**Fix:** Inside the clearcoat flag-gated block (lines 2845-2871), after loading coat factor/roughness from SSBO:
+1. Sample `prefiltered_coat = sample_lod(env_specular, r, coat_roughness * 8.0)`
+2. Compute `coat_ibl_contrib = coat_ibl(coat_factor, coat_roughness, n, v, prefiltered_coat)`
+3. Replace the `vec3(0.0)` placeholder at line 2957 with `coat_ibl_contrib`
+
+Or, with P21.2's `_emit_coat_ibl()` helper, this becomes a single function call.
+
+**Files:** `luxc/expansion/surface_expander.py` (modify `_emit_bindless_layer_body()`)
+**Net effect:** Correct coat IBL in all bindless pipelines (raster, RT, mesh)
+
+---
+
+#### P21.4: Create `stdlib/pbr_pipeline.lux`
+
+**New stdlib file** with a single convenience function that wraps `ibl_contribution()` + `compose_pbr_layers()`:
+
+```lux
+import compositing;
+import ibl;
+
+fn pbr_shade(
+    direct_lit: vec3,
+    n: vec3, v: vec3, l: vec3,
+    albedo: vec3, roughness: scalar, metallic: scalar,
+    // Pre-sampled IBL textures
+    prefiltered: vec3, irradiance: vec3, brdf_sample: vec2,
+    // Optional layers (factor=0 / color=vec3(0) to disable)
+    trans_factor: scalar, trans_ior: scalar,
+    trans_thickness: scalar, trans_atten_color: vec3, trans_atten_dist: scalar,
+    sheen_color: vec3, sheen_roughness: scalar,
+    coat_factor: scalar, coat_roughness: scalar,
+    coat_ibl_contrib: vec3,
+    emission: vec3
+) -> vec3 {
+    let n_dot_v: scalar = max(dot(n, v), 0.001);
+    let ambient: vec3 = ibl_contribution(
+        albedo, roughness, metallic, n_dot_v,
+        prefiltered, irradiance, brdf_sample);
+    return compose_pbr_layers(
+        direct_lit, n, v, l, albedo, roughness,
+        trans_factor, trans_ior, trans_thickness, trans_atten_color, trans_atten_dist,
+        ambient,
+        sheen_color, sheen_roughness,
+        coat_factor, coat_roughness,
+        coat_ibl_contrib,
+        emission);
+}
+```
+
+Both `_generate_layered_main()` and `_emit_bindless_layer_body()` emit a single `CallExpr(VarRef("pbr_shade"), [...])` after direct lighting + IBL sampling, replacing separate `ibl_contribution()` + `compose_pbr_layers()` calls.
+
+**Files:** `luxc/stdlib/pbr_pipeline.lux` (new), `luxc/expansion/surface_expander.py` (both paths)
+**Net effect:** Both paths converge to a single stdlib entry point for post-sampling PBR composition
+
+---
+
+#### P21.5: Backward Compatibility & Validation
+
+**What must NOT change:**
+- Existing `.lux` files with explicit `layers [...]` syntax (tested by `test_surface_expander.py`, `test_gltf_extensions.py`, `test_material_properties.py`)
+- Bindless pipeline expansion (tested by existing tests + engine renders)
+- Reflection JSON layout (engines parse it)
+- SPIR-V output for all non-modified shaders (binary diff check)
+
+**Validation strategy:**
+1. `pytest tests/` → 1036+ tests pass (zero regressions)
+2. Add ~15 new tests in `tests/test_stdlib_refactoring.py`:
+   - Non-bindless layered shader calls `compose_pbr_layers` (AST inspection)
+   - Non-bindless with all optional layers (transmission + sheen + coat + emission + IBL) produces identical SPIR-V
+   - Bindless coat IBL: new SPIR-V includes `coat_ibl()` call when clearcoat flag set
+   - `pbr_shade()` stdlib function compiles and inlines correctly
+   - Shared helper functions produce same AST as old inline code
+3. Visual regression: render `examples/gltf_pbr_layered.lux` and `examples/advanced_materials.lux` headless, compare PNG output (pixel-perfect or PSNR > 40dB)
+
+---
+
+#### Implementation Order
+
+| Step | Description | Estimated lines changed | Risk |
+|------|-------------|------------------------|------|
+| P21.1 | Non-bindless → `compose_pbr_layers()` | -80 / +40 in `surface_expander.py` | Low: mathematical identity |
+| P21.3 | Fix coat IBL in bindless | +20 in `surface_expander.py` | Low: additive fix |
+| P21.2 | Extract 4 shared helpers | -200 / +120 in `surface_expander.py` | Medium: refactor of central code |
+| P21.4 | `stdlib/pbr_pipeline.lux` + wire up | +30 new file, ±20 in expander | Low: thin wrapper |
+| P21.5 | Tests + validation | +80 in new test file | None |
+
+**Total estimated impact:** ~180 net lines removed from `surface_expander.py` (3266 → ~3086), 1 new stdlib file (30 lines), 1 new test file (80 lines). The expander's two 330-line PBR functions each shrink to ~120 lines of path-specific data loading + shared helper calls.
 
 ---
 

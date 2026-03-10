@@ -746,7 +746,8 @@ Import modules with `import <name>;` — functions are inlined at the call site.
 | `lighting` | 7 | Distance/spot attenuation, evaluate directional/point/spot lights, unified light evaluation, branchless light direction selection |
 | `shadow` | 4 | Basic shadow sampling, PCF4 shadow filtering, cascade selection, shadow UV computation |
 | `toon` | 1 | Cartoon cel-shading with quantized NdotL + rim lighting (`@layer` function) |
-| `compositing` | 2 | IBL multi-scattering (Fdez-Aguera 2019), layer compositing helpers |
+| `compositing` | 2 | IBL multi-scattering (Fdez-Aguera 2019), unified `compose_pbr_layers` (transmission, sheen, coat, IBL, emission) |
+| `pbr_pipeline` | 1 | `pbr_shade()` — single-call PBR orchestration (direct lighting + IBL + all optional layers) |
 | `gaussian` | 6 | SH constants (degrees 0–3), quaternion-to-rotation, 3D/2D covariance, Gaussian 2D eval, quad radius |
 | `debug` | 5 | Normal visualization, depth grayscale, scalar heatmap, index coloring, UV checkerboard |
 

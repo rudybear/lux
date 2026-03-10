@@ -80,9 +80,9 @@ luxc gltf_pbr_layered.lux --pipeline GltfMesh --features has_emission \
     --define max_vertices=64 --define max_primitives=124 --define workgroup_size=32
 ```
 
-### Gaussian Splatting — 3D Gaussian Splat Rendering
+### Gaussian Splatting — First-Class 3DGS Rendering Primitive
 
-First-class Gaussian splatting via the `splat` declaration — one block generates a complete 3-stage pipeline: compute preprocess (projection, covariance, SH evaluation), instanced vertex shader (sorted quad rendering), and fragment shader (2D Gaussian evaluation with alpha compositing). Supports SH degrees 0-3, CPU depth sorting, and `KHR_gaussian_splatting` glTF extension. All three engines (C++/Vulkan, Rust/ash, Python/numpy) render Gaussian splats with interactive orbit cameras.
+First-class Gaussian splatting via the `splat` declaration — one block generates a complete 3-stage pipeline: compute preprocess (projection, 3D→2D covariance via Jacobian, SH evaluation up to degree 3), instanced vertex shader (depth-sorted quad rendering), and fragment shader (2D Gaussian kernel with alpha cutoff and premultiplied alpha compositing). Supports SH degrees 0–3 (1/4/9/16 coefficients), CPU depth sorting, and `KHR_gaussian_splatting` glTF extension for interop. All three engines (C++/Vulkan, Rust/ash, Python/numpy) render Gaussian splats with interactive orbit cameras. Tools for `.ply` ↔ `.glb` conversion included.
 
 <p align="center">
 <img src="../screenshots/gaussian_splat_python.png" width="300">

@@ -346,7 +346,7 @@ class TestLightingExpansion:
         assert "prefiltered" in var_names
         assert "irradiance" in var_names
         assert "brdf_sample" in var_names
-        assert "ambient" in var_names
+        assert "bl_ambient" in var_names
 
     def test_lighting_samplers_in_fragment(self):
         """Lighting block samplers appear in generated fragment stage."""
@@ -397,7 +397,7 @@ class TestLightingExpansion:
         # IBL should still be generated from surface layers
         assert "prefiltered" in var_names
         assert "irradiance" in var_names
-        assert "ambient" in var_names
+        assert "bl_ambient" in var_names
 
 
 # --- Cross-block interaction tests ---
@@ -482,8 +482,9 @@ pipeline CoatedForward {
         var_names = [stmt.name for stmt in main_fn.body
                      if hasattr(stmt, 'name')]
         # Should have coat_ibl contribution from cross-block interaction
-        assert "coat_ibl_factor" in var_names
-        assert "coat_ibl_roughness" in var_names
+        # (coat params loaded into bl_ vars, coat IBL computed, passed to compose)
+        assert "bl_coat_factor" in var_names
+        assert "bl_coat_roughness" in var_names
         assert "prefiltered_coat" in var_names
-        assert "coat_ibl_contrib" in var_names
-        assert "ambient_with_coat" in var_names
+        assert "bl_coat_ibl" in var_names
+        assert "composed" in var_names

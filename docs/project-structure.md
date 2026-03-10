@@ -72,7 +72,8 @@ luxc/
         lighting.lux         # multi-light shading (directional, point, spot)
         shadow.lux           # shadow sampling (basic, PCF4, cascade selection, UV computation)
         toon.lux             # @layer cartoon cel-shading + rim lighting
-        compositing.lux      # IBL multi-scattering, layer compositing helpers
+        compositing.lux      # IBL multi-scattering, unified compose_pbr_layers compositing
+        pbr_pipeline.lux     # PBR orchestration: pbr_shade() single-call entry point
         debug.lux            # debug visualization helpers (normal, depth, heatmap, checkerboard)
         gaussian.lux         # Gaussian splatting helpers (SH, covariance, quad radius)
     transpiler/
@@ -170,10 +171,12 @@ tests/
     test_debugger.py            # CPU shader debugger tests (62 tests)
     test_autotype.py            # auto-type precision optimization tests (50 tests)
     test_gaussian_splatting.py  # Gaussian splatting tests (33 tests: parser, config, expansion, compilation)
+    test_stdlib_refactoring.py  # Shared stdlib refactoring tests (13 tests: compose_pbr_layers, coat IBL, helpers)
 tools/
     generate_training_data.py
     generate_test_splats.py  # generate test Gaussian splat .glb files (KHR_gaussian_splatting)
     ply_to_gltf.py           # convert .ply splat files to glTF with KHR_gaussian_splatting
     glb_to_ply.py            # convert KHR_gaussian_splatting .glb to standard .ply for external viewers
+    debug_splats.py          # debug visualization for Gaussian splat data
     visualize_brdf.py        # BRDF visualization CLI (compile + render + composite)
 ```
