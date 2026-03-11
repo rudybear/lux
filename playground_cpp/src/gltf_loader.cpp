@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <functional>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 #include <cstring>
 #include <iostream>
@@ -358,19 +359,27 @@ GltfScene loadGltf(const std::string& path) {
     // with custom attributes: POSITION (vec3), _ROTATION (vec4 quaternion),
     // _SCALE (vec3 log-space), _OPACITY (scalar logit-space), and
     // _SH_0.._SH_N for spherical harmonics coefficients.
+    // Helper: check if attribute name matches a splat attribute (supports both
+    // internal format: _ROTATION, _SCALE, _OPACITY, _SH_N
+    // and Khronos conformance format: KHR_gaussian_splatting:ROTATION, etc.)
+    auto isSplatAttr = [](const std::string& name, const std::string& suffix) -> bool {
+        return name == "_" + suffix
+            || name == "KHR_gaussian_splatting:" + suffix;
+    };
+
     for (size_t mi = 0; mi < data->meshes_count; mi++) {
         auto& mesh = data->meshes[mi];
         for (size_t pi = 0; pi < mesh.primitives_count; pi++) {
             auto& prim = mesh.primitives[pi];
             if (prim.type != cgltf_primitive_type_points) continue;
 
-            // Check for gaussian splatting attributes (_ROTATION or _SCALE)
+            // Check for gaussian splatting attributes (both naming conventions)
             bool hasRotation = false, hasScale = false;
             for (size_t ai = 0; ai < prim.attributes_count; ai++) {
                 if (prim.attributes[ai].name) {
                     std::string attrName(prim.attributes[ai].name);
-                    if (attrName == "_ROTATION") hasRotation = true;
-                    if (attrName == "_SCALE") hasScale = true;
+                    if (isSplatAttr(attrName, "ROTATION")) hasRotation = true;
+                    if (isSplatAttr(attrName, "SCALE")) hasScale = true;
                 }
             }
 
@@ -380,6 +389,11 @@ GltfScene loadGltf(const std::string& path) {
                       << (mesh.name ? mesh.name : "unnamed") << std::endl;
 
             // Parse all gaussian splatting attributes
+            // Conformance SH format: KHR_gaussian_splatting:SH_DEGREE_N_COEF_M (vec3 each)
+            // Internal SH format: _SH_N (packed float array per degree)
+            // We collect conformance SH coefficients per degree, then pack them.
+            std::map<int, std::vector<std::vector<float>>> khrSHByDegree; // degree -> [coef_idx] -> vec3 per splat
+
             for (size_t ai = 0; ai < prim.attributes_count; ai++) {
                 auto& attr = prim.attributes[ai];
                 if (!attr.name || !attr.data) continue;
@@ -396,23 +410,85 @@ GltfScene loadGltf(const std::string& path) {
                         scene.splat_data.positions[si * 4 + 2] = pos3[si * 3 + 2];
                         scene.splat_data.positions[si * 4 + 3] = 1.0f;
                     }
-                } else if (attrName == "_ROTATION") {
+                } else if (isSplatAttr(attrName, "ROTATION")) {
                     scene.splat_data.rotations = readFloatAccessor(attr.data);
-                } else if (attrName == "_SCALE") {
+                } else if (isSplatAttr(attrName, "SCALE")) {
                     scene.splat_data.scales = readFloatAccessor(attr.data);
-                } else if (attrName == "_OPACITY") {
+                } else if (isSplatAttr(attrName, "OPACITY")) {
                     scene.splat_data.opacities = readFloatAccessor(attr.data);
                 } else if (attrName.rfind("_SH_", 0) == 0) {
-                    // Spherical harmonics: _SH_0, _SH_1, ... _SH_N
+                    // Internal format: _SH_0, _SH_1, ... _SH_N (packed float array)
                     int degree = std::stoi(attrName.substr(4));
                     if (degree >= static_cast<int>(scene.splat_data.sh_coefficients.size())) {
                         scene.splat_data.sh_coefficients.resize(degree + 1);
                     }
                     scene.splat_data.sh_coefficients[degree] = readFloatAccessor(attr.data);
-                    // sh_degree tracks the max degree (0=DC only, 1=degree 1, etc.)
                     if (static_cast<uint32_t>(degree) > scene.splat_data.sh_degree) {
                         scene.splat_data.sh_degree = static_cast<uint32_t>(degree);
                     }
+                } else if (attrName.rfind("KHR_gaussian_splatting:SH_DEGREE_", 0) == 0) {
+                    // Conformance format: KHR_gaussian_splatting:SH_DEGREE_N_COEF_M
+                    // Each is a VEC3 accessor (one vec3 per splat for this coefficient)
+                    // Parse degree and coef index from name
+                    // Format: KHR_gaussian_splatting:SH_DEGREE_<D>_COEF_<C>
+                    std::string rest = attrName.substr(33); // after "KHR_gaussian_splatting:SH_DEGREE_"
+                    size_t underscorePos = rest.find("_COEF_");
+                    if (underscorePos != std::string::npos) {
+                        int degree = std::stoi(rest.substr(0, underscorePos));
+                        int coefIdx = std::stoi(rest.substr(underscorePos + 6));
+                        auto coeffData = readFloatAccessor(attr.data);
+                        if (degree >= static_cast<int>(khrSHByDegree.size())) {
+                            khrSHByDegree[degree]; // ensure entry exists
+                        }
+                        if (coefIdx >= static_cast<int>(khrSHByDegree[degree].size())) {
+                            khrSHByDegree[degree].resize(coefIdx + 1);
+                        }
+                        khrSHByDegree[degree][coefIdx] = coeffData;
+                    }
+                }
+            }
+
+            // Pack KHR conformance SH data into our internal format
+            // Internal: sh_coefficients[degree_idx] = flat float array (all splats, all coefficients for that degree)
+            // Degree 0 has 1 coefficient (3 floats per splat = DC color)
+            // Degree 1 has 3 coefficients, degree 2 has 5, degree 3 has 7
+            if (!khrSHByDegree.empty()) {
+                int maxDegree = 0;
+                for (auto& [deg, coeffs] : khrSHByDegree) {
+                    if (deg > maxDegree) maxDegree = deg;
+                }
+                scene.splat_data.sh_degree = static_cast<uint32_t>(maxDegree);
+
+                // For degree 0: pack as DC color (SH0 coefficient)
+                // Each KHR SH coefficient is a VEC3 (r,g,b) per splat
+                // Our internal format expects sh_coefficients[0] = [r0,g0,b0, r1,g1,b1, ...]
+                for (auto& [deg, coeffsByIdx] : khrSHByDegree) {
+                    // Ensure degree index exists in our array
+                    // For KHR format, we store ALL coefficients for a degree in one flat array
+                    // Number of coefficients per degree: 2*l+1
+                    size_t numCoeffs = coeffsByIdx.size();
+                    size_t numSplats = scene.splat_data.num_splats;
+
+                    // Flatten: for each splat, write all coefficients (each is vec3)
+                    std::vector<float> packed(numSplats * numCoeffs * 3, 0.0f);
+                    for (size_t ci = 0; ci < numCoeffs; ci++) {
+                        if (ci < coeffsByIdx.size() && !coeffsByIdx[ci].empty()) {
+                            for (size_t si = 0; si < numSplats; si++) {
+                                size_t srcBase = si * 3;
+                                size_t dstBase = si * numCoeffs * 3 + ci * 3;
+                                if (srcBase + 2 < coeffsByIdx[ci].size() && dstBase + 2 < packed.size()) {
+                                    packed[dstBase + 0] = coeffsByIdx[ci][srcBase + 0];
+                                    packed[dstBase + 1] = coeffsByIdx[ci][srcBase + 1];
+                                    packed[dstBase + 2] = coeffsByIdx[ci][srcBase + 2];
+                                }
+                            }
+                        }
+                    }
+
+                    if (deg >= static_cast<int>(scene.splat_data.sh_coefficients.size())) {
+                        scene.splat_data.sh_coefficients.resize(deg + 1);
+                    }
+                    scene.splat_data.sh_coefficients[deg] = std::move(packed);
                 }
             }
 
