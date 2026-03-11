@@ -1,0 +1,73 @@
+// OpenPBR Glass — tinted transmission with volume absorption
+// Demonstrates specular transmission through a dielectric surface with
+// amber-tinted volume color and smooth glass IOR.
+//
+// Compile: luxc openpbr_glass.lux
+
+import openpbr;
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    uv: vec2,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        frag_uv: uv,
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+surface TintedGlass {
+    properties Glass {
+        base_tint: vec3 = vec3(0.97, 0.97, 0.95),
+        volume_color: vec3 = vec3(0.9, 0.6, 0.3),
+        volume_depth: scalar = 0.5,
+        glass_ior: scalar = 1.5,
+    },
+
+    layers [
+        base(color: Glass.base_tint,
+             metalness: 0.0,
+             diffuse_roughness: 0.0,
+             weight: 1.0),
+        specular(weight: 1.0,
+                 color: vec3(1.0),
+                 roughness: 0.02,
+                 ior: Glass.glass_ior),
+        transmission(weight: 0.95,
+                     color: Glass.volume_color,
+                     depth: Glass.volume_depth),
+        emission(luminance: 0.0,
+                 color: vec3(0.0)),
+    ]
+}
+
+lighting SceneLighting {
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    properties Light {
+        light_dir: vec3 = vec3(0.0, -1.0, 0.0),
+        view_pos: vec3 = vec3(0.0, 0.0, 3.0),
+    },
+
+    layers [
+        directional(direction: Light.light_dir,
+                    color: vec3(1.0, 0.98, 0.95)),
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
+    ]
+}
+
+pipeline GlassForward {
+    geometry: StandardMesh,
+    surface: TintedGlass,
+    lighting: SceneLighting,
+}

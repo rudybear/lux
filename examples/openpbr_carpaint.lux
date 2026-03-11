@@ -1,0 +1,77 @@
+// OpenPBR Car Paint — metallic base + clearcoat + thin-film iridescence
+// Demonstrates OpenPBR's physically-richer coat layer (color, IOR, darkening)
+// and thin-film interference that glTF PBR cannot express.
+//
+// Compile: luxc openpbr_carpaint.lux
+
+import openpbr;
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    uv: vec2,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        frag_uv: uv,
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+surface CarPaint {
+    sampler2d flake_noise_tex,
+
+    properties Paint {
+        base_color: vec3 = vec3(0.02, 0.05, 0.25),
+        flake_intensity: scalar = 0.15,
+    },
+
+    layers [
+        base(color: Paint.base_color
+                    + sample(flake_noise_tex, uv * 8.0).xyz * Paint.flake_intensity,
+             metalness: 0.8,
+             diffuse_roughness: 0.3,
+             weight: 1.0),
+        specular(weight: 1.0,
+                 color: vec3(1.0),
+                 roughness: 0.25,
+                 ior: 1.5),
+        thin_film(weight: 0.3,
+                  thickness: 0.4,
+                  ior: 1.3),
+        coat(weight: 1.0,
+             color: vec3(1.0),
+             roughness: 0.05,
+             ior: 1.6,
+             darkening: 1.0),
+    ]
+}
+
+lighting SceneLighting {
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    properties Light {
+        light_dir: vec3 = vec3(0.5, -0.8, 0.3),
+        view_pos: vec3 = vec3(0.0, 1.5, 4.0),
+    },
+
+    layers [
+        directional(direction: Light.light_dir,
+                    color: vec3(1.0, 0.98, 0.95)),
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
+    ]
+}
+
+pipeline CarPaintForward {
+    geometry: StandardMesh,
+    surface: CarPaint,
+    lighting: SceneLighting,
+}

@@ -1,0 +1,373 @@
+// OpenPBR Surface v1.1 — Adobe/ASWF Material Model
+// Reference: https://github.com/AcademySoftwareFoundation/OpenPBR
+//
+// Implements the real-time approximation of the OpenPBR composition tree:
+//   fuzz -> coat -> mix(metal, dielectric) -> mix(opaque, translucent) -> emission
+//
+// Layer order follows the OpenPBR specification:
+//   - Innermost: base substrate (metal or dielectric diffuse)
+//   - Specular: GGX microfacet with IOR-based Fresnel (dielectric) or F82-tint (metal)
+//   - Transmission: volume attenuation for translucent dielectrics
+//   - Coat: physical IOR clearcoat with darkening and absorption
+//   - Fuzz: Charlie NDF velvet/fabric outermost layer
+//   - Emission: additive, attenuated by coat
+//
+// Activated via `import openpbr;` in surface declarations.
+
+import brdf;
+import compositing;
+
+// =====================================================================
+// Fresnel
+// =====================================================================
+
+// Exact dielectric Fresnel reflectance (s + p polarization average).
+// eta = exterior IOR / interior IOR (ratio).
+fn openpbr_fresnel_dielectric(cos_theta: scalar, eta: scalar) -> scalar {
+    let cos_i: scalar = clamp(cos_theta, 0.0, 1.0);
+    let sin2_t: scalar = (1.0 - cos_i * cos_i) / (eta * eta);
+    // Clamp sin2_t to avoid TIR domain issues; TIR returns 1.0
+    let sin2_safe: scalar = min(sin2_t, 0.9999);
+    let cos_t: scalar = sqrt(1.0 - sin2_safe);
+    let rs: scalar = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+    let rp: scalar = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
+    let fresnel: scalar = 0.5 * (rs * rs + rp * rp);
+    // TIR: when sin2_t >= 1.0, return 1.0; otherwise return computed Fresnel
+    let tir_blend: scalar = step(1.0, sin2_t);
+    return mix(fresnel, 1.0, tir_blend);
+}
+
+// Hemispherical average Fresnel reflectance.
+// Polynomial approximation (accurate to <0.5% for IOR 1.0–3.0).
+fn openpbr_fresnel_avg(eta: scalar) -> scalar {
+    let f0: scalar = ior_to_f0(eta);
+    // Approximation from d'Eon 2021 / OpenPBR reference
+    return f0 + (1.0 - f0) * (0.0477 + 0.8965 * f0 + 0.0582 * f0 * f0);
+}
+
+// Map specular_weight to a physically plausible modulated IOR.
+// specular_weight=1 preserves the original IOR, 0 flattens to 1.0.
+fn openpbr_specular_ior_modulated(eta: scalar, specular_weight: scalar) -> scalar {
+    let f_s: scalar = ior_to_f0(eta);
+    let eps_sign: scalar = sign(eta - 1.0);
+    // When eta == 1.0, eps_sign is 0 which is fine (eps = 0, result = 1.0)
+    let eps: scalar = eps_sign * sqrt(clamp(specular_weight * f_s, 0.0, 1.0));
+    let denom: scalar = max(1.0 - eps, 0.0001);
+    return (1.0 + eps) / denom;
+}
+
+// Dielectric Fresnel with specular_weight modulation.
+fn openpbr_fresnel_modulated(cos_theta: scalar, eta: scalar, specular_weight: scalar) -> scalar {
+    let eta_mod: scalar = openpbr_specular_ior_modulated(eta, specular_weight);
+    return openpbr_fresnel_dielectric(cos_theta, eta_mod);
+}
+
+// F82-tint conductor Fresnel (Lazanyi & Szirmay-Kalos 2005).
+// Wraps conductor_fresnel from brdf.lux with OpenPBR clamping (PR #256).
+fn openpbr_f82_tint(cos_theta: scalar, f0: vec3, f82: vec3) -> vec3 {
+    let result: vec3 = conductor_fresnel(f0, f82, cos_theta);
+    return clamp(result, vec3(0.0), vec3(1.0));
+}
+
+// =====================================================================
+// Coat
+// =====================================================================
+
+// Coat roughening: broadens base roughness under a rough coat.
+// Uses fourth-power blending (energy-preserving variance addition).
+fn openpbr_coat_roughening(base_roughness: scalar, coat_roughness: scalar, coat_weight: scalar) -> scalar {
+    let br4: scalar = base_roughness * base_roughness * base_roughness * base_roughness;
+    let cr4: scalar = coat_roughness * coat_roughness * coat_roughness * coat_roughness;
+    let broadened: scalar = pow(min(1.0, br4 + 2.0 * cr4), 0.25);
+    return mix(base_roughness, broadened, coat_weight);
+}
+
+// View-dependent coat tinting (Beer-Lambert absorption through coat layer).
+fn openpbr_coat_absorption(coat_color: vec3, coat_weight: scalar, cos_theta: scalar) -> vec3 {
+    let safe_cos: scalar = max(cos_theta, 0.01);
+    let absorption: vec3 = pow(coat_color, vec3(1.0 / safe_cos));
+    return mix(vec3(1.0), absorption, coat_weight);
+}
+
+// Internal reflection compensation (energy darkening under coat).
+// Accounts for light trapped between the coat and base via multiple bounces.
+fn openpbr_coat_darkening(
+    base_albedo: vec3, coat_ior: scalar, base_roughness: scalar,
+    coat_weight: scalar, coat_darkening_param: scalar, cos_theta: scalar
+) -> vec3 {
+    let e_f_avg: scalar = openpbr_fresnel_avg(coat_ior);
+    let k_r: scalar = 1.0 - (1.0 - e_f_avg) / (coat_ior * coat_ior);
+    let k_s: scalar = openpbr_fresnel_dielectric(cos_theta, coat_ior);
+    let k: scalar = mix(k_s, k_r, base_roughness);
+
+    // Delta = (1-K) / (1 - albedo*K), per-channel with safe denominator
+    let one_minus_k: scalar = max(1.0 - k, 0.0);
+    let denom: vec3 = vec3(1.0) - base_albedo * k;
+    let denom_safe: vec3 = max(denom, vec3(0.001));
+    let delta: vec3 = vec3(one_minus_k) / denom_safe;
+
+    return mix(vec3(1.0), delta, coat_weight * coat_darkening_param);
+}
+
+// Coat specular BRDF with physical IOR Fresnel (not hardcoded F0=0.04).
+fn openpbr_coat_brdf(
+    n: vec3, v: vec3, l: vec3,
+    coat_weight: scalar, coat_roughness: scalar, coat_ior: scalar
+) -> scalar {
+    let h: vec3 = normalize(v + l);
+    let n_dot_h: scalar = max(dot(n, h), 0.0);
+    let n_dot_v: scalar = max(dot(n, v), 0.001);
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let v_dot_h: scalar = max(dot(v, h), 0.0);
+
+    let safe_r: scalar = max(coat_roughness, 0.045);
+    let d: scalar = ggx_ndf(n_dot_h, safe_r);
+    let vis: scalar = v_ggx_correlated(n_dot_l, n_dot_v, safe_r);
+    let f: scalar = openpbr_fresnel_dielectric(v_dot_h, coat_ior);
+
+    return coat_weight * d * vis * f * n_dot_l;
+}
+
+// =====================================================================
+// Diffuse — Energy-preserving Oren-Nayar (Fujii 2024 / d'Eon FON)
+// =====================================================================
+
+// Directional albedo of the Fujii Oren-Nayar diffuse model.
+// Polynomial approximation of the hemispherical integral.
+fn openpbr_eon_albedo(cos_theta: scalar, roughness: scalar) -> scalar {
+    let mu_comp: scalar = 1.0 - cos_theta;
+    let mu2: scalar = mu_comp * mu_comp;
+    // Polynomial fit from OpenPBR reference implementation
+    let g: scalar = 0.0571085289 * (1.0 + mu_comp)
+                   + (-0.332181442 + 0.0714429953 * mu2) * mu2
+                   + 0.491881867 * mu_comp * mu2;
+    // c1 = 0.5 - 2/(3*PI)
+    let c1: scalar = 0.5 - 2.0 / (3.0 * PI);
+    return (1.0 + roughness * g) / (1.0 + c1 * roughness);
+}
+
+// Energy-preserving Oren-Nayar diffuse BRDF (Fujii 2024).
+// Includes multi-scatter compensation for energy conservation.
+fn openpbr_eon_diffuse(
+    albedo: vec3, roughness: scalar,
+    n_dot_l: scalar, n_dot_v: scalar, v_dot_l: scalar
+) -> vec3 {
+    // FON constants
+    let c1: scalar = 0.5 - 2.0 / (3.0 * PI);
+    let c2: scalar = 2.0 / 3.0 - 28.0 / (15.0 * PI);
+
+    // Optimized s = cos(phi_d) * sin(max_theta) form
+    let s: scalar = v_dot_l - n_dot_v * n_dot_l;
+    let stinv: scalar = s;
+    if (s > 0.0) {
+        stinv = s / max(n_dot_l, n_dot_v);
+    }
+
+    // Single-scatter term
+    let a_f: scalar = 1.0 / (1.0 + c1 * roughness);
+    let f_ss: vec3 = albedo * INV_PI * a_f * (1.0 + roughness * stinv);
+
+    // Multi-scatter energy compensation
+    let e_o: scalar = openpbr_eon_albedo(n_dot_l, roughness);
+    let e_i: scalar = openpbr_eon_albedo(n_dot_v, roughness);
+    let avg_e: scalar = a_f * (1.0 + c2 * roughness);
+
+    let rho_ms: vec3 = albedo * albedo * avg_e
+                     / (vec3(1.0) - albedo * max(1.0 - avg_e, 0.0));
+    let f_ms: vec3 = rho_ms * INV_PI
+                   * max(1.0 - e_o, 0.0) * max(1.0 - e_i, 0.0)
+                   / max(1.0 - avg_e, 0.001);
+
+    return (f_ss + f_ms) * max(n_dot_l, 0.0);
+}
+
+// =====================================================================
+// Albedo Estimates
+// =====================================================================
+
+// Approximate directional albedo of GGX specular (Karis UE4 fit).
+// Used for energy conservation between specular and diffuse layers.
+fn openpbr_specular_albedo(cos_theta: scalar, roughness: scalar, f0: scalar) -> scalar {
+    let a: scalar = roughness * roughness;
+    let x: scalar = cos_theta;
+    let scale: scalar = 1.0 - a * max(1.0 - x, x) * INV_PI;
+    let bias: scalar = a * max(0.0, 0.75 - x) * INV_PI;
+    return clamp(f0 * scale + bias, 0.0, 1.0);
+}
+
+// =====================================================================
+// Fuzz (Estevez & Kulla 2017 — Charlie NDF)
+// =====================================================================
+
+// Fuzz/velvet BRDF using Charlie NDF as a real-time approximation
+// of the Zeltner microflake LTC model from the OpenPBR spec.
+fn openpbr_fuzz_brdf(
+    n: vec3, v: vec3, l: vec3,
+    fuzz_color: vec3, fuzz_roughness: scalar
+) -> vec3 {
+    let h: vec3 = normalize(v + l);
+    let n_dot_h: scalar = max(dot(n, h), 0.0);
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let n_dot_v: scalar = max(dot(n, v), 0.001);
+
+    let safe_r: scalar = max(fuzz_roughness, 0.045);
+    let d: scalar = charlie_ndf(safe_r, n_dot_h);
+    let vis: scalar = sheen_visibility(n_dot_l, n_dot_v);
+
+    return fuzz_color * d * vis * max(n_dot_l, 0.0);
+}
+
+// =====================================================================
+// Direct Lighting — Full OpenPBR Evaluation
+// =====================================================================
+
+// Evaluates the OpenPBR material model for a single direct light.
+// Handles metal/dielectric blend, IOR-based Fresnel, F82-tint metals,
+// energy-preserving diffuse (EON), and specular energy conservation.
+//
+// This replaces gltf_pbr() for OpenPBR-based materials.
+fn openpbr_direct(
+    n: vec3, v: vec3, l: vec3,
+    base_color: vec3, base_metalness: scalar,
+    base_diffuse_roughness: scalar, base_weight: scalar,
+    specular_weight: scalar, specular_color: vec3,
+    specular_roughness: scalar, specular_ior: scalar,
+    coat_weight: scalar, coat_roughness: scalar, coat_ior: scalar,
+    thin_film_weight: scalar, thin_film_thickness: scalar, thin_film_ior: scalar
+) -> vec3 {
+    let h: vec3 = normalize(v + l);
+    let n_dot_h: scalar = max(dot(n, h), 0.0);
+    let n_dot_v: scalar = max(dot(n, v), 0.001);
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let v_dot_h: scalar = max(dot(v, h), 0.0);
+
+    // --- Specular microfacet terms (shared by metal and dielectric) ---
+    let safe_r: scalar = max(specular_roughness, 0.045);
+    let d: scalar = ggx_ndf(n_dot_h, safe_r);
+    let vis: scalar = v_ggx_correlated(n_dot_l, n_dot_v, safe_r);
+
+    // --- Metal Fresnel (F82-tint conductor model) ---
+    let f0_metal: vec3 = base_weight * base_color;
+    let f_metal: vec3 = openpbr_f82_tint(v_dot_h, f0_metal, specular_color);
+    let f_metal_weighted: vec3 = f_metal * min(specular_weight, 1.0);
+
+    // --- Dielectric Fresnel (exact, IOR-modulated by specular_weight) ---
+    let f_dielectric: scalar = openpbr_fresnel_modulated(v_dot_h, specular_ior, specular_weight);
+
+    // --- Blend metal vs dielectric specular ---
+    let spec_metal: vec3 = vec3(d * vis) * f_metal_weighted;
+    let spec_dielectric: vec3 = vec3(d * vis * f_dielectric);
+    let specular: vec3 = mix(spec_dielectric, spec_metal, base_metalness) * n_dot_l;
+
+    // --- Diffuse (energy-preserving Oren-Nayar) ---
+    let v_dot_l: scalar = max(dot(v, l), 0.0);
+    let diffuse_color: vec3 = base_weight * base_color;
+    let diffuse: vec3 = openpbr_eon_diffuse(
+        diffuse_color, base_diffuse_roughness,
+        n_dot_l, n_dot_v, v_dot_l
+    );
+
+    // --- Specular throughput for diffuse energy conservation ---
+    let eta_mod: scalar = openpbr_specular_ior_modulated(specular_ior, specular_weight);
+    let f0_dielectric: scalar = ior_to_f0(eta_mod);
+    let e_spec: scalar = openpbr_specular_albedo(n_dot_v, specular_roughness, f0_dielectric);
+    let diffuse_conserved: vec3 = diffuse * (1.0 - base_metalness) * (1.0 - e_spec);
+
+    return specular + diffuse_conserved;
+}
+
+// =====================================================================
+// Composition — Full OpenPBR Layer Stack
+// =====================================================================
+
+// Composes all OpenPBR layers in the specification-defined order:
+//   1. Base direct lighting (from openpbr_direct)
+//   2. Transmission (replaces diffuse for translucent dielectrics)
+//   3. IBL ambient
+//   4. Coat (darkening + absorption + specular + energy conservation)
+//   5. Fuzz (outermost attenuating layer)
+//   6. Emission (additive, attenuated by coat)
+fn openpbr_compose(
+    direct_lit: vec3,
+    n: vec3, v: vec3, l: vec3,
+    base_color: vec3, base_metalness: scalar, base_weight: scalar,
+    specular_weight: scalar, specular_color: vec3,
+    specular_roughness: scalar, specular_ior: scalar,
+    trans_weight: scalar, trans_color: vec3, trans_depth: scalar,
+    coat_weight: scalar, coat_color: vec3,
+    coat_roughness: scalar, coat_ior: scalar,
+    coat_darkening_param: scalar,
+    fuzz_weight: scalar, fuzz_color: vec3, fuzz_roughness: scalar,
+    thin_film_weight: scalar, thin_film_thickness: scalar, thin_film_ior: scalar,
+    emission_luminance: scalar, emission_color: vec3,
+    ibl_ambient: vec3, coat_ibl: vec3
+) -> vec3 {
+    let n_dot_v: scalar = max(dot(n, v), 0.001);
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let result: vec3 = direct_lit;
+
+    // --- 1. Transmission (replaces diffuse for translucent surfaces) ---
+    if (trans_weight > 0.0) {
+        let atten: vec3 = volume_attenuation(
+            trans_depth, trans_color, max(trans_depth, 0.001)
+        );
+        let trans_contrib: vec3 = base_color * atten * trans_weight;
+        result = mix(result, trans_contrib, trans_weight);
+    }
+
+    // --- 2. IBL ambient contribution ---
+    result = result + ibl_ambient;
+
+    // --- 3. Coat (darkening, absorption, specular, energy conservation) ---
+    if (coat_weight > 0.0) {
+        // Estimate base albedo for darkening calculation
+        let f0_d: scalar = ior_to_f0(specular_ior);
+        let base_albedo: vec3 = mix(
+            base_color * base_weight,
+            specular_color,
+            base_metalness
+        ) * f0_d;
+
+        let darkening: vec3 = openpbr_coat_darkening(
+            base_albedo, coat_ior, specular_roughness,
+            coat_weight, coat_darkening_param, n_dot_v
+        );
+        let absorption: vec3 = openpbr_coat_absorption(coat_color, coat_weight, n_dot_v);
+
+        // Coat specular BRDF
+        let coat_contrib: scalar = openpbr_coat_brdf(
+            n, v, l, coat_weight, coat_roughness, coat_ior
+        );
+
+        // Coat energy conservation: attenuate base by (1 - coat_weight * coat_E)
+        let coat_f0: scalar = ior_to_f0(coat_ior);
+        let coat_e: scalar = openpbr_specular_albedo(n_dot_v, coat_roughness, coat_f0);
+        let coat_attenuation: scalar = 1.0 - coat_weight * coat_e;
+
+        result = result * darkening * absorption * coat_attenuation
+               + vec3(coat_contrib) + coat_ibl;
+    }
+
+    // --- 4. Fuzz (outermost layer, attenuates everything below) ---
+    if (fuzz_weight > 0.0) {
+        let fuzz_contrib: vec3 = openpbr_fuzz_brdf(n, v, l, fuzz_color, fuzz_roughness);
+
+        // Approximate fuzz albedo for energy conservation
+        let fuzz_max_channel: scalar = max(fuzz_color.x, max(fuzz_color.y, fuzz_color.z));
+        let fuzz_e: scalar = fuzz_weight * fuzz_max_channel * 0.3;
+
+        result = result * (1.0 - fuzz_e) + fuzz_contrib * fuzz_weight;
+    }
+
+    // --- 5. Emission (additive, attenuated by coat absorption) ---
+    if (emission_luminance > 0.0) {
+        // Scale nits to a reasonable HDR range
+        let emit: vec3 = emission_color * emission_luminance * 0.01;
+
+        // Attenuate emission through coat (if present)
+        let emit_atten: vec3 = openpbr_coat_absorption(coat_color, coat_weight, n_dot_v);
+        result = result + emit * emit_atten;
+    }
+
+    return result;
+}

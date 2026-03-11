@@ -1115,6 +1115,400 @@ Extended the shadow infrastructure with sampling functions, shader permutation s
 
 ---
 
+### Phase 22: OpenPBR Material Model Integration [DONE — core]
+
+**Goal:** Add first-class support for the [OpenPBR Surface](https://github.com/adobe/openpbr-bsdf) material model (Adobe/ASWF, v1.1) as an alternative to the existing glTF PBR composition. Activated via `import openpbr;` — no grammar changes, no new keywords.
+
+**Status:** P22.1–P22.4, P22.7, P22.8 complete. P22.5 (bindless) and P22.6 (schedules) deferred. Fixed transitive import resolution bug in `compiler.py` — imports now recurse before merging. 35 new tests (1084 total), 3 examples, 15 stdlib functions.
+
+**Why:** OpenPBR is becoming the industry standard material interchange format (USD, MaterialX, Blender, Maya, Substance). It defines a 36-parameter physically-based model with 9 component lobes, proper energy conservation via albedo-scaling, and features Lux currently lacks: coat darkening, F82-tint metals, energy-preserving Oren-Nayar, specular weight IOR modulation, fuzz (Zeltner LTC), subsurface scattering, and thin-film iridescence. Lux already implements many of the required BRDF primitives (`conductor_fresnel`, `iridescence_fresnel`, `anisotropic_ggx_ndf`, `oren_nayar_diffuse`, `volumetric_btdf`, `dispersion_ior`) but none are wired into the layer system.
+
+**Design principle:** `import openpbr;` extends the set of recognized layer names, layer parameter schemas, and the composition function. The expander detects this import and dispatches to OpenPBR-specific code. Existing `import brdf;` surfaces work identically — zero breaking changes.
+
+**User-facing syntax:**
+
+```lux
+import openpbr;
+
+surface CarPaint {
+    sampler2d color_tex,
+
+    layers [
+        base(color: sample(color_tex, uv).xyz, metalness: 0.0,
+             diffuse_roughness: 0.2),
+        specular(weight: 1.0, ior: 1.5, roughness: 0.3,
+                 anisotropy: 0.0),
+        coat(weight: 1.0, color: vec3(1.0, 0.98, 0.95),
+             roughness: 0.05, ior: 1.6, darkening: 1.0),
+        fuzz(weight: 0.0, color: vec3(1.0), roughness: 0.5),
+        thin_film(weight: 0.3, thickness: 0.5, ior: 1.4),
+        emission(luminance: 0.0, color: vec3(1.0)),
+    ]
+}
+
+lighting SceneLighting {
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+    layers [
+        directional(direction: vec3(0.0, -1.0, 0.0), color: vec3(1.0)),
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
+    ]
+}
+
+pipeline CarPaintForward {
+    geometry: StandardMesh,
+    surface: CarPaint,
+    lighting: SceneLighting,
+}
+```
+
+---
+
+#### OpenPBR Composition Tree (from the spec)
+
+The full physical model, reduced to a linear lobe mixture:
+
+```
+f_PBR     = mix(f_transparent, f_surface, opacity)
+f_surface = F*f_fuzz + (1 - F*E[f_fuzz]) * f_coated_base
+f_coated  = C*f_coat + (1 - C*E[f_coat]) * T_coat * f_base_darkened
+f_base    = mix(f_dielectric, f_conductor, metalness)
+f_dielec  = f_spec_refl + (1 - E[f_spec_refl]) * f_dielec_transmission
+f_dielec_T = mix(mix(f_diffuse, f_SSS, S), f_spec_trans, T)
+```
+
+Where `E[f]` = directional albedo (hemispherical reflectance) of lobe f, ensuring energy conservation at every layer boundary.
+
+---
+
+#### P22.1: `stdlib/openpbr.lux` — Core Math Functions
+
+**File:** `luxc/stdlib/openpbr.lux`
+**Imports:** `brdf`, `compositing`, `ibl`
+**Functions to implement (15 new, from OpenPBR GLSL reference):**
+
+| Function | Source | Formula |
+|---|---|---|
+| `openpbr_f82_tint(cos, f0, f82) -> vec3` | metal_brdf.glsl | Lazanyi-Szirmay-Kalos: `schlick - cos*(1-cos)^6*(1-f82)*schlick_bar/denom` clamped to [0,1]. Uses `mu_bar = 1/7`. Already have `conductor_fresnel()` in brdf.lux — verify equivalence and delegate or replace. |
+| `openpbr_specular_ior_modulated(eta, spec_weight) -> scalar` | openpbr.frag.glsl | `F_s = ((eta-1)/(eta+1))^2`, `eps = sgn(eta-1)*sqrt(spec_weight*F_s)`, `eta' = (1+eps)/(1-eps)`. Maps specular_weight [0,∞) to physical IOR. |
+| `openpbr_dielectric_fresnel(cos, eta, spec_weight) -> scalar` | openpbr.frag.glsl | Full dielectric Fresnel with `specular_weight` modulation and TIR handling. Delegates to exact Fresnel (not Schlick). |
+| `openpbr_coat_ior_ratio(spec_ior, coat_ior, coat_weight) -> scalar` | openpbr.frag.glsl | `eta_sc = spec_ior/coat_ior; if eta_sc<1 eta_sc=1/eta_sc; mix(spec_ior, eta_sc, coat_weight)`. Substrate IOR seen through coat. |
+| `openpbr_coat_roughening(base_r, coat_r, coat_weight) -> scalar` | OpenPBR spec §4.6 | `mix(base_r, min(1, (base_r^4 + 2*coat_r^4)^0.25), coat_weight)`. Coat broadens substrate lobes. |
+| `openpbr_coat_absorption(coat_color, coat_weight, cos_theta) -> vec3` | openpbr.frag.glsl | `mix(vec3(1), pow(coat_color, vec3(1/cos_theta)), coat_weight)`. View-dependent coat tinting. |
+| `openpbr_fresnel_avg(eta) -> scalar` | openpbr.frag.glsl | d'Eon exact hemispherical Fresnel average. 15-line formula with `f_perp`, `f_para` terms. Needed for coat darkening. |
+| `openpbr_coat_darkening(base_albedo, coat_ior, base_roughness, coat_weight, coat_darkening, spec_weight, spec_ior, metalness, cos_theta) -> vec3` | openpbr.frag.glsl | `K = mix(K_s, K_r, roughness)`, `Delta = (1-K)/(1-E_base*K)`, `mix(vec3(1), Delta, coat_weight*coat_darkening)`. Internal reflection compensation. |
+| `openpbr_eon_diffuse(albedo, roughness, n_dot_l, n_dot_v, v_dot_l) -> vec3` | openpbr.frag.glsl | Energy-preserving Oren-Nayar (Fujii): single-scatter `f_ss` + multi-scatter `f_ms` with compensation term. Replaces Lambert. |
+| `openpbr_eon_albedo(cos, roughness) -> scalar` | openpbr.frag.glsl | `E_FON_approx`: directional albedo of EON diffuse. Needed for energy conservation. |
+| `openpbr_specular_albedo(cos, roughness, f0) -> scalar` | Karis fit | Approximate directional albedo of GGX specular. Needed for diffuse weighting. |
+| `openpbr_coat_albedo(cos, coat_roughness, coat_ior) -> scalar` | openpbr.frag.glsl | Approximate directional albedo of coat GGX. Used for substrate attenuation. |
+| `openpbr_fuzz_albedo(cos, fuzz_roughness) -> scalar` | openpbr.frag.glsl | Approximate directional albedo of fuzz lobe. Used for substrate attenuation. |
+| `openpbr_fuzz_brdf(n, v, l, fuzz_color, fuzz_roughness) -> vec3` | fuzz_brdf.glsl | Zeltner 2022 LTC microflake model, or Charlie NDF as real-time approximation (config via schedule). |
+| `openpbr_compose(direct_lit, n, v, l, <all OpenPBR params>, ibl_ambient, coat_ibl) -> vec3` | New | Top-level composition function — implements the full tree above. ~60 lines. |
+
+**Key design decisions:**
+
+1. `openpbr_compose()` takes ~30 parameters (OpenPBR's 36 minus geometry/normals + IBL inputs). Each subsystem is disabled by its weight parameter (0.0 = off). Zero-weight paths compile to no-ops after constant folding.
+
+2. `openpbr_fuzz_brdf` uses Charlie NDF (reuses `charlie_ndf` from brdf.lux) as real-time approximation. Full Zeltner LTC available via schedule: `fuzz_model: zeltner`.
+
+3. `openpbr_eon_diffuse` replaces Lambert. The existing `oren_nayar_diffuse()` in brdf.lux is the qualitative (no energy compensation) version — the EON model adds multi-scatter compensation for full energy preservation.
+
+4. All albedo functions (`openpbr_*_albedo`) are analytical approximations (polynomial fits from the OpenPBR reference), not LUT lookups. This is the standard approach for real-time — the pathtracer uses exact integration.
+
+**Estimated size:** ~350 lines of Lux code.
+
+---
+
+#### P22.2: Wire Existing Unwired Functions
+
+Six functions in `brdf.lux` are already implemented but not used anywhere. Wire them:
+
+| Function | Wire Into | How |
+|---|---|---|
+| `conductor_fresnel(f0, f82, cos)` | `openpbr_compose` metal path | Called when `metalness > 0` instead of Schlick |
+| `iridescence_fresnel(...)` | `openpbr_compose` thin_film path | Called when `thin_film_weight > 0`, modulates base Fresnel |
+| `anisotropic_ggx_ndf(...)` + `anisotropic_v_ggx(...)` | `openpbr_compose` specular/coat paths | Called when `anisotropy > 0` instead of isotropic GGX |
+| `oren_nayar_diffuse(...)` | Superseded by `openpbr_eon_diffuse` | EON is the improved version; keep old for glTF compat |
+| `volumetric_btdf(...)` | `openpbr_compose` transmission path | Called when `transmission_weight > 0` and not thin-walled |
+| `dispersion_ior(...)` / `dispersion_f0(...)` | `openpbr_compose` transmission path | Per-channel IOR when dispersion > 0 |
+
+**No changes to brdf.lux** — the existing functions stay as-is. `openpbr.lux` calls them directly.
+
+---
+
+#### P22.3: Expander — OpenPBR Layer Dispatch
+
+**File:** `luxc/expansion/surface_expander.py`
+
+**Detection** (in `expand_surfaces`, ~line 72):
+
+```python
+_use_openpbr = any(imp.module_name == "openpbr" for imp in module.imports)
+```
+
+**New builtin layer names** (registered when OpenPBR detected):
+
+```python
+_OPENPBR_LAYER_NAMES = frozenset({
+    "base", "specular", "transmission", "subsurface",
+    "coat", "fuzz", "thin_film", "emission", "normal_map",
+})
+```
+
+When `_use_openpbr`, validation uses `_OPENPBR_LAYER_NAMES` instead of `_BUILTIN_LAYER_NAMES`.
+
+**Layer parameter schemas** (used for extraction in `_generate_layered_main`):
+
+| Layer | OpenPBR Parameters | Defaults |
+|---|---|---|
+| `base` | `color: vec3`, `metalness: scalar`, `diffuse_roughness: scalar`, `weight: scalar` | `(0.8,0.8,0.8)`, `0.0`, `0.0`, `1.0` |
+| `specular` | `weight: scalar`, `color: vec3`, `roughness: scalar`, `anisotropy: scalar`, `ior: scalar` | `1.0`, `(1,1,1)`, `0.3`, `0.0`, `1.5` |
+| `transmission` | `weight: scalar`, `color: vec3`, `depth: scalar`, `scatter: vec3`, `scatter_anisotropy: scalar`, `dispersion_scale: scalar`, `dispersion_abbe: scalar` | `0.0`, `(1,1,1)`, `0.0`, `(0,0,0)`, `0.0`, `0.0`, `20.0` |
+| `subsurface` | `weight: scalar`, `color: vec3`, `radius: scalar`, `radius_scale: vec3`, `anisotropy: scalar` | `0.0`, `(0.8,0.8,0.8)`, `1.0`, `(1,0.5,0.25)`, `0.0` |
+| `coat` | `weight: scalar`, `color: vec3`, `roughness: scalar`, `anisotropy: scalar`, `ior: scalar`, `darkening: scalar` | `0.0`, `(1,1,1)`, `0.0`, `0.0`, `1.6`, `1.0` |
+| `fuzz` | `weight: scalar`, `color: vec3`, `roughness: scalar` | `0.0`, `(1,1,1)`, `0.5` |
+| `thin_film` | `weight: scalar`, `thickness: scalar`, `ior: scalar` | `0.0`, `0.5`, `1.4` |
+| `emission` | `luminance: scalar`, `color: vec3` | `0.0`, `(1,1,1)` |
+| `normal_map` | `map: vec3` | (required) |
+
+**New function: `_generate_openpbr_main()`** (~200 lines, mirrors `_generate_layered_main` structure):
+
+1. UV alias, normal setup, view/light direction — identical to existing path
+2. Extract all layer parameters using `_get_layer_args()` with OpenPBR defaults
+3. Emit `let` statements for all ~30 OpenPBR params
+4. Call `openpbr_direct(n, v, l, <base+specular params>)` for direct lighting
+5. Multi-light dispatch via existing `_emit_multi_light_from_lighting()` helper (P21)
+6. IBL sampling — same as existing path (reuses `ibl_contribution`)
+7. Call `openpbr_compose(<all params>, ibl_ambient, coat_ibl)` for final composition
+8. Tonemap + output — reuses `_emit_tonemap_output()`
+
+**Dispatch point** (in `_generate_layered_main`, line ~953, or separate function):
+
+```python
+if _use_openpbr:
+    return _generate_openpbr_main(surface, frag_inputs, schedule, module, lighting)
+else:
+    # existing glTF path unchanged
+    ...
+```
+
+**Custom `@layer` functions:** Still work in OpenPBR mode. Applied after `openpbr_compose` but before emission, receiving `(composed_color, n, v, l, ...args)`.
+
+---
+
+#### P22.4: OpenPBR Direct Lighting Function
+
+**File:** `luxc/stdlib/openpbr.lux`
+
+```
+fn openpbr_direct(
+    n: vec3, v: vec3, l: vec3,
+    base_color: vec3, base_metalness: scalar, base_diffuse_roughness: scalar,
+    base_weight: scalar,
+    specular_weight: scalar, specular_color: vec3, specular_roughness: scalar,
+    specular_ior: scalar, specular_anisotropy: scalar,
+    coat_weight: scalar, coat_roughness: scalar, coat_ior: scalar,
+    thin_film_weight: scalar, thin_film_thickness: scalar, thin_film_ior: scalar
+) -> vec3
+```
+
+Replaces `gltf_pbr()` for the OpenPBR path. Differences from `gltf_pbr`:
+- Metal Fresnel uses `openpbr_f82_tint(cos, base_weight*base_color, specular_color)` instead of Schlick
+- Dielectric Fresnel uses `openpbr_dielectric_fresnel(cos, eta_modulated, specular_weight)` with exact Fresnel
+- Diffuse uses `openpbr_eon_diffuse()` instead of Lambert
+- Specular weight modulates F0 via `openpbr_specular_ior_modulated()`
+- Optional anisotropic NDF when `specular_anisotropy > 0`
+- Optional thin-film Fresnel modulation when `thin_film_weight > 0`
+- Coat contribution via `openpbr_coat_roughening()` + `openpbr_coat_darkening()` + `openpbr_coat_absorption()`
+
+---
+
+#### P22.5: Bindless OpenPBR Support
+
+**File:** `luxc/expansion/surface_expander.py`
+
+**Extended BindlessMaterialData struct** (OpenPBR mode):
+
+Add fields to the SSBO after existing glTF fields:
+
+```python
+_OPENPBR_EXTRA_FIELDS = [
+    ("baseDiffuseRoughness", "scalar"),
+    ("baseWeight", "scalar"),
+    ("specularWeight", "scalar"),
+    ("specularIor", "scalar"),
+    ("specularAnisotropy", "scalar"),
+    ("coatIor", "scalar"),
+    ("coatDarkening", "scalar"),
+    ("fuzzWeight", "scalar"),
+    ("fuzzRoughness", "scalar"),
+    ("subsurfaceWeight", "scalar"),
+    ("subsurfaceRadius", "scalar"),
+    ("thinFilmWeight", "scalar"),
+    ("thinFilmThickness", "scalar"),
+    ("thinFilmIor", "scalar"),
+    ("specularColor", "vec3"),
+    ("coatColor", "vec3"),
+    ("fuzzColor", "vec3"),
+    ("subsurfaceColor", "vec3"),
+    ("subsurfaceRadiusScale", "vec3"),
+    ("transmissionScatter", "vec3"),
+    ("transmissionDepth", "scalar"),
+    ("transmissionScatterAniso", "scalar"),
+    ("dispersionScale", "scalar"),
+    ("dispersionAbbe", "scalar"),
+]
+```
+
+**Extended flags:**
+```python
+_FLAG_FUZZ = 0x20
+_FLAG_THIN_FILM = 0x40
+_FLAG_SUBSURFACE = 0x80
+_FLAG_ANISOTROPY = 0x100
+_FLAG_OPENPBR = 0x200  # master flag: use OpenPBR composition
+```
+
+**New function: `_emit_openpbr_bindless_body()`** — mirrors `_emit_bindless_layer_body()` but loads OpenPBR-specific fields and calls `openpbr_compose()` instead of `compose_pbr_layers()`.
+
+**Reflection JSON:** Extended `bindless.struct_fields` section includes all OpenPBR fields + `openpbr: true` flag for engines.
+
+---
+
+#### P22.6: OpenPBR Schedule Strategies
+
+**File:** `luxc/expansion/surface_expander.py`
+
+New schedule slots available when OpenPBR is active:
+
+```python
+_OPENPBR_STRATEGIES = {
+    "diffuse_model": "eon",            # eon | lambert | burley
+    "fuzz_model": "charlie",           # charlie | zeltner
+    "specular_fresnel": "exact",       # exact | schlick
+    "coat_fresnel": "exact",           # exact | schlick
+    "thin_film_model": "airy",         # airy | none
+    "subsurface_model": "diffusion",   # diffusion | wrap_diffuse
+}
+```
+
+```lux
+schedule OpenPBRDesktop {
+    diffuse_model: eon,
+    fuzz_model: charlie,
+    thin_film_model: airy,
+    tonemap: aces,
+}
+
+schedule OpenPBRMobile {
+    diffuse_model: lambert,
+    fuzz_model: charlie,
+    specular_fresnel: schlick,
+    coat_fresnel: schlick,
+    thin_film_model: none,
+    tonemap: reinhard,
+}
+```
+
+This allows quality scaling — full OpenPBR on desktop, simplified on mobile — same material, different schedule. Matches Lux's existing algorithm/schedule separation philosophy.
+
+---
+
+#### P22.7: Tests
+
+**File:** `tests/test_openpbr.py`
+
+| Test Class | Tests | What It Validates |
+|---|---|---|
+| `TestOpenPBRParsing` | 5 | Surfaces with OpenPBR layer names parse correctly; specular, fuzz, thin_film, subsurface layers accepted when `import openpbr` present |
+| `TestOpenPBRExpansion` | 8 | AST inspection: `openpbr_compose` called (not `compose_pbr_layers`), correct params passed, disabled layers get zero defaults, coat darkening params present |
+| `TestOpenPBRCompilation` | 8 | SPIR-V compilation succeeds: minimal surface, all-layers surface, metal surface, coated-glass, fuzz-only, thin-film, bindless, with schedule |
+| `TestOpenPBRMath` | 6 | Stdlib unit tests: `openpbr_f82_tint` matches reference values, `openpbr_specular_ior_modulated(1.5, 1.0) == 1.5`, coat darkening with `coat_darkening=0` returns identity, EON diffuse energy <= 1.0 |
+| `TestOpenPBRRegression` | 4 | Existing glTF shaders still compile identically (no import openpbr = no behavior change) |
+| `TestOpenPBRBindless` | 3 | Bindless mode with OpenPBR: extended SSBO struct, correct flags, reflection JSON has `openpbr: true` |
+
+~34 tests total.
+
+---
+
+#### P22.8: Documentation & Examples
+
+**New files:**
+- `examples/openpbr_carpaint.lux` — car paint: metallic base + clearcoat + thin-film iridescence
+- `examples/openpbr_velvet.lux` — velvet: dielectric base + fuzz layer
+- `examples/openpbr_glass.lux` — glass: transmission + volume + dispersion
+- `docs/openpbr.md` — OpenPBR parameter reference, comparison with glTF layers, migration guide
+
+**Updated files:**
+- `README.md` — add OpenPBR to features, stdlib table (15th module)
+- `docs/language-reference.md` — add OpenPBR layer table, `import openpbr` section
+- `docs/project-structure.md` — add `openpbr.lux`, `test_openpbr.py`, examples
+
+---
+
+#### Implementation Order and Dependencies
+
+```
+P22.1: stdlib/openpbr.lux (core math)
+  ↓
+P22.2: wire existing brdf.lux functions (verify, delegate)
+  ↓
+P22.4: openpbr_direct() + openpbr_compose() (full composition)
+  ↓
+P22.3: surface_expander.py (layer dispatch, _generate_openpbr_main)
+  ↓
+P22.6: schedule strategies (quality tiers)
+  ↓
+P22.5: bindless support (extended SSBO, reflection)
+  ↓
+P22.7: tests (34 tests)
+  ↓
+P22.8: docs + examples
+```
+
+P22.1–P22.4 are the core — once those work, a basic `import openpbr;` surface compiles to SPIR-V. P22.5–P22.8 are extensions.
+
+---
+
+#### OpenPBR ↔ glTF Parameter Mapping (for migration/compatibility)
+
+| OpenPBR | glTF Equivalent | Notes |
+|---|---|---|
+| `base_color` | `baseColorFactor.rgb` | Direct |
+| `base_metalness` | `metallicFactor` | Direct |
+| `specular_roughness` | `roughnessFactor` | Direct |
+| `specular_ior` | `KHR_materials_ior.ior` | Default 1.5 both |
+| `specular_weight` | `KHR_materials_specular.specularFactor` | Direct |
+| `specular_color` | `KHR_materials_specular.specularColorFactor` | Direct |
+| `coat_weight` | `KHR_materials_clearcoat.clearcoatFactor` | Direct |
+| `coat_roughness` | `KHR_materials_clearcoat.clearcoatRoughnessFactor` | Direct |
+| `coat_color` | — | glTF has no coat color |
+| `coat_ior` | — | glTF assumes 1.5 |
+| `coat_darkening` | — | glTF has no darkening control |
+| `fuzz_weight` / `fuzz_color` | `KHR_materials_sheen.sheenColorFactor` | Different BRDF model (LTC vs Charlie) |
+| `fuzz_roughness` | `KHR_materials_sheen.sheenRoughnessFactor` | Direct |
+| `transmission_weight` | `KHR_materials_transmission.transmissionFactor` | Direct |
+| `transmission_color/depth` | `KHR_materials_volume.attenuationColor/Distance` | Direct |
+| `thin_film_*` | `KHR_materials_iridescence.*` | Direct mapping |
+| `subsurface_*` | — | No glTF equivalent |
+| `base_diffuse_roughness` | — | glTF uses Lambert (roughness=0) |
+| `emission_luminance` | `emissiveFactor * KHR_materials_emissive_strength` | Conversion needed |
+
+---
+
+#### Estimated Scope
+
+| Component | Lines | Effort |
+|---|---|---|
+| `stdlib/openpbr.lux` (15 functions) | ~350 | Medium |
+| `surface_expander.py` changes | ~250 | Medium |
+| `tests/test_openpbr.py` (34 tests) | ~500 | Medium |
+| Examples (3 .lux files) | ~150 | Small |
+| Documentation | ~200 | Small |
+| **Total** | **~1450** | |
+
 ### Phase 21: Shared Stdlib Refactoring [DONE]
 
 The bindless uber-shader's PBR orchestration logic (`_emit_bindless_layer_body()` in `surface_expander.py`, ~340 lines) duplicates the same material pipeline that the non-bindless path (`_generate_layered_main()`, ~330 lines) builds declaratively from `.lux` surface layers. While the math functions (`gltf_pbr`, `ibl_contribution`, `tonemap_aces`, etc.) are correctly in stdlib, the orchestration — geometric preamble, direct lighting dispatch, IBL sampling, optional layer composition, tonemapping — is hardcoded in the expander with two divergent implementations.
@@ -1333,3 +1727,172 @@ Both `_generate_layered_main()` and `_emit_bindless_layer_body()` emit a single 
 **The one-liner:** Lux is what happens when you take OSL's philosophy
 (describe scattering, not pixels), MDL's declarative materials, and Halide's
 algorithm/schedule separation — and compile it all to real-time Vulkan SPIR-V.
+
+---
+
+### Phase 23: Interactive Scene Editor (C++ & Rust)
+
+**Goal:** Build a full interactive application with UI for both C++ and Rust engines — load glTF scenes, select shaders/pipelines, pick and transform meshes, and exercise all current Lux features from a single app.
+
+**Why:** Current viewers are single-pipeline launchers. A real scene editor lets users explore Lux's full feature set (PBR, OpenPBR, splats, mesh shaders, compute, RT) in one session without relaunching.
+
+**Core features:**
+
+1. **Scene browser / glTF loader**
+   - File dialog or drag-and-drop to load `.glb`/`.gltf` files
+   - Scene tree panel showing nodes, meshes, materials, cameras, lights
+   - Multi-model support (load several glTFs into one scene)
+
+2. **Shader / pipeline selector**
+   - List compiled `.spv` pipelines from a directory (auto-discover from reflection JSON)
+   - Hot-swap shaders on selected meshes
+   - Pipeline modes: raster, raytrace, mesh_shader, gaussian_splat
+   - Display active pipeline info (inputs, uniforms, descriptor sets from reflection JSON)
+
+3. **Mesh selection & basic transforms**
+   - Click-to-select mesh in viewport (ray picking or ID pass)
+   - Gizmo overlay for translate / rotate / scale (ImGuizmo or custom)
+   - Transform hierarchy (parent-child, world vs local)
+   - Selection outline or highlight
+
+4. **Material editor panel**
+   - Read surface properties from reflection JSON
+   - Sliders for scalar parameters, color pickers for vec3
+   - Support for `properties` UBO — live update uniform values
+   - OpenPBR layer parameter editing (base, specular, coat, fuzz, thin_film, etc.)
+
+5. **Lighting controls**
+   - Add/remove/edit directional, point, spot lights
+   - IBL environment selector (load HDR/EXR, switch cubemaps)
+   - Shadow map visualization toggle
+
+6. **Rendering feature toggles**
+   - Wireframe, normal visualization, depth view, UV checker
+   - Debug mode toggle (`-g`, `--debug-print`)
+   - Auto-type precision overlay (show fp16 vs fp32 regions)
+   - Tonemap selector (none, Reinhard, ACES)
+
+7. **Gaussian splat integration**
+   - Load `.glb` with `KHR_gaussian_splatting` extension
+   - Splat + mesh coexistence in the same viewport
+   - Splat debug views (SH degree, covariance ellipsoids)
+
+**UI framework:**
+- C++: Dear ImGui (already widely used in Vulkan apps) + GLFW
+- Rust: egui (native integration with winit/ash) or imgui-rs
+
+**Architecture:**
+- Scene graph abstraction layer shared between renderers
+- Reflection-driven pipeline binding (existing `reflected_pipeline.cpp/rs` as base)
+- Command pattern for undo/redo on transforms
+- Serialization: save/load scene state as JSON
+
+**Implementation phases:**
+1. P23.1: ImGui integration + basic panels (scene tree, properties) — C++ first
+2. P23.2: Pipeline hot-swap + material editor
+3. P23.3: Mesh picking + transform gizmos
+4. P23.4: Lighting editor + IBL selector
+5. P23.5: Gaussian splat integration in editor
+6. P23.6: Rust port (egui or imgui-rs)
+
+---
+
+### Phase 24: KHR_gaussian_splatting Conformance Test Assets
+
+**Goal:** Integrate the official Khronos `KHR_gaussian_splatting` test suite into Lux's test infrastructure, ensuring our splat renderer handles all edge cases from the upcoming ratification process.
+
+**Source:** [KhronosGroup/glTF#2562](https://github.com/KhronosGroup/glTF/issues/2562) — conformance test data collection.
+
+**Test data:** `gltf-splat-examples-2026-02-17.zip` containing glTF test scenes.
+
+**Test categories (from the Khronos issue):**
+
+| Test | Description | What It Validates |
+|------|-------------|-------------------|
+| Rotation tests | Splats rotated around x/y/z axes | Coordinate system, quaternion handling |
+| Mesh-splat mixing | glTF with both mesh primitives and splats | Multi-primitive-type rendering |
+| Depth/sorting | Front-to-back disc-shaped splats | Depth sorting correctness |
+| Scaling | Carefully positioned splats for scale validation | Linear vs log-space scale interpretation |
+| Spherical harmonics | 6 rotated primitives with directional color response | SH evaluation from multiple viewpoints |
+| Mixed SH degrees | Primitives with SH degree 2 vs 3 in same file | Per-primitive SH degree handling |
+
+**Important:** Opacity accessor stores alpha values [0,1], NOT log-space opacity (corrected in latest test data).
+
+**Implementation:**
+
+1. P24.1: Download and extract test assets to `tests/assets/khr_splat_conformance/`
+2. P24.2: Create `tests/test_khr_splat_conformance.py` — load each test glTF, compile splat pipeline, render headless, validate:
+   - Rotation: compare screenshots against reference at multiple camera angles
+   - Mesh-splat: verify both mesh and splat primitives render
+   - Sorting: verify correct front-to-back ordering (no Z-fighting artifacts)
+   - SH: verify color changes with viewpoint rotation
+   - Mixed SH: verify different SH degrees coexist
+3. P24.3: Fix any renderer issues discovered by conformance tests
+4. P24.4: Add conformance test results to documentation
+
+---
+
+### Phase 25: PLY-to-glTF Gaussian Splat Conversion Tool
+
+**Goal:** Add a robust PLY → glTF conversion pipeline for Gaussian splats as a first-class Lux tool, supporting the `KHR_gaussian_splatting` extension.
+
+**Why:** Most 3DGS training outputs (3DGS, gsplat, nerfstudio) produce `.ply` files. Lux's splat renderer expects glTF with `KHR_gaussian_splatting`. We already have `tools/ply_to_gltf.py` but want a more robust solution.
+
+**Reference implementation:** [NorbertNopper-Huawei/3dgs_ply2gltf](https://github.com/NorbertNopper-Huawei/3dgs_ply2gltf) — C++ converter with coordinate system conversion and round-trip verification.
+
+**Key features:**
+
+1. **Coordinate system conversion**
+   - Input: right-handed Z-up (3DGS training convention)
+   - Output: right-handed Y-up (glTF convention)
+   - `-90°` rotation around X axis, with quaternion adjustment
+   - Flag: `--convert` (enabled by default, `--no-convert` to skip)
+
+2. **SH degree detection**
+   - Auto-detect from PLY header (count of `f_rest_*` properties)
+   - Degree 0: 0 coefficients (DC only via `f_dc_*`)
+   - Degree 1: 9 coefficients (3 per band)
+   - Degree 2: 24 coefficients
+   - Degree 3: 45 coefficients
+
+3. **Opacity handling**
+   - Input: log-space opacity from training (`sigmoid(x)` to get alpha)
+   - Output: linear alpha [0,1] in glTF accessor (per Khronos spec correction)
+
+4. **Scale handling**
+   - Input: log-space scale from training (`exp(x)` to get actual scale)
+   - Output: linear scale in glTF accessor
+
+5. **Round-trip verification** (`--verify`)
+   - Convert PLY → glTF → PLY
+   - Compare numerical equality of all attributes
+   - Report any precision loss
+
+6. **Batch processing** (`--batch <dir>`)
+   - Convert all `.ply` files in a directory
+   - Progress bar, parallel processing
+
+**Implementation options:**
+
+- **Option A:** Enhance existing `tools/ply_to_gltf.py` (Python, numpy — already handles basic case)
+- **Option B:** Integrate the C++ `3dgs_ply2gltf` as a submodule + build dependency
+- **Option C:** Port the C++ logic to Python for zero-compile dependency
+
+**Recommended: Option A** — extend `tools/ply_to_gltf.py` with coordinate conversion, opacity/scale transforms, SH degree detection, verification. Python-only, no build dependency.
+
+**CLI:**
+```bash
+# Basic conversion
+python -m tools.ply_to_gltf input.ply -o output.glb
+
+# With coordinate conversion (default)
+python -m tools.ply_to_gltf input.ply --convert -o output.glb
+
+# Round-trip verification
+python -m tools.ply_to_gltf input.ply --verify -o output.glb
+
+# Batch
+python -m tools.ply_to_gltf --batch ./splats/ -o ./gltf_out/
+```
+
+**Tests:** `tests/test_ply_to_gltf.py` — PLY parsing, coordinate conversion, opacity transform, SH degree detection, round-trip verification, POSITION min/max.

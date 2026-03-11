@@ -73,18 +73,17 @@ def _resolve_imports(module, source_dir: Path | None = None):
         imported_source = found.read_text(encoding="utf-8")
         imported = parse_lux(imported_source)
 
+        # Recursively resolve imports from the imported module FIRST,
+        # so transitive dependencies are merged into `imported` before
+        # we copy everything into the top-level module.
+        if imported.imports:
+            _resolve_imports(imported, found.parent)
+
         # Merge: type aliases, constants, functions, schedules (but not stages, surfaces, etc.)
         module.type_aliases.extend(imported.type_aliases)
         module.constants.extend(imported.constants)
         module.functions.extend(imported.functions)
         module.schedules.extend(imported.schedules)
-
-        # Recursively resolve imports from the imported module
-        if imported.imports:
-            _resolve_imports(imported, found.parent)
-            # After recursive resolution, merge any additional items
-            # that were added to the imported module
-            # (already handled by extend above since we recurse first)
 
 
 def collect_import_paths(source: str, source_dir: Path | None = None) -> set[Path]:

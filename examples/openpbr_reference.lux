@@ -1,0 +1,58 @@
+// OpenPBR Reference: Car Paint — exact ASWF values
+// Compare: https://portsmouth.github.io/OpenPBR-viewer
+//   Set base_color=(0.1,0.6,0.9), specular_ior=1.6, specular_roughness=0.3,
+//   coat_weight=1, coat_roughness=0.02, coat_ior=1.6
+//
+// Compile: luxc examples/openpbr_reference.lux
+// Run:     playground_cpp\build\Release\lux-playground.exe --scene sphere --pipeline examples/openpbr_reference --no-ibl --interactive
+
+import openpbr;
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    uv: vec2,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        frag_uv: uv,
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+surface CarPaint {
+    layers [
+        base(color: vec3(0.1, 0.6, 0.9),
+             metalness: 0.0,
+             diffuse_roughness: 0.0,
+             weight: 1.0),
+        specular(weight: 1.0,
+                 color: vec3(1.0),
+                 roughness: 0.3,
+                 ior: 1.6),
+        coat(weight: 1.0,
+             color: vec3(1.0),
+             roughness: 0.02,
+             ior: 1.6,
+             darkening: 1.0),
+        emission(luminance: 0.0, color: vec3(1.0)),
+    ]
+}
+
+lighting SceneLighting {
+    layers [
+        directional(direction: vec3(0.5, -0.7, 0.5),
+                    color: vec3(3.0, 2.94, 2.85)),
+    ]
+}
+
+pipeline ReferenceForward {
+    geometry: StandardMesh,
+    surface: CarPaint,
+    lighting: SceneLighting,
+}

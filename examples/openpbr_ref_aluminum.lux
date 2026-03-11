@@ -1,0 +1,51 @@
+// OpenPBR Reference: Brushed Aluminum — exact ASWF values
+// Compare: https://portsmouth.github.io/OpenPBR-viewer
+//   Set base_color=(0.912,0.914,0.920), base_metalness=1,
+//   specular_color=(0.970,0.979,0.988), specular_roughness=0.2
+//   (anisotropy=0.9 in reference — not yet supported, using isotropic)
+
+import openpbr;
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    uv: vec2,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        frag_uv: uv,
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+surface BrushedAluminum {
+    layers [
+        base(color: vec3(0.912, 0.914, 0.920),
+             metalness: 1.0,
+             diffuse_roughness: 0.0,
+             weight: 1.0),
+        specular(weight: 1.0,
+                 color: vec3(0.970, 0.979, 0.988),
+                 roughness: 0.2,
+                 ior: 1.5),
+        emission(luminance: 0.0, color: vec3(1.0)),
+    ]
+}
+
+lighting SceneLighting {
+    layers [
+        directional(direction: vec3(0.5, -0.7, 0.5),
+                    color: vec3(3.0, 2.94, 2.85)),
+    ]
+}
+
+pipeline ReferenceForward {
+    geometry: StandardMesh,
+    surface: BrushedAluminum,
+    lighting: SceneLighting,
+}

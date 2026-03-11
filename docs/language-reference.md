@@ -749,6 +749,7 @@ Import modules with `import <name>;` — functions are inlined at the call site.
 | `compositing` | 2 | IBL multi-scattering (Fdez-Aguera 2019), unified `compose_pbr_layers` (transmission, sheen, coat, IBL, emission) |
 | `pbr_pipeline` | 1 | `pbr_shade()` — single-call PBR orchestration (direct lighting + IBL + all optional layers) |
 | `gaussian` | 6 | SH constants (degrees 0–3), quaternion-to-rotation, 3D/2D covariance, Gaussian 2D eval, quad radius |
+| `openpbr` | 15 | OpenPBR Surface v1.1: F82-tint conductor Fresnel, energy-preserving Oren-Nayar (EON), coat darkening/absorption/roughening, fuzz BRDF, specular IOR modulation, thin-film, direct lighting, full composition (9 layers) |
 | `debug` | 5 | Normal visualization, depth grayscale, scalar heatmap, index coloring, UV checkerboard |
 
 ### Built-in Functions
@@ -812,6 +813,40 @@ const PI: scalar = 3.14159265;
 ```
 import brdf;        // loads luxc/stdlib/brdf.lux
 import noise;       // loads luxc/stdlib/noise.lux
+import openpbr;     // enables OpenPBR Surface v1.1 material model
 ```
 
 The compiler searches `luxc/stdlib/` first, then the source file's directory.
+Imports are transitive: `import openpbr;` also brings in `brdf` and `compositing`.
+
+### OpenPBR Material Model
+
+`import openpbr;` activates the OpenPBR Surface v1.1 material model (Adobe/ASWF standard).
+The surface expander automatically detects the import and generates physically-based composition
+using energy-conserving layer stacking instead of the default glTF PBR path.
+
+**Supported layers**: `base`, `specular`, `coat`, `fuzz`, `thin_film`, `transmission`, `emission`, `subsurface`, `normal_map`
+
+```
+import openpbr;
+
+surface CarPaint {
+    sampler2d albedo_tex,
+    layers [
+        base(color: sample(albedo_tex, uv).xyz, metalness: 0.9, diffuse_roughness: 0.0),
+        specular(weight: 1.0, color: vec3(1.0), roughness: 0.15, ior: 1.5),
+        coat(weight: 1.0, roughness: 0.02, ior: 1.6, color: vec3(1.0), darkening: 1.0),
+        thin_film(weight: 0.6, thickness: 0.5, ior: 1.4),
+        emission(luminance: 0.0, color: vec3(1.0)),
+    ]
+}
+```
+
+**Key features:**
+- F82-tint metal Fresnel (Lazanyi-Szirmay-Kalos conductor model)
+- Energy-preserving Oren-Nayar diffuse (EON/Fujii 2024)
+- Coat darkening with internal reflection compensation
+- Specular weight IOR modulation
+- Fuzz BRDF for velvet/fabric
+- Thin-film iridescence
+- Transmission with volume absorption

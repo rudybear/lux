@@ -76,6 +76,7 @@ luxc/
         pbr_pipeline.lux     # PBR orchestration: pbr_shade() single-call entry point
         debug.lux            # debug visualization helpers (normal, depth, heatmap, checkerboard)
         gaussian.lux         # Gaussian splatting helpers (SH, covariance, quad radius)
+        openpbr.lux          # OpenPBR Surface v1.1 material model (F82-tint, EON diffuse, coat darkening)
     transpiler/
         glsl_ast.py          # GLSL AST nodes
         glsl_parser.py       # GLSL subset parser
@@ -113,6 +114,9 @@ examples/
     compute_reduction.lux    # parallel reduction: barrier-synchronized sum
     debug_features_demo.lux  # debug_print, assert, @[debug], semantic types
     gaussian_splat.lux       # Gaussian splatting: splat decl + 3-stage pipeline
+    openpbr_carpaint.lux     # OpenPBR: metallic car paint with clearcoat + thin-film
+    openpbr_velvet.lux       # OpenPBR: velvet with fuzz layer + Oren-Nayar diffuse
+    openpbr_glass.lux        # OpenPBR: amber glass with transmission + volume absorption
     debug_playground.lux     # CPU debugger playground: PBR + NaN trap
     debug_playground_inputs.json  # custom input values for debug_playground
 playground/
@@ -172,6 +176,7 @@ tests/
     test_autotype.py            # auto-type precision optimization tests (50 tests)
     test_gaussian_splatting.py  # Gaussian splatting tests (33 tests: parser, config, expansion, compilation)
     test_stdlib_refactoring.py  # Shared stdlib refactoring tests (13 tests: compose_pbr_layers, coat IBL, helpers)
+    test_openpbr.py             # OpenPBR material model tests (35 tests: parser, stdlib, expansion, compilation, imports)
 tools/
     generate_training_data.py
     generate_test_splats.py  # generate test Gaussian splat .glb files (KHR_gaussian_splatting)

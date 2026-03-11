@@ -29,6 +29,11 @@ from luxc.parser.ast_nodes import (
 from luxc.expansion.splat_expander import expand_splat_pipeline
 
 
+def _is_openpbr(module):
+    """Check if module imports openpbr."""
+    return any(imp.module_name == "openpbr" for imp in getattr(module, 'imports', []))
+
+
 # --- Schedule strategy tables ---
 
 _DEFAULT_STRATEGIES = {
@@ -485,9 +490,15 @@ _BUILTIN_LAYER_NAMES = frozenset({
     "base", "normal_map", "ibl", "emission", "coat", "sheen", "transmission",
 })
 
+_OPENPBR_LAYER_NAMES = frozenset({
+    "base", "specular", "transmission", "subsurface",
+    "coat", "fuzz", "thin_film", "emission", "normal_map",
+})
+
 
 def _collect_layer_functions(module: Module) -> dict:
     """Scan module functions for @layer annotations, validate, return dict[name, FunctionDef]."""
+    builtin_names = _OPENPBR_LAYER_NAMES if _is_openpbr(module) else _BUILTIN_LAYER_NAMES
     layer_fns = {}
     for fn in module.functions:
         if "layer" not in fn.attributes:
@@ -500,7 +511,7 @@ def _collect_layer_functions(module: Module) -> dict:
             raise ValueError(
                 f"@layer function '{fn.name}' must return vec3"
             )
-        if fn.name in _BUILTIN_LAYER_NAMES:
+        if fn.name in builtin_names:
             raise ValueError(
                 f"@layer function '{fn.name}' conflicts with built-in layer"
             )
@@ -950,17 +961,18 @@ def _emit_tonemap_output(body, result_var, schedule):
         return result_var
 
 
-def _generate_layered_main(
+def _generate_openpbr_main(
     surface: SurfaceDecl,
     frag_inputs: list[tuple[str, str]],
     schedule: dict[str, str] | None = None,
     module: Module | None = None,
     lighting: LightingDecl | None = None,
 ) -> list:
-    """Generate main() body for a layered surface-expanded fragment shader.
+    """Generate main() body for an OpenPBR layered fragment shader.
 
-    Processes layer declarations to generate PBR lighting code equivalent to
-    hand-written gltf_pbr.lux. Supports base, normal_map, ibl, and emission layers.
+    Mirrors _generate_layered_main() but emits calls to openpbr_direct() and
+    openpbr_compose() instead of gltf_pbr() and compose_pbr_layers().  Activated
+    when the module contains ``import openpbr;``.
     """
     body = []
 
@@ -978,7 +990,350 @@ def _generate_layered_main(
     has_tangent = any(n == "world_tangent" for n, _ in frag_inputs)
 
     # Create UV alias so layer expressions using `uv` resolve correctly
-    body.append(LetStmt("uv", "vec2", VarRef("frag_uv")))
+    _has_frag_uv = any(n == "frag_uv" for n, _ in frag_inputs)
+    if _has_frag_uv:
+        body.append(LetStmt("uv", "vec2", VarRef("frag_uv")))
+
+    # --- Normal setup ---
+    if "normal_map" in layers_by_name and has_tangent:
+        nmap_args = _get_layer_args(layers_by_name["normal_map"])
+        map_expr = nmap_args.get("map")
+        body.append(LetStmt("normal_map_raw", "vec3", map_expr))
+        body.append(LetStmt("n", "vec3", CallExpr(VarRef("tbn_perturb_normal"), [
+            VarRef("normal_map_raw"),
+            CallExpr(VarRef("normalize"), [VarRef("world_normal")]),
+            CallExpr(VarRef("normalize"), [VarRef("world_tangent")]),
+            CallExpr(VarRef("normalize"), [VarRef("world_bitangent")]),
+        ])))
+    else:
+        normal_var = next(
+            (n for n, _ in frag_inputs if n in ("world_normal", "frag_normal")),
+            "world_normal",
+        )
+        body.append(LetStmt("n", "vec3",
+            CallExpr(VarRef("normalize"), [VarRef(normal_var)])))
+
+    # --- View and light directions ---
+    if has_pos:
+        body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
+            BinaryOp("-", VarRef("view_pos"), VarRef(pos_var)),
+        ])))
+    else:
+        body.append(LetStmt("v", "vec3", CallExpr(VarRef("normalize"), [
+            ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("0.0"), NumberLit("1.0")]),
+        ])))
+
+    # Detect multi_light vs directional lighting mode
+    _has_multi_light = _detect_multi_light(lighting)
+    lighting_by_name = {}
+    if lighting and lighting.layers:
+        lighting_by_name = {layer.name: layer for layer in lighting.layers}
+
+    # Light direction: from lighting block (directional/multi_light) or legacy uniform
+    if _has_multi_light:
+        body.append(LetStmt("l", "vec3",
+            ConstructorExpr("vec3", [NumberLit("0.0"), NumberLit("1.0"), NumberLit("0.0")])))
+    elif lighting and lighting.layers:
+        if "directional" in lighting_by_name:
+            dir_args = _get_layer_args(lighting_by_name["directional"])
+            body.append(LetStmt("l", "vec3",
+                CallExpr(VarRef("normalize"), [
+                    dir_args.get("direction", VarRef("light_dir"))])))
+            body.append(LetStmt("light_color", "vec3",
+                dir_args.get("color",
+                    ConstructorExpr("vec3", [NumberLit("1.0")]))))
+        else:
+            body.append(LetStmt("l", "vec3",
+                CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+            body.append(LetStmt("light_color", "vec3",
+                ConstructorExpr("vec3", [
+                    NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95")])))
+    else:
+        body.append(LetStmt("l", "vec3",
+            CallExpr(VarRef("normalize"), [VarRef("light_dir")])))
+        body.append(LetStmt("light_color", "vec3",
+            ConstructorExpr("vec3", [
+                NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95")])))
+
+    body.append(LetStmt("n_dot_v", "scalar", CallExpr(VarRef("max"), [
+        CallExpr(VarRef("dot"), [VarRef("n"), VarRef("v")]),
+        NumberLit("0.001"),
+    ])))
+
+    # ----------------------------------------------------------------
+    # Extract OpenPBR layer parameters
+    # ----------------------------------------------------------------
+
+    # --- base layer ---
+    base_args = _get_layer_args(layers_by_name["base"]) if "base" in layers_by_name else {}
+    base_color_expr = base_args.get("color", ConstructorExpr("vec3", [NumberLit("0.8")]))
+    base_metalness_expr = base_args.get("metalness", NumberLit("0.0"))
+    base_diffuse_roughness_expr = base_args.get("diffuse_roughness", NumberLit("0.0"))
+    base_weight_expr = base_args.get("weight", NumberLit("1.0"))
+
+    body.append(LetStmt("base_color", "vec3", base_color_expr))
+    body.append(LetStmt("base_metalness", "scalar", base_metalness_expr))
+    body.append(LetStmt("base_diffuse_roughness", "scalar", base_diffuse_roughness_expr))
+    body.append(LetStmt("base_weight", "scalar", base_weight_expr))
+
+    # --- specular layer ---
+    spec_args = _get_layer_args(layers_by_name["specular"]) if "specular" in layers_by_name else {}
+    body.append(LetStmt("specular_weight", "scalar",
+        spec_args.get("weight", NumberLit("1.0"))))
+    body.append(LetStmt("specular_color", "vec3",
+        spec_args.get("color", ConstructorExpr("vec3", [NumberLit("1.0")]))))
+    body.append(LetStmt("specular_roughness", "scalar",
+        spec_args.get("roughness", NumberLit("0.3"))))
+    body.append(LetStmt("specular_ior", "scalar",
+        spec_args.get("ior", NumberLit("1.5"))))
+
+    # --- coat layer ---
+    coat_args = _get_layer_args(layers_by_name["coat"]) if "coat" in layers_by_name else {}
+    body.append(LetStmt("coat_weight", "scalar",
+        coat_args.get("weight", NumberLit("0.0"))))
+    body.append(LetStmt("coat_color", "vec3",
+        coat_args.get("color", ConstructorExpr("vec3", [NumberLit("1.0")]))))
+    body.append(LetStmt("coat_roughness", "scalar",
+        coat_args.get("roughness", NumberLit("0.0"))))
+    body.append(LetStmt("coat_ior", "scalar",
+        coat_args.get("ior", NumberLit("1.6"))))
+    body.append(LetStmt("coat_darkening", "scalar",
+        coat_args.get("darkening", NumberLit("1.0"))))
+
+    # --- fuzz layer ---
+    fuzz_args = _get_layer_args(layers_by_name["fuzz"]) if "fuzz" in layers_by_name else {}
+    body.append(LetStmt("fuzz_weight", "scalar",
+        fuzz_args.get("weight", NumberLit("0.0"))))
+    body.append(LetStmt("fuzz_color", "vec3",
+        fuzz_args.get("color", ConstructorExpr("vec3", [NumberLit("1.0")]))))
+    body.append(LetStmt("fuzz_roughness", "scalar",
+        fuzz_args.get("roughness", NumberLit("0.5"))))
+
+    # --- thin_film layer ---
+    tf_args = _get_layer_args(layers_by_name["thin_film"]) if "thin_film" in layers_by_name else {}
+    body.append(LetStmt("thin_film_weight", "scalar",
+        tf_args.get("weight", NumberLit("0.0"))))
+    body.append(LetStmt("thin_film_thickness", "scalar",
+        tf_args.get("thickness", NumberLit("0.5"))))
+    body.append(LetStmt("thin_film_ior", "scalar",
+        tf_args.get("ior", NumberLit("1.4"))))
+
+    # --- transmission layer ---
+    trans_args = _get_layer_args(layers_by_name["transmission"]) if "transmission" in layers_by_name else {}
+    body.append(LetStmt("trans_weight", "scalar",
+        trans_args.get("weight", NumberLit("0.0"))))
+    body.append(LetStmt("trans_color", "vec3",
+        trans_args.get("color", ConstructorExpr("vec3", [NumberLit("1.0")]))))
+    body.append(LetStmt("trans_depth", "scalar",
+        trans_args.get("depth", NumberLit("0.0"))))
+
+    # --- emission layer ---
+    em_args = _get_layer_args(layers_by_name["emission"]) if "emission" in layers_by_name else {}
+    body.append(LetStmt("emission_luminance", "scalar",
+        em_args.get("luminance", NumberLit("0.0"))))
+    body.append(LetStmt("emission_color", "vec3",
+        em_args.get("color", ConstructorExpr("vec3", [NumberLit("1.0")]))))
+
+    # ----------------------------------------------------------------
+    # Also expose base params as layer_albedo/layer_roughness/layer_metallic
+    # for multi-light loop compatibility (gltf_pbr call inside the loop)
+    # ----------------------------------------------------------------
+    body.append(LetStmt("layer_albedo", "vec3", VarRef("base_color")))
+    body.append(LetStmt("layer_roughness", "scalar", VarRef("specular_roughness")))
+    body.append(LetStmt("layer_metallic", "scalar", VarRef("base_metalness")))
+
+    # ----------------------------------------------------------------
+    # Direct lighting
+    # ----------------------------------------------------------------
+    result_var = "result_zero"
+    body.append(LetStmt(result_var, "vec3",
+        ConstructorExpr("vec3", [NumberLit("0.0")])))
+
+    if _has_multi_light:
+        result_var = _emit_multi_light_from_lighting(
+            body, lighting, pos_var)
+    else:
+        # Single directional light: call openpbr_direct
+        body.append(LetStmt("direct_raw", "vec3", CallExpr(VarRef("openpbr_direct"), [
+            VarRef("n"), VarRef("v"), VarRef("l"),
+            VarRef("base_color"), VarRef("base_metalness"),
+            VarRef("base_diffuse_roughness"), VarRef("base_weight"),
+            VarRef("specular_weight"), VarRef("specular_color"),
+            VarRef("specular_roughness"), VarRef("specular_ior"),
+            VarRef("coat_weight"), VarRef("coat_roughness"), VarRef("coat_ior"),
+            VarRef("thin_film_weight"), VarRef("thin_film_thickness"), VarRef("thin_film_ior"),
+        ])))
+
+        # Light color tint
+        body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
+            VarRef("direct_raw"), VarRef("light_color"),
+        )))
+        result_var = "direct_lit"
+
+    # ----------------------------------------------------------------
+    # IBL sampling
+    # ----------------------------------------------------------------
+    ibl_args = None
+    if lighting and lighting.layers:
+        _lighting_by_name = {layer.name: layer for layer in lighting.layers}
+        if "ibl" in _lighting_by_name:
+            ibl_args = _get_layer_args(_lighting_by_name["ibl"])
+    if ibl_args is None and "ibl" in layers_by_name:
+        ibl_args = _get_layer_args(layers_by_name["ibl"])
+    _has_ibl = ibl_args is not None
+
+    body.append(LetStmt("bl_ambient", "vec3",
+        ConstructorExpr("vec3", [NumberLit("0.0")])))
+    body.append(LetStmt("bl_coat_ibl", "vec3",
+        ConstructorExpr("vec3", [NumberLit("0.0")])))
+
+    if _has_ibl:
+        specular_map = ibl_args.get("specular_map")
+        irradiance_map = ibl_args.get("irradiance_map")
+        brdf_lut_ref = ibl_args.get("brdf_lut")
+
+        body.append(LetStmt("r", "vec3", CallExpr(VarRef("reflect"), [
+            BinaryOp("*", VarRef("v"), UnaryOp("-", NumberLit("1.0"))),
+            VarRef("n"),
+        ])))
+        body.append(LetStmt("prefiltered", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                specular_map, VarRef("r"),
+                BinaryOp("*", VarRef("specular_roughness"),
+                         NumberLit("8.0")),
+            ]), "xyz")))
+        body.append(LetStmt("irradiance", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample"), [irradiance_map, VarRef("n")]),
+            "xyz")))
+        body.append(LetStmt("brdf_sample", "vec2", SwizzleAccess(
+            CallExpr(VarRef("sample"), [
+                brdf_lut_ref,
+                ConstructorExpr("vec2", [
+                    VarRef("n_dot_v"), VarRef("specular_roughness"),
+                ]),
+            ]), "xy")))
+
+        body.append(AssignStmt(AssignTarget(VarRef("bl_ambient")),
+            CallExpr(VarRef("ibl_contribution"), [
+                VarRef("base_color"), VarRef("specular_roughness"),
+                VarRef("base_metalness"),
+                VarRef("n_dot_v"), VarRef("prefiltered"),
+                VarRef("irradiance"), VarRef("brdf_sample"),
+            ])))
+
+        # Coat IBL contribution (if coat layer is active)
+        if "coat" in layers_by_name:
+            body.append(LetStmt("prefiltered_coat", "vec3", SwizzleAccess(
+                CallExpr(VarRef("sample_lod"), [
+                    specular_map, VarRef("r"),
+                    BinaryOp("*", VarRef("coat_roughness"),
+                             NumberLit("8.0")),
+                ]), "xyz")))
+            body.append(AssignStmt(
+                AssignTarget(VarRef("bl_coat_ibl")),
+                CallExpr(VarRef("coat_ibl"), [
+                    VarRef("coat_weight"),
+                    VarRef("coat_roughness"),
+                    VarRef("n"), VarRef("v"),
+                    VarRef("prefiltered_coat"),
+                ])))
+
+    # ----------------------------------------------------------------
+    # Compose via openpbr_compose
+    # ----------------------------------------------------------------
+    # Custom @layer functions
+    _custom_layer_list = []
+    if module is not None:
+        layer_fns = _collect_layer_functions(module)
+        _custom_layer_list = [
+            (layer, layer_fns[layer.name])
+            for layer in surface.layers if layer.name in layer_fns
+        ]
+    _has_custom_layers = len(_custom_layer_list) > 0
+
+    def _emit_openpbr_compose(emission_lum_expr, emission_col_expr):
+        return LetStmt("composed", "vec3", CallExpr(
+            VarRef("openpbr_compose"), [
+                VarRef(result_var),
+                VarRef("n"), VarRef("v"), VarRef("l"),
+                VarRef("base_color"), VarRef("base_metalness"), VarRef("base_weight"),
+                VarRef("specular_weight"), VarRef("specular_color"),
+                VarRef("specular_roughness"), VarRef("specular_ior"),
+                VarRef("trans_weight"), VarRef("trans_color"), VarRef("trans_depth"),
+                VarRef("coat_weight"), VarRef("coat_color"),
+                VarRef("coat_roughness"), VarRef("coat_ior"), VarRef("coat_darkening"),
+                VarRef("fuzz_weight"), VarRef("fuzz_color"), VarRef("fuzz_roughness"),
+                VarRef("thin_film_weight"), VarRef("thin_film_thickness"), VarRef("thin_film_ior"),
+                emission_lum_expr, emission_col_expr,
+                VarRef("bl_ambient"), VarRef("bl_coat_ibl"),
+            ]))
+
+    if _has_custom_layers:
+        # Compose WITHOUT emission (custom layers run before emission)
+        body.append(_emit_openpbr_compose(
+            NumberLit("0.0"),
+            ConstructorExpr("vec3", [NumberLit("1.0")])))
+        result_var = "composed"
+        for layer, fn in _custom_layer_list:
+            result_var = _emit_custom_layer(
+                layer, fn, result_var, body,
+                prefix=f"custom_{layer.name}", rewrite_for_rt=False)
+        body.append(LetStmt("hdr", "vec3",
+            BinaryOp("+", VarRef(result_var),
+                BinaryOp("*", VarRef("emission_color"), VarRef("emission_luminance")))))
+        result_var = "hdr"
+    else:
+        body.append(_emit_openpbr_compose(
+            VarRef("emission_luminance"), VarRef("emission_color")))
+        result_var = "composed"
+
+    # --- Tonemap + gamma ---
+    output_var = _emit_tonemap_output(body, result_var, schedule)
+
+    # Output final color
+    body.append(AssignStmt(
+        AssignTarget(VarRef("color")),
+        ConstructorExpr("vec4", [VarRef(output_var), NumberLit("1.0")]),
+    ))
+
+    return body
+
+
+def _generate_layered_main(
+    surface: SurfaceDecl,
+    frag_inputs: list[tuple[str, str]],
+    schedule: dict[str, str] | None = None,
+    module: Module | None = None,
+    lighting: LightingDecl | None = None,
+) -> list:
+    """Generate main() body for a layered surface-expanded fragment shader.
+
+    Processes layer declarations to generate PBR lighting code equivalent to
+    hand-written gltf_pbr.lux. Supports base, normal_map, ibl, and emission layers.
+    """
+    # OpenPBR dispatch
+    if module and _is_openpbr(module):
+        return _generate_openpbr_main(surface, frag_inputs, schedule, module, lighting)
+
+    body = []
+
+    # Index layers by name
+    layers_by_name = {}
+    for layer in surface.layers:
+        layers_by_name[layer.name] = layer
+
+    # Determine which inputs we have
+    has_pos = any(n in ("world_pos", "frag_pos") for n, _ in frag_inputs)
+    pos_var = next(
+        (n for n, _ in frag_inputs if n in ("world_pos", "frag_pos")),
+        "world_pos",
+    )
+    has_tangent = any(n == "world_tangent" for n, _ in frag_inputs)
+
+    # Create UV alias so layer expressions using `uv` resolve correctly
+    _has_frag_uv_layered = any(n == "frag_uv" for n, _ in frag_inputs)
+    if _has_frag_uv_layered:
+        body.append(LetStmt("uv", "vec2", VarRef("frag_uv")))
 
     # --- Normal setup ---
     if "normal_map" in layers_by_name and has_tangent:

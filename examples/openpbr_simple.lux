@@ -1,0 +1,55 @@
+// OpenPBR Simple — no textures, just material parameters
+// Use for quick visual testing: luxc openpbr_simple.lux
+// Run: lux-playground.exe --scene sphere --pipeline examples/openpbr_simple --interactive
+
+import openpbr;
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    uv: vec2,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        frag_uv: uv,
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+surface SimpleOpenPBR {
+    layers [
+        base(color: vec3(0.8, 0.2, 0.1),
+             metalness: 0.0,
+             diffuse_roughness: 0.2,
+             weight: 1.0),
+        specular(weight: 1.0,
+                 color: vec3(1.0),
+                 roughness: 0.3,
+                 ior: 1.5),
+        coat(weight: 0.5,
+             color: vec3(1.0),
+             roughness: 0.1,
+             ior: 1.6,
+             darkening: 0.8),
+        emission(luminance: 0.0,
+                 color: vec3(1.0)),
+    ]
+}
+
+lighting SimpleLighting {
+    layers [
+        directional(direction: vec3(0.5, -0.8, 0.3),
+                    color: vec3(1.0, 0.98, 0.95)),
+    ]
+}
+
+pipeline SimpleForward {
+    geometry: StandardMesh,
+    surface: SimpleOpenPBR,
+    lighting: SimpleLighting,
+}

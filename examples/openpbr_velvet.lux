@@ -1,0 +1,75 @@
+// OpenPBR Velvet — fabric with fuzz sheen layer and Oren-Nayar diffuse
+// Demonstrates the fuzz layer for soft fabrics that scatter light at
+// grazing angles, combined with diffuse_roughness for micro-roughness.
+//
+// Compile: luxc openpbr_velvet.lux
+
+import openpbr;
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    uv: vec2,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        frag_uv: uv,
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+surface Velvet {
+    sampler2d weave_tex,
+    sampler2d normal_tex,
+
+    properties Fabric {
+        base_color: vec3 = vec3(0.25, 0.02, 0.04),
+        fuzz_color: vec3 = vec3(0.55, 0.15, 0.18),
+        weave_scale: scalar = 6.0,
+    },
+
+    layers [
+        base(color: Fabric.base_color
+                    * sample(weave_tex, uv * Fabric.weave_scale).xyz,
+             metalness: 0.0,
+             diffuse_roughness: 0.5,
+             weight: 1.0),
+        specular(weight: 0.3,
+                 color: vec3(1.0),
+                 roughness: 0.6,
+                 ior: 1.5),
+        fuzz(weight: 0.8,
+             color: Fabric.fuzz_color,
+             roughness: 0.7),
+        normal_map(map: sample(normal_tex, uv * Fabric.weave_scale).xyz),
+    ]
+}
+
+lighting SceneLighting {
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    properties Light {
+        light_dir: vec3 = vec3(0.3, -0.6, 0.7),
+        view_pos: vec3 = vec3(0.0, 0.0, 3.0),
+    },
+
+    layers [
+        directional(direction: Light.light_dir,
+                    color: vec3(1.0, 0.95, 0.9)),
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
+    ]
+}
+
+pipeline VelvetForward {
+    geometry: StandardMesh,
+    surface: Velvet,
+    lighting: SceneLighting,
+}
