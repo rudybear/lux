@@ -1730,7 +1730,7 @@ algorithm/schedule separation — and compile it all to real-time Vulkan SPIR-V.
 
 ---
 
-### Phase 23: Interactive Scene Editor (C++ & Rust)
+### Phase 23: Interactive Scene Editor (C++ & Rust) [DONE — P23.1-P23.2]
 
 **Goal:** Build a full interactive application with UI for both C++ and Rust engines — load glTF scenes, select shaders/pipelines, pick and transform meshes, and exercise all current Lux features from a single app.
 
@@ -1797,7 +1797,7 @@ algorithm/schedule separation — and compile it all to real-time Vulkan SPIR-V.
 
 ---
 
-### Phase 24: KHR_gaussian_splatting Conformance Test Assets
+### Phase 24: KHR_gaussian_splatting Conformance Test Assets [DONE]
 
 **Goal:** Integrate the official Khronos `KHR_gaussian_splatting` test suite into Lux's test infrastructure, ensuring our splat renderer handles all edge cases from the upcoming ratification process.
 
@@ -1832,7 +1832,7 @@ algorithm/schedule separation — and compile it all to real-time Vulkan SPIR-V.
 
 ---
 
-### Phase 25: PLY-to-glTF Gaussian Splat Conversion Tool
+### Phase 25: PLY-to-glTF Gaussian Splat Conversion Tool [DONE]
 
 **Goal:** Add a robust PLY → glTF conversion pipeline for Gaussian splats as a first-class Lux tool, supporting the `KHR_gaussian_splatting` extension.
 

@@ -134,6 +134,7 @@ playground/
 assets/                      # glTF models, IBL maps (downloaded separately, gitignored)
 playground_cpp/
     src/                     # native Vulkan C++ renderer (raster + RT + mesh + splat, GLFW)
+    src/editor_ui.h/cpp      # interactive scene editor UI (Dear ImGui: scene tree, properties, pipeline hot-swap)
     src/splat_renderer.cpp/h # Gaussian splat renderer (compute + instanced draw)
     src/metal_*.cpp/h/mm     # native Metal renderer (raster + mesh, macOS, SPIRV-Cross)
 playground_rust/
@@ -182,10 +183,12 @@ tests/
     test_gaussian_splatting.py  # Gaussian splatting tests (33 tests: parser, config, expansion, compilation)
     test_stdlib_refactoring.py  # Shared stdlib refactoring tests (13 tests: compose_pbr_layers, coat IBL, helpers)
     test_openpbr.py             # OpenPBR material model tests (35 tests: parser, stdlib, expansion, compilation, imports)
+    test_khr_splat_conformance.py  # KHR_gaussian_splatting conformance tests (226 tests: asset loading, data validation, compilation)
+    test_ply_to_gltf.py         # PLY-to-glTF converter tests (73 tests: parsing, transforms, round-trip, edge cases)
 tools/
     generate_training_data.py
     generate_test_splats.py  # generate test Gaussian splat .glb files (KHR_gaussian_splatting)
-    ply_to_gltf.py           # convert .ply splat files to glTF with KHR_gaussian_splatting
+    ply_to_gltf.py           # enhanced PLY-to-glTF converter (coord transform, opacity/scale, SH auto-detect, verify, batch)
     glb_to_ply.py            # convert KHR_gaussian_splatting .glb to standard .ply for external viewers
     debug_splats.py          # debug visualization for Gaussian splat data
     visualize_brdf.py        # BRDF visualization CLI (compile + render + composite)

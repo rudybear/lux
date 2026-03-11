@@ -76,8 +76,11 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 
 **Ecosystem**
 - 4 rendering engines: Python/wgpu, C++/Vulkan, C++/Metal, Rust/ash — all reflection-driven
+- **Interactive scene editor** (`--editor`): Dear ImGui overlay with scene tree, material property sliders, pipeline hot-swap, transform inspector, viewport controls
 - AI material authoring: text-to-shader, image-to-material, video-to-animation, 5 providers
 - glTF 2.0 PBR with IBL, multi-material permutations, interactive viewers
+- KHR_gaussian_splatting conformance test suite (11 official Khronos assets, 226 tests)
+- PLY-to-glTF converter: coordinate transform, opacity/scale auto-detection, SH degree 0–3, round-trip verification, batch processing
 - Metal backend via SPIRV-Cross, BRDF visualization tools, IBL preprocessing pipeline
 
 ## Prerequisites
@@ -231,7 +234,7 @@ Alternative path (--debug-run):
 luxc/            Compiler (parser, type checker, codegen, optimizer, autotype, debug)
 docs/            Documentation (language ref, gallery, usage, rendering engines)
 examples/        Example .lux shaders
-tests/           Test suite (1084+ tests)
+tests/           Test suite (1383+ tests)
 playground/      Python/wgpu rendering engine + screenshot tests
 playground_cpp/  C++/Vulkan + Metal rendering engines
 playground_rust/ Rust/Vulkan rendering engine
@@ -286,7 +289,7 @@ See [full project structure](docs/project-structure.md) for the complete directo
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 1084+ tests
+# 1383+ tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.
