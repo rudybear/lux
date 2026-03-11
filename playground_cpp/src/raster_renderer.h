@@ -58,6 +58,9 @@ public:
     VkImage getOffscreenImage() const { return offscreenImage; }
     VkFormat getOffscreenFormat() const { return VK_FORMAT_R8G8B8A8_UNORM; }
 
+    // Update a material UBO at runtime (editor property editing)
+    void updateMaterialUBO(VulkanContext& ctx, int materialIndex, const MaterialUBOData& data);
+
     // Render to a swapchain image (interactive mode)
     void renderToSwapchain(VulkanContext& ctx, VkImage swapImage, VkImageView swapView,
                            VkFormat swapFormat, VkExtent2D extent,

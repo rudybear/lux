@@ -2548,6 +2548,42 @@ void RasterRenderer::setupMultiPipeline(VulkanContext& ctx, const ShaderManifest
 }
 
 // --------------------------------------------------------------------------
+// Update a material UBO at runtime (editor property editing)
+// --------------------------------------------------------------------------
+
+void RasterRenderer::updateMaterialUBO(VulkanContext& ctx, int materialIndex, const MaterialUBOData& data) {
+    void* mapped = nullptr;
+
+    // Single-pipeline mode: material index 0 uses m_materialBuffer
+    if (!m_multiPipeline && materialIndex == 0 && m_materialBuffer != VK_NULL_HANDLE) {
+        vmaMapMemory(ctx.allocator, m_materialAllocation, &mapped);
+        memcpy(mapped, &data, sizeof(MaterialUBOData));
+        vmaUnmapMemory(ctx.allocator, m_materialAllocation);
+        return;
+    }
+
+    // Multi-pipeline mode: per-material buffers
+    if (materialIndex >= 0 && materialIndex < static_cast<int>(m_perMaterialBuffers.size())) {
+        vmaMapMemory(ctx.allocator, m_perMaterialAllocations[materialIndex], &mapped);
+        memcpy(mapped, &data, sizeof(MaterialUBOData));
+        vmaUnmapMemory(ctx.allocator, m_perMaterialAllocations[materialIndex]);
+        return;
+    }
+
+    // Also check permutation per-material UBOs
+    for (auto& perm : m_permutations) {
+        for (size_t i = 0; i < perm.materialIndices.size(); i++) {
+            if (perm.materialIndices[i] == materialIndex && i < perm.perMaterialUBOs.size()) {
+                vmaMapMemory(ctx.allocator, perm.perMaterialAllocations[i], &mapped);
+                memcpy(mapped, &data, sizeof(MaterialUBOData));
+                vmaUnmapMemory(ctx.allocator, perm.perMaterialAllocations[i]);
+                return;
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // Record draw commands (shared between render() and renderToSwapchain())
 // --------------------------------------------------------------------------
 

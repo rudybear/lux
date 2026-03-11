@@ -1090,6 +1090,89 @@ static int runInteractive(CLIOptions opts) {
             if (editorActive) editorNeedsReinit = true;
         }
 
+        // Handle editor glTF load requests
+        if (editorActive && editorUI.getState().gltfLoadRequested) {
+            editorUI.getState().gltfLoadRequested = false;
+            std::string newGltf = editorUI.getState().pendingGltfPath;
+            std::cout << "[editor] Loading glTF: " << newGltf << std::endl;
+
+            vkDeviceWaitIdle(ctx.device);
+
+            // Destroy old renderer
+            if (renderer) {
+                renderer->cleanup(ctx);
+                renderer.reset();
+            }
+
+            // Reload scene
+            try {
+                scene.cleanup(ctx);
+                scene.loadScene(ctx, newGltf);
+
+                int vertexStride = scene.hasGltfScene() ? 48 : 32;
+                scene.uploadToGPU(ctx, vertexStride);
+                scene.uploadTextures(ctx);
+
+                // Rebuild renderer with current pipeline
+                std::string rp = detectRenderPath(opts.shaderBase, "");
+                auto raster = std::make_unique<RasterRenderer>();
+                raster->init(ctx, scene, opts.shaderBase, rp,
+                             ctx.swapchainExtent.width, ctx.swapchainExtent.height);
+                renderer = std::move(raster);
+
+                // Reset camera to new scene bounds
+                if (scene.hasSceneBounds()) {
+                    g_orbit.initFromAutoCamera(
+                        scene.getAutoEye(), scene.getAutoTarget(),
+                        scene.getAutoUp(), scene.getAutoFar());
+                }
+
+                // Re-init editor state from new scene
+                editorUI.getState().nodeTransforms.clear();
+                editorUI.getState().materialOverrides.clear();
+                editorUI.getState().selectedNodeIndex = -1;
+                editorUI.getState().selectedMaterialIndex = -1;
+                editorUI.resetSceneState();
+
+                opts.sceneSource = newGltf;
+                std::cout << "[editor] glTF load successful" << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "[editor] glTF load failed: " << e.what() << std::endl;
+            }
+        }
+
+        // Handle editor material property changes
+        if (editorActive && renderer && scene.hasGltfScene()) {
+            auto& state = editorUI.getState();
+            auto* rasterR = dynamic_cast<RasterRenderer*>(renderer.get());
+            if (rasterR) {
+                for (int mi = 0; mi < static_cast<int>(state.materialOverrides.size()); mi++) {
+                    auto& ov = state.materialOverrides[mi];
+                    if (ov.modified) {
+                        ov.modified = false;
+                        MaterialUBOData data{};
+                        data.baseColorFactor = glm::vec4(ov.baseColor[0], ov.baseColor[1],
+                                                         ov.baseColor[2], ov.baseColor[3]);
+                        data.metallicFactor = ov.metallic;
+                        data.roughnessFactor = ov.roughness;
+                        data.emissiveFactor = glm::vec3(ov.emissive[0], ov.emissive[1], ov.emissive[2]);
+                        data.emissiveStrength = 1.0f;
+                        // Preserve other fields from original material
+                        if (mi < static_cast<int>(scene.getGltfScene().materials.size())) {
+                            const auto& mat = scene.getGltfScene().materials[mi];
+                            data.ior = mat.ior;
+                            data.clearcoatFactor = mat.clearcoatFactor;
+                            data.clearcoatRoughnessFactor = mat.clearcoatRoughnessFactor;
+                            data.sheenColorFactor = mat.sheenColorFactor;
+                            data.sheenRoughnessFactor = mat.sheenRoughnessFactor;
+                            data.transmissionFactor = mat.transmissionFactor;
+                        }
+                        rasterR->updateMaterialUBO(ctx, mi, data);
+                    }
+                }
+            }
+        }
+
         // Handle editor pipeline reload requests
         if (editorActive && editorUI.getState().pipelineReloadRequested) {
             editorUI.getState().pipelineReloadRequested = false;

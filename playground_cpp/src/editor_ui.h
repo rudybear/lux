@@ -199,4 +199,8 @@ private:
     // Initialize editable state from scene data
     void initFromScene(SceneManager& scene);
     bool m_sceneInitialized = false;
+
+public:
+    // Reset scene state (call after loading a new glTF)
+    void resetSceneState() { m_sceneInitialized = false; }
 };
