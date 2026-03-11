@@ -312,6 +312,10 @@ def generate_reflection(
                 for name, type_name in extra
             ]
 
+        # Flag OpenPBR mode in reflection output
+        if getattr(stage, '_openpbr', False):
+            bindless_meta["openpbr"] = True
+
         result["bindless"] = bindless_meta
 
     # --- Push constants ---

@@ -371,3 +371,122 @@ fn openpbr_compose(
 
     return result;
 }
+
+// =====================================================================
+// Fast Variants — Simplified for mobile/low-end (schedule dispatch)
+// =====================================================================
+
+// Scalar Schlick Fresnel approximation for fast dielectric path.
+fn openpbr_schlick_scalar(f0: scalar, cos_theta: scalar) -> scalar {
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+// Simplified direct lighting: Lambert instead of EON diffuse,
+// Schlick instead of exact dielectric Fresnel, no coat roughening.
+// Same signature as openpbr_direct() for hot-swap via schedule.
+fn openpbr_direct_fast(
+    n: vec3, v: vec3, l: vec3,
+    base_color: vec3, base_metalness: scalar,
+    base_diffuse_roughness: scalar, base_weight: scalar,
+    specular_weight: scalar, specular_color: vec3,
+    specular_roughness: scalar, specular_ior: scalar,
+    coat_weight: scalar, coat_roughness: scalar, coat_ior: scalar,
+    thin_film_weight: scalar, thin_film_thickness: scalar, thin_film_ior: scalar
+) -> vec3 {
+    let h: vec3 = normalize(v + l);
+    let n_dot_h: scalar = max(dot(n, h), 0.0);
+    let n_dot_v: scalar = max(dot(n, v), 0.001);
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let v_dot_h: scalar = max(dot(v, h), 0.0);
+
+    // --- Specular microfacet terms (shared by metal and dielectric) ---
+    let safe_r: scalar = max(specular_roughness, 0.045);
+    let d: scalar = ggx_ndf(n_dot_h, safe_r);
+    let vis: scalar = v_ggx_correlated(n_dot_l, n_dot_v, safe_r);
+
+    // --- Metal Fresnel (F82-tint conductor model) ---
+    let f0_metal: vec3 = base_weight * base_color;
+    let f_metal: vec3 = openpbr_f82_tint(v_dot_h, f0_metal, specular_color);
+    let f_metal_weighted: vec3 = f_metal * min(specular_weight, 1.0);
+
+    // --- Dielectric Fresnel (Schlick approximation instead of exact) ---
+    let eta_mod: scalar = openpbr_specular_ior_modulated(specular_ior, specular_weight);
+    let f0_d: scalar = ior_to_f0(eta_mod);
+    let f_dielectric: scalar = openpbr_schlick_scalar(f0_d, v_dot_h);
+
+    // --- Blend metal vs dielectric specular ---
+    let spec_metal: vec3 = vec3(d * vis) * f_metal_weighted;
+    let spec_dielectric: vec3 = vec3(d * vis * f_dielectric);
+    let specular: vec3 = mix(spec_dielectric, spec_metal, base_metalness) * n_dot_l;
+
+    // --- Diffuse (simple Lambert instead of EON) ---
+    let diffuse_color: vec3 = base_weight * base_color;
+    let diffuse: vec3 = diffuse_color * INV_PI * n_dot_l;
+
+    // --- Specular throughput for diffuse energy conservation ---
+    let f0_dielectric: scalar = ior_to_f0(eta_mod);
+    let e_spec: scalar = openpbr_specular_albedo(n_dot_v, specular_roughness, f0_dielectric);
+    let diffuse_conserved: vec3 = diffuse * (1.0 - base_metalness) * (1.0 - e_spec);
+
+    return specular + diffuse_conserved;
+}
+
+// Simplified composition: skips fuzz layer, simplified coat (no absorption,
+// no darkening), no thin-film iridescence.
+// Same signature as openpbr_compose() for hot-swap via schedule.
+fn openpbr_compose_fast(
+    direct_lit: vec3,
+    n: vec3, v: vec3, l: vec3,
+    base_color: vec3, base_metalness: scalar, base_weight: scalar,
+    specular_weight: scalar, specular_color: vec3,
+    specular_roughness: scalar, specular_ior: scalar,
+    trans_weight: scalar, trans_color: vec3, trans_depth: scalar,
+    coat_weight: scalar, coat_color: vec3,
+    coat_roughness: scalar, coat_ior: scalar,
+    coat_darkening_param: scalar,
+    fuzz_weight: scalar, fuzz_color: vec3, fuzz_roughness: scalar,
+    thin_film_weight: scalar, thin_film_thickness: scalar, thin_film_ior: scalar,
+    emission_luminance: scalar, emission_color: vec3,
+    ibl_ambient: vec3, coat_ibl: vec3
+) -> vec3 {
+    let n_dot_v: scalar = max(dot(n, v), 0.001);
+    let n_dot_l: scalar = max(dot(n, l), 0.0);
+    let result: vec3 = direct_lit;
+
+    // --- 1. Transmission (simplified — same as full version) ---
+    if (trans_weight > 0.0) {
+        let atten: vec3 = volume_attenuation(
+            trans_depth, trans_color, max(trans_depth, 0.001)
+        );
+        let trans_contrib: vec3 = base_color * atten * trans_weight;
+        result = mix(result, trans_contrib, trans_weight);
+    }
+
+    // --- 2. IBL ambient contribution ---
+    result = result + ibl_ambient;
+
+    // --- 3. Simplified coat (specular only, no darkening, no absorption) ---
+    if (coat_weight > 0.0) {
+        // Coat specular BRDF
+        let coat_contrib: scalar = openpbr_coat_brdf(
+            n, v, l, coat_weight, coat_roughness, coat_ior
+        );
+
+        // Coat energy conservation: attenuate base by (1 - coat_weight * coat_E)
+        let coat_f0: scalar = ior_to_f0(coat_ior);
+        let coat_e: scalar = openpbr_specular_albedo(n_dot_v, coat_roughness, coat_f0);
+        let coat_attenuation: scalar = 1.0 - coat_weight * coat_e;
+
+        result = result * coat_attenuation + vec3(coat_contrib) + coat_ibl;
+    }
+
+    // --- 4. Fuzz skipped in fast path ---
+
+    // --- 5. Emission (additive, no coat absorption in fast path) ---
+    if (emission_luminance > 0.0) {
+        let emit: vec3 = emission_color * emission_luminance * 0.01;
+        result = result + emit;
+    }
+
+    return result;
+}

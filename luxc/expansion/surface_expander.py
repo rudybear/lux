@@ -41,6 +41,11 @@ _DEFAULT_STRATEGIES = {
     "distribution": "ggx",
     "geometry_term": "smith_ggx",
     "tonemap": "none",
+    # OpenPBR-specific
+    "diffuse_model": "eon",
+    "fuzz_model": "charlie",
+    "specular_fresnel": "exact",
+    "coat_fresnel": "exact",
 }
 
 _STRATEGY_FUNCTIONS = {
@@ -53,6 +58,17 @@ _STRATEGY_FUNCTIONS = {
     ("tonemap", "aces"): "tonemap_aces",
     ("tonemap", "reinhard"): "tonemap_reinhard",
     ("tonemap", "none"): None,
+    # OpenPBR diffuse model
+    ("diffuse_model", "eon"): "openpbr_eon_diffuse",
+    ("diffuse_model", "lambert"): None,  # built-in Lambert (no function needed)
+    ("diffuse_model", "burley"): "burley_diffuse",
+    # OpenPBR fuzz
+    ("fuzz_model", "charlie"): "openpbr_fuzz_brdf",
+    # OpenPBR Fresnel
+    ("specular_fresnel", "exact"): "openpbr_fresnel_dielectric",
+    ("specular_fresnel", "schlick"): "fresnel_schlick",
+    ("coat_fresnel", "exact"): "openpbr_fresnel_dielectric",
+    ("coat_fresnel", "schlick"): "fresnel_schlick",
 }
 
 _VALID_SLOTS = set(_DEFAULT_STRATEGIES.keys())
@@ -1145,6 +1161,15 @@ def _generate_openpbr_main(
     # ----------------------------------------------------------------
     # Direct lighting
     # ----------------------------------------------------------------
+    # Determine which OpenPBR direct function to use based on schedule
+    _use_fast_direct = False
+    if schedule:
+        _use_fast_direct = (
+            schedule.get("diffuse_model") == "lambert"
+            or schedule.get("specular_fresnel") == "schlick"
+        )
+    _direct_fn = "openpbr_direct_fast" if _use_fast_direct else "openpbr_direct"
+
     result_var = "result_zero"
     body.append(LetStmt(result_var, "vec3",
         ConstructorExpr("vec3", [NumberLit("0.0")])))
@@ -1153,8 +1178,8 @@ def _generate_openpbr_main(
         result_var = _emit_multi_light_from_lighting(
             body, lighting, pos_var)
     else:
-        # Single directional light: call openpbr_direct
-        body.append(LetStmt("direct_raw", "vec3", CallExpr(VarRef("openpbr_direct"), [
+        # Single directional light: call openpbr_direct or openpbr_direct_fast
+        body.append(LetStmt("direct_raw", "vec3", CallExpr(VarRef(_direct_fn), [
             VarRef("n"), VarRef("v"), VarRef("l"),
             VarRef("base_color"), VarRef("base_metalness"),
             VarRef("base_diffuse_roughness"), VarRef("base_weight"),
@@ -1239,8 +1264,17 @@ def _generate_openpbr_main(
                 ])))
 
     # ----------------------------------------------------------------
-    # Compose via openpbr_compose
+    # Compose via openpbr_compose or openpbr_compose_fast
     # ----------------------------------------------------------------
+    # Determine which compose function to use based on schedule
+    _use_fast_compose = False
+    if schedule:
+        _use_fast_compose = (
+            schedule.get("diffuse_model") == "lambert"
+            or schedule.get("specular_fresnel") == "schlick"
+        )
+    _compose_fn = "openpbr_compose_fast" if _use_fast_compose else "openpbr_compose"
+
     # Custom @layer functions
     _custom_layer_list = []
     if module is not None:
@@ -1253,7 +1287,7 @@ def _generate_openpbr_main(
 
     def _emit_openpbr_compose(emission_lum_expr, emission_col_expr):
         return LetStmt("composed", "vec3", CallExpr(
-            VarRef("openpbr_compose"), [
+            VarRef(_compose_fn), [
                 VarRef(result_var),
                 VarRef("n"), VarRef("v"), VarRef("l"),
                 VarRef("base_color"), VarRef("base_metalness"), VarRef("base_weight"),
@@ -2908,6 +2942,11 @@ _FLAG_CLEARCOAT    = 0x2
 _FLAG_SHEEN        = 0x4
 _FLAG_EMISSION     = 0x8
 _FLAG_TRANSMISSION = 0x10
+_FLAG_FUZZ         = 0x20
+_FLAG_THIN_FILM    = 0x40
+_FLAG_SUBSURFACE   = 0x80
+_FLAG_ANISOTROPY   = 0x100
+_FLAG_OPENPBR      = 0x200
 
 # Texture slot names in declaration order (matches BindlessMaterialData struct)
 _BINDLESS_TEX_SLOTS = [
@@ -2950,13 +2989,64 @@ _PROPERTY_TO_BINDLESS = {
     "sheen_roughness": "sheenRoughness",
 }
 
+# Map OpenPBR surface property names to SSBO field names
+_OPENPBR_PROPERTY_TO_BINDLESS = {
+    "base_color": "baseColorFactor",       # reuse existing core fields
+    "roughness": "roughnessFactor",
+    "metallic": "metallicFactor",
+    # OpenPBR-specific fields (stored in extended region)
+    "base_diffuse_roughness": "baseDiffuseRoughness",
+    "base_weight": "baseWeight",
+    "specular_weight": "specularWeight",
+    "specular_ior": "specularIor",
+    "coat_ior": "coatIor",
+    "coat_darkening": "coatDarkening",
+    "fuzz_weight": "fuzzWeight",
+    "fuzz_roughness": "fuzzRoughness",
+    "thin_film_weight": "thinFilmWeight",
+    "thin_film_thickness": "thinFilmThickness",
+    "thin_film_ior": "thinFilmIor",
+}
 
-def _build_bindless_material_struct_fields(extra_properties=None) -> list[BlockField]:
+# Extra struct fields appended to BindlessMaterialData when OpenPBR is active.
+# Must maintain std430 alignment: vec3 fields are padded to 16 bytes.
+_OPENPBR_EXTRA_FIELDS = [
+    ("baseDiffuseRoughness", "scalar"),
+    ("baseWeight", "scalar"),
+    ("specularWeight", "scalar"),
+    ("specularIor", "scalar"),
+    ("coatIor", "scalar"),
+    ("coatDarkening", "scalar"),
+    ("fuzzWeight", "scalar"),
+    ("fuzzRoughness", "scalar"),
+    ("thinFilmWeight", "scalar"),
+    ("thinFilmThickness", "scalar"),
+    ("thinFilmIor", "scalar"),
+    ("_pad_openpbr_0", "scalar"),       # align to 16 bytes
+    ("specularColor", "vec3"),
+    ("_pad_openpbr_1", "scalar"),
+    ("coatColor", "vec3"),
+    ("_pad_openpbr_2", "scalar"),
+    ("fuzzColor", "vec3"),
+    ("_pad_openpbr_3", "scalar"),
+    ("transmissionColor", "vec3"),
+    ("_pad_openpbr_4", "scalar"),
+    ("transmissionDepth", "scalar"),
+    ("emissionLuminance", "scalar"),
+    ("_pad_openpbr_end_0", "scalar"),
+    ("_pad_openpbr_end_1", "scalar"),
+]
+
+
+def _build_bindless_material_struct_fields(extra_properties=None, openpbr=False) -> list[BlockField]:
     """Return the fields for BindlessMaterialData (std430 SSBO layout).
 
     If extra_properties is provided (list of (name, type) tuples for properties
     NOT in _PROPERTY_TO_BINDLESS), they are appended after the core 128-byte struct
     with proper std430 alignment padding.
+
+    If openpbr is True, the OpenPBR extended fields (_OPENPBR_EXTRA_FIELDS) are
+    appended after the core struct (before any extra_properties).
     """
     fields = [
         # PBR factors
@@ -2989,6 +3079,11 @@ def _build_bindless_material_struct_fields(extra_properties=None) -> list[BlockF
         BlockField("index_offset", "scalar"),
         BlockField("_pad3", "uint"),
     ]
+
+    # Append OpenPBR extended fields when active
+    if openpbr:
+        for fname, ftype in _OPENPBR_EXTRA_FIELDS:
+            fields.append(BlockField(fname, ftype))
 
     if extra_properties:
         # Add padding if needed for alignment after the core struct
@@ -3350,6 +3445,362 @@ def _emit_bindless_layer_body(
     return body, output_var
 
 
+def _emit_openpbr_bindless_body(
+    surface: SurfaceDecl,
+    mat_idx_expr,
+    schedule: dict[str, str] | None = None,
+    is_rt: bool = False,
+    lighting: LightingDecl | None = None,
+    pos_var: str = "world_pos",
+) -> tuple[list, str]:
+    """Generate shared OpenPBR uber-shader body for bindless mode.
+
+    Mirrors _emit_bindless_layer_body() but loads OpenPBR-specific fields
+    from the extended SSBO region and calls openpbr_direct() / openpbr_compose()
+    instead of gltf_pbr() / compose_pbr_layers().
+
+    Returns (body_stmts, output_var_name).
+    """
+    body = []
+
+    # Determine type from the source expression
+    mat_idx_type = "int" if is_rt else "uint"
+    body.append(LetStmt("mat_idx", mat_idx_type, mat_idx_expr))
+
+    # --- Load core PBR factors from materials SSBO ---
+    def _mat_field(local_name, field_name, lux_type):
+        """Generate: let <local_name>: <type> = materials[mat_idx].<field_name>;"""
+        return LetStmt(local_name, lux_type,
+            FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")), field_name))
+
+    body.append(_mat_field("mat_baseColor", "baseColorFactor", "vec4"))
+    body.append(_mat_field("mat_emissiveFactor", "emissiveFactor", "vec3"))
+    body.append(_mat_field("mat_metallic", "metallicFactor", "scalar"))
+    body.append(_mat_field("mat_roughness", "roughnessFactor", "scalar"))
+    body.append(_mat_field("mat_flags", "material_flags", "uint"))
+
+    # --- Load OpenPBR-specific fields from extended SSBO region ---
+    body.append(_mat_field("base_diffuse_roughness", "baseDiffuseRoughness", "scalar"))
+    body.append(_mat_field("base_weight", "baseWeight", "scalar"))
+    body.append(_mat_field("specular_weight", "specularWeight", "scalar"))
+    body.append(_mat_field("specular_ior", "specularIor", "scalar"))
+    body.append(_mat_field("specular_color", "specularColor", "vec3"))
+    body.append(_mat_field("coat_ior", "coatIor", "scalar"))
+    body.append(_mat_field("coat_darkening", "coatDarkening", "scalar"))
+    body.append(_mat_field("coat_color", "coatColor", "vec3"))
+    body.append(_mat_field("trans_color", "transmissionColor", "vec3"))
+    body.append(_mat_field("trans_depth", "transmissionDepth", "scalar"))
+    body.append(_mat_field("emission_luminance", "emissionLuminance", "scalar"))
+
+    # --- Texture index loads ---
+    body.append(_mat_field("tex_baseColor", "base_color_tex_index", "int"))
+    body.append(_mat_field("tex_normal", "normal_tex_index", "int"))
+    body.append(_mat_field("tex_mr", "metallic_roughness_tex_index", "int"))
+    body.append(_mat_field("tex_occlusion", "occlusion_tex_index", "int"))
+    body.append(_mat_field("tex_emissive", "emissive_tex_index", "int"))
+    body.append(_mat_field("tex_clearcoat", "clearcoat_tex_index", "int"))
+    body.append(_mat_field("tex_clearcoatRough", "clearcoat_roughness_tex_index", "int"))
+    body.append(_mat_field("tex_sheenColor", "sheen_color_tex_index", "int"))
+    body.append(_mat_field("tex_transmission", "transmission_tex_index", "int"))
+
+    # Use the appropriate sample function
+    sample_fn = "sample_bindless_lod" if is_rt else "sample_bindless"
+
+    def _sample_tex(tex_idx_var, result_var, result_type="vec4"):
+        """Generate: if (tex_idx >= 0) result = sample_bindless(textures, tex_idx, uv);"""
+        if is_rt:
+            sample_call = CallExpr(VarRef(sample_fn), [
+                VarRef("textures"), VarRef(tex_idx_var), VarRef("uv"), NumberLit("0.0")])
+        else:
+            sample_call = CallExpr(VarRef(sample_fn), [
+                VarRef("textures"), VarRef(tex_idx_var), VarRef("uv")])
+        sample_call.resolved_type = "vec4"
+        return IfStmt(
+            BinaryOp(">=", VarRef(tex_idx_var), NumberLit("0")),
+            [AssignStmt(AssignTarget(VarRef(result_var)), sample_call)],
+            [],
+        )
+
+    # --- Base color: srgb_to_linear(texture) * factor ---
+    body.append(LetStmt("base_color", "vec3", SwizzleAccess(VarRef("mat_baseColor"), "xyz")))
+    body.append(LetStmt("bc_tex_sample", "vec4",
+        ConstructorExpr("vec4", [NumberLit("1.0")])))
+    body.append(_sample_tex("tex_baseColor", "bc_tex_sample"))
+    body.append(IfStmt(
+        BinaryOp(">=", VarRef("tex_baseColor"), NumberLit("0")),
+        [
+            LetStmt("bc_linear", "vec3",
+                CallExpr(VarRef("srgb_to_linear"), [
+                    SwizzleAccess(VarRef("bc_tex_sample"), "xyz")])),
+            AssignStmt(AssignTarget(VarRef("base_color")),
+                BinaryOp("*", SwizzleAccess(VarRef("mat_baseColor"), "xyz"),
+                    VarRef("bc_linear"))),
+        ],
+        [],
+    ))
+
+    # --- Metallic/Roughness: factor * texture (B=metallic, G=roughness) ---
+    body.append(LetStmt("specular_roughness", "scalar", VarRef("mat_roughness")))
+    body.append(LetStmt("base_metalness", "scalar", VarRef("mat_metallic")))
+    body.append(LetStmt("mr_sample", "vec4",
+        ConstructorExpr("vec4", [NumberLit("1.0")])))
+    body.append(_sample_tex("tex_mr", "mr_sample"))
+    body.append(IfStmt(
+        BinaryOp(">=", VarRef("tex_mr"), NumberLit("0")),
+        [
+            AssignStmt(AssignTarget(VarRef("specular_roughness")),
+                BinaryOp("*", VarRef("mat_roughness"),
+                    SwizzleAccess(VarRef("mr_sample"), "y"))),
+            AssignStmt(AssignTarget(VarRef("base_metalness")),
+                BinaryOp("*", VarRef("mat_metallic"),
+                    SwizzleAccess(VarRef("mr_sample"), "z"))),
+        ],
+        [],
+    ))
+
+    # --- Expose aliases for multi-light loop compatibility ---
+    body.append(LetStmt("layer_albedo", "vec3", VarRef("base_color")))
+    body.append(LetStmt("layer_roughness", "scalar", VarRef("specular_roughness")))
+    body.append(LetStmt("layer_metallic", "scalar", VarRef("base_metalness")))
+
+    # --- Direct lighting ---
+    _bl_has_multi_light = _detect_multi_light(lighting)
+
+    if _bl_has_multi_light:
+        result_var = _emit_multi_light_from_lighting(
+            body, lighting, pos_var)
+    else:
+        body.append(LetStmt("direct_raw", "vec3", CallExpr(VarRef("openpbr_direct"), [
+            VarRef("n"), VarRef("v"), VarRef("l"),
+            VarRef("base_color"), VarRef("base_metalness"),
+            VarRef("base_diffuse_roughness"), VarRef("base_weight"),
+            VarRef("specular_weight"), VarRef("specular_color"),
+            VarRef("specular_roughness"), VarRef("specular_ior"),
+            # Coat params (loaded conditionally below, defaults safe for non-coat)
+            NumberLit("0.0"), VarRef("specular_roughness"), NumberLit("1.6"),
+            # Thin film params (defaults)
+            NumberLit("0.0"), NumberLit("0.5"), NumberLit("1.4"),
+        ])))
+        body.append(LetStmt("direct_lit", "vec3", BinaryOp("*",
+            VarRef("direct_raw"),
+            ConstructorExpr("vec3", [
+                NumberLit("1.0"), NumberLit("0.98"), NumberLit("0.95"),
+            ]),
+        )))
+        result_var = "direct_lit"
+
+    # --- Initialize optional OpenPBR layer params (defaults = layer disabled) ---
+    body.append(LetStmt("bl_coat_weight", "scalar", NumberLit("0.0")))
+    body.append(LetStmt("bl_coat_color", "vec3",
+        ConstructorExpr("vec3", [NumberLit("1.0")])))
+    body.append(LetStmt("bl_coat_roughness", "scalar", NumberLit("0.0")))
+    body.append(LetStmt("bl_coat_ior", "scalar", NumberLit("1.6")))
+    body.append(LetStmt("bl_coat_darkening", "scalar", NumberLit("1.0")))
+    body.append(LetStmt("bl_trans_weight", "scalar", NumberLit("0.0")))
+    body.append(LetStmt("bl_trans_color", "vec3",
+        ConstructorExpr("vec3", [NumberLit("1.0")])))
+    body.append(LetStmt("bl_trans_depth", "scalar", NumberLit("0.0")))
+    body.append(LetStmt("bl_fuzz_weight", "scalar", NumberLit("0.0")))
+    body.append(LetStmt("bl_fuzz_color", "vec3",
+        ConstructorExpr("vec3", [NumberLit("1.0")])))
+    body.append(LetStmt("bl_fuzz_roughness", "scalar", NumberLit("0.5")))
+    body.append(LetStmt("bl_thin_film_weight", "scalar", NumberLit("0.0")))
+    body.append(LetStmt("bl_thin_film_thickness", "scalar", NumberLit("0.5")))
+    body.append(LetStmt("bl_thin_film_ior", "scalar", NumberLit("1.4")))
+    body.append(LetStmt("bl_emission_luminance", "scalar", NumberLit("0.0")))
+    body.append(LetStmt("bl_emission_color", "vec3",
+        ConstructorExpr("vec3", [NumberLit("1.0")])))
+
+    # --- Coat param loading (flag-gated) ---
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_CLEARCOAT))),
+            NumberLit("0")),
+        [
+            AssignStmt(AssignTarget(VarRef("bl_coat_weight")),
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "clearcoatFactor")),
+            AssignStmt(AssignTarget(VarRef("bl_coat_roughness")),
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "clearcoatRoughness")),
+            AssignStmt(AssignTarget(VarRef("bl_coat_ior")), VarRef("coat_ior")),
+            AssignStmt(AssignTarget(VarRef("bl_coat_darkening")), VarRef("coat_darkening")),
+            AssignStmt(AssignTarget(VarRef("bl_coat_color")), VarRef("coat_color")),
+        ],
+        [],
+    ))
+
+    # --- Transmission param loading (flag-gated) ---
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_TRANSMISSION))),
+            NumberLit("0")),
+        [
+            AssignStmt(AssignTarget(VarRef("bl_trans_weight")),
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "transmissionFactor")),
+            AssignStmt(AssignTarget(VarRef("bl_trans_color")), VarRef("trans_color")),
+            AssignStmt(AssignTarget(VarRef("bl_trans_depth")), VarRef("trans_depth")),
+        ],
+        [],
+    ))
+
+    # --- Fuzz param loading (flag-gated) ---
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_FUZZ))),
+            NumberLit("0")),
+        [
+            AssignStmt(AssignTarget(VarRef("bl_fuzz_weight")),
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "fuzzWeight")),
+            AssignStmt(AssignTarget(VarRef("bl_fuzz_roughness")),
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "fuzzRoughness")),
+            AssignStmt(AssignTarget(VarRef("bl_fuzz_color")),
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "fuzzColor")),
+        ],
+        [],
+    ))
+
+    # --- Thin film param loading (flag-gated) ---
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_THIN_FILM))),
+            NumberLit("0")),
+        [
+            AssignStmt(AssignTarget(VarRef("bl_thin_film_weight")),
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "thinFilmWeight")),
+            AssignStmt(AssignTarget(VarRef("bl_thin_film_thickness")),
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "thinFilmThickness")),
+            AssignStmt(AssignTarget(VarRef("bl_thin_film_ior")),
+                FieldAccess(IndexAccess(VarRef("materials"), VarRef("mat_idx")),
+                    "thinFilmIor")),
+        ],
+        [],
+    ))
+
+    # --- Emission param loading (flag-gated) ---
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_EMISSION))),
+            NumberLit("0")),
+        [
+            AssignStmt(AssignTarget(VarRef("bl_emission_luminance")),
+                VarRef("emission_luminance")),
+            AssignStmt(AssignTarget(VarRef("bl_emission_color")),
+                VarRef("mat_emissiveFactor")),
+        ],
+        [],
+    ))
+
+    # --- IBL sampling ---
+    body.append(LetStmt("r", "vec3", CallExpr(VarRef("reflect"), [
+        BinaryOp("*", VarRef("v"), UnaryOp("-", NumberLit("1.0"))),
+        VarRef("n"),
+    ])))
+
+    if is_rt:
+        body.append(LetStmt("prefiltered", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_specular"), VarRef("r"),
+                BinaryOp("*", VarRef("specular_roughness"), NumberLit("8.0")),
+            ]), "xyz")))
+        body.append(LetStmt("irradiance", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_irradiance"), VarRef("n"), NumberLit("0.0"),
+            ]), "xyz")))
+        body.append(LetStmt("brdf_sample", "vec2", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("brdf_lut"),
+                ConstructorExpr("vec2", [VarRef("n_dot_v"), VarRef("specular_roughness")]),
+                NumberLit("0.0"),
+            ]), "xy")))
+    else:
+        body.append(LetStmt("prefiltered", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_specular"), VarRef("r"),
+                BinaryOp("*", VarRef("specular_roughness"), NumberLit("8.0")),
+            ]), "xyz")))
+        body.append(LetStmt("irradiance", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_irradiance"), VarRef("n"), NumberLit("0.0"),
+            ]), "xyz")))
+        body.append(LetStmt("brdf_sample", "vec2", SwizzleAccess(
+            CallExpr(VarRef("sample"), [
+                VarRef("brdf_lut"),
+                ConstructorExpr("vec2", [VarRef("n_dot_v"), VarRef("specular_roughness")]),
+            ]), "xy")))
+
+    body.append(LetStmt("bl_ambient", "vec3", CallExpr(
+        VarRef("ibl_contribution"), [
+            VarRef("base_color"), VarRef("specular_roughness"),
+            VarRef("base_metalness"),
+            VarRef("n_dot_v"), VarRef("prefiltered"), VarRef("irradiance"),
+            VarRef("brdf_sample"),
+        ])))
+
+    # --- Coat IBL (flag-gated) ---
+    body.append(LetStmt("bl_coat_ibl", "vec3",
+        ConstructorExpr("vec3", [NumberLit("0.0")])))
+    coat_ibl_body = []
+    if is_rt:
+        coat_ibl_body.append(LetStmt("prefiltered_coat", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_specular"), VarRef("r"),
+                BinaryOp("*", VarRef("bl_coat_roughness"), NumberLit("8.0")),
+            ]), "xyz")))
+    else:
+        coat_ibl_body.append(LetStmt("prefiltered_coat", "vec3", SwizzleAccess(
+            CallExpr(VarRef("sample_lod"), [
+                VarRef("env_specular"), VarRef("r"),
+                BinaryOp("*", VarRef("bl_coat_roughness"), NumberLit("8.0")),
+            ]), "xyz")))
+    coat_ibl_body.append(AssignStmt(AssignTarget(VarRef("bl_coat_ibl")),
+        CallExpr(VarRef("coat_ibl"), [
+            VarRef("bl_coat_weight"), VarRef("bl_coat_roughness"),
+            VarRef("n"), VarRef("v"), VarRef("prefiltered_coat"),
+        ])))
+    body.append(IfStmt(
+        BinaryOp("!=",
+            BinaryOp("&", VarRef("mat_flags"), NumberLit(str(_FLAG_CLEARCOAT))),
+            NumberLit("0")),
+        coat_ibl_body, []))
+
+    # --- Unified composition via openpbr_compose ---
+    body.append(LetStmt("composed", "vec3", CallExpr(
+        VarRef("openpbr_compose"), [
+            VarRef(result_var),
+            VarRef("n"), VarRef("v"), VarRef("l"),
+            VarRef("base_color"), VarRef("base_metalness"), VarRef("base_weight"),
+            VarRef("specular_weight"), VarRef("specular_color"),
+            VarRef("specular_roughness"), VarRef("specular_ior"),
+            # Transmission
+            VarRef("bl_trans_weight"), VarRef("bl_trans_color"), VarRef("bl_trans_depth"),
+            # Coat
+            VarRef("bl_coat_weight"), VarRef("bl_coat_color"),
+            VarRef("bl_coat_roughness"), VarRef("bl_coat_ior"), VarRef("bl_coat_darkening"),
+            # Fuzz
+            VarRef("bl_fuzz_weight"), VarRef("bl_fuzz_color"), VarRef("bl_fuzz_roughness"),
+            # Thin film
+            VarRef("bl_thin_film_weight"), VarRef("bl_thin_film_thickness"),
+            VarRef("bl_thin_film_ior"),
+            # Emission
+            VarRef("bl_emission_luminance"), VarRef("bl_emission_color"),
+            # IBL
+            VarRef("bl_ambient"), VarRef("bl_coat_ibl"),
+        ])))
+    result_var = "composed"
+
+    # --- Tonemap + output ---
+    output_var = _emit_tonemap_output(body, result_var, schedule)
+
+    return body, output_var
+
+
 def _expand_bindless_fragment(
     surface: SurfaceDecl,
     module: Module,
@@ -3486,23 +3937,35 @@ def _expand_bindless_fragment(
         NumberLit("0.001"),
     ])))
 
+    # Detect OpenPBR mode
+    _use_openpbr = _is_openpbr(module)
+
     # Collect custom properties for extended struct
     _bl_frag_props = getattr(surface, 'properties', None)
     extra_props = []
     if _bl_frag_props and hasattr(_bl_frag_props, 'fields') and _bl_frag_props.fields:
+        prop_map = _OPENPBR_PROPERTY_TO_BINDLESS if _use_openpbr else _PROPERTY_TO_BINDLESS
         for prop in _bl_frag_props.fields:
-            if prop.name not in _PROPERTY_TO_BINDLESS:
+            if prop.name not in prop_map:
                 extra_props.append((prop.name, prop.type_name))
 
-    # Build struct with extra fields
-    if extra_props:
+    # Build struct with extra fields (OpenPBR appends its own extended fields)
+    if _use_openpbr:
+        stage._bindless_extra_properties = list(_OPENPBR_EXTRA_FIELDS) + extra_props
+        stage._openpbr = True
+    elif extra_props:
         stage._bindless_extra_properties = extra_props
 
     # Bindless uber-shader body (material_index from push constant)
-    uber_body, output_var = _emit_bindless_layer_body(
-        surface, VarRef("material_index"), schedule, is_rt=False,
-        lighting=lighting, pos_var=pos_var,
-        properties=getattr(surface, 'properties', None))
+    if _use_openpbr:
+        uber_body, output_var = _emit_openpbr_bindless_body(
+            surface, VarRef("material_index"), schedule, is_rt=False,
+            lighting=lighting, pos_var=pos_var)
+    else:
+        uber_body, output_var = _emit_bindless_layer_body(
+            surface, VarRef("material_index"), schedule, is_rt=False,
+            lighting=lighting, pos_var=pos_var,
+            properties=getattr(surface, 'properties', None))
     body.extend(uber_body)
 
     # Output final color
@@ -3611,23 +4074,35 @@ def _expand_bindless_closest_hit(
         NumberLit("0.001"),
     ])))
 
+    # Detect OpenPBR mode
+    _use_openpbr = _is_openpbr(module)
+
     # Collect custom properties for extended struct
     _bl_rt_props = getattr(surface, 'properties', None)
     extra_props = []
     if _bl_rt_props and hasattr(_bl_rt_props, 'fields') and _bl_rt_props.fields:
+        prop_map = _OPENPBR_PROPERTY_TO_BINDLESS if _use_openpbr else _PROPERTY_TO_BINDLESS
         for prop in _bl_rt_props.fields:
-            if prop.name not in _PROPERTY_TO_BINDLESS:
+            if prop.name not in prop_map:
                 extra_props.append((prop.name, prop.type_name))
 
-    # Build struct with extra fields
-    if extra_props:
+    # Build struct with extra fields (OpenPBR appends its own extended fields)
+    if _use_openpbr:
+        stage._bindless_extra_properties = list(_OPENPBR_EXTRA_FIELDS) + extra_props
+        stage._openpbr = True
+    elif extra_props:
         stage._bindless_extra_properties = extra_props
 
     # Bindless uber-shader body (material index from gl_GeometryIndexEXT)
-    uber_body, output_var = _emit_bindless_layer_body(
-        surface, VarRef("geometry_index"), schedule, is_rt=True,
-        lighting=lighting, pos_var="hit_pos",
-        properties=getattr(surface, 'properties', None))
+    if _use_openpbr:
+        uber_body, output_var = _emit_openpbr_bindless_body(
+            surface, VarRef("geometry_index"), schedule, is_rt=True,
+            lighting=lighting, pos_var="hit_pos")
+    else:
+        uber_body, output_var = _emit_bindless_layer_body(
+            surface, VarRef("geometry_index"), schedule, is_rt=True,
+            lighting=lighting, pos_var="hit_pos",
+            properties=getattr(surface, 'properties', None))
     body.extend(uber_body)
 
     # Write to payload
