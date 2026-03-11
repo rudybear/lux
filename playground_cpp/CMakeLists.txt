@@ -60,10 +60,30 @@ set(VMA_BUILD_DOCUMENTATION OFF CACHE BOOL "" FORCE)
 set(VMA_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(VulkanMemoryAllocator)
 
+# Dear ImGui (downloaded via FetchContent)
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.91.8
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(imgui)
+
 # ===========================================================================
 # Vulkan backend (all platforms with Vulkan SDK)
 # ===========================================================================
 if(Vulkan_FOUND)
+    # ImGui source files (core + Vulkan/GLFW backends)
+    set(IMGUI_SOURCES
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_demo.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+    )
+
     # Source files
     set(SOURCES
         src/main.cpp
@@ -80,6 +100,8 @@ if(Vulkan_FOUND)
         src/mesh_renderer.cpp
         src/meshlet.cpp
         src/splat_renderer.cpp
+        src/editor_ui.cpp
+        ${IMGUI_SOURCES}
     )
 
     add_executable(${PROJECT_NAME} ${SOURCES})
@@ -87,6 +109,8 @@ if(Vulkan_FOUND)
     target_include_directories(${PROJECT_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/deps
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/backends
     )
 
     target_link_libraries(${PROJECT_NAME} PRIVATE

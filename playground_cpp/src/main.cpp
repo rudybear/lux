@@ -9,6 +9,7 @@
 #include "scene.h"
 #include "camera.h"
 #include "screenshot.h"
+#include "editor_ui.h"
 
 #include <GLFW/glfw3.h>
 #include <iostream>
@@ -64,8 +65,12 @@ struct OrbitCamera {
 };
 
 static OrbitCamera g_orbit;
+static EditorUI* g_editorUI = nullptr; // non-null when editor mode is active
 
 static void mouseButtonCallback(GLFWwindow* window, int button, int action, int /*mods*/) {
+    // Let ImGui handle input when it wants to capture the mouse
+    if (g_editorUI && g_editorUI->wantCaptureMouse()) return;
+
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         g_orbit.dragging = (action == GLFW_PRESS);
         if (g_orbit.dragging) {
@@ -75,6 +80,7 @@ static void mouseButtonCallback(GLFWwindow* window, int button, int action, int 
 }
 
 static void cursorPosCallback(GLFWwindow* /*window*/, double xpos, double ypos) {
+    if (g_editorUI && g_editorUI->wantCaptureMouse()) return;
     if (!g_orbit.dragging) return;
     float dx = static_cast<float>(xpos - g_orbit.lastX);
     float dy = static_cast<float>(ypos - g_orbit.lastY);
@@ -87,6 +93,7 @@ static void cursorPosCallback(GLFWwindow* /*window*/, double xpos, double ypos) 
 }
 
 static void scrollCallback(GLFWwindow* /*window*/, double /*xoff*/, double yoff) {
+    if (g_editorUI && g_editorUI->wantCaptureMouse()) return;
     g_orbit.distance *= (1.0f - 0.1f * static_cast<float>(yoff));
     g_orbit.distance = glm::clamp(g_orbit.distance, 0.01f, 1000.0f);
 }
@@ -105,6 +112,7 @@ struct CLIOptions {
     std::string output = "output.png";
     bool interactive = false;
     bool headless = true;
+    bool editor = false;       // --editor: enable ImGui scene editor overlay
     bool forceValidation = false;
     bool demoLights = false;
     bool sponzaLights = false;
@@ -126,6 +134,7 @@ static void printUsage(const char* program) {
               << "  --height <N>           Output height in pixels (default: 512)\n"
               << "  --output <PATH>        Output PNG path (default: output.png)\n"
               << "  --interactive          Open GLFW preview window\n"
+              << "  --editor               Interactive mode with ImGui scene editor\n"
               << "  --headless             Offscreen render only (default)\n"
               << "  --validation           Enable Vulkan validation layers (even in release)\n"
               << "  --demo-lights          Add 3 demo lights (directional + point + spot) with shadows\n"
@@ -171,6 +180,10 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             i++;
             opts.output = argv[i];
         } else if (arg == "--interactive") {
+            opts.interactive = true;
+            opts.headless = false;
+        } else if (arg == "--editor") {
+            opts.editor = true;
             opts.interactive = true;
             opts.headless = false;
         } else if (arg == "--headless") {
@@ -573,8 +586,8 @@ static int runHeadless(const CLIOptions& opts) {
 static int runInteractive(CLIOptions opts) {
     // Use larger window for interactive mode if user didn't specify
     if (opts.width == 512 && opts.height == 512) {
-        opts.width = 1024;
-        opts.height = 768;
+        opts.width = opts.editor ? 1280 : 1024;
+        opts.height = opts.editor ? 800 : 768;
     }
     std::string renderPath = detectRenderPath(opts.shaderBase, opts.forceMode);
     bool needRT = (renderPath == "rt");
@@ -588,6 +601,7 @@ static int runInteractive(CLIOptions opts) {
     std::cout << "[info] Interactive render: scene=\"" << opts.sceneSource
               << "\" pipeline=\"" << opts.shaderBase
               << "\" path=" << renderPath
+              << (opts.editor ? " (editor)" : "")
               << " (" << opts.width << "x" << opts.height << ")" << std::endl;
 
     // Initialize GLFW
@@ -599,9 +613,10 @@ static int runInteractive(CLIOptions opts) {
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
+    const char* windowTitle = opts.editor ? "Lux Editor" : "Lux Playground";
     GLFWwindow* window = glfwCreateWindow(
         static_cast<int>(opts.width), static_cast<int>(opts.height),
-        "Lux Playground", nullptr, nullptr);
+        windowTitle, nullptr, nullptr);
     if (!window) {
         std::cerr << "[error] Failed to create GLFW window" << std::endl;
         glfwTerminate();
@@ -649,17 +664,38 @@ static int runInteractive(CLIOptions opts) {
     // Create synchronization objects
     VkSemaphore imageAvailableSem = VK_NULL_HANDLE;
     VkSemaphore renderFinishedSem = VK_NULL_HANDLE;
+    VkSemaphore sceneRenderSem = VK_NULL_HANDLE;  // intermediate: scene done, before imgui
     VkFence inFlightFence = VK_NULL_HANDLE;
 
     VkSemaphoreCreateInfo semInfo = {};
     semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     vkCreateSemaphore(ctx.device, &semInfo, nullptr, &imageAvailableSem);
     vkCreateSemaphore(ctx.device, &semInfo, nullptr, &renderFinishedSem);
+    vkCreateSemaphore(ctx.device, &semInfo, nullptr, &sceneRenderSem);
 
     VkFenceCreateInfo fenceInfo = {};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     vkCreateFence(ctx.device, &fenceInfo, nullptr, &inFlightFence);
+
+    // Initialize editor UI (if --editor)
+    EditorUI editorUI;
+    bool editorActive = opts.editor;
+    bool editorNeedsReinit = false;  // set after swapchain recreation
+    if (editorActive) {
+        try {
+            editorUI.init(ctx, window,
+                          static_cast<uint32_t>(ctx.swapchainImages.size()));
+            editorUI.getState().currentPipelineBase = opts.shaderBase;
+            // Scan for available pipelines
+            editorUI.scanPipelines("shadercache");
+            editorUI.scanPipelines("examples");
+            g_editorUI = &editorUI;
+        } catch (const std::exception& e) {
+            std::cerr << "[error] Failed to initialize editor: " << e.what() << std::endl;
+            editorActive = false;
+        }
+    }
 
     // Initialize shared scene
     SceneManager scene;
@@ -765,8 +801,10 @@ static int runInteractive(CLIOptions opts) {
         }
     } catch (const std::exception& e) {
         std::cerr << "[error] Failed to initialize renderer: " << e.what() << std::endl;
+        if (editorActive) { editorUI.cleanup(ctx); g_editorUI = nullptr; }
         vkDestroySemaphore(ctx.device, imageAvailableSem, nullptr);
         vkDestroySemaphore(ctx.device, renderFinishedSem, nullptr);
+        vkDestroySemaphore(ctx.device, sceneRenderSem, nullptr);
         vkDestroyFence(ctx.device, inFlightFence, nullptr);
         ctx.cleanup();
         glfwDestroyWindow(window);
@@ -792,16 +830,19 @@ static int runInteractive(CLIOptions opts) {
     std::cout << "[info] Mouse: drag to orbit, scroll to zoom." << std::endl;
 
     VkCommandBuffer rtBlitCmd = VK_NULL_HANDLE; // Track RT blit cmd for deferred free
+    VkCommandBuffer editorCmd = VK_NULL_HANDLE; // Track editor cmd for deferred free
     auto startTime = std::chrono::high_resolution_clock::now();
 
     // Render loop
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        // Check for ESC key
+        // Check for ESC key (only when editor is not capturing keyboard)
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
-            glfwSetWindowShouldClose(window, GLFW_TRUE);
-            continue;
+            if (!editorActive || !editorUI.wantCaptureKeyboard()) {
+                glfwSetWindowShouldClose(window, GLFW_TRUE);
+                continue;
+            }
         }
 
         // Check for minimized window
@@ -820,6 +861,11 @@ static int runInteractive(CLIOptions opts) {
             vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &rtBlitCmd);
             rtBlitCmd = VK_NULL_HANDLE;
         }
+        // Free previous editor command buffer
+        if (editorCmd != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &editorCmd);
+            editorCmd = VK_NULL_HANDLE;
+        }
 
         // Acquire swapchain image
         uint32_t imageIndex;
@@ -837,6 +883,7 @@ static int runInteractive(CLIOptions opts) {
             vkDestroySwapchainKHR(ctx.device, ctx.swapchain, nullptr);
             ctx.swapchain = VK_NULL_HANDLE;
             ctx.createSwapchain(static_cast<uint32_t>(fbWidth), static_cast<uint32_t>(fbHeight));
+            if (editorActive) editorNeedsReinit = true;
             continue;
         }
         if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
@@ -844,7 +891,23 @@ static int runInteractive(CLIOptions opts) {
             break;
         }
 
+        // Reinitialize editor framebuffers after swapchain recreation
+        if (editorActive && editorNeedsReinit) {
+            editorUI.cleanup(ctx);
+            editorUI.init(ctx, window,
+                          static_cast<uint32_t>(ctx.swapchainImages.size()));
+            editorUI.getState().currentPipelineBase = opts.shaderBase;
+            editorNeedsReinit = false;
+        }
+
         vkResetFences(ctx.device, 1, &inFlightFence);
+
+        // Begin editor frame (before any ImGui calls this frame)
+        if (editorActive) {
+            editorUI.beginFrame();
+            editorUI.drawPanels(scene);
+            editorUI.updateFPS();
+        }
 
         // Animate Sponza torch light (light[1] orbits inside the courtyard)
         if (useSponzaLights && scene.getLightCount() >= 2) {
@@ -873,6 +936,12 @@ static int runInteractive(CLIOptions opts) {
             }
         }
 
+        // Determine which semaphore the scene render signals:
+        // if editor is active, signal sceneRenderSem (intermediate); else signal renderFinishedSem
+        VkSemaphore sceneSignalSem = editorActive ? sceneRenderSem : renderFinishedSem;
+        // The fence is only signaled by the last submit (editor if active, scene otherwise)
+        VkFence sceneSubmitFence = editorActive ? VK_NULL_HANDLE : inFlightFence;
+
         if (useSplat && scene.getSplatRenderer()) {
             // Gaussian splatting compute path: render to storage image and blit to swapchain
             scene.getSplatRenderer()->render(ctx);
@@ -894,9 +963,9 @@ static int runInteractive(CLIOptions opts) {
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &cmd;
             submitInfo.signalSemaphoreCount = 1;
-            submitInfo.pSignalSemaphores = &renderFinishedSem;
+            submitInfo.pSignalSemaphores = &sceneSignalSem;
 
-            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, inFlightFence);
+            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, sceneSubmitFence);
         } else if (useRT) {
             // RT rendering: render to storage image (synchronous)
             renderer->render(ctx);
@@ -909,7 +978,7 @@ static int runInteractive(CLIOptions opts) {
 
             vkEndCommandBuffer(cmd);
 
-            // Submit with semaphore sync: wait on imageAvailable, signal renderFinished + fence
+            // Submit with semaphore sync: wait on imageAvailable, signal sceneSignalSem + fence
             VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
             VkSubmitInfo submitInfo = {};
             submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -919,9 +988,9 @@ static int runInteractive(CLIOptions opts) {
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &cmd;
             submitInfo.signalSemaphoreCount = 1;
-            submitInfo.pSignalSemaphores = &renderFinishedSem;
+            submitInfo.pSignalSemaphores = &sceneSignalSem;
 
-            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, inFlightFence);
+            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, sceneSubmitFence);
         } else if (useMesh) {
             // Mesh shader rendering to swapchain
             auto* meshPtr = static_cast<MeshRenderer*>(renderer.get());
@@ -929,7 +998,7 @@ static int runInteractive(CLIOptions opts) {
                 ctx.swapchainImages[imageIndex],
                 ctx.swapchainImageViews[imageIndex],
                 ctx.swapchainFormat, ctx.swapchainExtent,
-                imageAvailableSem, renderFinishedSem, inFlightFence);
+                imageAvailableSem, sceneSignalSem, sceneSubmitFence);
         } else {
             // Raster rendering to swapchain
             // Cast to RasterRenderer for renderToSwapchain (uses internal command buffer)
@@ -938,7 +1007,63 @@ static int runInteractive(CLIOptions opts) {
                 ctx.swapchainImages[imageIndex],
                 ctx.swapchainImageViews[imageIndex],
                 ctx.swapchainFormat, ctx.swapchainExtent,
-                imageAvailableSem, renderFinishedSem, inFlightFence);
+                imageAvailableSem, sceneSignalSem, sceneSubmitFence);
+        }
+
+        // Editor overlay pass: record ImGui draw commands and submit
+        if (editorActive) {
+            editorCmd = ctx.beginSingleTimeCommands();
+
+            // Transition swapchain image to color attachment (scene left it in PRESENT_SRC)
+            VkImageMemoryBarrier barrier = {};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = ctx.swapchainImages[imageIndex];
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseMipLevel = 0;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.baseArrayLayer = 0;
+            barrier.subresourceRange.layerCount = 1;
+            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+
+            vkCmdPipelineBarrier(editorCmd,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+            // Begin ImGui render pass (loads existing content, ends with PRESENT_SRC)
+            VkRenderPassBeginInfo rpBegin = {};
+            rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            rpBegin.renderPass = editorUI.getImGuiRenderPass();
+            rpBegin.framebuffer = editorUI.getImGuiFramebuffer(imageIndex);
+            rpBegin.renderArea.offset = { 0, 0 };
+            rpBegin.renderArea.extent = ctx.swapchainExtent;
+
+            vkCmdBeginRenderPass(editorCmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+            // Render ImGui draw data
+            editorUI.endFrame(editorCmd);
+
+            vkCmdEndRenderPass(editorCmd);
+            vkEndCommandBuffer(editorCmd);
+
+            // Submit editor pass: wait on sceneRenderSem, signal renderFinishedSem + fence
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            VkSubmitInfo submitInfo = {};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.waitSemaphoreCount = 1;
+            submitInfo.pWaitSemaphores = &sceneRenderSem;
+            submitInfo.pWaitDstStageMask = &waitStage;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &editorCmd;
+            submitInfo.signalSemaphoreCount = 1;
+            submitInfo.pSignalSemaphores = &renderFinishedSem;
+
+            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, inFlightFence);
         }
 
         // Present (wait for rendering to finish before presenting)
@@ -962,11 +1087,60 @@ static int runInteractive(CLIOptions opts) {
             ctx.swapchain = VK_NULL_HANDLE;
             glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
             ctx.createSwapchain(static_cast<uint32_t>(fbWidth), static_cast<uint32_t>(fbHeight));
+            if (editorActive) editorNeedsReinit = true;
+        }
+
+        // Handle editor pipeline reload requests
+        if (editorActive && editorUI.getState().pipelineReloadRequested) {
+            editorUI.getState().pipelineReloadRequested = false;
+            std::string newBase = editorUI.getState().pendingPipelinePath;
+            std::cout << "[editor] Hot-swap pipeline to: " << newBase << std::endl;
+
+            vkDeviceWaitIdle(ctx.device);
+
+            // Destroy old renderer
+            if (renderer) {
+                renderer->cleanup(ctx);
+                renderer.reset();
+            }
+
+            // Create new raster renderer with the new pipeline
+            try {
+                std::string newPath = detectRenderPath(newBase, "");
+                auto raster = std::make_unique<RasterRenderer>();
+                raster->init(ctx, scene, newBase, newPath,
+                             ctx.swapchainExtent.width, ctx.swapchainExtent.height);
+                renderer = std::move(raster);
+                useRT = false;
+                useMesh = false;
+                useSplat = false;
+
+                editorUI.getState().currentPipelineBase = newBase;
+                opts.shaderBase = newBase;
+                std::cout << "[editor] Pipeline hot-swap successful" << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "[editor] Pipeline hot-swap failed: " << e.what() << std::endl;
+                // Try to restore old renderer
+                try {
+                    std::string oldPath = detectRenderPath(opts.shaderBase, "");
+                    auto raster = std::make_unique<RasterRenderer>();
+                    raster->init(ctx, scene, opts.shaderBase, oldPath,
+                                 ctx.swapchainExtent.width, ctx.swapchainExtent.height);
+                    renderer = std::move(raster);
+                } catch (...) {
+                    std::cerr << "[editor] Failed to restore previous pipeline!" << std::endl;
+                }
+            }
         }
     }
 
     // Cleanup
     vkDeviceWaitIdle(ctx.device);
+
+    g_editorUI = nullptr;
+    if (editorActive) {
+        editorUI.cleanup(ctx);
+    }
 
     if (renderer) {
         renderer->cleanup(ctx);
@@ -975,6 +1149,7 @@ static int runInteractive(CLIOptions opts) {
 
     vkDestroySemaphore(ctx.device, imageAvailableSem, nullptr);
     vkDestroySemaphore(ctx.device, renderFinishedSem, nullptr);
+    vkDestroySemaphore(ctx.device, sceneRenderSem, nullptr);
     vkDestroyFence(ctx.device, inFlightFence, nullptr);
 
     ctx.cleanup();
