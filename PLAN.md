@@ -1115,11 +1115,11 @@ Extended the shadow infrastructure with sampling functions, shader permutation s
 
 ---
 
-### Phase 22: OpenPBR Material Model Integration [DONE — core]
+### Phase 22: OpenPBR Material Model Integration [DONE]
 
 **Goal:** Add first-class support for the [OpenPBR Surface](https://github.com/adobe/openpbr-bsdf) material model (Adobe/ASWF, v1.1) as an alternative to the existing glTF PBR composition. Activated via `import openpbr;` — no grammar changes, no new keywords.
 
-**Status:** P22.1–P22.4, P22.7, P22.8 complete. P22.5 (bindless) and P22.6 (schedules) deferred. Fixed transitive import resolution bug in `compiler.py` — imports now recurse before merging. 35 new tests (1084 total), 3 examples, 15 stdlib functions.
+**Status:** All phases complete (P22.1–P22.8). Fixed transitive import resolution bug in `compiler.py` — imports now recurse before merging. P22.5 adds bindless OpenPBR uber-shader with extended SSBO struct, feature flags, and `_emit_openpbr_bindless_body()`. P22.6 adds schedule strategies with 4 new slots (`diffuse_model`, `fuzz_model`, `specular_fresnel`, `coat_fresnel`) and fast variants (`openpbr_direct_fast`, `openpbr_compose_fast`) for mobile/low-end targets. 35 new tests (1084 total), 4 ASWF reference examples, 17 stdlib functions.
 
 **Why:** OpenPBR is becoming the industry standard material interchange format (USD, MaterialX, Blender, Maya, Substance). It defines a 36-parameter physically-based model with 9 component lobes, proper energy conservation via albedo-scaling, and features Lux currently lacks: coat darkening, F82-tint metals, energy-preserving Oren-Nayar, specular weight IOR modulation, fuzz (Zeltner LTC), subsurface scattering, and thin-film iridescence. Lux already implements many of the required BRDF primitives (`conductor_fresnel`, `iridescence_fresnel`, `anisotropic_ggx_ndf`, `oren_nayar_diffuse`, `volumetric_btdf`, `dispersion_ior`) but none are wired into the layer system.
 

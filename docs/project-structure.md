@@ -117,6 +117,11 @@ examples/
     openpbr_carpaint.lux     # OpenPBR: metallic car paint with clearcoat + thin-film
     openpbr_velvet.lux       # OpenPBR: velvet with fuzz layer + Oren-Nayar diffuse
     openpbr_glass.lux        # OpenPBR: amber glass with transmission + volume absorption
+    openpbr_simple.lux       # OpenPBR: simple no-texture surface for quick testing
+    openpbr_reference.lux    # OpenPBR ASWF reference: car paint (exact values from OpenPBR viewer)
+    openpbr_ref_aluminum.lux # OpenPBR ASWF reference: brushed aluminum (metalness=1)
+    openpbr_ref_pearl.lux    # OpenPBR ASWF reference: pearl (coat + thin-film iridescence)
+    openpbr_ref_velvet.lux   # OpenPBR ASWF reference: velvet (fuzz layer, dark base)
     debug_playground.lux     # CPU debugger playground: PBR + NaN trap
     debug_playground_inputs.json  # custom input values for debug_playground
 playground/

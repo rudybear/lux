@@ -51,14 +51,14 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 **Language**
 - Declarative `surface` + `geometry` + `pipeline` blocks expand to full shader stages
 - **Gaussian splatting**: first-class `splat` declaration — one block generates a complete 3-stage pipeline (compute preprocess, instanced vertex, alpha-composited fragment), SH degrees 0–3, CPU depth sorting, glTF `KHR_gaussian_splatting`, interactive orbit viewers in all 3 engines
-- **OpenPBR Surface v1.1**: `import openpbr;` enables the full Adobe/ASWF material model — F82-tint metal Fresnel, energy-preserving Oren-Nayar diffuse, coat darkening, fuzz, thin-film iridescence, transmission with volume absorption, 9 composable layers
+- **OpenPBR Surface v1.1**: `import openpbr;` enables the full Adobe/ASWF material model — F82-tint metal Fresnel, energy-preserving Oren-Nayar diffuse, coat darkening, fuzz, thin-film iridescence, transmission with volume absorption, 9 composable layers, bindless uber-shader support, schedule-based quality tiers (desktop/mobile fast variants)
 - Layered surfaces with `layers [base, normal_map, sheen, coat, emission, ibl]` — unified `compose_pbr_layers` compositing, energy conservation, raster + RT from one declaration
 - `lighting` blocks separate illumination from material response; multi-light with shadows
 - Custom `@layer` functions, compile-time `features` with `if` guards, material `properties` UBO pipeline
 - Semantic types (`type strict WorldPos = vec3`) prevent coordinate-space mixing at compile time
 - Algorithm/schedule separation, math-first syntax (`scalar` not `float`), auto-layout
 - `for`/`while` loops, `break`/`continue`, `@[unroll]` hints, native integer arithmetic
-- 100+ stdlib functions across 15 modules: BRDF, SDF, noise, color, IBL, lighting, shadow, toon, compositing, PBR pipeline, Gaussian, OpenPBR, debug...
+- 160+ stdlib functions across 15 modules: BRDF, SDF, noise, color, IBL, lighting, shadow, toon, compositing, PBR pipeline, Gaussian, OpenPBR, debug...
 
 **Compiler**
 - Built-in optimizer: mem2reg, AST-level inlining, CSE, constant vector hoisting — **21.7% fewer instructions than hand-written GLSL** out of the box
@@ -275,6 +275,10 @@ See [full project structure](docs/project-structure.md) for the complete directo
 | `compute_reduction.lux` | Parallel reduction: barrier-synchronized tree sum with shared memory |
 | `debug_features_demo.lux` | Debug instrumentation: `debug_print`, `assert`, `@[debug]` blocks, semantic types, `any_nan`/`any_inf` |
 | `gaussian_splat.lux` | Gaussian splatting: `splat` declaration, 3-stage pipeline (compute + vertex + fragment) |
+| `openpbr_reference.lux` | OpenPBR ASWF reference: car paint (coat + specular, exact values from OpenPBR viewer) |
+| `openpbr_ref_aluminum.lux` | OpenPBR ASWF reference: brushed aluminum (metalness=1, specular color tint) |
+| `openpbr_ref_pearl.lux` | OpenPBR ASWF reference: pearl (coat + thin-film iridescence) |
+| `openpbr_ref_velvet.lux` | OpenPBR ASWF reference: velvet (fuzz layer, dark base) |
 | `debug_playground.lux` | CPU debugger playground: PBR with intentional NaN trap, 8 labeled stages for breakpoint exploration |
 
 ## Running Tests

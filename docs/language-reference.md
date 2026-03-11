@@ -749,7 +749,7 @@ Import modules with `import <name>;` — functions are inlined at the call site.
 | `compositing` | 2 | IBL multi-scattering (Fdez-Aguera 2019), unified `compose_pbr_layers` (transmission, sheen, coat, IBL, emission) |
 | `pbr_pipeline` | 1 | `pbr_shade()` — single-call PBR orchestration (direct lighting + IBL + all optional layers) |
 | `gaussian` | 6 | SH constants (degrees 0–3), quaternion-to-rotation, 3D/2D covariance, Gaussian 2D eval, quad radius |
-| `openpbr` | 15 | OpenPBR Surface v1.1: F82-tint conductor Fresnel, energy-preserving Oren-Nayar (EON), coat darkening/absorption/roughening, fuzz BRDF, specular IOR modulation, thin-film, direct lighting, full composition (9 layers) |
+| `openpbr` | 18 | OpenPBR Surface v1.1: F82-tint conductor Fresnel, energy-preserving Oren-Nayar (EON), coat darkening/absorption/roughening, fuzz BRDF, specular IOR modulation, thin-film, direct lighting, full composition (9 layers), fast variants for mobile/low-end |
 | `debug` | 5 | Normal visualization, depth grayscale, scalar heatmap, index coloring, UV checkerboard |
 
 ### Built-in Functions
@@ -850,3 +850,23 @@ surface CarPaint {
 - Fuzz BRDF for velvet/fabric
 - Thin-film iridescence
 - Transmission with volume absorption
+- Bindless uber-shader support (`--bindless` with extended SSBO: `_FLAG_OPENPBR`, fuzz/thin_film/subsurface/anisotropy flags)
+- Schedule-based quality tiers: `diffuse_model` (eon/lambert/burley), `fuzz_model` (charlie), `specular_fresnel` (exact/schlick), `coat_fresnel` (exact/schlick)
+- Fast variants: `openpbr_direct_fast` (Lambert + Schlick) and `openpbr_compose_fast` (no fuzz, simplified coat) for mobile/low-end
+
+**Schedule example (quality tiers):**
+
+```
+schedule OpenPBRMobile {
+    diffuse_model: lambert,
+    specular_fresnel: schlick,
+    coat_fresnel: schlick,
+    tonemap: aces,
+}
+
+pipeline MobilePBR {
+    geometry: StandardMesh,
+    surface: CarPaint,
+    schedule: OpenPBRMobile,
+}
+```
