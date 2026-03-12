@@ -492,7 +492,10 @@ static int runHeadless(const CLIOptions& opts) {
         // RT/mesh renderers create their own SoA buffers but still need draw
         // ranges for per-material rendering. Raster shaders that don't use
         // tangent (stride=32) simply ignore the extra bytes.
-        int vertexStride = scene.hasGltfScene() ? 48 : 32;
+        // When the glTF has only splat primitives (no triangle meshes), use 32-byte
+        // stride since the sphere fallback uses standard Vertex layout.
+        bool glTFHasMeshes = scene.hasGltfScene() && !scene.getGltfScene().meshes.empty();
+        int vertexStride = glTFHasMeshes ? 48 : 32;
 
         scene.uploadToGPU(ctx, vertexStride);
         scene.uploadTextures(ctx);
@@ -530,14 +533,65 @@ static int runHeadless(const CLIOptions& opts) {
 
         // Initialize splat renderer if scene has gaussian splat data
         if (needSplat && scene.hasSplatData()) {
-            scene.initSplatRenderer(ctx, resolvedBase, opts.width, opts.height);
+            // Auto-upgrade to SH degree 3 shader if scene needs higher SH evaluation
+            std::string splatBase = resolvedBase;
+            if (scene.getGltfScene().splat_data.sh_degree > 0) {
+                std::string sh3Base = resolvedBase + "_sh3";
+                if (fs::exists(sh3Base + ".comp.spv")) {
+                    std::cout << "[info] Scene SH degree " << scene.getGltfScene().splat_data.sh_degree
+                              << " > 0, upgrading to " << sh3Base << std::endl;
+                    splatBase = sh3Base;
+                }
+            }
+            scene.initSplatRenderer(ctx, splatBase, opts.width, opts.height);
+        }
+
+        // Detect hybrid scene: both triangle meshes AND gaussian splats
+        bool hasRasterMeshes = scene.hasGltfScene() && !scene.getGltfScene().meshes.empty();
+        bool hasSplats = needSplat && scene.getSplatRenderer() != nullptr;
+        bool isHybrid = hasRasterMeshes && hasSplats;
+
+        if (isHybrid) {
+            std::cout << "[info] Hybrid scene detected: "
+                      << scene.getGltfScene().meshes.size() << " mesh primitive(s) + "
+                      << scene.getSplatRenderer()->getWidth() << "x"
+                      << scene.getSplatRenderer()->getHeight() << " splat layer" << std::endl;
         }
 
         std::unique_ptr<IRenderer> renderer;
-        if (needSplat && scene.getSplatRenderer()) {
-            // Gaussian splatting compute path: use SplatRenderer directly
+        if (hasSplats) {
             auto* splatR = scene.getSplatRenderer();
-            splatR->render(ctx);
+
+            if (isHybrid) {
+                // Hybrid rendering: raster meshes first, then splats composited on top
+                // Use default PBR pipeline for mesh primitives (the main pipeline is splat-specific)
+                std::string meshPipeline = "examples/gltf_pbr";
+                auto raster = std::make_unique<RasterRenderer>();
+                raster->init(ctx, scene, meshPipeline, "raster", opts.width, opts.height);
+
+                // Sync splat renderer camera to scene's unified auto-camera
+                // (auto-camera now includes both mesh and splat bounds)
+                float aspect = static_cast<float>(opts.width) / static_cast<float>(opts.height);
+                splatR->updateCamera(scene.getAutoEye(), scene.getAutoTarget(),
+                                     scene.getAutoUp(), glm::radians(45.0f), aspect,
+                                     0.1f, scene.getAutoFar());
+
+                raster->render(ctx);
+
+                // Blit raster color + depth into splat buffers for compositing
+                splatR->preloadBackground(ctx, raster->getOutputImage(), raster->getOutputFormat(),
+                                           raster->getWidth(), raster->getHeight());
+                splatR->preloadDepth(ctx, raster->getDepthImage(),
+                                      raster->getWidth(), raster->getHeight());
+                raster->cleanup(ctx);
+
+                // Render splats on top (uses LOAD render pass to preserve background)
+                splatR->render(ctx);
+                std::cout << "[info] Hybrid render complete (raster + splat composite)" << std::endl;
+            } else {
+                // Splat-only rendering
+                splatR->render(ctx);
+            }
 
             Screenshot::saveImageToPNG(ctx, splatR->getOutputImage(), splatR->getOutputFormat(),
                                         splatR->getWidth(), splatR->getHeight(),
@@ -703,6 +757,7 @@ static int runInteractive(CLIOptions opts) {
     bool useRT = needRT;
     bool useMesh = needMesh;
     bool useSplat = needSplat;
+    bool isHybrid = false;  // set true when scene has both meshes and splats
 
     // Track whether this is a Sponza scene for torch animation
     bool useSponzaLights = opts.sponzaLights;
@@ -777,7 +832,27 @@ static int runInteractive(CLIOptions opts) {
 
         // Initialize splat renderer if scene has gaussian splat data
         if (useSplat && scene.hasSplatData()) {
-            scene.initSplatRenderer(ctx, resolvedBase, opts.width, opts.height);
+            // Auto-upgrade to SH degree 3 shader if scene needs higher SH evaluation
+            std::string splatBase = resolvedBase;
+            if (scene.getGltfScene().splat_data.sh_degree > 0) {
+                std::string sh3Base = resolvedBase + "_sh3";
+                if (fs::exists(sh3Base + ".comp.spv")) {
+                    std::cout << "[info] Scene SH degree " << scene.getGltfScene().splat_data.sh_degree
+                              << " > 0, upgrading to " << sh3Base << std::endl;
+                    splatBase = sh3Base;
+                }
+            }
+            scene.initSplatRenderer(ctx, splatBase, opts.width, opts.height);
+        }
+
+        // Detect hybrid scene: both triangle meshes AND gaussian splats
+        bool hasRasterMeshes = scene.hasGltfScene() && !scene.getGltfScene().meshes.empty();
+        isHybrid = hasRasterMeshes && useSplat && scene.getSplatRenderer() != nullptr;
+
+        if (isHybrid) {
+            std::cout << "[info] Hybrid scene detected: "
+                      << scene.getGltfScene().meshes.size() << " mesh primitive(s) + splats"
+                      << std::endl;
         }
 
         if (useRT) {
@@ -793,9 +868,15 @@ static int runInteractive(CLIOptions opts) {
             meshR->init(ctx, scene, resolvedBase,
                         opts.width, opts.height);
             renderer = std::move(meshR);
-        } else if (!useSplat) {
+        } else if (!useSplat || isHybrid) {
+            // Create raster renderer for non-splat scenes, OR for hybrid scenes
+            // (hybrid: raster renders meshes, splat renderer overlays splats)
             auto raster = std::make_unique<RasterRenderer>();
-            raster->init(ctx, scene, opts.shaderBase, renderPath,
+            // For hybrid scenes, the main pipeline is splat-specific (compute+vert+frag for
+            // Gaussian splatting). Use a default PBR pipeline for the mesh primitives.
+            std::string rasterBase = isHybrid ? "examples/gltf_pbr" : opts.shaderBase;
+            std::string rasterPath = isHybrid ? "raster" : renderPath;
+            raster->init(ctx, scene, rasterBase, rasterPath,
                          opts.width, opts.height);
             renderer = std::move(raster);
         }
@@ -942,7 +1023,44 @@ static int runInteractive(CLIOptions opts) {
         // The fence is only signaled by the last submit (editor if active, scene otherwise)
         VkFence sceneSubmitFence = editorActive ? VK_NULL_HANDLE : inFlightFence;
 
-        if (useSplat && scene.getSplatRenderer()) {
+        if (isHybrid && renderer && scene.getSplatRenderer()) {
+            // Hybrid rendering: raster meshes + splats composited together
+            // 1. Render raster offscreen (synchronous)
+            renderer->render(ctx);
+
+            // 2. Blit raster color + depth into splat buffers for compositing
+            scene.getSplatRenderer()->preloadBackground(ctx,
+                renderer->getOutputImage(), renderer->getOutputFormat(),
+                renderer->getWidth(), renderer->getHeight());
+            scene.getSplatRenderer()->preloadDepth(ctx,
+                static_cast<RasterRenderer*>(renderer.get())->getDepthImage(),
+                renderer->getWidth(), renderer->getHeight());
+
+            // 3. Render splats on top (LOAD render pass preserves raster background)
+            scene.getSplatRenderer()->render(ctx);
+
+            // 4. Blit composited result to swapchain
+            rtBlitCmd = ctx.beginSingleTimeCommands();
+            VkCommandBuffer cmd = rtBlitCmd;
+
+            scene.getSplatRenderer()->blitToSwapchain(ctx, cmd,
+                ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
+
+            vkEndCommandBuffer(cmd);
+
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSubmitInfo submitInfo = {};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.waitSemaphoreCount = 1;
+            submitInfo.pWaitSemaphores = &imageAvailableSem;
+            submitInfo.pWaitDstStageMask = &waitStage;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &cmd;
+            submitInfo.signalSemaphoreCount = 1;
+            submitInfo.pSignalSemaphores = &sceneSignalSem;
+
+            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, sceneSubmitFence);
+        } else if (useSplat && scene.getSplatRenderer()) {
             // Gaussian splatting compute path: render to storage image and blit to swapchain
             scene.getSplatRenderer()->render(ctx);
 

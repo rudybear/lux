@@ -202,6 +202,7 @@ private:
     // Scene geometry
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
+    std::vector<Vertex> m_splatBoundsVerts;  // splat positions as vertices for auto-camera
     GPUMesh m_mesh = {};
 
     // glTF scene data

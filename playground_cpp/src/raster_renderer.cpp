@@ -136,7 +136,7 @@ void RasterRenderer::createOffscreenTarget(VulkanContext& ctx) {
     if (m_needsDepth) {
         VkImageCreateInfo depthInfo = imageInfo;
         depthInfo.format = VK_FORMAT_D32_SFLOAT;
-        depthInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        depthInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
         vmaCreateImage(ctx.allocator, &depthInfo, &allocInfo,
                        &depthImage, &depthAllocation, nullptr);
@@ -182,7 +182,7 @@ void RasterRenderer::createRenderPass(VulkanContext& ctx) {
         depthAtt.format = VK_FORMAT_D32_SFLOAT;
         depthAtt.samples = VK_SAMPLE_COUNT_1_BIT;
         depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         depthAtt.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         depthAtt.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depthAtt.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;

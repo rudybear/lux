@@ -7,6 +7,46 @@
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
+#include <fstream>
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
+// --------------------------------------------------------------------------
+// SH degree helpers
+// --------------------------------------------------------------------------
+
+static uint32_t numShCoeffsForDegree(uint32_t degree) {
+    // degree 0: 1 (DC), degree 1: 4, degree 2: 9, degree 3: 16
+    switch (degree) {
+        case 0: return 1;
+        case 1: return 4;
+        case 2: return 9;
+        case 3: return 16;
+        default: return 1;
+    }
+}
+
+static uint32_t readShaderShDegree(const std::string& shaderBase) {
+    // Read the gaussian_splatting.sh_degree from the compute reflection JSON
+    std::string jsonPath = shaderBase + ".comp.json";
+    if (!fs::exists(jsonPath)) return 0;
+    std::ifstream f(jsonPath);
+    if (!f.is_open()) return 0;
+    std::string content((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+    // Find "gaussian_splatting" section, then "sh_degree" within it
+    auto gsPos = content.find("\"gaussian_splatting\"");
+    if (gsPos == std::string::npos) return 0;
+    auto shPos = content.find("\"sh_degree\"", gsPos);
+    if (shPos == std::string::npos) return 0;
+    auto colonPos = content.find(':', shPos + 11);
+    if (colonPos == std::string::npos) return 0;
+    colonPos++;
+    while (colonPos < content.size() && (content[colonPos] == ' ' || content[colonPos] == '\t'))
+        colonPos++;
+    return static_cast<uint32_t>(std::atoi(content.c_str() + colonPos));
+}
 
 // --------------------------------------------------------------------------
 // VMA buffer helper
@@ -69,7 +109,7 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
     imageInfo.arrayLayers = 1;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VmaAllocationCreateInfo allocInfo = {};
@@ -92,7 +132,7 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
     // Depth image
     VkImageCreateInfo depthInfo = imageInfo;
     depthInfo.format = VK_FORMAT_D32_SFLOAT;
-    depthInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    depthInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
     vmaCreateImage(ctx.allocator, &depthInfo, &allocInfo,
                    &depthImage_, &depthAlloc_, nullptr);
@@ -172,6 +212,143 @@ void SplatRenderer::createRenderPass(VkDevice device) {
 }
 
 // --------------------------------------------------------------------------
+// Render pass (LOAD variant: color loaded, for compositing on background)
+// --------------------------------------------------------------------------
+
+void SplatRenderer::createRenderPassLoad(VkDevice device) {
+    VkAttachmentDescription attachments[2] = {};
+
+    // Color — LOAD existing contents (background was blitted in)
+    attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachments[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+    // Depth — still CLEAR (splats have their own depth)
+    attachments[1].format = VK_FORMAT_D32_SFLOAT;
+    attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference colorRef = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depthRef = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorRef;
+    subpass.pDepthStencilAttachment = &depthRef;
+
+    VkSubpassDependency deps[2] = {};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    VkRenderPassCreateInfo rpInfo = {};
+    rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpInfo.attachmentCount = 2;
+    rpInfo.pAttachments = attachments;
+    rpInfo.subpassCount = 1;
+    rpInfo.pSubpasses = &subpass;
+    rpInfo.dependencyCount = 2;
+    rpInfo.pDependencies = deps;
+
+    vkCreateRenderPass(device, &rpInfo, nullptr, &renderPassLoad_);
+}
+
+// --------------------------------------------------------------------------
+// Render pass (LOAD variant: both color AND depth loaded, for full hybrid compositing)
+// --------------------------------------------------------------------------
+
+void SplatRenderer::createRenderPassLoadDepth(VkDevice device) {
+    VkAttachmentDescription attachments[2] = {};
+
+    // Color — LOAD existing contents (background was blitted in)
+    attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachments[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+    // Depth — LOAD existing depth from raster pass (splats depth-test against mesh)
+    attachments[1].format = VK_FORMAT_D32_SFLOAT;
+    attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference colorRef = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depthRef = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorRef;
+    subpass.pDepthStencilAttachment = &depthRef;
+
+    VkSubpassDependency deps[2] = {};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    VkRenderPassCreateInfo rpInfo = {};
+    rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpInfo.attachmentCount = 2;
+    rpInfo.pAttachments = attachments;
+    rpInfo.subpassCount = 1;
+    rpInfo.pSubpasses = &subpass;
+    rpInfo.dependencyCount = 2;
+    rpInfo.pDependencies = deps;
+
+    vkCreateRenderPass(device, &rpInfo, nullptr, &renderPassLoadDepth_);
+}
+
+// --------------------------------------------------------------------------
 // Framebuffer
 // --------------------------------------------------------------------------
 
@@ -190,6 +367,36 @@ void SplatRenderer::createFramebuffer(VkDevice device) {
     vkCreateFramebuffer(device, &fbInfo, nullptr, &framebuffer_);
 }
 
+void SplatRenderer::createFramebufferLoad(VkDevice device) {
+    VkImageView fbViews[2] = {colorView_, depthView_};
+
+    VkFramebufferCreateInfo fbInfo = {};
+    fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fbInfo.renderPass = renderPassLoad_;
+    fbInfo.attachmentCount = 2;
+    fbInfo.pAttachments = fbViews;
+    fbInfo.width = width_;
+    fbInfo.height = height_;
+    fbInfo.layers = 1;
+
+    vkCreateFramebuffer(device, &fbInfo, nullptr, &framebufferLoad_);
+}
+
+void SplatRenderer::createFramebufferLoadDepth(VkDevice device) {
+    VkImageView fbViews[2] = {colorView_, depthView_};
+
+    VkFramebufferCreateInfo fbInfo = {};
+    fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fbInfo.renderPass = renderPassLoadDepth_;
+    fbInfo.attachmentCount = 2;
+    fbInfo.pAttachments = fbViews;
+    fbInfo.width = width_;
+    fbInfo.height = height_;
+    fbInfo.layers = 1;
+
+    vkCreateFramebuffer(device, &fbInfo, nullptr, &framebufferLoadDepth_);
+}
+
 // --------------------------------------------------------------------------
 // Pipeline creation
 // --------------------------------------------------------------------------
@@ -197,9 +404,11 @@ void SplatRenderer::createFramebuffer(VkDevice device) {
 void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBase) {
     // --- Descriptor set layouts ---
 
-    // Compute: bindings 0..9 = 10 SSBOs
-    std::vector<VkDescriptorSetLayoutBinding> computeBindings(10);
-    for (uint32_t i = 0; i < 10; ++i) {
+    // Compute: 4 input + N SH coefficients + 5 output SSBOs
+    uint32_t numShCoeffs = numShCoeffsForDegree(shaderShDegree_);
+    uint32_t numComputeBindings = 4 + numShCoeffs + 5;
+    std::vector<VkDescriptorSetLayoutBinding> computeBindings(numComputeBindings);
+    for (uint32_t i = 0; i < numComputeBindings; ++i) {
         computeBindings[i] = {};
         computeBindings[i].binding = i;
         computeBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -369,7 +578,7 @@ void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBa
     // --- Descriptor pool ---
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 20;
+    poolSize.descriptorCount = numComputeBindings + 4 + 4; // compute + render + margin
 
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -502,23 +711,52 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
         vkUpdateDescriptorSets(ctx.device, 1, &write, 0, nullptr);
     };
 
-    // Compute set: positions(0), rotations(1), scales(2), opacities(3), sh(4),
-    //   projected_centers(5), projected_conics(6), projected_colors(7),
-    //   sort_keys(8), visible_count(9)
+    // Compute set layout:
+    //   0: positions, 1: rotations, 2: scales, 3: opacities,
+    //   4..4+numShCoeffs-1: SH coefficient buffers,
+    //   4+numShCoeffs: projected_centers, +1: conics, +2: colors, +3: sort_keys, +4: visible_count
+    uint32_t numShCoeffs = numShCoeffsForDegree(shaderShDegree_);
+    uint32_t outputBase = 4 + numShCoeffs;
+
     writeSSBO(computeDescSet_, 0, posBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(computeDescSet_, 1, rotBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(computeDescSet_, 2, scaleBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(computeDescSet_, 3, opacityBuffer_, numSplats_ * sizeof(float));
 
-    VkBuffer shBuf = shBuffers_.empty() ? posBuffer_ : shBuffers_[0];
-    VkDeviceSize shSize = shBuffers_.empty() ? sizeof(float) : numSplats_ * 4 * sizeof(float);
-    writeSSBO(computeDescSet_, 4, shBuf, std::max(shSize, VkDeviceSize(sizeof(float))));
+    // Bind SH coefficient buffers: use scene data where available, zero-filled dummy otherwise.
+    // The sh3 shader evaluates ALL degrees unconditionally (no runtime branching on sh_degree),
+    // so missing SH buffers MUST contain zeros (not random data).
+    for (uint32_t i = 0; i < numShCoeffs; ++i) {
+        VkBuffer shBuf;
+        VkDeviceSize shSize;
+        if (i < static_cast<uint32_t>(shBuffers_.size())) {
+            shBuf = shBuffers_[i];
+            shSize = numSplats_ * 4 * sizeof(float);
+        } else {
+            // Create zero-filled dummy buffer for missing SH coefficients
+            VkBuffer dummyBuf = VK_NULL_HANDLE;
+            VmaAllocation dummyAlloc = VK_NULL_HANDLE;
+            VkDeviceSize dummySize = numSplats_ * 4 * sizeof(float);
+            createVmaBuffer(ctx.allocator, dummySize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            VMA_MEMORY_USAGE_CPU_TO_GPU, dummyBuf, dummyAlloc);
+            // Zero-fill: VMA CPU_TO_GPU memory is not guaranteed to be zeroed
+            void* mapped = nullptr;
+            vmaMapMemory(ctx.allocator, dummyAlloc, &mapped);
+            std::memset(mapped, 0, static_cast<size_t>(dummySize));
+            vmaUnmapMemory(ctx.allocator, dummyAlloc);
+            shBuffers_.push_back(dummyBuf);
+            shAllocs_.push_back(dummyAlloc);
+            shBuf = dummyBuf;
+            shSize = dummySize;
+        }
+        writeSSBO(computeDescSet_, 4 + i, shBuf, std::max(shSize, VkDeviceSize(sizeof(float))));
+    }
 
-    writeSSBO(computeDescSet_, 5, projCenterBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(computeDescSet_, 6, projConicBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(computeDescSet_, 7, projColorBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(computeDescSet_, 8, sortKeysBuffer_, numSplats_ * sizeof(float));
-    writeSSBO(computeDescSet_, 9, visibleCountBuffer_, sizeof(uint32_t));
+    writeSSBO(computeDescSet_, outputBase + 0, projCenterBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(computeDescSet_, outputBase + 1, projConicBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(computeDescSet_, outputBase + 2, projColorBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(computeDescSet_, outputBase + 3, sortKeysBuffer_, numSplats_ * sizeof(float));
+    writeSSBO(computeDescSet_, outputBase + 4, visibleCountBuffer_, sizeof(uint32_t));
 
     // Render set: projected_centers(0), conics(1), colors(2), sorted_indices(3)
     writeSSBO(renderDescSet_, 0, projCenterBuffer_, numSplats_ * 4 * sizeof(float));
@@ -536,9 +774,22 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
     width_ = width;
     height_ = height;
 
+    // Read shader's compiled SH degree from reflection JSON (determines descriptor layout)
+    shaderShDegree_ = readShaderShDegree(shaderBase);
+    // Scene's actual SH degree (for push constant — determines which SH coefficients to evaluate)
+    shDegree_ = data.sh_degree;
+
+    std::cout << "[info] Shader SH degree: " << shaderShDegree_
+              << ", scene SH degree: " << shDegree_
+              << " (" << numShCoeffsForDegree(shaderShDegree_) << " SH bindings)" << std::endl;
+
     createOffscreenTarget(ctx);
     createRenderPass(ctx.device);
+    createRenderPassLoad(ctx.device);
+    createRenderPassLoadDepth(ctx.device);
     createFramebuffer(ctx.device);
+    createFramebufferLoad(ctx.device);
+    createFramebufferLoadDepth(ctx.device);
     createPipelines(ctx.device, shaderBase);
     createBuffers(ctx, data);
 
@@ -567,6 +818,13 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
         // For square pixels: fx = fy = h/(2*tan(fov_y/2))
         focalY_ = 0.5f * static_cast<float>(height) / tanf(fov * 0.5f);
         focalX_ = focalY_;  // square pixels
+
+        std::cout << "[info] Splat bounds: min=(" << minB.x << "," << minB.y << "," << minB.z
+                  << ") max=(" << maxB.x << "," << maxB.y << "," << maxB.z
+                  << ") center=(" << center.x << "," << center.y << "," << center.z
+                  << ") radius=" << radius
+                  << " cam=(" << camPos_.x << "," << camPos_.y << "," << camPos_.z
+                  << ") shBufs=" << data.sh_coefficients.size() << std::endl;
     }
 
     std::cout << "[info] SplatRenderer initialized: " << numSplats_ << " splats, "
@@ -663,19 +921,34 @@ void SplatRenderer::render(VulkanContext& ctx) {
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 
     // --- Render pass ---
+    // Use LOAD render pass when a background has been blitted in (hybrid compositing)
     VkClearValue clearValues[2] = {};
     clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
     clearValues[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rpBegin = {};
     rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpBegin.renderPass = renderPass_;
-    rpBegin.framebuffer = framebuffer_;
+    if (hasBackgroundDepth_) {
+        // Full hybrid: both color and depth loaded from raster pass
+        rpBegin.renderPass = renderPassLoadDepth_;
+        rpBegin.framebuffer = framebufferLoadDepth_;
+    } else if (hasBackground_) {
+        // Color-only compositing: color loaded, depth cleared
+        rpBegin.renderPass = renderPassLoad_;
+        rpBegin.framebuffer = framebufferLoad_;
+    } else {
+        rpBegin.renderPass = renderPass_;
+        rpBegin.framebuffer = framebuffer_;
+    }
     rpBegin.renderArea.extent = {width_, height_};
     rpBegin.clearValueCount = 2;
     rpBegin.pClearValues = clearValues;
 
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+    // Reset background flags after use (one-shot per render call)
+    hasBackground_ = false;
+    hasBackgroundDepth_ = false;
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderPipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderLayout_,
@@ -758,6 +1031,224 @@ void SplatRenderer::blitToSwapchain(VulkanContext& ctx, VkCommandBuffer cmd,
 }
 
 // --------------------------------------------------------------------------
+// Blit to swapchain (compositing mode — from PRESENT_SRC, not UNDEFINED)
+// --------------------------------------------------------------------------
+
+void SplatRenderer::blitToSwapchainComposite(VulkanContext& ctx, VkCommandBuffer cmd,
+                                              VkImage swapImage, VkExtent2D extent) {
+    // Transition swapchain image: PRESENT_SRC -> TRANSFER_DST
+    // (scene has already been blitted to the swapchain before us)
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = swapImage;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    // Blit offscreen -> swapchain
+    VkImageBlit blitRegion = {};
+    blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blitRegion.srcSubresource.layerCount = 1;
+    blitRegion.srcOffsets[1] = {static_cast<int32_t>(width_),
+                                static_cast<int32_t>(height_), 1};
+    blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blitRegion.dstSubresource.layerCount = 1;
+    blitRegion.dstOffsets[1] = {static_cast<int32_t>(extent.width),
+                                static_cast<int32_t>(extent.height), 1};
+
+    vkCmdBlitImage(cmd,
+        colorImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blitRegion, VK_FILTER_LINEAR);
+
+    // Transition swapchain image: TRANSFER_DST -> PRESENT_SRC
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = 0;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+// --------------------------------------------------------------------------
+// Preload background image (blit external image into splat color target)
+// --------------------------------------------------------------------------
+
+void SplatRenderer::preloadBackground(VulkanContext& ctx, VkImage srcImage, VkFormat /*srcFormat*/,
+                                       uint32_t srcWidth, uint32_t srcHeight) {
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+
+    // Transition splat color image: UNDEFINED -> TRANSFER_DST
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = colorImage_;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    // Blit source image -> splat color image
+    VkImageBlit blitRegion = {};
+    blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blitRegion.srcSubresource.layerCount = 1;
+    blitRegion.srcOffsets[1] = {static_cast<int32_t>(srcWidth),
+                                static_cast<int32_t>(srcHeight), 1};
+    blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blitRegion.dstSubresource.layerCount = 1;
+    blitRegion.dstOffsets[1] = {static_cast<int32_t>(width_),
+                                static_cast<int32_t>(height_), 1};
+
+    vkCmdBlitImage(cmd,
+        srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        colorImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blitRegion, VK_FILTER_LINEAR);
+
+    // Transition splat color image: TRANSFER_DST -> COLOR_ATTACHMENT_OPTIMAL
+    // (the LOAD render pass expects this layout as initialLayout)
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    ctx.endSingleTimeCommands(cmd);
+
+    hasBackground_ = true;
+    std::cout << "[info] Preloaded background image into splat color target ("
+              << srcWidth << "x" << srcHeight << " -> "
+              << width_ << "x" << height_ << ")" << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Preload depth from raster pass (copy raster depth into splat depth buffer)
+// --------------------------------------------------------------------------
+
+void SplatRenderer::preloadDepth(VulkanContext& ctx, VkImage srcDepthImage,
+                                  uint32_t srcWidth, uint32_t srcHeight) {
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+
+    // Transition raster depth: DEPTH_STENCIL_ATTACHMENT_OPTIMAL -> TRANSFER_SRC
+    VkImageMemoryBarrier barriers[2] = {};
+
+    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].image = srcDepthImage;
+    barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    barriers[0].subresourceRange.levelCount = 1;
+    barriers[0].subresourceRange.layerCount = 1;
+    barriers[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    // Transition splat depth: UNDEFINED -> TRANSFER_DST
+    barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[1].image = depthImage_;
+    barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    barriers[1].subresourceRange.levelCount = 1;
+    barriers[1].subresourceRange.layerCount = 1;
+    barriers[1].srcAccessMask = 0;
+    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 2, barriers);
+
+    // Copy depth image (vkCmdCopyImage requires matching dimensions, or use blit)
+    if (srcWidth == width_ && srcHeight == height_) {
+        VkImageCopy copyRegion = {};
+        copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        copyRegion.srcSubresource.layerCount = 1;
+        copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        copyRegion.dstSubresource.layerCount = 1;
+        copyRegion.extent = {srcWidth, srcHeight, 1};
+
+        vkCmdCopyImage(cmd,
+            srcDepthImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            depthImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &copyRegion);
+    } else {
+        // Blit with nearest filter for depth (no linear interpolation on depth)
+        VkImageBlit blitRegion = {};
+        blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        blitRegion.srcSubresource.layerCount = 1;
+        blitRegion.srcOffsets[1] = {static_cast<int32_t>(srcWidth),
+                                    static_cast<int32_t>(srcHeight), 1};
+        blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        blitRegion.dstSubresource.layerCount = 1;
+        blitRegion.dstOffsets[1] = {static_cast<int32_t>(width_),
+                                    static_cast<int32_t>(height_), 1};
+
+        vkCmdBlitImage(cmd,
+            srcDepthImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            depthImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &blitRegion, VK_FILTER_NEAREST);
+    }
+
+    // Transition splat depth: TRANSFER_DST -> DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    // (the LoadDepth render pass expects this layout as initialLayout)
+    VkImageMemoryBarrier depthBarrier = {};
+    depthBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    depthBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    depthBarrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depthBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depthBarrier.image = depthImage_;
+    depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depthBarrier.subresourceRange.levelCount = 1;
+    depthBarrier.subresourceRange.layerCount = 1;
+    depthBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    depthBarrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &depthBarrier);
+
+    ctx.endSingleTimeCommands(cmd);
+
+    hasBackgroundDepth_ = true;
+    std::cout << "[info] Preloaded raster depth into splat depth buffer ("
+              << srcWidth << "x" << srcHeight << " -> "
+              << width_ << "x" << height_ << ")" << std::endl;
+}
+
+// --------------------------------------------------------------------------
 // Cleanup
 // --------------------------------------------------------------------------
 
@@ -765,6 +1256,10 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     vkDeviceWaitIdle(ctx.device);
 
     // Framebuffer and render pass
+    if (framebufferLoadDepth_ != VK_NULL_HANDLE) vkDestroyFramebuffer(ctx.device, framebufferLoadDepth_, nullptr);
+    if (renderPassLoadDepth_ != VK_NULL_HANDLE)  vkDestroyRenderPass(ctx.device, renderPassLoadDepth_, nullptr);
+    if (framebufferLoad_ != VK_NULL_HANDLE) vkDestroyFramebuffer(ctx.device, framebufferLoad_, nullptr);
+    if (renderPassLoad_ != VK_NULL_HANDLE)  vkDestroyRenderPass(ctx.device, renderPassLoad_, nullptr);
     if (framebuffer_ != VK_NULL_HANDLE) vkDestroyFramebuffer(ctx.device, framebuffer_, nullptr);
     if (renderPass_ != VK_NULL_HANDLE)  vkDestroyRenderPass(ctx.device, renderPass_, nullptr);
 
@@ -806,8 +1301,14 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     shAllocs_.clear();
 
     // Zero out all handles
+    framebufferLoadDepth_ = VK_NULL_HANDLE;
+    renderPassLoadDepth_ = VK_NULL_HANDLE;
+    framebufferLoad_ = VK_NULL_HANDLE;
+    renderPassLoad_ = VK_NULL_HANDLE;
     framebuffer_ = VK_NULL_HANDLE;
     renderPass_ = VK_NULL_HANDLE;
+    hasBackground_ = false;
+    hasBackgroundDepth_ = false;
     colorView_ = VK_NULL_HANDLE;
     depthView_ = VK_NULL_HANDLE;
     colorImage_ = VK_NULL_HANDLE;

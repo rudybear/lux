@@ -1,0 +1,12 @@
+splat GaussianCloud {
+    sh_degree: 1,
+    kernel: ellipse,
+    color_space: srgb,
+    sort: camera_distance,
+    alpha_cutoff: 0.004,
+}
+
+pipeline SplatViewer {
+    mode: gaussian_splat,
+    splat: GaussianCloud,
+}

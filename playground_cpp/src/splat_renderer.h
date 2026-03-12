@@ -27,6 +27,22 @@ public:
     void blitToSwapchain(VulkanContext& ctx, VkCommandBuffer cmd,
                          VkImage swapImage, VkExtent2D extent);
 
+    // Blit to swapchain in compositing mode: transitions from PRESENT_SRC
+    // instead of UNDEFINED (for drawing on top of a previously-rendered frame).
+    void blitToSwapchainComposite(VulkanContext& ctx, VkCommandBuffer cmd,
+                                   VkImage swapImage, VkExtent2D extent);
+
+    // Preload a background image into the splat color buffer.
+    // Subsequent render() call will use LOAD instead of CLEAR so splats
+    // are composited on top of the background.
+    void preloadBackground(VulkanContext& ctx, VkImage srcImage, VkFormat srcFormat,
+                           uint32_t srcWidth, uint32_t srcHeight);
+
+    // Preload depth from raster pass into splat depth buffer.
+    // Splats will depth-test against mesh geometry so occluded splats are hidden.
+    void preloadDepth(VulkanContext& ctx, VkImage srcDepthImage,
+                      uint32_t srcWidth, uint32_t srcHeight);
+
     void cleanup(VulkanContext& ctx);
 
     VkImage getOutputImage() const { return colorImage_; }
@@ -49,6 +65,16 @@ private:
 
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+
+    // Second render pass/framebuffer pair with LOAD_OP_LOAD for color compositing
+    VkRenderPass renderPassLoad_ = VK_NULL_HANDLE;
+    VkFramebuffer framebufferLoad_ = VK_NULL_HANDLE;
+    bool hasBackground_ = false;
+
+    // Third render pass/framebuffer pair: LOAD both color AND depth (full hybrid compositing)
+    VkRenderPass renderPassLoadDepth_ = VK_NULL_HANDLE;
+    VkFramebuffer framebufferLoadDepth_ = VK_NULL_HANDLE;
+    bool hasBackgroundDepth_ = false;
 
     // Pipelines
     VkPipeline computePipeline_ = VK_NULL_HANDLE;
@@ -89,7 +115,8 @@ private:
     glm::vec3 camPos_{0.0f, 0.0f, 3.0f};
     float focalX_ = 256.0f;
     float focalY_ = 256.0f;
-    uint32_t shDegree_ = 0;
+    uint32_t shDegree_ = 0;        // scene's actual SH degree (for push constant)
+    uint32_t shaderShDegree_ = 0;  // shader's compiled SH degree (for descriptor layout)
 
     // Cached positions for CPU sort
     std::vector<float> hostPositions_;
@@ -97,7 +124,11 @@ private:
     // Helpers
     void createOffscreenTarget(VulkanContext& ctx);
     void createRenderPass(VkDevice device);
+    void createRenderPassLoad(VkDevice device);
+    void createRenderPassLoadDepth(VkDevice device);
     void createFramebuffer(VkDevice device);
+    void createFramebufferLoad(VkDevice device);
+    void createFramebufferLoadDepth(VkDevice device);
     void createPipelines(VkDevice device, const std::string& shaderBase);
     void createBuffers(VulkanContext& ctx, const GaussianSplatData& data);
 };

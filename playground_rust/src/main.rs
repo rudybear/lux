@@ -187,18 +187,12 @@ fn run(args: Args) -> Result<(), String> {
     let mut render_path = detect_render_path(&pipeline_base, force_mode);
 
     // Pre-scan glTF files for KHR_gaussian_splatting data to override render path.
-    // This allows automatic splat rendering when a .glb contains gaussian splats.
+    // Uses our loader (which bypasses strict validation) so KHR conformance files work.
     if (scene_source.ends_with(".glb") || scene_source.ends_with(".gltf"))
         && (force_mode.is_empty() || force_mode == "splat")
     {
-        if let Ok((document, _buffers, _images)) = gltf::import(Path::new(&scene_source)) {
-            let has_splats = document.meshes().any(|mesh| {
-                mesh.primitives().any(|prim| {
-                    prim.mode() == gltf::mesh::Mode::Points
-                        && prim.extension_value("KHR_gaussian_splatting").is_some()
-                })
-            });
-            if has_splats {
+        if let Ok(scene) = gltf_loader::load_gltf(Path::new(&scene_source)) {
+            if scene.splat_data.has_splats {
                 info!("Detected KHR_gaussian_splatting in scene, switching to splat render path");
                 render_path = "splat";
             }
@@ -402,12 +396,104 @@ fn run_headless(
                 scene_source, pipeline_base
             );
 
-            let mut renderer = splat_renderer::GaussianSplatRenderer::new(
+            // Detect hybrid scene: both triangle meshes AND gaussian splats
+            let has_raster_meshes = (scene_source.ends_with(".glb") || scene_source.ends_with(".gltf"))
+                && {
+                    // Quick check: load glTF to see if there are non-POINTS primitives
+                    if let Ok((doc, _, _)) = gltf::import(Path::new(scene_source)) {
+                        doc.meshes().any(|mesh| {
+                            mesh.primitives().any(|prim| prim.mode() != gltf::mesh::Mode::Points)
+                        })
+                    } else {
+                        false
+                    }
+                };
+
+            let mut splat_renderer = splat_renderer::GaussianSplatRenderer::new(
                 &mut ctx, scene_source, pipeline_base, width, height,
             )?;
 
-            // Render frame
-            let cmd = renderer.render(&ctx)?;
+            let is_hybrid = has_raster_meshes;
+
+            if is_hybrid {
+                info!("Hybrid scene detected: raster meshes + gaussian splats");
+
+                // 1. Render raster scene offscreen
+                let raster_pipeline = if std::path::Path::new("shadercache/gltf_pbr.vert.spv").exists() {
+                    "shadercache/gltf_pbr".to_string()
+                } else if std::path::Path::new("examples/gltf_pbr.vert.spv").exists() {
+                    "examples/gltf_pbr".to_string()
+                } else if std::path::Path::new("../examples/gltf_pbr.vert.spv").exists() {
+                    "../examples/gltf_pbr".to_string()
+                } else {
+                    return Err("Cannot find gltf_pbr shaders for hybrid rendering".to_string());
+                };
+
+                let mut raster = raster_renderer::PersistentRenderer::init(
+                    &mut ctx,
+                    &raster_pipeline,
+                    scene_source,
+                    width,
+                    height,
+                    ibl_name,
+                    demo_lights,
+                    sponza_lights,
+                )?;
+
+                // Update raster camera to match splat auto-camera
+                if splat_renderer.has_scene_bounds() {
+                    let aspect = width as f32 / height as f32;
+                    raster.update_camera(
+                        splat_renderer.auto_eye(),
+                        splat_renderer.auto_target(),
+                        splat_renderer.auto_up(),
+                        45.0f32.to_radians(),
+                        aspect,
+                        0.1,
+                        splat_renderer.auto_far(),
+                    );
+                }
+
+                let raster_cmd = raster.render(&ctx)?;
+                unsafe {
+                    ctx.device.end_command_buffer(raster_cmd)
+                        .map_err(|e| format!("Failed to end raster cmd: {:?}", e))?;
+                }
+                let raster_bufs = [raster_cmd];
+                let raster_submit = ash::vk::SubmitInfo::default().command_buffers(&raster_bufs);
+                let raster_fence = unsafe {
+                    ctx.device.create_fence(&ash::vk::FenceCreateInfo::default(), None)
+                        .map_err(|e| format!("Failed to create fence: {:?}", e))?
+                };
+                unsafe {
+                    ctx.device.queue_submit(ctx.graphics_queue, &[raster_submit], raster_fence)
+                        .map_err(|e| format!("Failed to submit raster: {:?}", e))?;
+                    ctx.device.wait_for_fences(&[raster_fence], true, u64::MAX)
+                        .map_err(|e| format!("Failed to wait: {:?}", e))?;
+                    ctx.device.destroy_fence(raster_fence, None);
+                    ctx.device.free_command_buffers(ctx.command_pool, &raster_bufs);
+                }
+
+                // 2. Blit raster color + depth into splat buffers for compositing
+                splat_renderer.preload_background(
+                    &ctx,
+                    raster.output_image(),
+                    raster.width(),
+                    raster.height(),
+                )?;
+                splat_renderer.preload_depth(
+                    &ctx,
+                    raster.depth_image(),
+                    raster.width(),
+                    raster.height(),
+                )?;
+
+                raster.destroy(&mut ctx);
+                info!("Hybrid: raster pass complete, compositing splats on top");
+            }
+
+            // Render splats (uses LOAD render pass if background was preloaded)
+            let cmd = splat_renderer.render(&ctx)?;
 
             // End command buffer and submit
             unsafe {
@@ -451,7 +537,7 @@ fn run_headless(
             screenshot::cmd_copy_image_to_buffer(
                 &device_clone,
                 cmd2,
-                renderer.output_image(),
+                splat_renderer.output_image(),
                 staging.buffer,
                 width,
                 height,
@@ -462,10 +548,14 @@ fn run_headless(
             let pixels = staging.read_pixels(width, height)?;
             screenshot::save_png(&pixels, width, height, output_path)?;
 
-            info!("Saved splat render to {:?}", output_path);
+            info!(
+                "Saved {} render to {:?}",
+                if is_hybrid { "hybrid (raster + splat)" } else { "splat" },
+                output_path
+            );
 
             staging.destroy(&device_clone, ctx.allocator_mut());
-            renderer.destroy(&mut ctx);
+            splat_renderer.destroy(&mut ctx);
 
             Ok(())
         }
@@ -675,12 +765,16 @@ fn run_interactive(
         // Vulkan state (initialized after window creation)
         ctx: Option<vulkan_context::VulkanContext>,
         renderer: Option<Box<dyn Renderer>>,
+        // Hybrid rendering: separate splat renderer + raster renderer for mesh geometry
+        hybrid_splat: Option<splat_renderer::GaussianSplatRenderer>,
+        hybrid_raster: Option<raster_renderer::PersistentRenderer>,
         orbit: OrbitCamera,
         // Frame sync
         image_available_sem: vk::Semaphore,
         render_finished_sem: vk::Semaphore,
         in_flight_fence: vk::Fence,
         initialized: bool,
+        is_hybrid: bool,
     }
 
     impl App {
@@ -714,8 +808,74 @@ fn run_interactive(
                 ctx.device.create_fence(&fence_info, None).unwrap()
             };
 
+            // Detect hybrid scene for splat path: check if glTF has non-POINTS primitives
+            if self.use_splat
+                && (self.scene_source.ends_with(".glb") || self.scene_source.ends_with(".gltf"))
+            {
+                if let Ok((doc, _, _)) = gltf::import(std::path::Path::new(&self.scene_source)) {
+                    let has_meshes = doc.meshes().any(|mesh| {
+                        mesh.primitives().any(|prim| prim.mode() != gltf::mesh::Mode::Points)
+                    });
+                    if has_meshes {
+                        self.is_hybrid = true;
+                        info!("Hybrid interactive scene detected: raster meshes + gaussian splats");
+                    }
+                }
+            }
+
             // Create the renderer (unified via Renderer trait)
-            let renderer_result: Result<Box<dyn Renderer>, String> = if self.use_splat {
+            let renderer_result: Result<Box<dyn Renderer>, String> = if self.use_splat && self.is_hybrid {
+                // Hybrid: create both splat and raster renderers
+                info!("Initializing hybrid splat + raster renderer...");
+                let splat = splat_renderer::GaussianSplatRenderer::new(
+                    &mut ctx,
+                    &self.scene_source,
+                    &self.pipeline_base,
+                    self.width,
+                    self.height,
+                );
+                match splat {
+                    Ok(s) => {
+                        let raster_pipeline = if std::path::Path::new("shadercache/gltf_pbr.vert.spv").exists() {
+                            "shadercache/gltf_pbr".to_string()
+                        } else if std::path::Path::new("examples/gltf_pbr.vert.spv").exists() {
+                            "examples/gltf_pbr".to_string()
+                        } else if std::path::Path::new("../examples/gltf_pbr.vert.spv").exists() {
+                            "../examples/gltf_pbr".to_string()
+                        } else {
+                            "examples/gltf_pbr".to_string()
+                        };
+                        let raster = raster_renderer::PersistentRenderer::init(
+                            &mut ctx,
+                            &raster_pipeline,
+                            &self.scene_source,
+                            self.width,
+                            self.height,
+                            &self.ibl_name,
+                            self.demo_lights,
+                            self.sponza_lights,
+                        );
+                        match raster {
+                            Ok(r) => {
+                                self.hybrid_raster = Some(r);
+                                self.hybrid_splat = Some(s);
+                                // Create a dummy — hybrid_splat is the actual renderer
+                                // We need something for the unified renderer slot;
+                                // we'll handle hybrid specially in render_frame
+                                // Return an error to skip the normal path
+                                Err("__hybrid__".to_string())
+                            }
+                            Err(e) => {
+                                // Fall back to splat-only
+                                info!("Hybrid raster init failed ({}), falling back to splat-only", e);
+                                self.is_hybrid = false;
+                                Ok(Box::new(s) as Box<dyn Renderer>)
+                            }
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            } else if self.use_splat {
                 info!("Initializing gaussian splat renderer...");
                 splat_renderer::GaussianSplatRenderer::new(
                     &mut ctx,
@@ -763,8 +923,10 @@ fn run_interactive(
                 ).map(|r| Box::new(r) as Box<dyn Renderer>)
             };
 
-            let renderer = match renderer_result {
-                Ok(r) => r,
+            // Handle hybrid case: renderer_result is Err("__hybrid__") when hybrid_splat/raster are set
+            let renderer: Option<Box<dyn Renderer>> = match renderer_result {
+                Ok(r) => Some(r),
+                Err(ref e) if e == "__hybrid__" => None,
                 Err(e) => {
                     error!("Failed to init renderer: {}", e);
                     unsafe {
@@ -778,19 +940,30 @@ fn run_interactive(
             };
 
             // Init orbit camera from auto-camera
-            if renderer.has_scene_bounds() {
-                self.orbit.init_from_auto_camera(
-                    renderer.auto_eye(),
-                    renderer.auto_target(),
-                    renderer.auto_up(),
-                    renderer.auto_far(),
-                );
+            if let Some(ref r) = renderer {
+                if r.has_scene_bounds() {
+                    self.orbit.init_from_auto_camera(
+                        r.auto_eye(),
+                        r.auto_target(),
+                        r.auto_up(),
+                        r.auto_far(),
+                    );
+                }
+            } else if let Some(ref s) = self.hybrid_splat {
+                if s.has_scene_bounds() {
+                    self.orbit.init_from_auto_camera(
+                        s.auto_eye(),
+                        s.auto_target(),
+                        s.auto_up(),
+                        s.auto_far(),
+                    );
+                }
             }
 
             self.image_available_sem = image_available;
             self.render_finished_sem = render_finished;
             self.in_flight_fence = fence;
-            self.renderer = Some(renderer);
+            self.renderer = renderer;
             self.ctx = Some(ctx);
             self.initialized = true;
 
@@ -824,6 +997,119 @@ fn run_interactive(
 
             let extent = ctx.swapchain_extent;
 
+            // --- Hybrid rendering path ---
+            if self.is_hybrid && self.hybrid_splat.is_some() && self.hybrid_raster.is_some() {
+                let aspect = extent.width as f32 / extent.height as f32;
+
+                // Update both cameras
+                let eye = self.orbit.eye();
+                let target = self.orbit.target;
+                let up = self.orbit.up;
+                let fov_y = self.orbit.fov_y;
+                let near = self.orbit.near_plane;
+                let far = self.orbit.far_plane;
+
+                let raster = self.hybrid_raster.as_mut().unwrap();
+                raster.update_camera(eye, target, up, fov_y, aspect, near, far);
+
+                // 1. Render raster scene
+                let raster_cmd = match raster.render(ctx) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Hybrid raster render failed: {}", e);
+                        return;
+                    }
+                };
+                unsafe {
+                    let _ = ctx.device.end_command_buffer(raster_cmd);
+                }
+                // Submit raster synchronously
+                let raster_bufs = [raster_cmd];
+                let raster_submit = vk::SubmitInfo::default().command_buffers(&raster_bufs);
+                let raster_fence = unsafe {
+                    ctx.device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap()
+                };
+                unsafe {
+                    let _ = ctx.device.queue_submit(ctx.graphics_queue, &[raster_submit], raster_fence);
+                    let _ = ctx.device.wait_for_fences(&[raster_fence], true, u64::MAX);
+                    ctx.device.destroy_fence(raster_fence, None);
+                    ctx.device.free_command_buffers(ctx.command_pool, &raster_bufs);
+                }
+
+                // 2. Preload raster color + depth into splat buffers
+                let raster_output = raster.output_image();
+                let raster_depth = raster.depth_image();
+                let raster_w = raster.width();
+                let raster_h = raster.height();
+
+                let splat = self.hybrid_splat.as_mut().unwrap();
+                splat.update_camera(eye, target, up, fov_y, aspect, near, far);
+
+                if let Err(e) = splat.preload_background(ctx, raster_output, raster_w, raster_h) {
+                    error!("preload_background failed: {}", e);
+                    return;
+                }
+                if let Err(e) = splat.preload_depth(ctx, raster_depth, raster_w, raster_h) {
+                    error!("preload_depth failed: {}", e);
+                    return;
+                }
+
+                // 3. Render splats on top (LOAD render pass preserves raster background)
+                let cmd = match splat.render(ctx) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Hybrid splat render failed: {}", e);
+                        return;
+                    }
+                };
+
+                // Blit splat output to swapchain
+                let swapchain_image = ctx.swapchain_images[image_index as usize];
+                splat.blit_to_swapchain(&ctx.device, cmd, swapchain_image, extent);
+
+                // End and submit
+                unsafe {
+                    let _ = ctx.device.end_command_buffer(cmd);
+                }
+
+                let wait_semaphores = [self.image_available_sem];
+                let signal_semaphores = [self.render_finished_sem];
+                let wait_stages = [vk::PipelineStageFlags::COMPUTE_SHADER];
+                let cmd_bufs = [cmd];
+                let submit_info = vk::SubmitInfo::default()
+                    .wait_semaphores(&wait_semaphores)
+                    .wait_dst_stage_mask(&wait_stages)
+                    .command_buffers(&cmd_bufs)
+                    .signal_semaphores(&signal_semaphores);
+
+                unsafe {
+                    let _ = ctx.device.queue_submit(
+                        ctx.graphics_queue,
+                        &[submit_info],
+                        self.in_flight_fence,
+                    );
+                }
+
+                // Present
+                match ctx.queue_present(image_index, self.render_finished_sem) {
+                    Ok(_) => {}
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                        info!("Swapchain out of date during present");
+                    }
+                    Err(e) => {
+                        error!("Present failed: {:?}", e);
+                    }
+                }
+
+                // Free the command buffer
+                unsafe {
+                    let _ = ctx.device.device_wait_idle();
+                    ctx.device.free_command_buffers(ctx.command_pool, &cmd_bufs);
+                }
+                return;
+            }
+
+            // --- Standard (non-hybrid) rendering path ---
             let renderer = match self.renderer.as_mut() {
                 Some(r) => r,
                 None => return,
@@ -917,6 +1203,20 @@ fn run_interactive(
                     renderer.destroy(ctx);
                 }
             }
+
+            // Destroy hybrid renderers
+            if let Some(ref mut splat) = self.hybrid_splat {
+                if let Some(ref mut ctx) = self.ctx {
+                    splat.cleanup(ctx);
+                }
+            }
+            self.hybrid_splat = None;
+            if let Some(ref mut raster) = self.hybrid_raster {
+                if let Some(ref mut ctx) = self.ctx {
+                    raster.cleanup(ctx);
+                }
+            }
+            self.hybrid_raster = None;
 
             if let Some(ref ctx) = self.ctx {
                 unsafe {
@@ -1040,11 +1340,14 @@ fn run_interactive(
         start_time: std::time::Instant::now(),
         ctx: None,
         renderer: None,
+        hybrid_splat: None,
+        hybrid_raster: None,
         orbit: OrbitCamera::new(),
         image_available_sem: vk::Semaphore::null(),
         render_finished_sem: vk::Semaphore::null(),
         in_flight_fence: vk::Fence::null(),
         initialized: false,
+        is_hybrid: false,
     };
 
     event_loop

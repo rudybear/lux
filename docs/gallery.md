@@ -91,7 +91,7 @@ First-class Gaussian splatting via the `splat` declaration — one block generat
 
 ```lux
 splat GaussianCloud {
-    sh_degree: 0,
+    sh_degree: 3,
     kernel: ellipse,
     color_space: srgb,
     sort: camera_distance,
@@ -110,6 +110,28 @@ python -m luxc examples/gaussian_splat.lux
 python -m tools.generate_test_splats tests/assets/test_splats.glb
 playground_cpp/build/Release/lux-playground.exe --scene tests/assets/test_splats.glb --pipeline examples/gaussian_splat --interactive
 ```
+
+#### KHR_gaussian_splatting Conformance
+
+Full support for the Khronos `KHR_gaussian_splatting` glTF extension — all 11 official conformance test scenes render correctly with dynamic SH degree 0–3 evaluation, per-coefficient SH buffer binding, and auto-shader selection.
+
+<p align="center">
+<img src="../screenshots/khr_splat_conformance/Depths.png" width="150">
+<img src="../screenshots/khr_splat_conformance/MixedDegrees.png" width="150">
+<img src="../screenshots/khr_splat_conformance/ShGrid.png" width="150">
+<img src="../screenshots/khr_splat_conformance/RotationsX.png" width="150">
+<img src="../screenshots/khr_splat_conformance/Scales.png" width="150">
+</p>
+<p align="center"><em>KHR conformance tests: Depths, MixedDegrees (SH 0–3), ShGrid (SH 3), RotationsX, Scales</em></p>
+
+<p align="center">
+<img src="../screenshots/khr_splat_conformance/RotationsY.png" width="150">
+<img src="../screenshots/khr_splat_conformance/RotationsZ.png" width="150">
+<img src="../screenshots/khr_splat_conformance/ScaledScales.png" width="150">
+<img src="../screenshots/khr_splat_conformance/ScalesX.png" width="150">
+<img src="../screenshots/khr_splat_conformance/MeshInSplats.png" width="150">
+</p>
+<p align="center"><em>RotationsY, RotationsZ, ScaledScales, ScalesX, MeshInSplats (hybrid mesh + splat rendering)</em></p>
 
 ### Compute Shaders — GPU General-Purpose Computation
 

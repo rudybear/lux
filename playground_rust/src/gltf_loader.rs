@@ -199,6 +199,9 @@ pub struct GaussianSplatData {
     pub sh_degree: u32,
     pub num_splats: u32,
     pub has_splats: bool,
+    /// True when loaded from KHR_gaussian_splatting extension (opacities are linear [0,1],
+    /// need logit conversion for shader compatibility).
+    pub khr_format: bool,
 }
 
 impl Default for GaussianSplatData {
@@ -212,6 +215,7 @@ impl Default for GaussianSplatData {
             sh_degree: 0,
             num_splats: 0,
             has_splats: false,
+            khr_format: false,
         }
     }
 }
@@ -430,10 +434,28 @@ fn extract_texture(
     }
 }
 
+/// Import glTF without validation (KHR_gaussian_splatting uses custom attribute
+/// names like "KHR_gaussian_splatting:ROTATION" that the gltf crate's strict
+/// validation rejects as invalid semantic names).
+fn import_without_validation(path: &Path) -> Result<(gltf::Document, Vec<gltf::buffer::Data>, Vec<gltf::image::Data>), String> {
+    let file_data = std::fs::read(path)
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let gltf_data = gltf::Gltf::from_slice_without_validation(&file_data)
+        .map_err(|e| format!("Failed to parse glTF {}: {}", path.display(), e))?;
+    let base = path.parent();
+    let blob = gltf_data.blob;
+    let document = gltf_data.document;
+    let buffers = gltf::import_buffers(&document, base, blob)
+        .map_err(|e| format!("Failed to load glTF buffers {}: {}", path.display(), e))?;
+    let images = gltf::import_images(&document, base, &buffers)
+        .map_err(|e| format!("Failed to load glTF images {}: {}", path.display(), e))?;
+    Ok((document, buffers, images))
+}
+
 /// Load a .glb or .gltf file.
 pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
     let (document, buffers, images) =
-        gltf::import(path).map_err(|e| format!("Failed to load glTF {}: {}", path.display(), e))?;
+        import_without_validation(path)?;
 
     info!("Loaded glTF: {} images, {} materials", images.len(), document.materials().len());
 
@@ -617,6 +639,10 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
     for mesh in document.meshes() {
         let prim_start = scene.meshes.len();
         for prim in mesh.primitives() {
+            // Skip POINTS primitives (splats) — they are handled separately below
+            if prim.mode() == gltf::mesh::Mode::Points {
+                continue;
+            }
             let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
 
             let positions: Vec<[f32; 3]> = reader
@@ -690,7 +716,60 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
     // Scan primitives for POINTS mode with the KHR_gaussian_splatting extension.
     // The extension stores splat attributes (position, rotation, scale, opacity, SH)
     // as regular glTF accessors referenced from the primitive's extension JSON.
-    for mesh in document.meshes() {
+    // Supports multi-primitive merging: accumulates ALL splat primitives across all meshes,
+    // with zero-padding for SH degree mismatches between primitives.
+
+    // Per-primitive metadata for deferred node transform application
+    struct SplatPrimInfo {
+        mesh_index: usize,    // glTF mesh index this primitive belongs to
+        start_splat: usize,   // index of first splat in accumulated arrays
+        splat_count: usize,   // number of splats in this primitive
+    }
+    let mut splat_prim_infos: Vec<SplatPrimInfo> = Vec::new();
+    let mut global_max_sh_degree: u32 = 0;
+
+    // Helper: read a float accessor by index from the buffer data.
+    let read_accessor_f32 = |acc_idx: usize| -> Vec<f32> {
+        if let Some(accessor) = document.accessors().nth(acc_idx) {
+            let view = match accessor.view() {
+                Some(v) => v,
+                None => return Vec::new(),
+            };
+            let buf_idx = view.buffer().index();
+            if buf_idx >= buffers.len() {
+                return Vec::new();
+            }
+            let data = &buffers[buf_idx];
+            let offset = view.offset() + accessor.offset();
+            let count = accessor.count();
+            let comp_count = match accessor.dimensions() {
+                gltf::accessor::Dimensions::Scalar => 1,
+                gltf::accessor::Dimensions::Vec2 => 2,
+                gltf::accessor::Dimensions::Vec3 => 3,
+                gltf::accessor::Dimensions::Vec4 => 4,
+                _ => 1,
+            };
+            let stride = view.stride().unwrap_or(comp_count * 4);
+            let mut out = Vec::with_capacity(count * comp_count);
+            for i in 0..count {
+                let base = offset + i * stride;
+                for c in 0..comp_count {
+                    let off = base + c * 4;
+                    if off + 4 <= data.len() {
+                        let val = f32::from_le_bytes([
+                            data[off], data[off + 1], data[off + 2], data[off + 3],
+                        ]);
+                        out.push(val);
+                    }
+                }
+            }
+            out
+        } else {
+            Vec::new()
+        }
+    };
+
+    for (mi, mesh) in document.meshes().enumerate() {
         for prim in mesh.primitives() {
             // glTF mode 0 = POINTS
             if prim.mode() != gltf::mesh::Mode::Points {
@@ -704,62 +783,36 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
             let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
 
             // Read positions from the standard POSITION attribute (vec3 -> pad to vec4)
-            let positions: Vec<[f32; 4]> = reader
+            let prim_positions: Vec<[f32; 4]> = reader
                 .read_positions()
                 .map(|iter| iter.map(|p| [p[0], p[1], p[2], 1.0]).collect())
                 .unwrap_or_default();
 
-            let num_splats = positions.len() as u32;
-            if num_splats == 0 {
+            let prim_num_splats = prim_positions.len() as u32;
+            if prim_num_splats == 0 {
                 continue;
             }
 
-            // Helper: read a float accessor by index from the buffer data.
-            let read_accessor_f32 = |acc_idx: usize| -> Vec<f32> {
-                if let Some(accessor) = document.accessors().nth(acc_idx) {
-                    let view = match accessor.view() {
-                        Some(v) => v,
-                        None => return Vec::new(),
-                    };
-                    let buf_idx = view.buffer().index();
-                    if buf_idx >= buffers.len() {
-                        return Vec::new();
-                    }
-                    let data = &buffers[buf_idx];
-                    let offset = view.offset() + accessor.offset();
-                    let count = accessor.count();
-                    let comp_count = match accessor.dimensions() {
-                        gltf::accessor::Dimensions::Scalar => 1,
-                        gltf::accessor::Dimensions::Vec2 => 2,
-                        gltf::accessor::Dimensions::Vec3 => 3,
-                        gltf::accessor::Dimensions::Vec4 => 4,
-                        _ => 1,
-                    };
-                    let stride = view.stride().unwrap_or(comp_count * 4);
-                    let mut out = Vec::with_capacity(count * comp_count);
-                    for i in 0..count {
-                        let base = offset + i * stride;
-                        for c in 0..comp_count {
-                            let off = base + c * 4;
-                            if off + 4 <= data.len() {
-                                let val = f32::from_le_bytes([
-                                    data[off], data[off + 1], data[off + 2], data[off + 3],
-                                ]);
-                                out.push(val);
-                            }
-                        }
-                    }
-                    out
-                } else {
-                    Vec::new()
-                }
-            };
+            if scene.splat_data.has_splats {
+                info!(
+                    "Merging additional splat primitive from mesh: {}",
+                    mesh.name().unwrap_or("unnamed")
+                );
+            } else {
+                info!(
+                    "Detected KHR_gaussian_splatting primitive in mesh: {}",
+                    mesh.name().unwrap_or("unnamed")
+                );
+            }
+
+            // Mark as KHR format (opacities are linear [0,1], need logit conversion)
+            scene.splat_data.khr_format = true;
 
             // Parse the extension's "attributes" sub-object for accessor indices
             let ext_attrs = ext.get("attributes");
 
             // Parse rotation accessor (vec4 quaternions)
-            let rotations: Vec<[f32; 4]> = ext_attrs
+            let prim_rotations: Vec<[f32; 4]> = ext_attrs
                 .and_then(|a| a.get("ROTATION"))
                 .and_then(|v| v.as_u64())
                 .map(|idx| {
@@ -773,10 +826,10 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                         ])
                         .collect()
                 })
-                .unwrap_or_else(|| vec![[0.0, 0.0, 0.0, 1.0]; num_splats as usize]);
+                .unwrap_or_else(|| vec![[0.0, 0.0, 0.0, 1.0]; prim_num_splats as usize]);
 
             // Parse scale accessor (vec3 -> pad to vec4)
-            let scales: Vec<[f32; 4]> = ext_attrs
+            let prim_scales: Vec<[f32; 4]> = ext_attrs
                 .and_then(|a| a.get("SCALE"))
                 .and_then(|v| v.as_u64())
                 .map(|idx| {
@@ -790,30 +843,30 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                         ])
                         .collect()
                 })
-                .unwrap_or_else(|| vec![[1.0, 1.0, 1.0, 0.0]; num_splats as usize]);
+                .unwrap_or_else(|| vec![[1.0, 1.0, 1.0, 0.0]; prim_num_splats as usize]);
 
             // Parse opacity accessor (scalar)
-            let opacities: Vec<f32> = ext_attrs
+            let prim_opacities: Vec<f32> = ext_attrs
                 .and_then(|a| a.get("OPACITY"))
                 .and_then(|v| v.as_u64())
                 .map(|idx| read_accessor_f32(idx as usize))
-                .unwrap_or_else(|| vec![1.0; num_splats as usize]);
+                .unwrap_or_else(|| vec![1.0; prim_num_splats as usize]);
 
             // Parse spherical harmonics coefficients
             // Extension format: "sh": [{"coefficients": <accessor_idx>, "degree": <N>}, ...]
-            let mut sh_degree = 0u32;
-            let mut sh_coefficients: Vec<Vec<[f32; 4]>> = Vec::new();
+            let mut prim_sh_degree = 0u32;
+            let mut prim_sh_coefficients: Vec<Vec<[f32; 4]>> = Vec::new();
             if let Some(sh_arr) = ext.get("sh").and_then(|v| v.as_array()) {
                 for sh_entry in sh_arr {
                     let degree = sh_entry.get("degree")
                         .and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    if degree > sh_degree {
-                        sh_degree = degree;
+                    if degree > prim_sh_degree {
+                        prim_sh_degree = degree;
                     }
                     if let Some(acc_idx) = sh_entry.get("coefficients").and_then(|v| v.as_u64()) {
                         let raw = read_accessor_f32(acc_idx as usize);
                         // Pad to vec4: source may be vec3 (3 floats per splat)
-                        let comp = if raw.len() == num_splats as usize * 3 { 3 } else { 4 };
+                        let comp = if raw.len() == prim_num_splats as usize * 3 { 3 } else { 4 };
                         let coeffs: Vec<[f32; 4]> = raw.chunks(comp)
                             .map(|c| [
                                 c.first().copied().unwrap_or(0.0),
@@ -822,33 +875,94 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                                 if comp >= 4 { c.get(3).copied().unwrap_or(0.0) } else { 0.0 },
                             ])
                             .collect();
-                        sh_coefficients.push(coeffs);
+                        prim_sh_coefficients.push(coeffs);
                     }
                 }
             }
 
+            // Update global max SH degree
+            if prim_sh_degree > global_max_sh_degree {
+                global_max_sh_degree = prim_sh_degree;
+            }
+
+            // Record per-primitive metadata for node transform application
+            splat_prim_infos.push(SplatPrimInfo {
+                mesh_index: mi,
+                start_splat: scene.splat_data.num_splats as usize,
+                splat_count: prim_num_splats as usize,
+            });
+
+            // Append positions, rotations, scales, opacities to scene-level arrays
+            scene.splat_data.positions.extend_from_slice(&prim_positions);
+            scene.splat_data.rotations.extend_from_slice(&prim_rotations);
+            scene.splat_data.scales.extend_from_slice(&prim_scales);
+            scene.splat_data.opacities.extend_from_slice(&prim_opacities);
+
+            // Append SH coefficients with zero-padding for missing higher degrees
+            // Ensure scene-level sh_coefficients has enough degree slots
+            if prim_sh_coefficients.len() > scene.splat_data.sh_coefficients.len() {
+                let old_size = scene.splat_data.sh_coefficients.len();
+                scene.splat_data.sh_coefficients.resize_with(
+                    prim_sh_coefficients.len(), Vec::new,
+                );
+                // Zero-fill new degree arrays for previously accumulated splats
+                for d in old_size..prim_sh_coefficients.len() {
+                    if !prim_sh_coefficients[d].is_empty() && prim_num_splats > 0 {
+                        let floats_per_splat = prim_sh_coefficients[d].len() / prim_num_splats as usize;
+                        scene.splat_data.sh_coefficients[d] =
+                            vec![[0.0f32; 4]; scene.splat_data.num_splats as usize * floats_per_splat];
+                    }
+                }
+            }
+            // Append this primitive's SH data for each degree
+            for d in 0..prim_sh_coefficients.len() {
+                scene.splat_data.sh_coefficients[d]
+                    .extend_from_slice(&prim_sh_coefficients[d]);
+            }
+            // For degrees that exist at the scene level but not in this primitive, zero-pad
+            for d in prim_sh_coefficients.len()..scene.splat_data.sh_coefficients.len() {
+                if !scene.splat_data.sh_coefficients[d].is_empty()
+                    && scene.splat_data.num_splats > 0
+                {
+                    let floats_per_splat = scene.splat_data.sh_coefficients[d].len()
+                        / scene.splat_data.num_splats as usize;
+                    let padding = vec![[0.0f32; 4]; prim_num_splats as usize * floats_per_splat];
+                    scene.splat_data.sh_coefficients[d].extend_from_slice(&padding);
+                }
+            }
+
+            scene.splat_data.num_splats += prim_num_splats;
+            scene.splat_data.has_splats = true;
+
             info!(
-                "KHR_gaussian_splatting: {} splats, SH degree {}, {} SH bands",
-                num_splats, sh_degree, sh_coefficients.len()
+                "Gaussian splats (cumulative): {} splats, primitive SH degree {}",
+                scene.splat_data.num_splats, prim_sh_degree
             );
-
-            scene.splat_data = GaussianSplatData {
-                positions,
-                rotations,
-                scales,
-                opacities,
-                sh_coefficients,
-                sh_degree,
-                num_splats,
-                has_splats: true,
-            };
-
-            // Only process the first gaussian splat primitive found
-            break;
         }
-        if scene.splat_data.has_splats {
-            break;
+    }
+
+    // Finalize global SH degree and apply KHR opacity logit conversion
+    if scene.splat_data.has_splats {
+        scene.splat_data.sh_degree = global_max_sh_degree;
+
+        // Convert KHR linear opacity [0,1] to logit for shader compatibility
+        // logit(p) = log(p / (1 - p))
+        // Only for KHR format; internal format (_OPACITY) already stores logit values
+        if scene.splat_data.khr_format {
+            for opacity in &mut scene.splat_data.opacities {
+                let p = opacity.clamp(1e-6, 1.0 - 1e-6);
+                *opacity = (p / (1.0 - p)).ln();
+            }
+            info!(
+                "Converted KHR linear opacity to logit for {} splats",
+                scene.splat_data.opacities.len()
+            );
         }
+
+        info!(
+            "Total gaussian splats: {}, max SH degree {}",
+            scene.splat_data.num_splats, scene.splat_data.sh_degree
+        );
     }
 
     // --- Nodes ---
@@ -891,6 +1005,158 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
     // Root nodes
     if let Some(gltf_scene) = document.default_scene().or_else(|| document.scenes().next()) {
         scene.root_nodes = gltf_scene.nodes().map(|n| n.index()).collect();
+    }
+
+    // --- Apply node transforms to splat data ---
+    // Now that nodes are loaded and parent relationships are set, compute world
+    // transforms and apply them to splat positions, rotations, and scales.
+    if scene.splat_data.has_splats && !splat_prim_infos.is_empty() {
+        // First compute world transforms for all nodes (top-down BFS from roots)
+        fn compute_world(nodes: &mut [GltfNode], node_idx: usize, parent_world: Mat4) {
+            let world = parent_world * nodes[node_idx].local_transform;
+            nodes[node_idx].world_transform = world;
+            let children = nodes[node_idx].children.clone();
+            for child in children {
+                if child < nodes.len() {
+                    compute_world(nodes, child, world);
+                }
+            }
+        }
+        for &root in &scene.root_nodes {
+            if root < scene.nodes.len() {
+                compute_world(&mut scene.nodes, root, Mat4::IDENTITY);
+            }
+        }
+
+        // Build mapping: glTF mesh index -> node world transform
+        // (use the first node referencing each mesh)
+        let mut mesh_to_world: std::collections::HashMap<usize, Mat4> =
+            std::collections::HashMap::new();
+        for node in &scene.nodes {
+            if node.mesh_index >= 0 {
+                let mi = node.mesh_index as usize;
+                mesh_to_world.entry(mi).or_insert(node.world_transform);
+            }
+        }
+
+        // Apply transforms to each splat primitive's data
+        for prim_info in &splat_prim_infos {
+            let world = match mesh_to_world.get(&prim_info.mesh_index) {
+                Some(m) => *m,
+                None => continue,
+            };
+
+            // Check if transform is identity (skip if so)
+            let cols = world.to_cols_array();
+            let identity_cols = Mat4::IDENTITY.to_cols_array();
+            let is_identity = cols.iter().zip(identity_cols.iter())
+                .all(|(a, b)| (a - b).abs() < 1e-6);
+            if is_identity {
+                continue;
+            }
+
+            info!(
+                "Applying node transform to splat range [{}, {})",
+                prim_info.start_splat,
+                prim_info.start_splat + prim_info.splat_count
+            );
+
+            // Extract rotation matrix (upper-left 3x3) and scale from world matrix
+            let col0 = Vec3::new(world.x_axis.x, world.x_axis.y, world.x_axis.z);
+            let col1 = Vec3::new(world.y_axis.x, world.y_axis.y, world.y_axis.z);
+            let col2 = Vec3::new(world.z_axis.x, world.z_axis.y, world.z_axis.z);
+            let sx = col0.length();
+            let sy = col1.length();
+            let sz = col2.length();
+            let uniform_scale = (sx * sy * sz).cbrt(); // geometric mean
+
+            // Normalize rotation matrix (remove scale)
+            let r0 = if sx > 1e-6 { col0 / sx } else { col0 };
+            let r1 = if sy > 1e-6 { col1 / sy } else { col1 };
+            let r2 = if sz > 1e-6 { col2 / sz } else { col2 };
+
+            // Convert rotation matrix to quaternion (Shepperd's method)
+            let trace = r0.x + r1.y + r2.z;
+            let node_quat: [f32; 4]; // [x, y, z, w]
+            if trace > 0.0 {
+                let s = 0.5 / (trace + 1.0f32).sqrt();
+                let w = 0.25 / s;
+                let x = (r1.z - r2.y) * s;
+                let y = (r2.x - r0.z) * s;
+                let z = (r0.y - r1.x) * s;
+                node_quat = [x, y, z, w];
+            } else if r0.x > r1.y && r0.x > r2.z {
+                let s = 2.0 * (1.0 + r0.x - r1.y - r2.z).sqrt();
+                let w = (r1.z - r2.y) / s;
+                let x = 0.25 * s;
+                let y = (r1.x + r0.y) / s;
+                let z = (r2.x + r0.z) / s;
+                node_quat = [x, y, z, w];
+            } else if r1.y > r2.z {
+                let s = 2.0 * (1.0 + r1.y - r0.x - r2.z).sqrt();
+                let w = (r2.x - r0.z) / s;
+                let x = (r1.x + r0.y) / s;
+                let y = 0.25 * s;
+                let z = (r2.y + r1.z) / s;
+                node_quat = [x, y, z, w];
+            } else {
+                let s = 2.0 * (1.0 + r2.z - r0.x - r1.y).sqrt();
+                let w = (r0.y - r1.x) / s;
+                let x = (r2.x + r0.z) / s;
+                let y = (r2.y + r1.z) / s;
+                let z = 0.25 * s;
+                node_quat = [x, y, z, w];
+            }
+            // Normalize quaternion
+            let qlen = (node_quat[0] * node_quat[0]
+                + node_quat[1] * node_quat[1]
+                + node_quat[2] * node_quat[2]
+                + node_quat[3] * node_quat[3])
+                .sqrt();
+            let nq = if qlen > 1e-6 {
+                [
+                    node_quat[0] / qlen,
+                    node_quat[1] / qlen,
+                    node_quat[2] / qlen,
+                    node_quat[3] / qlen,
+                ]
+            } else {
+                node_quat
+            };
+
+            let end_splat = prim_info.start_splat + prim_info.splat_count;
+
+            // Apply to positions: worldPos = world * vec4(pos, 1.0)
+            for si in prim_info.start_splat..end_splat {
+                if si >= scene.splat_data.positions.len() { break; }
+                let pos = scene.splat_data.positions[si];
+                let p = glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
+                let wp = world * p;
+                scene.splat_data.positions[si] = [wp.x, wp.y, wp.z, 1.0];
+            }
+
+            // Apply to rotations: q_combined = q_node * q_splat (Hamilton product)
+            for si in prim_info.start_splat..end_splat {
+                if si >= scene.splat_data.rotations.len() { break; }
+                let q = scene.splat_data.rotations[si];
+                let qx = q[0]; let qy = q[1]; let qz = q[2]; let qw = q[3];
+                scene.splat_data.rotations[si] = [
+                    nq[3] * qx + nq[0] * qw + nq[1] * qz - nq[2] * qy,
+                    nq[3] * qy - nq[0] * qz + nq[1] * qw + nq[2] * qx,
+                    nq[3] * qz + nq[0] * qy - nq[1] * qx + nq[2] * qw,
+                    nq[3] * qw - nq[0] * qx - nq[1] * qy - nq[2] * qz,
+                ];
+            }
+
+            // Apply to scales: log_scale + log(uniform_scale)
+            let log_scale = uniform_scale.ln();
+            for si in prim_info.start_splat..end_splat {
+                if si >= scene.splat_data.scales.len() { break; }
+                scene.splat_data.scales[si][0] += log_scale;
+                scene.splat_data.scales[si][1] += log_scale;
+                scene.splat_data.scales[si][2] += log_scale;
+            }
+        }
     }
 
     // --- Cameras ---

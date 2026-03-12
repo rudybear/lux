@@ -34,5 +34,8 @@ playground_cpp/build-metal/
 playground_cpp/deps/
 playground_rust/target/
 
+# Dear ImGui state
+imgui.ini
+
 # Claude Code working files
 .claude/

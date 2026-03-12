@@ -6,6 +6,7 @@
 #include <map>
 #include <stdexcept>
 #include <cstring>
+#include <cmath>
 #include <iostream>
 
 // cgltf — single-header glTF parser
@@ -287,6 +288,7 @@ GltfScene loadGltf(const std::string& path) {
         size_t primStart = scene.meshes.size();
         for (size_t pi = 0; pi < mesh.primitives_count; pi++) {
             auto& prim = mesh.primitives[pi];
+            if (prim.type == cgltf_primitive_type_points) continue;
             GltfMesh gmesh;
             gmesh.name = mesh.name ? mesh.name : "unnamed";
 
@@ -367,6 +369,17 @@ GltfScene loadGltf(const std::string& path) {
             || name == "KHR_gaussian_splatting:" + suffix;
     };
 
+    // Per-primitive metadata for deferred node transform application
+    struct SplatPrimInfo {
+        size_t meshIndex;     // cgltf mesh index this primitive belongs to
+        size_t startSplat;    // index of first splat in accumulated arrays
+        size_t splatCount;    // number of splats in this primitive
+    };
+    std::vector<SplatPrimInfo> splatPrimInfos;
+
+    // Track max SH degree across all primitives for zero-padding
+    uint32_t globalMaxSHDegree = 0;
+
     for (size_t mi = 0; mi < data->meshes_count; mi++) {
         auto& mesh = data->meshes[mi];
         for (size_t pi = 0; pi < mesh.primitives_count; pi++) {
@@ -375,18 +388,36 @@ GltfScene loadGltf(const std::string& path) {
 
             // Check for gaussian splatting attributes (both naming conventions)
             bool hasRotation = false, hasScale = false;
+            bool primIsKHR = false;
             for (size_t ai = 0; ai < prim.attributes_count; ai++) {
                 if (prim.attributes[ai].name) {
                     std::string attrName(prim.attributes[ai].name);
                     if (isSplatAttr(attrName, "ROTATION")) hasRotation = true;
                     if (isSplatAttr(attrName, "SCALE")) hasScale = true;
+                    if (attrName.rfind("KHR_gaussian_splatting:", 0) == 0) primIsKHR = true;
                 }
             }
 
             if (!hasRotation && !hasScale) continue;
 
-            std::cout << "[info] Detected KHR_gaussian_splatting primitive in mesh: "
-                      << (mesh.name ? mesh.name : "unnamed") << std::endl;
+            if (scene.splat_data.has_splats) {
+                std::cout << "[info] Merging additional splat primitive from mesh: "
+                          << (mesh.name ? mesh.name : "unnamed") << std::endl;
+            } else {
+                std::cout << "[info] Detected KHR_gaussian_splatting primitive in mesh: "
+                          << (mesh.name ? mesh.name : "unnamed") << std::endl;
+            }
+
+            if (primIsKHR) scene.splat_data.khr_format = true;
+
+            // Temporary per-primitive buffers
+            std::vector<float> primPositions;
+            std::vector<float> primRotations;
+            std::vector<float> primScales;
+            std::vector<float> primOpacities;
+            std::vector<std::vector<float>> primSHCoeffs; // per-degree
+            uint32_t primSHDegree = 0;
+            uint32_t primNumSplats = 0;
 
             // Parse all gaussian splatting attributes
             // Conformance SH format: KHR_gaussian_splatting:SH_DEGREE_N_COEF_M (vec3 each)
@@ -402,29 +433,29 @@ GltfScene loadGltf(const std::string& path) {
                 if (attr.type == cgltf_attribute_type_position) {
                     // Pack positions as vec4 (xyz, w=1)
                     auto pos3 = readFloatAccessor(attr.data);
-                    scene.splat_data.num_splats = static_cast<uint32_t>(attr.data->count);
-                    scene.splat_data.positions.resize(attr.data->count * 4);
+                    primNumSplats = static_cast<uint32_t>(attr.data->count);
+                    primPositions.resize(attr.data->count * 4);
                     for (size_t si = 0; si < attr.data->count; si++) {
-                        scene.splat_data.positions[si * 4 + 0] = pos3[si * 3 + 0];
-                        scene.splat_data.positions[si * 4 + 1] = pos3[si * 3 + 1];
-                        scene.splat_data.positions[si * 4 + 2] = pos3[si * 3 + 2];
-                        scene.splat_data.positions[si * 4 + 3] = 1.0f;
+                        primPositions[si * 4 + 0] = pos3[si * 3 + 0];
+                        primPositions[si * 4 + 1] = pos3[si * 3 + 1];
+                        primPositions[si * 4 + 2] = pos3[si * 3 + 2];
+                        primPositions[si * 4 + 3] = 1.0f;
                     }
                 } else if (isSplatAttr(attrName, "ROTATION")) {
-                    scene.splat_data.rotations = readFloatAccessor(attr.data);
+                    primRotations = readFloatAccessor(attr.data);
                 } else if (isSplatAttr(attrName, "SCALE")) {
-                    scene.splat_data.scales = readFloatAccessor(attr.data);
+                    primScales = readFloatAccessor(attr.data);
                 } else if (isSplatAttr(attrName, "OPACITY")) {
-                    scene.splat_data.opacities = readFloatAccessor(attr.data);
+                    primOpacities = readFloatAccessor(attr.data);
                 } else if (attrName.rfind("_SH_", 0) == 0) {
                     // Internal format: _SH_0, _SH_1, ... _SH_N (packed float array)
                     int degree = std::stoi(attrName.substr(4));
-                    if (degree >= static_cast<int>(scene.splat_data.sh_coefficients.size())) {
-                        scene.splat_data.sh_coefficients.resize(degree + 1);
+                    if (degree >= static_cast<int>(primSHCoeffs.size())) {
+                        primSHCoeffs.resize(degree + 1);
                     }
-                    scene.splat_data.sh_coefficients[degree] = readFloatAccessor(attr.data);
-                    if (static_cast<uint32_t>(degree) > scene.splat_data.sh_degree) {
-                        scene.splat_data.sh_degree = static_cast<uint32_t>(degree);
+                    primSHCoeffs[degree] = readFloatAccessor(attr.data);
+                    if (static_cast<uint32_t>(degree) > primSHDegree) {
+                        primSHDegree = static_cast<uint32_t>(degree);
                     }
                 } else if (attrName.rfind("KHR_gaussian_splatting:SH_DEGREE_", 0) == 0) {
                     // Conformance format: KHR_gaussian_splatting:SH_DEGREE_N_COEF_M
@@ -448,58 +479,120 @@ GltfScene loadGltf(const std::string& path) {
                 }
             }
 
-            // Pack KHR conformance SH data into our internal format
+            // Pack KHR conformance SH data into our internal per-primitive format
             // Internal: sh_coefficients[degree_idx] = flat float array (all splats, all coefficients for that degree)
             // Degree 0 has 1 coefficient (3 floats per splat = DC color)
             // Degree 1 has 3 coefficients, degree 2 has 5, degree 3 has 7
             if (!khrSHByDegree.empty()) {
-                int maxDegree = 0;
+                int maxDeg = 0;
                 for (auto& [deg, coeffs] : khrSHByDegree) {
-                    if (deg > maxDegree) maxDegree = deg;
+                    if (deg > maxDeg) maxDeg = deg;
                 }
-                scene.splat_data.sh_degree = static_cast<uint32_t>(maxDegree);
+                primSHDegree = static_cast<uint32_t>(maxDeg);
 
-                // For degree 0: pack as DC color (SH0 coefficient)
-                // Each KHR SH coefficient is a VEC3 (r,g,b) per splat
-                // Our internal format expects sh_coefficients[0] = [r0,g0,b0, r1,g1,b1, ...]
+                // Unpack KHR per-degree data into per-coefficient arrays
+                // Each coefficient gets its own array (vec3 per splat), matching
+                // the shader's splat_sh0..splat_sh15 buffer layout.
+                // Coefficient index mapping:
+                //   Degree 0: 1 coeff  -> indices 0
+                //   Degree 1: 3 coeffs -> indices 1,2,3
+                //   Degree 2: 5 coeffs -> indices 4,5,6,7,8
+                //   Degree 3: 7 coeffs -> indices 9,10,11,12,13,14,15
+                static const int coeffBase[] = {0, 1, 4, 9};
                 for (auto& [deg, coeffsByIdx] : khrSHByDegree) {
-                    // Ensure degree index exists in our array
-                    // For KHR format, we store ALL coefficients for a degree in one flat array
-                    // Number of coefficients per degree: 2*l+1
-                    size_t numCoeffs = coeffsByIdx.size();
-                    size_t numSplats = scene.splat_data.num_splats;
-
-                    // Flatten: for each splat, write all coefficients (each is vec3)
-                    std::vector<float> packed(numSplats * numCoeffs * 3, 0.0f);
-                    for (size_t ci = 0; ci < numCoeffs; ci++) {
-                        if (ci < coeffsByIdx.size() && !coeffsByIdx[ci].empty()) {
-                            for (size_t si = 0; si < numSplats; si++) {
-                                size_t srcBase = si * 3;
-                                size_t dstBase = si * numCoeffs * 3 + ci * 3;
-                                if (srcBase + 2 < coeffsByIdx[ci].size() && dstBase + 2 < packed.size()) {
-                                    packed[dstBase + 0] = coeffsByIdx[ci][srcBase + 0];
-                                    packed[dstBase + 1] = coeffsByIdx[ci][srcBase + 1];
-                                    packed[dstBase + 2] = coeffsByIdx[ci][srcBase + 2];
-                                }
-                            }
+                    int base = coeffBase[deg];
+                    for (size_t ci = 0; ci < coeffsByIdx.size(); ci++) {
+                        int coeffIdx = base + static_cast<int>(ci);
+                        if (coeffIdx >= static_cast<int>(primSHCoeffs.size())) {
+                            primSHCoeffs.resize(coeffIdx + 1);
+                        }
+                        if (!coeffsByIdx[ci].empty()) {
+                            primSHCoeffs[coeffIdx] = coeffsByIdx[ci]; // vec3 per splat
                         }
                     }
-
-                    if (deg >= static_cast<int>(scene.splat_data.sh_coefficients.size())) {
-                        scene.splat_data.sh_coefficients.resize(deg + 1);
-                    }
-                    scene.splat_data.sh_coefficients[deg] = std::move(packed);
                 }
             }
 
-            scene.splat_data.has_splats = true;
-            std::cout << "[info] Gaussian splats: " << scene.splat_data.num_splats
-                      << " splats, SH degree " << scene.splat_data.sh_degree << std::endl;
+            // Update global max SH degree
+            if (primSHDegree > globalMaxSHDegree) {
+                globalMaxSHDegree = primSHDegree;
+            }
 
-            // Only process the first gaussian splatting primitive
-            break;
+            // Record per-primitive metadata for node transform application
+            SplatPrimInfo info;
+            info.meshIndex = mi;
+            info.startSplat = scene.splat_data.num_splats;
+            info.splatCount = primNumSplats;
+            splatPrimInfos.push_back(info);
+
+            // Append positions, rotations, scales, opacities to scene-level arrays
+            scene.splat_data.positions.insert(scene.splat_data.positions.end(),
+                primPositions.begin(), primPositions.end());
+            scene.splat_data.rotations.insert(scene.splat_data.rotations.end(),
+                primRotations.begin(), primRotations.end());
+            scene.splat_data.scales.insert(scene.splat_data.scales.end(),
+                primScales.begin(), primScales.end());
+            scene.splat_data.opacities.insert(scene.splat_data.opacities.end(),
+                primOpacities.begin(), primOpacities.end());
+
+            // Append SH coefficients with zero-padding for missing higher degrees
+            // Ensure scene-level sh_coefficients has enough degree slots
+            if (primSHCoeffs.size() > scene.splat_data.sh_coefficients.size()) {
+                // Expand scene-level array; new degree slots need zero-padding for
+                // previously accumulated splats
+                size_t oldSize = scene.splat_data.sh_coefficients.size();
+                scene.splat_data.sh_coefficients.resize(primSHCoeffs.size());
+                // Zero-fill new degree arrays for previously accumulated splats
+                for (size_t d = oldSize; d < primSHCoeffs.size(); d++) {
+                    if (d < primSHCoeffs.size() && !primSHCoeffs[d].empty() && primNumSplats > 0) {
+                        // Determine floats-per-splat from this primitive's data
+                        size_t floatsPerSplat = primSHCoeffs[d].size() / primNumSplats;
+                        scene.splat_data.sh_coefficients[d].resize(
+                            scene.splat_data.num_splats * floatsPerSplat, 0.0f);
+                    }
+                }
+            }
+            // Now append this primitive's SH data for each degree
+            for (size_t d = 0; d < primSHCoeffs.size(); d++) {
+                scene.splat_data.sh_coefficients[d].insert(
+                    scene.splat_data.sh_coefficients[d].end(),
+                    primSHCoeffs[d].begin(), primSHCoeffs[d].end());
+            }
+            // For degrees that exist at the scene level but not in this primitive, zero-pad
+            for (size_t d = primSHCoeffs.size(); d < scene.splat_data.sh_coefficients.size(); d++) {
+                if (!scene.splat_data.sh_coefficients[d].empty() && scene.splat_data.num_splats > 0) {
+                    size_t floatsPerSplat = scene.splat_data.sh_coefficients[d].size() / scene.splat_data.num_splats;
+                    scene.splat_data.sh_coefficients[d].resize(
+                        scene.splat_data.sh_coefficients[d].size() + primNumSplats * floatsPerSplat, 0.0f);
+                }
+            }
+
+            scene.splat_data.num_splats += primNumSplats;
+            scene.splat_data.has_splats = true;
+
+            std::cout << "[info] Gaussian splats (cumulative): " << scene.splat_data.num_splats
+                      << " splats, primitive SH degree " << primSHDegree << std::endl;
         }
-        if (scene.splat_data.has_splats) break;
+    }
+
+    // Finalize global SH degree
+    if (scene.splat_data.has_splats) {
+        scene.splat_data.sh_degree = globalMaxSHDegree;
+
+        // Convert KHR linear opacity [0,1] to logit for shader compatibility
+        // logit(p) = log(p / (1 - p))
+        // Only for KHR format; internal format (_OPACITY) already stores logit values
+        if (scene.splat_data.khr_format) {
+            for (size_t i = 0; i < scene.splat_data.opacities.size(); ++i) {
+                float p = std::clamp(scene.splat_data.opacities[i], 1e-6f, 1.0f - 1e-6f);
+                scene.splat_data.opacities[i] = std::log(p / (1.0f - p));
+            }
+            std::cout << "[info] Converted KHR linear opacity to logit for "
+                      << scene.splat_data.opacities.size() << " splats" << std::endl;
+        }
+
+        std::cout << "[info] Total gaussian splats: " << scene.splat_data.num_splats
+                  << ", max SH degree " << scene.splat_data.sh_degree << std::endl;
     }
 
     // --- Nodes ---
@@ -543,6 +636,150 @@ GltfScene loadGltf(const std::string& path) {
         auto& s = data->scenes[data->scene ? cgltf_scene_index(data, data->scene) : 0];
         for (size_t i = 0; i < s.nodes_count; i++) {
             scene.rootNodes.push_back(static_cast<int>(cgltf_node_index(data, s.nodes[i])));
+        }
+    }
+
+    // --- Apply node transforms to splat data ---
+    // Now that nodes are loaded and parent relationships are set, compute world
+    // transforms and apply them to splat positions, rotations, and scales.
+    if (scene.splat_data.has_splats && !splatPrimInfos.empty()) {
+        // First compute world transforms for all nodes (top-down BFS from roots)
+        // We need to do this before flattenScene which also computes them
+        std::function<void(int, const glm::mat4&)> computeWorld =
+            [&](int nodeIdx, const glm::mat4& parentWorld) {
+                auto& node = scene.nodes[nodeIdx];
+                node.worldTransform = parentWorld * node.localTransform;
+                for (int child : node.children) {
+                    if (child >= 0 && child < static_cast<int>(scene.nodes.size())) {
+                        computeWorld(child, node.worldTransform);
+                    }
+                }
+            };
+        glm::mat4 identity(1.0f);
+        for (int root : scene.rootNodes) {
+            if (root >= 0 && root < static_cast<int>(scene.nodes.size())) {
+                computeWorld(root, identity);
+            }
+        }
+
+        // Build mapping: cgltf mesh index -> node world transform
+        // (use the first node referencing each mesh)
+        std::unordered_map<size_t, glm::mat4> meshToWorldTransform;
+        for (size_t ni = 0; ni < scene.nodes.size(); ni++) {
+            int mi = scene.nodes[ni].meshIndex;
+            if (mi >= 0 && meshToWorldTransform.find(static_cast<size_t>(mi)) == meshToWorldTransform.end()) {
+                meshToWorldTransform[static_cast<size_t>(mi)] = scene.nodes[ni].worldTransform;
+            }
+        }
+
+        // Apply transforms to each splat primitive's data
+        for (auto& info : splatPrimInfos) {
+            auto it = meshToWorldTransform.find(info.meshIndex);
+            if (it == meshToWorldTransform.end()) continue;
+
+            glm::mat4 world = it->second;
+
+            // Check if transform is identity (skip if so)
+            bool isIdentity = true;
+            for (int c = 0; c < 4 && isIdentity; c++) {
+                for (int r = 0; r < 4 && isIdentity; r++) {
+                    float expected = (c == r) ? 1.0f : 0.0f;
+                    if (std::abs(world[c][r] - expected) > 1e-6f) isIdentity = false;
+                }
+            }
+            if (isIdentity) continue;
+
+            std::cout << "[info] Applying node transform to splat range ["
+                      << info.startSplat << ", " << info.startSplat + info.splatCount
+                      << ")" << std::endl;
+
+            // Extract rotation quaternion from the 3x3 upper-left of the world matrix
+            // (assumes no shear; uses normalized rotation matrix)
+            glm::mat3 rotMat(world);
+            // Extract scale from column lengths
+            float sx = glm::length(glm::vec3(rotMat[0]));
+            float sy = glm::length(glm::vec3(rotMat[1]));
+            float sz = glm::length(glm::vec3(rotMat[2]));
+            float uniformScale = std::cbrt(sx * sy * sz); // geometric mean
+
+            // Normalize rotation matrix (remove scale)
+            if (sx > 1e-6f) rotMat[0] /= sx;
+            if (sy > 1e-6f) rotMat[1] /= sy;
+            if (sz > 1e-6f) rotMat[2] /= sz;
+
+            // Convert rotation matrix to quaternion (Shepperd's method)
+            glm::vec4 nodeQuat;
+            float trace = rotMat[0][0] + rotMat[1][1] + rotMat[2][2];
+            if (trace > 0.0f) {
+                float s = 0.5f / std::sqrt(trace + 1.0f);
+                nodeQuat.w = 0.25f / s;
+                nodeQuat.x = (rotMat[1][2] - rotMat[2][1]) * s;
+                nodeQuat.y = (rotMat[2][0] - rotMat[0][2]) * s;
+                nodeQuat.z = (rotMat[0][1] - rotMat[1][0]) * s;
+            } else if (rotMat[0][0] > rotMat[1][1] && rotMat[0][0] > rotMat[2][2]) {
+                float s = 2.0f * std::sqrt(1.0f + rotMat[0][0] - rotMat[1][1] - rotMat[2][2]);
+                nodeQuat.w = (rotMat[1][2] - rotMat[2][1]) / s;
+                nodeQuat.x = 0.25f * s;
+                nodeQuat.y = (rotMat[1][0] + rotMat[0][1]) / s;
+                nodeQuat.z = (rotMat[2][0] + rotMat[0][2]) / s;
+            } else if (rotMat[1][1] > rotMat[2][2]) {
+                float s = 2.0f * std::sqrt(1.0f + rotMat[1][1] - rotMat[0][0] - rotMat[2][2]);
+                nodeQuat.w = (rotMat[2][0] - rotMat[0][2]) / s;
+                nodeQuat.x = (rotMat[1][0] + rotMat[0][1]) / s;
+                nodeQuat.y = 0.25f * s;
+                nodeQuat.z = (rotMat[2][1] + rotMat[1][2]) / s;
+            } else {
+                float s = 2.0f * std::sqrt(1.0f + rotMat[2][2] - rotMat[0][0] - rotMat[1][1]);
+                nodeQuat.w = (rotMat[0][1] - rotMat[1][0]) / s;
+                nodeQuat.x = (rotMat[2][0] + rotMat[0][2]) / s;
+                nodeQuat.y = (rotMat[2][1] + rotMat[1][2]) / s;
+                nodeQuat.z = 0.25f * s;
+            }
+            // Normalize quaternion
+            float qlen = std::sqrt(nodeQuat.x*nodeQuat.x + nodeQuat.y*nodeQuat.y +
+                                   nodeQuat.z*nodeQuat.z + nodeQuat.w*nodeQuat.w);
+            if (qlen > 1e-6f) { nodeQuat.x /= qlen; nodeQuat.y /= qlen; nodeQuat.z /= qlen; nodeQuat.w /= qlen; }
+
+            // Apply to positions: worldPos = world * vec4(pos, 1.0)
+            for (size_t si = info.startSplat; si < info.startSplat + info.splatCount; si++) {
+                size_t base = si * 4;
+                if (base + 3 >= scene.splat_data.positions.size()) break;
+                glm::vec4 pos(scene.splat_data.positions[base],
+                              scene.splat_data.positions[base + 1],
+                              scene.splat_data.positions[base + 2], 1.0f);
+                glm::vec4 worldPos = world * pos;
+                scene.splat_data.positions[base + 0] = worldPos.x;
+                scene.splat_data.positions[base + 1] = worldPos.y;
+                scene.splat_data.positions[base + 2] = worldPos.z;
+                scene.splat_data.positions[base + 3] = 1.0f;
+            }
+
+            // Apply to rotations: multiply splat quaternion by node quaternion
+            // q_combined = q_node * q_splat (Hamilton product)
+            for (size_t si = info.startSplat; si < info.startSplat + info.splatCount; si++) {
+                size_t base = si * 4;
+                if (base + 3 >= scene.splat_data.rotations.size()) break;
+                float qx = scene.splat_data.rotations[base + 0];
+                float qy = scene.splat_data.rotations[base + 1];
+                float qz = scene.splat_data.rotations[base + 2];
+                float qw = scene.splat_data.rotations[base + 3];
+                // Hamilton product: nodeQuat * splatQuat
+                scene.splat_data.rotations[base + 0] = nodeQuat.w*qx + nodeQuat.x*qw + nodeQuat.y*qz - nodeQuat.z*qy;
+                scene.splat_data.rotations[base + 1] = nodeQuat.w*qy - nodeQuat.x*qz + nodeQuat.y*qw + nodeQuat.z*qx;
+                scene.splat_data.rotations[base + 2] = nodeQuat.w*qz + nodeQuat.x*qy - nodeQuat.y*qx + nodeQuat.z*qw;
+                scene.splat_data.rotations[base + 3] = nodeQuat.w*qw - nodeQuat.x*qx - nodeQuat.y*qy - nodeQuat.z*qz;
+            }
+
+            // Apply to scales: multiply by uniform scale factor
+            // Scales are in log-space, so add log(uniformScale) to each component
+            float logScale = std::log(uniformScale);
+            for (size_t si = info.startSplat; si < info.startSplat + info.splatCount; si++) {
+                size_t base = si * 3;
+                if (base + 2 >= scene.splat_data.scales.size()) break;
+                scene.splat_data.scales[base + 0] += logScale;
+                scene.splat_data.scales[base + 1] += logScale;
+                scene.splat_data.scales[base + 2] += logScale;
+            }
         }
     }
 

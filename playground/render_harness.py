@@ -97,12 +97,115 @@ def load_shader_module(device: wgpu.GPUDevice, spv_path: Path) -> wgpu.GPUShader
 # GLB / Gaussian splat loading
 # ---------------------------------------------------------------------------
 
-def load_splat_glb(path: Path) -> dict:
-    """Parse a GLB file with KHR_gaussian_splatting extension.
+def _is_splat_attr(name: str, suffix: str) -> bool:
+    """Check if a glTF attribute name matches a splat attribute.
 
-    Returns a dict with numpy arrays: positions (N,3), rotations (N,4),
-    scales (N,3), opacities (N,), sh_coeffs list of arrays, sh_degree int,
-    and num_splats int.
+    Supports both internal format (_ROTATION, _SCALE, _OPACITY, _SH_N)
+    and KHR conformance format (KHR_gaussian_splatting:ROTATION, etc.).
+    """
+    return name == f"_{suffix}" or name == f"KHR_gaussian_splatting:{suffix}"
+
+
+def _node_local_transform(node: dict) -> np.ndarray:
+    """Compute a 4x4 local transform matrix from a glTF node's TRS or matrix."""
+    if 'matrix' in node:
+        # glTF stores matrices in column-major order
+        return np.array(node['matrix'], dtype=np.float64).reshape(4, 4)
+
+    m = np.eye(4, dtype=np.float64)
+
+    if 'scale' in node:
+        s = node['scale']
+        sm = np.eye(4, dtype=np.float64)
+        sm[0, 0], sm[1, 1], sm[2, 2] = s[0], s[1], s[2]
+        m = sm
+
+    if 'rotation' in node:
+        x, y, z, w = node['rotation']
+        rm = np.eye(4, dtype=np.float64)
+        rm[0, 0] = 1 - 2 * (y * y + z * z)
+        rm[0, 1] = 2 * (x * y + z * w)
+        rm[0, 2] = 2 * (x * z - y * w)
+        rm[1, 0] = 2 * (x * y - z * w)
+        rm[1, 1] = 1 - 2 * (x * x + z * z)
+        rm[1, 2] = 2 * (y * z + x * w)
+        rm[2, 0] = 2 * (x * z + y * w)
+        rm[2, 1] = 2 * (y * z - x * w)
+        rm[2, 2] = 1 - 2 * (x * x + y * y)
+        m = rm @ m
+
+    if 'translation' in node:
+        t = node['translation']
+        tm = np.eye(4, dtype=np.float64)
+        tm[0, 3], tm[1, 3], tm[2, 3] = t[0], t[1], t[2]
+        m = tm @ m
+
+    return m
+
+
+def _mat3_to_quaternion(rot_mat: np.ndarray) -> np.ndarray:
+    """Convert a 3x3 rotation matrix to an XYZW quaternion (Shepperd's method)."""
+    m = rot_mat
+    trace = m[0, 0] + m[1, 1] + m[2, 2]
+    if trace > 0.0:
+        s = 0.5 / math.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (m[1, 2] - m[2, 1]) * s
+        y = (m[2, 0] - m[0, 2]) * s
+        z = (m[0, 1] - m[1, 0]) * s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
+        w = (m[1, 2] - m[2, 1]) / s
+        x = 0.25 * s
+        y = (m[1, 0] + m[0, 1]) / s
+        z = (m[2, 0] + m[0, 2]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
+        w = (m[2, 0] - m[0, 2]) / s
+        x = (m[1, 0] + m[0, 1]) / s
+        y = 0.25 * s
+        z = (m[2, 1] + m[1, 2]) / s
+    else:
+        s = 2.0 * math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
+        w = (m[0, 1] - m[1, 0]) / s
+        x = (m[2, 0] + m[0, 2]) / s
+        y = (m[2, 1] + m[1, 2]) / s
+        z = 0.25 * s
+    q = np.array([x, y, z, w], dtype=np.float64)
+    qlen = np.linalg.norm(q)
+    if qlen > 1e-6:
+        q /= qlen
+    return q
+
+
+def _quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton quaternion product q1 * q2. Both in XYZW format."""
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return np.array([
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ], dtype=np.float64)
+
+
+def load_splat_glb(path: Path) -> dict:
+    """Parse a GLB file and extract Gaussian splat data.
+
+    Supports multi-primitive merging across all meshes, KHR_gaussian_splatting
+    opacity logit conversion, node transform application, and hybrid
+    mesh+splat scenes (POINTS primitives are splats, others are mesh geometry).
+
+    Returns a dict with numpy arrays:
+        positions   (N, 3)  - world-space xyz
+        rotations   (N, 4)  - XYZW quaternion (world-space)
+        scales      (N, 3)  - log-space (world-transformed)
+        opacities   (N,)    - logit-space (ready for sigmoid in rasterizer)
+        sh_coeffs   list of (N, C) arrays per SH degree
+        sh_degree   int     - max SH degree across all primitives
+        num_splats  int
+        has_mesh    bool    - True if non-POINTS mesh geometry also exists
     """
     data = path.read_bytes()
     magic, version, length = struct.unpack_from('<III', data, 0)
@@ -128,26 +231,404 @@ def load_splat_glb(path: Path) -> dict:
     def read_accessor(idx):
         acc = accessors[idx]
         bv = buffer_views[acc['bufferView']]
-        offset = bv.get('byteOffset', 0)
+        offset = bv.get('byteOffset', 0) + acc.get('byteOffset', 0)
         count = acc['count']
         components = {'SCALAR': 1, 'VEC2': 2, 'VEC3': 3, 'VEC4': 4}[acc['type']]
         arr = np.frombuffer(bin_data, dtype=np.float32,
                             count=count * components, offset=offset)
         return arr.reshape(count, components) if components > 1 else arr.copy()
 
-    prim = gltf['meshes'][0]['primitives'][0]
-    gs = prim['extensions']['KHR_gaussian_splatting']
+    # -----------------------------------------------------------------------
+    # Scan all meshes for POINTS primitives (splats) and non-POINTS (mesh)
+    # -----------------------------------------------------------------------
+    # Per-primitive metadata for deferred node transform application
+    class _PrimInfo:
+        __slots__ = ('mesh_index', 'start_splat', 'splat_count')
+        def __init__(self, mi, start, count):
+            self.mesh_index = mi
+            self.start_splat = start
+            self.splat_count = count
 
-    result = {
-        'positions': read_accessor(prim['attributes']['POSITION']),
-        'rotations': read_accessor(gs['attributes']['ROTATION']),
-        'scales': read_accessor(gs['attributes']['SCALE']),
-        'opacities': read_accessor(gs['attributes']['OPACITY']),
-        'sh_coeffs': [read_accessor(e['coefficients']) for e in gs.get('sh', [])],
-        'sh_degree': max((e['degree'] for e in gs.get('sh', [])), default=0),
-        'num_splats': accessors[prim['attributes']['POSITION']]['count'],
+    all_positions = []      # list of (Ni, 3) arrays
+    all_rotations = []      # list of (Ni, 4) arrays
+    all_scales = []         # list of (Ni, 3) arrays
+    all_opacities = []      # list of (Ni,) arrays
+    # Per-degree: list of (Ni, C) arrays per primitive
+    all_sh_per_degree = {}  # degree -> list of (Ni, C) arrays
+    prim_infos = []
+    global_max_sh_degree = 0
+    total_splats = 0
+    khr_format = False
+    has_mesh = False
+
+    for mi, mesh in enumerate(gltf.get('meshes', [])):
+        for prim in mesh.get('primitives', []):
+            # glTF mode: 0 = POINTS, 4 = TRIANGLES (default if absent)
+            mode = prim.get('mode', 4)
+            if mode != 0:
+                # Non-POINTS primitive -- this is regular mesh geometry
+                has_mesh = True
+                continue
+
+            attrs = prim.get('attributes', {})
+
+            # Detect splat attributes: check for KHR extension or _ROTATION/_SCALE
+            # prim_is_khr is True ONLY when attribute names use the
+            # "KHR_gaussian_splatting:" prefix (conformance format with linear
+            # opacity).  Having the extension object alone does NOT imply
+            # linear opacity -- internal format stores logit values.
+            has_rotation = False
+            has_scale = False
+            prim_is_khr = False
+            gs_ext = prim.get('extensions', {}).get('KHR_gaussian_splatting')
+
+            # Always scan top-level attributes for both naming conventions
+            for aname in attrs:
+                if _is_splat_attr(aname, 'ROTATION'):
+                    has_rotation = True
+                if _is_splat_attr(aname, 'SCALE'):
+                    has_scale = True
+                if aname.startswith('KHR_gaussian_splatting:'):
+                    prim_is_khr = True
+
+            # Also check the extension object's attributes sub-dict
+            if gs_ext is not None:
+                gs_attrs_dict = gs_ext.get('attributes', {})
+                if 'ROTATION' in gs_attrs_dict:
+                    has_rotation = True
+                if 'SCALE' in gs_attrs_dict:
+                    has_scale = True
+
+            if not has_rotation and not has_scale:
+                continue
+
+            if prim_is_khr:
+                khr_format = True
+
+            # Read position data
+            if 'POSITION' not in attrs:
+                continue
+            positions = read_accessor(attrs['POSITION'])
+            prim_n = positions.shape[0]
+            if prim_n == 0:
+                continue
+
+            # Read splat-specific attributes.
+            # Three formats:
+            #   1. Conformance: attrs have "KHR_gaussian_splatting:ROTATION" etc.
+            #   2. Extension object: gs_ext.attributes = {ROTATION: idx, ...}
+            #   3. Underscore: attrs have "_ROTATION", "_SCALE" etc.
+            prim_sh = {}
+
+            if prim_is_khr:
+                # Conformance format: read from top-level attrs with prefix
+                rot_key = next((k for k in attrs if k.endswith(':ROTATION')), None)
+                scl_key = next((k for k in attrs if k.endswith(':SCALE')), None)
+                opa_key = next((k for k in attrs if k.endswith(':OPACITY')), None)
+
+                rotations = read_accessor(attrs[rot_key]) if rot_key else np.zeros((prim_n, 4), dtype=np.float32)
+                scales = read_accessor(attrs[scl_key]) if scl_key else np.zeros((prim_n, 3), dtype=np.float32)
+                opacities = read_accessor(attrs[opa_key]) if opa_key else np.zeros(prim_n, dtype=np.float32)
+
+                # SH from conformance attributes or extension sh list
+                for aname in attrs:
+                    if 'SH_DEGREE_' in aname:
+                        # KHR_gaussian_splatting:SH_DEGREE_N_COEF_M
+                        # For simplicity, treat each as a separate degree entry
+                        # The read_accessor returns the vec3 per splat
+                        rest = aname.split('SH_DEGREE_')[1]
+                        parts = rest.split('_COEF_')
+                        if len(parts) == 2:
+                            degree = int(parts[0])
+                            coeffs = read_accessor(attrs[aname])
+                            # For degree 0, there's only 1 coef (the DC)
+                            if degree not in prim_sh:
+                                prim_sh[degree] = coeffs
+                            else:
+                                # Multiple coefs for same degree: concat columns
+                                prim_sh[degree] = np.hstack([prim_sh[degree], coeffs])
+                            if degree > global_max_sh_degree:
+                                global_max_sh_degree = degree
+
+                # Also check extension sh list (some conformance files may use it)
+                if gs_ext is not None:
+                    for sh_entry in gs_ext.get('sh', []):
+                        degree = sh_entry['degree']
+                        coeffs = read_accessor(sh_entry['coefficients'])
+                        if degree not in prim_sh:
+                            prim_sh[degree] = coeffs
+                        if degree > global_max_sh_degree:
+                            global_max_sh_degree = degree
+
+            elif gs_ext is not None and gs_ext.get('attributes'):
+                # Extension object format: accessor indices in gs_ext.attributes
+                gs_attrs = gs_ext['attributes']
+                rotations = read_accessor(gs_attrs['ROTATION']) if 'ROTATION' in gs_attrs else np.zeros((prim_n, 4), dtype=np.float32)
+                scales = read_accessor(gs_attrs['SCALE']) if 'SCALE' in gs_attrs else np.zeros((prim_n, 3), dtype=np.float32)
+                opacities = read_accessor(gs_attrs['OPACITY']) if 'OPACITY' in gs_attrs else np.zeros(prim_n, dtype=np.float32)
+
+                # SH from extension sh list
+                for sh_entry in gs_ext.get('sh', []):
+                    degree = sh_entry['degree']
+                    coeffs = read_accessor(sh_entry['coefficients'])
+                    prim_sh[degree] = coeffs
+                    if degree > global_max_sh_degree:
+                        global_max_sh_degree = degree
+
+            else:
+                # Underscore attribute format (_ROTATION, _SCALE, _OPACITY, _SH_N)
+                rot_key = next((k for k in attrs if _is_splat_attr(k, 'ROTATION')), None)
+                scl_key = next((k for k in attrs if _is_splat_attr(k, 'SCALE')), None)
+                opa_key = next((k for k in attrs if _is_splat_attr(k, 'OPACITY')), None)
+
+                rotations = read_accessor(attrs[rot_key]) if rot_key else np.zeros((prim_n, 4), dtype=np.float32)
+                scales = read_accessor(attrs[scl_key]) if scl_key else np.zeros((prim_n, 3), dtype=np.float32)
+                opacities = read_accessor(attrs[opa_key]) if opa_key else np.zeros(prim_n, dtype=np.float32)
+
+                # SH from _SH_N attributes
+                for aname in attrs:
+                    if aname.startswith('_SH_'):
+                        degree = int(aname[4:])
+                        prim_sh[degree] = read_accessor(attrs[aname])
+                        if degree > global_max_sh_degree:
+                            global_max_sh_degree = degree
+
+            # Ensure correct shapes
+            if positions.ndim == 1:
+                positions = positions.reshape(-1, 3)
+            if rotations.ndim == 1:
+                rotations = rotations.reshape(-1, 4)
+            if scales.ndim == 1:
+                scales = scales.reshape(-1, 3)
+
+            # Record per-primitive info for node transform
+            prim_infos.append(_PrimInfo(mi, total_splats, prim_n))
+
+            all_positions.append(positions)
+            all_rotations.append(rotations)
+            all_scales.append(scales)
+            all_opacities.append(opacities)
+
+            # Accumulate SH by degree
+            for degree, coeffs in prim_sh.items():
+                if degree not in all_sh_per_degree:
+                    all_sh_per_degree[degree] = []
+                all_sh_per_degree[degree].append((total_splats, prim_n, coeffs))
+
+            total_splats += prim_n
+
+    # -----------------------------------------------------------------------
+    # Handle legacy single-primitive path (no POINTS mode set but has KHR ext)
+    # -----------------------------------------------------------------------
+    if total_splats == 0:
+        # Fall back: try the original path for files that don't set mode=0
+        for mi, mesh in enumerate(gltf.get('meshes', [])):
+            for prim in mesh.get('primitives', []):
+                gs_ext = prim.get('extensions', {}).get('KHR_gaussian_splatting')
+                if gs_ext is None:
+                    continue
+
+                # Check if this primitive uses conformance attribute naming
+                attrs = prim.get('attributes', {})
+                for aname in attrs:
+                    if aname.startswith('KHR_gaussian_splatting:'):
+                        khr_format = True
+                        break
+                gs_attrs = gs_ext.get('attributes', {})
+
+                if 'POSITION' not in attrs:
+                    continue
+                positions = read_accessor(attrs['POSITION'])
+                prim_n = positions.shape[0]
+                if prim_n == 0:
+                    continue
+
+                rotations = read_accessor(gs_attrs['ROTATION']) if 'ROTATION' in gs_attrs else np.zeros((prim_n, 4), dtype=np.float32)
+                scales = read_accessor(gs_attrs['SCALE']) if 'SCALE' in gs_attrs else np.zeros((prim_n, 3), dtype=np.float32)
+                opacities = read_accessor(gs_attrs['OPACITY']) if 'OPACITY' in gs_attrs else np.zeros(prim_n, dtype=np.float32)
+
+                if positions.ndim == 1:
+                    positions = positions.reshape(-1, 3)
+                if rotations.ndim == 1:
+                    rotations = rotations.reshape(-1, 4)
+                if scales.ndim == 1:
+                    scales = scales.reshape(-1, 3)
+
+                prim_sh = {}
+                for sh_entry in gs_ext.get('sh', []):
+                    degree = sh_entry['degree']
+                    coeffs = read_accessor(sh_entry['coefficients'])
+                    prim_sh[degree] = coeffs
+                    if degree > global_max_sh_degree:
+                        global_max_sh_degree = degree
+
+                prim_infos.append(_PrimInfo(mi, total_splats, prim_n))
+                all_positions.append(positions)
+                all_rotations.append(rotations)
+                all_scales.append(scales)
+                all_opacities.append(opacities)
+
+                for degree, coeffs in prim_sh.items():
+                    if degree not in all_sh_per_degree:
+                        all_sh_per_degree[degree] = []
+                    all_sh_per_degree[degree].append((total_splats, prim_n, coeffs))
+
+                total_splats += prim_n
+
+    if total_splats == 0:
+        raise ValueError(f"No Gaussian splat primitives found in {path}")
+
+    # -----------------------------------------------------------------------
+    # Merge accumulated arrays
+    # -----------------------------------------------------------------------
+    merged_positions = np.concatenate(all_positions, axis=0)   # (N, 3)
+    merged_rotations = np.concatenate(all_rotations, axis=0)   # (N, 4)
+    merged_scales = np.concatenate(all_scales, axis=0)         # (N, 3)
+    merged_opacities = np.concatenate(all_opacities, axis=0)   # (N,)
+
+    # Merge SH coefficients with zero-padding for primitives missing higher degrees
+    sh_coeffs_list = []
+    for degree in sorted(all_sh_per_degree.keys()):
+        entries = all_sh_per_degree[degree]
+        # Determine the number of components per splat for this degree
+        # from the first entry that has data
+        components = None
+        for _, _, coeffs in entries:
+            if coeffs.ndim == 2:
+                components = coeffs.shape[1]
+            else:
+                components = 1
+            break
+        if components is None:
+            continue
+
+        merged = np.zeros((total_splats, components), dtype=np.float32)
+        for start, count, coeffs in entries:
+            if coeffs.ndim == 1:
+                # Scalar per splat
+                merged[start:start + count, 0] = coeffs[:count]
+            else:
+                # Pad or truncate to match target components
+                c = min(coeffs.shape[1], components)
+                merged[start:start + count, :c] = coeffs[:count, :c]
+        sh_coeffs_list.append(merged)
+
+    # -----------------------------------------------------------------------
+    # KHR opacity logit conversion
+    # -----------------------------------------------------------------------
+    # KHR_gaussian_splatting stores opacity in linear [0,1] space.
+    # The CPU rasterizer applies sigmoid, so we need logit(p) = log(p/(1-p))
+    # to produce the correct value after sigmoid is applied.
+    # Non-KHR formats already store logit values.
+    if khr_format:
+        p = np.clip(merged_opacities, 1e-6, 1.0 - 1e-6)
+        merged_opacities = np.log(p / (1.0 - p)).astype(np.float32)
+
+    # -----------------------------------------------------------------------
+    # Node transform application
+    # -----------------------------------------------------------------------
+    nodes = gltf.get('nodes', [])
+    if nodes and prim_infos:
+        # Compute local transforms for each node
+        local_transforms = []
+        for node in nodes:
+            local_transforms.append(_node_local_transform(node))
+
+        # Build parent mapping from children lists
+        parents = [-1] * len(nodes)
+        for ni, node in enumerate(nodes):
+            for ci in node.get('children', []):
+                if 0 <= ci < len(nodes):
+                    parents[ci] = ni
+
+        # Determine root nodes from scene
+        root_nodes = []
+        scenes = gltf.get('scenes', [])
+        if scenes:
+            scene_idx = gltf.get('scene', 0)
+            if 0 <= scene_idx < len(scenes):
+                root_nodes = scenes[scene_idx].get('nodes', [])
+        if not root_nodes:
+            # Fallback: nodes with no parent
+            root_nodes = [i for i in range(len(nodes)) if parents[i] == -1]
+
+        # Compute world transforms (top-down BFS from roots)
+        world_transforms = [np.eye(4, dtype=np.float64)] * len(nodes)
+
+        def _compute_world(ni, parent_world):
+            world_transforms[ni] = parent_world @ local_transforms[ni]
+            for ci in nodes[ni].get('children', []):
+                if 0 <= ci < len(nodes):
+                    _compute_world(ci, world_transforms[ni])
+
+        for root in root_nodes:
+            if 0 <= root < len(nodes):
+                _compute_world(root, np.eye(4, dtype=np.float64))
+
+        # Build mapping: glTF mesh index -> first node's world transform
+        mesh_to_world = {}
+        for ni, node in enumerate(nodes):
+            mi = node.get('mesh', -1)
+            if mi >= 0 and mi not in mesh_to_world:
+                mesh_to_world[mi] = world_transforms[ni]
+
+        # Apply transforms to each primitive's splat range
+        for info in prim_infos:
+            world = mesh_to_world.get(info.mesh_index)
+            if world is None:
+                continue
+
+            # Check if transform is identity (skip if so)
+            if np.allclose(world, np.eye(4), atol=1e-6):
+                continue
+
+            sl = slice(info.start_splat, info.start_splat + info.splat_count)
+
+            # --- Transform positions: world @ (pos, 1) -> xyz ---
+            pos = merged_positions[sl]  # (K, 3)
+            ones = np.ones((pos.shape[0], 1), dtype=np.float64)
+            pos4 = np.hstack([pos.astype(np.float64), ones])  # (K, 4)
+            world_pos = (world @ pos4.T).T  # (K, 4)
+            merged_positions[sl] = world_pos[:, :3].astype(np.float32)
+
+            # --- Extract rotation and scale from world matrix ---
+            rot_mat = world[:3, :3].copy()
+            sx = np.linalg.norm(rot_mat[:, 0])
+            sy = np.linalg.norm(rot_mat[:, 1])
+            sz = np.linalg.norm(rot_mat[:, 2])
+            uniform_scale = (sx * sy * sz) ** (1.0 / 3.0)  # geometric mean
+
+            # Normalize rotation matrix (remove scale)
+            if sx > 1e-6:
+                rot_mat[:, 0] /= sx
+            if sy > 1e-6:
+                rot_mat[:, 1] /= sy
+            if sz > 1e-6:
+                rot_mat[:, 2] /= sz
+
+            node_quat = _mat3_to_quaternion(rot_mat)  # XYZW
+
+            # --- Transform rotations: q_node * q_splat ---
+            rots = merged_rotations[sl].astype(np.float64)  # (K, 4)
+            for i in range(rots.shape[0]):
+                rots[i] = _quat_multiply(node_quat, rots[i])
+            merged_rotations[sl] = rots.astype(np.float32)
+
+            # --- Transform scales: log_scale + log(uniform_scale) ---
+            if uniform_scale > 1e-6:
+                log_scale = math.log(uniform_scale)
+                merged_scales[sl] = (merged_scales[sl].astype(np.float64) + log_scale).astype(np.float32)
+
+    return {
+        'positions': merged_positions,
+        'rotations': merged_rotations,
+        'scales': merged_scales,
+        'opacities': merged_opacities,
+        'sh_coeffs': sh_coeffs_list,
+        'sh_degree': global_max_sh_degree,
+        'num_splats': total_splats,
+        'has_mesh': has_mesh,
     }
-    return result
 
 
 # ---------------------------------------------------------------------------

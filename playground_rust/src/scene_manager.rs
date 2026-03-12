@@ -658,6 +658,9 @@ pub trait Renderer {
     /// The output image (for screenshot readback).
     fn output_image(&self) -> vk::Image;
 
+    /// The depth image (for hybrid compositing). Default: null (not available).
+    fn depth_image(&self) -> vk::Image { vk::Image::null() }
+
     /// The output image format.
     fn output_format(&self) -> vk::Format;
 

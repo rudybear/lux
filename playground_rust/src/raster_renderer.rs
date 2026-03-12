@@ -3790,7 +3790,8 @@ impl PersistentRenderer {
         let depth_image = create_offscreen_image(
             &device, ctx.allocator_mut(), width, height,
             vk::Format::D32_SFLOAT,
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC,
             vk::ImageAspectFlags::DEPTH, "pbr_depth",
         )?;
 
@@ -5574,6 +5575,10 @@ impl scene_manager::Renderer for PersistentRenderer {
 
     fn output_image(&self) -> vk::Image {
         self.color_image.image
+    }
+
+    fn depth_image(&self) -> vk::Image {
+        self.depth_image.image
     }
 
     fn output_format(&self) -> vk::Format {

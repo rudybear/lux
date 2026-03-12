@@ -466,6 +466,15 @@ def _collect_and_replace(stmts: list, counter: list[int]) -> list:
     for idx, let_stmt in insertions:
         insert_map.setdefault(idx, []).append(let_stmt)
 
+    # Topologically sort CSE lets within each insertion group so that if
+    # _cse_A references _cse_B, B comes before A.  This fixes the case where
+    # a larger expression (processed first by CSE) has a sub-expression that
+    # is itself CSE'd later, creating a forward reference.
+    for idx in insert_map:
+        group = insert_map[idx]
+        if len(group) > 1:
+            insert_map[idx] = _topo_sort_cse_lets(group)
+
     new_stmts: list = []
     for idx, stmt in enumerate(stmts):
         if idx in insert_map:
@@ -473,6 +482,71 @@ def _collect_and_replace(stmts: list, counter: list[int]) -> list:
         new_stmts.append(stmt)
 
     return new_stmts
+
+
+def _collect_var_refs(expr: Any, refs: set[str]) -> None:
+    """Collect all VarRef names referenced in an expression tree."""
+    if isinstance(expr, VarRef):
+        refs.add(expr.name)
+    elif isinstance(expr, BinaryOp):
+        _collect_var_refs(expr.left, refs)
+        _collect_var_refs(expr.right, refs)
+    elif isinstance(expr, UnaryOp):
+        _collect_var_refs(expr.operand, refs)
+    elif isinstance(expr, CallExpr):
+        _collect_var_refs(expr.func, refs)
+        for a in expr.args:
+            _collect_var_refs(a, refs)
+    elif isinstance(expr, ConstructorExpr):
+        for a in expr.args:
+            _collect_var_refs(a, refs)
+    elif isinstance(expr, FieldAccess):
+        _collect_var_refs(expr.object, refs)
+    elif isinstance(expr, SwizzleAccess):
+        _collect_var_refs(expr.object, refs)
+    elif isinstance(expr, IndexAccess):
+        _collect_var_refs(expr.object, refs)
+        _collect_var_refs(expr.index, refs)
+    elif isinstance(expr, TernaryExpr):
+        _collect_var_refs(expr.condition, refs)
+        _collect_var_refs(expr.then_expr, refs)
+        _collect_var_refs(expr.else_expr, refs)
+
+
+def _topo_sort_cse_lets(lets: list[LetStmt]) -> list[LetStmt]:
+    """Topologically sort a list of CSE let stmts so dependencies come first.
+
+    If _cse_A's value references _cse_B, then _cse_B must appear before
+    _cse_A in the output.  Falls back to the original order for any lets
+    that don't participate in inter-CSE dependencies.
+    """
+    cse_names = {s.name for s in lets}
+    # Build dependency graph: name -> set of CSE names it depends on
+    deps: dict[str, set[str]] = {}
+    by_name: dict[str, LetStmt] = {}
+    for s in lets:
+        refs: set[str] = set()
+        _collect_var_refs(s.value, refs)
+        deps[s.name] = refs & cse_names
+        by_name[s.name] = s
+
+    # Kahn's algorithm for topological sort
+    result: list[LetStmt] = []
+    remaining = set(cse_names)
+    while remaining:
+        # Find a node with no unresolved dependencies
+        ready = [n for n in remaining if not (deps[n] & remaining - {n})]
+        if not ready:
+            # Cycle — just emit remaining in original order as fallback
+            result.extend(s for s in lets if s.name in remaining)
+            break
+        # Among ready nodes, prefer original order
+        ready_set = set(ready)
+        for s in lets:
+            if s.name in ready_set and s.name in remaining:
+                result.append(s)
+                remaining.discard(s.name)
+    return result
 
 
 def _expr_size(expr: Any) -> int:

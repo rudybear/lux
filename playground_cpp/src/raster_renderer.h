@@ -58,6 +58,10 @@ public:
     VkImage getOffscreenImage() const { return offscreenImage; }
     VkFormat getOffscreenFormat() const { return VK_FORMAT_R8G8B8A8_UNORM; }
 
+    // Depth image access (for hybrid compositing with SplatRenderer)
+    VkImage getDepthImage() const { return depthImage; }
+    VkFormat getDepthFormat() const { return VK_FORMAT_D32_SFLOAT; }
+
     // Update a material UBO at runtime (editor property editing)
     void updateMaterialUBO(VulkanContext& ctx, int materialIndex, const MaterialUBOData& data);
 

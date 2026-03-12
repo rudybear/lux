@@ -98,9 +98,27 @@ void SceneManager::loadScene(VulkanContext& ctx, const std::string& sceneSource)
         Scene::generateSphere(32, 32, m_vertices, m_indices);
     }
 
-    // Compute auto-camera from vertex bounds
-    if (!m_vertices.empty()) {
-        computeAutoCamera(m_vertices);
+    // Compute auto-camera from vertex bounds (including splat positions)
+    if (m_gltfScene.splat_data.has_splats) {
+        // Add splat positions as synthetic vertices for bounding box computation
+        // so the auto-camera encompasses both mesh and splat data
+        const auto& sp = m_gltfScene.splat_data;
+        for (uint32_t i = 0; i < sp.num_splats; ++i) {
+            Vertex v;
+            v.position = glm::vec3(sp.positions[i * 4 + 0],
+                                   sp.positions[i * 4 + 1],
+                                   sp.positions[i * 4 + 2]);
+            v.normal = glm::vec3(0, 1, 0);
+            v.uv = glm::vec2(0);
+            m_splatBoundsVerts.push_back(v);
+        }
+    }
+    // Merge mesh + splat vertices for camera computation
+    std::vector<Vertex> allBoundsVerts = m_vertices;
+    allBoundsVerts.insert(allBoundsVerts.end(),
+                          m_splatBoundsVerts.begin(), m_splatBoundsVerts.end());
+    if (!allBoundsVerts.empty()) {
+        computeAutoCamera(allBoundsVerts);
     }
 }
 
@@ -242,6 +260,11 @@ void SceneManager::uploadToGPU(VulkanContext& ctx, int vertexStride) {
     if (vertexStride == 48 && m_hasGltfScene) {
         // 48-byte stride upload with tangents for raster path
         auto drawItems = flattenScene(m_gltfScene);
+
+        if (drawItems.empty()) {
+            // Splat-only glTF scene with no triangle meshes — nothing to upload
+            return;
+        }
 
         std::vector<float> vdata;
         std::vector<uint32_t> allIndices;

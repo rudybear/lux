@@ -13,6 +13,7 @@
 #include <array>
 #include <unordered_map>
 #include <cstdint>
+#include <cmath>
 
 // ===========================================================================
 // Data structures
@@ -138,6 +139,7 @@ struct GaussianSplatData {
     uint32_t sh_degree = 0;
     uint32_t num_splats = 0;
     bool has_splats = false;
+    bool khr_format = false;  // true when loaded from KHR_gaussian_splatting attributes
 };
 
 struct GltfScene {

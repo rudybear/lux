@@ -69,6 +69,19 @@ pub struct GaussianSplatRenderer {
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
 
+    // Render pass variants for hybrid compositing (LOAD instead of CLEAR)
+    render_pass_load: vk::RenderPass,       // color=LOAD, depth=CLEAR
+    framebuffer_load: vk::Framebuffer,
+    render_pass_load_depth: vk::RenderPass, // color=LOAD, depth=LOAD
+    framebuffer_load_depth: vk::Framebuffer,
+    // Graphics pipeline for LOAD render pass (compatible render pass required)
+    render_pipeline_load: vk::Pipeline,
+    render_pipeline_load_depth: vk::Pipeline,
+
+    // Hybrid compositing state
+    has_background: bool,
+    has_background_depth: bool,
+
     // Descriptor pools/sets
     descriptor_pool: vk::DescriptorPool,
     compute_set_layout: vk::DescriptorSetLayout,
@@ -143,7 +156,9 @@ impl GaussianSplatRenderer {
             ctx.allocator_mut(),
             width, height,
             vk::Format::R8G8B8A8_UNORM,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
             vk::ImageAspectFlags::COLOR,
             "splat_color",
         )?;
@@ -153,28 +168,35 @@ impl GaussianSplatRenderer {
             ctx.allocator_mut(),
             width, height,
             vk::Format::D32_SFLOAT,
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
             vk::ImageAspectFlags::DEPTH,
             "splat_depth",
         )?;
 
-        // --- Render pass ---
+        // --- Render passes ---
         let render_pass = Self::create_render_pass(&device)?;
+        let render_pass_load = Self::create_render_pass_load(&device)?;
+        let render_pass_load_depth = Self::create_render_pass_load_depth(&device)?;
 
-        // --- Framebuffer ---
-        let framebuffer = {
+        // --- Framebuffers (one per render pass variant, same attachments) ---
+        let create_fb = |rp: vk::RenderPass| -> Result<vk::Framebuffer, String> {
             let views = [color_image.view, depth_image.view];
             let fb_info = vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
+                .render_pass(rp)
                 .attachments(&views)
                 .width(width)
                 .height(height)
                 .layers(1);
             unsafe {
                 device.create_framebuffer(&fb_info, None)
-                    .map_err(|e| format!("Failed to create framebuffer: {:?}", e))?
+                    .map_err(|e| format!("Failed to create framebuffer: {:?}", e))
             }
         };
+        let framebuffer = create_fb(render_pass)?;
+        let framebuffer_load = create_fb(render_pass_load)?;
+        let framebuffer_load_depth = create_fb(render_pass_load_depth)?;
 
         // --- Descriptor set layouts ---
         let compute_set_layout = Self::create_compute_set_layout(&device)?;
@@ -236,6 +258,12 @@ impl GaussianSplatRenderer {
 
         let render_pipeline = Self::create_render_pipeline(
             &device, render_pass, render_layout, vert_module, frag_module, width, height,
+        )?;
+        let render_pipeline_load = Self::create_render_pipeline(
+            &device, render_pass_load, render_layout, vert_module, frag_module, width, height,
+        )?;
+        let render_pipeline_load_depth = Self::create_render_pipeline(
+            &device, render_pass_load_depth, render_layout, vert_module, frag_module, width, height,
         )?;
 
         unsafe {
@@ -428,6 +456,14 @@ impl GaussianSplatRenderer {
             depth_image,
             render_pass,
             framebuffer,
+            render_pass_load,
+            framebuffer_load,
+            render_pass_load_depth,
+            framebuffer_load_depth,
+            render_pipeline_load,
+            render_pipeline_load_depth,
+            has_background: false,
+            has_background_depth: false,
             descriptor_pool,
             compute_set_layout,
             render_set_layout,
@@ -523,6 +559,137 @@ impl GaussianSplatRenderer {
         unsafe {
             device.create_render_pass(&rp_info, None)
                 .map_err(|e| format!("Failed to create render pass: {:?}", e))
+        }
+    }
+
+    // --- Helper: create render pass (LOAD color, CLEAR depth) ---
+    // Used for hybrid compositing: background color was blitted in, splats render on top.
+    fn create_render_pass_load(device: &ash::Device) -> Result<vk::RenderPass, String> {
+        let attachments = [
+            // Color: LOAD existing contents (background was blitted in)
+            vk::AttachmentDescription::default()
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+            // Depth: still CLEAR (splats have their own depth)
+            vk::AttachmentDescription::default()
+                .format(vk::Format::D32_SFLOAT)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+        ];
+
+        let color_ref = vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let depth_ref = vk::AttachmentReference::default()
+            .attachment(1)
+            .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(std::slice::from_ref(&color_ref))
+            .depth_stencil_attachment(&depth_ref);
+
+        let dependencies = [
+            vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+            vk::SubpassDependency::default()
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+        ];
+
+        let rp_info = vk::RenderPassCreateInfo::default()
+            .attachments(&attachments)
+            .subpasses(std::slice::from_ref(&subpass))
+            .dependencies(&dependencies);
+
+        unsafe {
+            device.create_render_pass(&rp_info, None)
+                .map_err(|e| format!("Failed to create render pass (load): {:?}", e))
+        }
+    }
+
+    // --- Helper: create render pass (LOAD both color AND depth) ---
+    // Used for full hybrid compositing: both raster color and depth are loaded,
+    // so splats depth-test against mesh geometry for proper occlusion.
+    fn create_render_pass_load_depth(device: &ash::Device) -> Result<vk::RenderPass, String> {
+        let attachments = [
+            // Color: LOAD existing contents
+            vk::AttachmentDescription::default()
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+            // Depth: LOAD existing depth from raster pass
+            vk::AttachmentDescription::default()
+                .format(vk::Format::D32_SFLOAT)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+        ];
+
+        let color_ref = vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let depth_ref = vk::AttachmentReference::default()
+            .attachment(1)
+            .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(std::slice::from_ref(&color_ref))
+            .depth_stencil_attachment(&depth_ref);
+
+        let dependencies = [
+            vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+            vk::SubpassDependency::default()
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+        ];
+
+        let rp_info = vk::RenderPassCreateInfo::default()
+            .attachments(&attachments)
+            .subpasses(std::slice::from_ref(&subpass))
+            .dependencies(&dependencies);
+
+        unsafe {
+            device.create_render_pass(&rp_info, None)
+                .map_err(|e| format!("Failed to create render pass (load depth): {:?}", e))
         }
     }
 
@@ -677,6 +844,268 @@ impl GaussianSplatRenderer {
         }
     }
 
+    /// Access to the depth image (for hybrid compositing).
+    pub fn depth_image_handle(&self) -> vk::Image {
+        self.depth_image.image
+    }
+
+    /// Preload a background color image into the splat color target.
+    /// The subsequent `render()` call will use LOAD instead of CLEAR so splats
+    /// are composited on top of the background.
+    pub fn preload_background(
+        &mut self,
+        ctx: &VulkanContext,
+        src_image: vk::Image,
+        src_width: u32,
+        src_height: u32,
+    ) -> Result<(), String> {
+        let device = &ctx.device;
+        let cmd = ctx.begin_single_commands()?;
+
+        unsafe {
+            // Transition splat color image: UNDEFINED -> TRANSFER_DST
+            let barrier = vk::ImageMemoryBarrier::default()
+                .image(self.color_image.image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[], &[], &[barrier],
+            );
+
+            // Blit source image -> splat color image
+            let blit_region = vk::ImageBlit::default()
+                .src_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .src_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: src_width as i32,
+                        y: src_height as i32,
+                        z: 1,
+                    },
+                ])
+                .dst_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .dst_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: self.width as i32,
+                        y: self.height as i32,
+                        z: 1,
+                    },
+                ]);
+            device.cmd_blit_image(
+                cmd,
+                src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                self.color_image.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[blit_region],
+                vk::Filter::LINEAR,
+            );
+
+            // Transition splat color image: TRANSFER_DST -> COLOR_ATTACHMENT_OPTIMAL
+            // (the LOAD render pass expects this layout as initialLayout)
+            let barrier = vk::ImageMemoryBarrier::default()
+                .image(self.color_image.image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_READ
+                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                )
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[], &[], &[barrier],
+            );
+        }
+
+        ctx.end_single_commands(cmd)?;
+        self.has_background = true;
+        info!(
+            "Preloaded background image into splat color target ({}x{} -> {}x{})",
+            src_width, src_height, self.width, self.height
+        );
+        Ok(())
+    }
+
+    /// Preload depth from raster pass into splat depth buffer.
+    /// Splats will depth-test against mesh geometry so occluded splats are hidden.
+    pub fn preload_depth(
+        &mut self,
+        ctx: &VulkanContext,
+        src_depth_image: vk::Image,
+        src_width: u32,
+        src_height: u32,
+    ) -> Result<(), String> {
+        let device = &ctx.device;
+        let cmd = ctx.begin_single_commands()?;
+
+        unsafe {
+            // Transition raster depth: DEPTH_STENCIL_ATTACHMENT_OPTIMAL -> TRANSFER_SRC
+            let barrier_src = vk::ImageMemoryBarrier::default()
+                .image(src_depth_image)
+                .old_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+
+            // Transition splat depth: UNDEFINED -> TRANSFER_DST
+            let barrier_dst = vk::ImageMemoryBarrier::default()
+                .image(self.depth_image.image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS | vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[], &[], &[barrier_src, barrier_dst],
+            );
+
+            // Copy or blit depth image
+            if src_width == self.width && src_height == self.height {
+                let copy_region = vk::ImageCopy::default()
+                    .src_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .layer_count(1),
+                    )
+                    .dst_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .layer_count(1),
+                    )
+                    .extent(vk::Extent3D {
+                        width: src_width,
+                        height: src_height,
+                        depth: 1,
+                    });
+                device.cmd_copy_image(
+                    cmd,
+                    src_depth_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.depth_image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[copy_region],
+                );
+            } else {
+                // Blit with nearest filter for depth (no linear interpolation on depth)
+                let blit_region = vk::ImageBlit::default()
+                    .src_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .layer_count(1),
+                    )
+                    .src_offsets([
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D {
+                            x: src_width as i32,
+                            y: src_height as i32,
+                            z: 1,
+                        },
+                    ])
+                    .dst_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .layer_count(1),
+                    )
+                    .dst_offsets([
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D {
+                            x: self.width as i32,
+                            y: self.height as i32,
+                            z: 1,
+                        },
+                    ]);
+                device.cmd_blit_image(
+                    cmd,
+                    src_depth_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.depth_image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[blit_region],
+                    vk::Filter::NEAREST,
+                );
+            }
+
+            // Transition splat depth: TRANSFER_DST -> DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+            let depth_barrier = vk::ImageMemoryBarrier::default()
+                .image(self.depth_image.image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                )
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                vk::DependencyFlags::empty(),
+                &[], &[], &[depth_barrier],
+            );
+        }
+
+        ctx.end_single_commands(cmd)?;
+        self.has_background_depth = true;
+        info!(
+            "Preloaded raster depth into splat depth buffer ({}x{} -> {}x{})",
+            src_width, src_height, self.width, self.height
+        );
+        Ok(())
+    }
+
     /// Blit offscreen to swapchain image.
     pub fn cmd_blit_to_swapchain(
         &self,
@@ -774,9 +1203,15 @@ impl GaussianSplatRenderer {
 
         unsafe {
             device.destroy_framebuffer(self.framebuffer, None);
+            device.destroy_framebuffer(self.framebuffer_load, None);
+            device.destroy_framebuffer(self.framebuffer_load_depth, None);
             device.destroy_render_pass(self.render_pass, None);
+            device.destroy_render_pass(self.render_pass_load, None);
+            device.destroy_render_pass(self.render_pass_load_depth, None);
             device.destroy_pipeline(self.compute_pipeline, None);
             device.destroy_pipeline(self.render_pipeline, None);
+            device.destroy_pipeline(self.render_pipeline_load, None);
+            device.destroy_pipeline(self.render_pipeline_load_depth, None);
             device.destroy_pipeline_layout(self.compute_layout, None);
             device.destroy_pipeline_layout(self.render_layout, None);
             device.destroy_descriptor_set_layout(self.compute_set_layout, None);
@@ -860,14 +1295,29 @@ impl Renderer for GaussianSplatRenderer {
             );
 
             // --- Render pass ---
+            // Use LOAD render pass when a background has been blitted in (hybrid compositing)
             let clear_values = [
                 vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] } },
                 vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
             ];
 
+            let (rp, fb, pipeline) = if self.has_background_depth {
+                // Full hybrid: both color and depth loaded from raster pass
+                (self.render_pass_load_depth, self.framebuffer_load_depth, self.render_pipeline_load_depth)
+            } else if self.has_background {
+                // Color-only compositing: color loaded, depth cleared
+                (self.render_pass_load, self.framebuffer_load, self.render_pipeline_load)
+            } else {
+                (self.render_pass, self.framebuffer, self.render_pipeline)
+            };
+
+            // Reset background flags after use (one-shot per render call)
+            self.has_background = false;
+            self.has_background_depth = false;
+
             let rp_begin = vk::RenderPassBeginInfo::default()
-                .render_pass(self.render_pass)
-                .framebuffer(self.framebuffer)
+                .render_pass(rp)
+                .framebuffer(fb)
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D { width: self.width, height: self.height },
@@ -876,7 +1326,7 @@ impl Renderer for GaussianSplatRenderer {
 
             ctx.device.cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
 
-            ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.render_pipeline);
+            ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             ctx.device.cmd_bind_descriptor_sets(
                 cmd, vk::PipelineBindPoint::GRAPHICS, self.render_layout,
                 0, &[self.render_desc_set], &[],
