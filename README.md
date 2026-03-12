@@ -48,6 +48,13 @@ The compiler expands this into fully typed vertex + fragment SPIR-V — no manua
 <p align="center"><em>KHR_gaussian_splatting conformance: all 11 official Khronos test scenes pass — SH degrees 0–3, rotations, scales, depth ordering, hybrid mesh+splat rendering</em></p>
 
 <p align="center">
+<img src="screenshots/hybrid/hybrid_raster_splat.png" width="250">
+<img src="screenshots/hybrid/hybrid_rt_splat.png" width="250">
+<img src="screenshots/hybrid/hybrid_mesh_splat.png" width="250">
+</p>
+<p align="center"><em>Hybrid rendering: Gaussian splats composited with raster (left), ray tracing (center), and mesh shaders (right) — all three rendering backends support splat overlay with auto-detected splat pipeline</em></p>
+
+<p align="center">
 <img src="screenshots/hello_triangle_cpp.png" width="250">
 <img src="screenshots/ai_gallery.png" width="500">
 </p>
@@ -59,7 +66,7 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 
 **Language**
 - Declarative `surface` + `geometry` + `pipeline` blocks expand to full shader stages
-- **Gaussian splatting**: first-class `splat` declaration — one block generates a complete 3-stage pipeline (compute preprocess, instanced vertex, alpha-composited fragment), SH degrees 0–3, CPU depth sorting, glTF `KHR_gaussian_splatting`, interactive orbit viewers in all 3 engines
+- **Gaussian splatting**: first-class `splat` declaration — one block generates a complete 3-stage pipeline (compute preprocess, instanced vertex, alpha-composited fragment), SH degrees 0–3, CPU depth sorting, glTF `KHR_gaussian_splatting`, **hybrid rendering** (splats composited with raster, ray tracing, or mesh shaders), interactive orbit viewers in all engines
 - **OpenPBR Surface v1.1**: `import openpbr;` enables the full Adobe/ASWF material model — F82-tint metal Fresnel, energy-preserving Oren-Nayar diffuse, coat darkening, fuzz, thin-film iridescence, transmission with volume absorption, 9 composable layers, bindless uber-shader support, schedule-based quality tiers (desktop/mobile fast variants)
 - Layered surfaces with `layers [base, normal_map, sheen, coat, emission, ibl]` — unified `compose_pbr_layers` compositing, energy conservation, raster + RT from one declaration
 - `lighting` blocks separate illumination from material response; multi-light with shadows
@@ -73,7 +80,7 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 - Built-in optimizer: mem2reg, AST-level inlining, CSE, constant vector hoisting — **21.7% fewer instructions than hand-written GLSL** out of the box
 - Auto-type precision: `--auto-type=relaxed` emits RelaxedPrecision for 2x mobile throughput
 - `@differentiable` automatic differentiation, GLSL transpiler (`--transpile`)
-- Ray tracing (`mode: raytrace`), mesh shaders (`mode: mesh_shader`), compute shaders, Gaussian splatting (`mode: gaussian_splat`)
+- Ray tracing (`mode: raytrace`), mesh shaders (`mode: mesh_shader`), compute shaders, Gaussian splatting (`mode: gaussian_splat`), hybrid RT+splat / mesh+splat compositing
 - Bindless rendering (`--bindless`), hot reload (`--watch`), feature permutations (`--all-permutations`)
 - 39 GLSL.std.450 builtins + texture sampling (7 variants) + image queries + RT/mesh/compute intrinsics
 

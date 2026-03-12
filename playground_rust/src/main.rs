@@ -76,6 +76,10 @@ struct Args {
     /// Sponza courtyard lights (sun + orbiting torch + accent).
     #[arg(long)]
     sponza_lights: bool,
+
+    /// Splat shader base for hybrid RT/mesh+splat rendering.
+    #[arg(long)]
+    splat_pipeline: Option<String>,
 }
 
 fn main() {

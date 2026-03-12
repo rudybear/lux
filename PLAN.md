@@ -33,6 +33,9 @@
 | P23 | Interactive Scene Editor + Compute Shaders | ✅ Complete (P23.1-P23.2; gizmos, lighting editor deferred) |
 | P24 | KHR_gaussian_splatting Conformance | ✅ Complete |
 | P25 | PLY-to-glTF Converter | ✅ Complete |
+| P26 | Hybrid Rendering (RT+Splat, Mesh+Splat) | ✅ Complete (C++; Rust partial) |
+| P27 | WebGPU Backend | Planned |
+| P28 | RT Gaussian Splats (Elliptic Intersections) | Research |
 
 **Test suite: 1383+ tests passing. Compiler: 160+ stdlib functions, 15 modules.**
 
@@ -852,7 +855,7 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P11** | Metal backend via SPIR-V cross-compilation (SPIRV-Cross → MSL) | ✅ Complete |
 | **P12** | Official glTF PBR extensions in engine materials (auto-detect, permutation selection) | ✅ Complete |
 | **P13** | Mesh shader support (`task`/`mesh` stages, meshlet-based geometry, `--define` compile-time parameters) | ✅ Complete |
-| **P14** | Gaussian splatting representation (splat sorting, tile-based rasterizer, SH evaluation) | Planned |
+| **P14** | Gaussian splatting representation (splat sorting, tile-based rasterizer, SH evaluation) | ✅ Complete |
 | **P15** | BRDF & layer visualization (lobe plots, transfer function graphs, energy conservation tests) | ✅ Complete |
 | **P16** | AI features for Lux (image-to-shader, prompt-based generation, AI skills, training pipeline, critique, style transfer, batch generation, video-to-animation, reference matching, benchmark) | ✅ Complete |
 | **P17.1** | Lighting block (`lighting` declarations, `directional()` + `ibl()` layers, IBL migration from surface to lighting, backward compat) | ✅ Complete |
@@ -866,6 +869,9 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P23** | GPU compute shaders (compute stage, RW SSBOs, storage images, barriers, shared memory, atomics, dispatch) | ✅ Complete (23.1 + 23.2) |
 | **P24** | Shader hot-reload (`--watch` file watcher, live recompile, sentinel protocol for engine hot-swap) | ✅ Complete |
 | **P25** | Performance optimization (`-O` spirv-opt integration, algebraic identity folding) | ✅ Complete (25.1) |
+| **P26** | Hybrid rendering (RT+splat, mesh shader+splat compositing in all engines) | ✅ Complete (C++) |
+| **P27** | WebGPU backend (browser deployment via WGSL, wgpu-native desktop) | Planned |
+| **P28** | RT Gaussian splats (analytic ray-ellipsoid intersection, custom intersection shaders) | Research |
 
 ---
 
@@ -1909,3 +1915,209 @@ python -m tools.ply_to_gltf --batch ./splats/ -o ./gltf_out/
 ```
 
 **Tests:** `tests/test_ply_to_gltf.py` — PLY parsing, coordinate conversion, opacity transform, SH degree detection, round-trip verification, POSITION min/max.
+
+---
+
+### Phase 26: Hybrid Rendering (RT+Splat, Mesh Shader+Splat) ✅ COMPLETE (C++)
+
+Extended the hybrid rendering system to support compositing Gaussian splats with **all** rendering backends — not just raster, but also ray tracing and mesh shaders.
+
+**C++ Engine (`playground_cpp/src/main.cpp`):**
+- `--splat-pipeline <BASE>` CLI option for explicit splat shader path
+- Auto-detects `examples/gaussian_splat` or `shadercache/gaussian_splat` when scene has splat data and main pipeline is RT/mesh
+- Three hybrid modes: `isHybridRaster`, `isHybridRT`, `isHybridMesh`
+- Raster hybrid: `preloadBackground()` + `preloadDepth()` (full color + depth compositing)
+- RT/mesh hybrid: `preloadBackground()` only (color-only compositing — RT and mesh shader renderers use storage images without accessible depth buffers)
+- Both headless and interactive paths wired
+- Interactive render loop uses `blitAndSubmit` helper to reduce duplicated blit+submit code
+- SH degree auto-upgrade works for all hybrid modes
+
+**Rust Engine (`playground_rust/src/main.rs`):**
+- `--splat-pipeline` CLI flag added (clap)
+- Hybrid RT/mesh+splat headless rendering deferred (requires refactoring `render_rt`/`render_mesh_headless` to expose output images instead of saving directly)
+
+**Key design insight:** RT and mesh shader renderers render to storage images (`VK_IMAGE_USAGE_STORAGE_BIT`) without depth attachments, so `preloadDepth()` cannot be used. Splats render on top of the color output without depth-aware occlusion. This is visually correct for additive splat clouds; for scenes requiring proper depth interleaving, a future extension could use the splat renderer's depth test against a separate depth pass.
+
+---
+
+### Phase 27: WebGPU Backend (Planned)
+
+Add WebGPU as a first-class rendering backend alongside Vulkan and Metal, enabling browser-based rendering and broader platform support.
+
+**Goals:**
+- Browser deployment via WebAssembly + WebGPU API
+- Native desktop via wgpu-native (Dawn or wgpu)
+- Unified shader pipeline: Lux → SPIR-V → WGSL (via Naga/Tint)
+- Same scene loading, IBL, and material systems
+
+**Key components:**
+1. **WGSL codegen path** — either SPIR-V → WGSL transpilation (Naga) or direct WGSL emission from Lux AST
+2. **WebGPU render harness** — TypeScript/JavaScript or Rust/wasm renderer matching Python render_harness API
+3. **Compute pipeline** — WebGPU compute shaders for Gaussian splat preprocessing
+4. **Push constant emulation** — WebGPU lacks push constants; use uniform buffers with dynamic offsets
+5. **Texture/sampler binding model** — WebGPU bind groups vs Vulkan descriptor sets
+6. **Browser demo** — interactive viewer with orbit camera, scene loading, pipeline hot-swap
+
+**Challenges:**
+- WebGPU has no ray tracing extensions yet (future WebRT proposal)
+- Push constants must be emulated via uniform buffers
+- SPIR-V feature set must be restricted to what Naga/Tint can translate
+- Mesh shaders not available in WebGPU
+- Bindless textures limited (texture arrays with dynamic indexing)
+
+**Implementation options:**
+- **Option A:** Rust wgpu crate → wasm32 target (reuse existing Rust playground infrastructure)
+- **Option B:** TypeScript with @webgpu/types (greenfield, best browser integration)
+- **Option C:** C++ Dawn (Google's WebGPU impl) with Emscripten
+
+---
+
+### Phase 28: RT Gaussian Splats — Elliptic Intersections (Research)
+
+Proper ray tracing integration for Gaussian splats using analytic ray-ellipsoid intersection instead of rasterization-based splatting.
+
+**Goal:** Replace the current hybrid compositing approach (raster/RT renders background → splat renderer overlays) with true ray-traced Gaussian splat primitives that participate in the same BVH as triangle geometry, enabling correct depth interleaving, reflections, refractions, and shadows.
+
+**Research areas:**
+1. **Ray-ellipsoid intersection** — analytic intersection of rays with 3D Gaussians (ellipsoidal proxy geometry)
+2. **Custom intersection shaders** — `VK_KHR_ray_tracing_pipeline` intersection shaders for AABB-wrapped ellipsoids
+3. **3DGS-specific ray marching** — volumetric ray marching through Gaussian fields with alpha accumulation
+4. **Hybrid BVH** — mixed BLAS containing both triangle and AABB (splat) geometry
+5. **SH evaluation in hit shaders** — spherical harmonic color evaluation at ray-hit points
+6. **Sorting vs ray marching** — whether front-to-back ray traversal eliminates the need for CPU-side sorting
+
+**Key papers:**
+- "3D Gaussian Ray Tracing" (Moenne-Loccoz et al., 2024) — analytic ray-3DGS intersection
+- "3D Gaussian Splatting for Real-Time Radiance Field Rendering" (Kerbl et al., 2023) — original 3DGS
+- "Gaussian Opacity Fields" — ray-based Gaussian rendering
+- "StopThePop" — improved depth sorting for 3DGS
+
+**Implementation sketch:**
+```
+Ray generation → Trace(TLAS with triangles + splat AABBs)
+  → Triangle intersection: standard closest-hit
+  → Splat AABB intersection: custom intersection shader
+    → Solve ray-ellipsoid quadratic
+    → Evaluate SH color at intersection point
+    → Return (t, alpha, color) for alpha compositing
+  → Any-hit: alpha accumulation with early termination
+  → Miss: environment map
+```
+
+**Design decision:** No new grammar needed. The `splat` declaration stays as a pure data definition. The `pipeline` mode determines codegen:
+
+```lux
+splat GaussianCloud {
+    sh_degree: 3,
+    kernel: ellipse,
+    color_space: srgb,
+    alpha_cutoff: 0.004,
+}
+
+// Raster splatting (current) → compute + vert + frag
+pipeline SplatRaster {
+    mode: gaussian_splat,
+    splat: GaussianCloud,
+}
+
+// RT splatting → rgen + rint + rahit + rmiss
+pipeline SplatRT {
+    mode: raytrace,
+    splat: GaussianCloud,
+}
+
+// Hybrid RT: triangles + Gaussians in same BVH
+pipeline HybridRT {
+    mode: raytrace,
+    geometry: StandardMesh,
+    surface: PBRMaterial,
+    lighting: SceneLighting,
+    splat: GaussianCloud,
+}
+```
+
+The compiler sees `mode: raytrace` + `splat:` and generates intersection shaders. When both `surface:` and `splat:` are present, it generates two SBT hit groups (triangles → `.rchit`, Gaussians → `.rint` + `.rahit`) sharing one `.rgen` and `.rmiss`. Quality knobs go in the `schedule`:
+
+```lux
+schedule DesktopRT {
+    splat_method: peak_response,    // 3DGRT analytical peak (vs volumetric erf)
+    splat_kernel_degree: 2,         // sharper falloff, ~2x fewer intersections
+    splat_k_buffer: 16,             // hits per tracing round
+    splat_termination: 0.001,       // transmittance early-out threshold
+    tonemap: aces,
+}
+```
+
+This follows Lux's core philosophy: `splat` = what (data), `pipeline` = how (scheduling), `schedule` = quality (approximation strategy). The compiler decides GPU dispatch.
+
+#### Research Findings (2026-03-12)
+
+**The definitive paper: "3D Gaussian Ray Tracing" (3DGRT, Moenne-Loccoz et al., SIGGRAPH Asia 2024, NVIDIA Toronto AI Lab)**
+
+The key insight is that 3D Gaussians have **no hard surface** — instead of solving a ray-surface intersection, 3DGRT finds the **point of maximum Gaussian response along a ray** analytically:
+
+```
+// In Gaussian-local space (S^{-1} * R^T transforms ray to unit space):
+o_g = S^{-1} * R^T * (ray_origin - gaussian_center)
+d_g = S^{-1} * R^T * ray_direction
+tau_max = -(dot(o_g, d_g)) / dot(d_g, d_g)
+rho = exp(-dot(o_g + tau_max * d_g, o_g + tau_max * d_g))
+alpha = opacity * rho
+```
+
+This is NOT a quadratic intersection — it's a closed-form maximum-density evaluation. Much cheaper than solving a quadratic and more physically accurate for volumetric Gaussians.
+
+**Vulkan RT pipeline mapping:**
+
+| Shader Stage | Role |
+|---|---|
+| `.rgen` (Ray Generation) | Casts primary rays, runs multi-round tracing loop, alpha compositing, SH evaluation |
+| `.rint` (Intersection) | Tests ray against Gaussian (AABB or unit sphere in local space), reports `tau_max` via `reportIntersectionEXT` |
+| `.rahit` (Any-Hit) | Maintains k-buffer of k=16 closest hits via insertion sort; evicts farthest when full |
+| `.rmiss` (Miss) | Returns background/environment color |
+
+**k-Buffer algorithm:** The any-hit shader maintains a sorted array of 16 entries (t-value + Gaussian index). After BVH traversal, the raygen shader processes hits front-to-back, evaluating SH color and accumulating alpha. If transmittance > threshold, resumes tracing for next batch. This avoids global sorting.
+
+**BLAS construction:** Two approaches:
+1. **Per-Gaussian AABBs** (`VK_GEOMETRY_TYPE_AABBS_KHR`) — straightforward but high memory
+2. **Shared unit-sphere BLAS + per-Gaussian TLAS transforms** (GRTX optimization, 2025) — 10x less BVH memory, 4.36x faster
+
+**Hybrid BLAS:** Vulkan supports mixing triangle BLAS + AABB BLAS in the same TLAS via different SBT hit groups — exactly what we need for mesh+splat hybrid RT.
+
+**Performance (RTX 5090):**
+- Rasterized 3DGS: ~238 FPS (MipNeRF360)
+- 3DGRT baseline: ~78 FPS
+- 3DGRT + GRTX optimizations: ~340 FPS (4.36x speedup)
+- RT enables reflections, refractions, shadows that rasterization cannot
+
+**SH evaluation:** Happens in raygen shader (after hit collection), not in intersection/any-hit. Memory bandwidth is the bottleneck, not ALU.
+
+**Reference implementations:**
+- NVIDIA `nvpro-samples/vk_gaussian_splatting` — Vulkan RT pipeline with 3DGRT support
+- NVIDIA `nv-tlabs/3dgrut` — CUDA+OptiX training+rendering, also via vk_gaussian_splatting
+- GRTX — shared-BLAS optimization achieving near-rasterization speeds
+
+**Lux compiler extensions needed:**
+
+1. **SPIR-V codegen for `.rint` and `.rahit` stages** — `splat_expander.py` gets a `raytrace` codepath alongside the existing `gaussian_splat` raster codepath
+   - `.rint` (intersection): transform ray to Gaussian-local space, compute `tau_max`, evaluate density, `reportIntersectionEXT(tau_max, hitKind)`
+   - `.rahit` (any-hit): k-buffer insertion sort (payload array of k hits), `ignoreIntersectionEXT()` when buffer full and hit is farther than worst entry
+   - `.rgen` (ray generation): multi-round tracing loop, alpha compositing, SH evaluation from SSBO, early termination on transmittance threshold
+   - `.rmiss`: environment map / background color
+2. **New SPIR-V intrinsics**: `reportIntersectionEXT()`, `ignoreIntersectionEXT()`, `terminateRayEXT()` (existing RT codegen already emits `traceRayEXT`)
+3. **Hit attributes** (`hitAttributeEXT`) — data passing from intersection to any-hit shaders (Gaussian index, density)
+4. **Ray payload extensions** — k-buffer array in `rayPayloadEXT` (existing RT codegen already handles simple payloads)
+5. **`accelerationStructureEXT`** descriptor type for TLAS binding (already supported in RT renderer)
+6. **Hybrid SBT generation** — when pipeline has both `surface:` and `splat:`, reflection JSON emits two hit groups with SBT offsets
+7. **Engine: AABB BLAS builder** — compute Gaussian bounding boxes from covariance matrices, build `VK_GEOMETRY_TYPE_AABBS_KHR` BLAS
+8. **Schedule slots**: `splat_method` (peak_response / volumetric), `splat_kernel_degree` (1/2), `splat_k_buffer` (8/16/32), `splat_termination` (float)
+
+**Implementation order:**
+1. `.rint` + `.rahit` codegen in `splat_expander.py` (standalone RT splat pipeline)
+2. AABB BLAS builder in C++ engine
+3. k-buffer `.rgen` with multi-round tracing
+4. SH evaluation in raygen shader
+5. Hybrid SBT: mixed triangle + Gaussian pipeline
+6. Schedule-driven quality knobs
+
+**Alternative: "Don't Splat Your Gaussians" (Meta/FAIR, SIGGRAPH 2025)** — treats Gaussians as true volumetric densities with closed-form transmittance via error function. More physically correct but more expensive. Could be exposed as `splat_method: volumetric` schedule option.

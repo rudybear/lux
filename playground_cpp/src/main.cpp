@@ -117,6 +117,7 @@ struct CLIOptions {
     bool demoLights = false;
     bool sponzaLights = false;
     bool noIBL = false;
+    std::string splatPipeline; // --splat-pipeline: splat shader base for hybrid RT/mesh+splat scenes
 };
 
 static void printUsage(const char* program) {
@@ -140,6 +141,7 @@ static void printUsage(const char* program) {
               << "  --demo-lights          Add 3 demo lights (directional + point + spot) with shadows\n"
               << "  --sponza-lights        Sponza courtyard lights (sun + orbiting torch + accent)\n"
               << "  --no-ibl               Disable IBL environment loading\n"
+              << "  --splat-pipeline <BASE> Splat shader base for hybrid RT/mesh+splat rendering\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -197,6 +199,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.sponzaLights = true;
         } else if (arg == "--no-ibl") {
             opts.noIBL = true;
+        } else if (arg == "--splat-pipeline" && i + 1 < argc) {
+            opts.splatPipeline = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -531,12 +535,13 @@ static int runHeadless(const CLIOptions& opts) {
             // (renderers handle per-material permutation selection internally)
         }
 
-        // Initialize splat renderer if scene has gaussian splat data
-        if (needSplat && scene.hasSplatData()) {
-            // Auto-upgrade to SH degree 3 shader if scene needs higher SH evaluation
-            std::string splatBase = resolvedBase;
+        // Initialize splat renderer if scene has gaussian splat data.
+        // For splat-primary pipelines, use the main resolved base.
+        // For RT/mesh pipelines with splat data in the scene, use a separate splat pipeline.
+        auto initSplatFromBase = [&](const std::string& base) {
+            std::string splatBase = base;
             if (scene.getGltfScene().splat_data.sh_degree > 0) {
-                std::string sh3Base = resolvedBase + "_sh3";
+                std::string sh3Base = base + "_sh3";
                 if (fs::exists(sh3Base + ".comp.spv")) {
                     std::cout << "[info] Scene SH degree " << scene.getGltfScene().splat_data.sh_degree
                               << " > 0, upgrading to " << sh3Base << std::endl;
@@ -544,50 +549,97 @@ static int runHeadless(const CLIOptions& opts) {
                 }
             }
             scene.initSplatRenderer(ctx, splatBase, opts.width, opts.height);
+        };
+
+        if (needSplat && scene.hasSplatData()) {
+            initSplatFromBase(resolvedBase);
+        } else if ((needRT || needMesh) && scene.hasSplatData()) {
+            // Auto-detect splat pipeline for hybrid RT/mesh + splat rendering
+            std::string splatPipelineBase = opts.splatPipeline;
+            if (splatPipelineBase.empty()) {
+                // Try common default locations
+                if (fs::exists("examples/gaussian_splat.comp.spv"))
+                    splatPipelineBase = "examples/gaussian_splat";
+                else if (fs::exists("shadercache/gaussian_splat.comp.spv"))
+                    splatPipelineBase = "shadercache/gaussian_splat";
+            }
+            if (!splatPipelineBase.empty() && fs::exists(splatPipelineBase + ".comp.spv")) {
+                std::cout << "[info] Scene has splat data + " << renderPath
+                          << " pipeline, enabling hybrid " << renderPath << "+splat" << std::endl;
+                initSplatFromBase(splatPipelineBase);
+            }
         }
 
-        // Detect hybrid scene: both triangle meshes AND gaussian splats
+        // Detect hybrid scene variants
         bool hasRasterMeshes = scene.hasGltfScene() && !scene.getGltfScene().meshes.empty();
-        bool hasSplats = needSplat && scene.getSplatRenderer() != nullptr;
-        bool isHybrid = hasRasterMeshes && hasSplats;
+        bool hasSplatRenderer = scene.getSplatRenderer() != nullptr;
+        bool isHybridRaster = hasRasterMeshes && needSplat && hasSplatRenderer;
+        bool isHybridRT = needRT && hasSplatRenderer;
+        bool isHybridMesh = needMesh && hasSplatRenderer;
+        bool isHybrid = isHybridRaster || isHybridRT || isHybridMesh;
 
         if (isHybrid) {
-            std::cout << "[info] Hybrid scene detected: "
-                      << scene.getGltfScene().meshes.size() << " mesh primitive(s) + "
+            std::string hybridType = isHybridRT ? "RT" : (isHybridMesh ? "mesh shader" : "raster");
+            std::cout << "[info] Hybrid scene detected: " << hybridType << " + "
                       << scene.getSplatRenderer()->getWidth() << "x"
                       << scene.getSplatRenderer()->getHeight() << " splat layer" << std::endl;
         }
 
-        std::unique_ptr<IRenderer> renderer;
-        if (hasSplats) {
-            auto* splatR = scene.getSplatRenderer();
+        // Helper: sync splat camera to scene auto-camera
+        auto syncSplatCamera = [&]() {
+            float aspect = static_cast<float>(opts.width) / static_cast<float>(opts.height);
+            scene.getSplatRenderer()->updateCamera(
+                scene.getAutoEye(), scene.getAutoTarget(), scene.getAutoUp(),
+                glm::radians(45.0f), aspect, 0.1f, scene.getAutoFar());
+        };
 
-            if (isHybrid) {
-                // Hybrid rendering: raster meshes first, then splats composited on top
-                // Use default PBR pipeline for mesh primitives (the main pipeline is splat-specific)
+        std::unique_ptr<IRenderer> renderer;
+        if (hasSplatRenderer) {
+            auto* splatR = scene.getSplatRenderer();
+            syncSplatCamera();
+
+            if (isHybridRaster) {
+                // Hybrid raster + splat: full color + depth compositing
                 std::string meshPipeline = "examples/gltf_pbr";
                 auto raster = std::make_unique<RasterRenderer>();
                 raster->init(ctx, scene, meshPipeline, "raster", opts.width, opts.height);
-
-                // Sync splat renderer camera to scene's unified auto-camera
-                // (auto-camera now includes both mesh and splat bounds)
-                float aspect = static_cast<float>(opts.width) / static_cast<float>(opts.height);
-                splatR->updateCamera(scene.getAutoEye(), scene.getAutoTarget(),
-                                     scene.getAutoUp(), glm::radians(45.0f), aspect,
-                                     0.1f, scene.getAutoFar());
-
                 raster->render(ctx);
 
-                // Blit raster color + depth into splat buffers for compositing
                 splatR->preloadBackground(ctx, raster->getOutputImage(), raster->getOutputFormat(),
                                            raster->getWidth(), raster->getHeight());
                 splatR->preloadDepth(ctx, raster->getDepthImage(),
                                       raster->getWidth(), raster->getHeight());
                 raster->cleanup(ctx);
 
-                // Render splats on top (uses LOAD render pass to preserve background)
                 splatR->render(ctx);
-                std::cout << "[info] Hybrid render complete (raster + splat composite)" << std::endl;
+                std::cout << "[info] Hybrid render complete (raster + splat)" << std::endl;
+            } else if (isHybridRT) {
+                // Hybrid RT + splat: color-only compositing (RT has no depth buffer)
+                auto rt = std::make_unique<RTRenderer>();
+                rt->init(ctx, resolvedBase + ".rgen.spv", resolvedBase + ".rmiss.spv",
+                         resolvedBase + ".rchit.spv", opts.width, opts.height, scene);
+                rt->render(ctx);
+
+                splatR->preloadBackground(ctx, rt->getOutputImage(), rt->getOutputFormat(),
+                                           rt->getWidth(), rt->getHeight());
+                // No preloadDepth — RT renders to storage image without depth attachment
+                rt->cleanup(ctx);
+
+                splatR->render(ctx);
+                std::cout << "[info] Hybrid render complete (RT + splat)" << std::endl;
+            } else if (isHybridMesh) {
+                // Hybrid mesh shader + splat: color-only compositing (mesh shader has no depth buffer)
+                auto meshR = std::make_unique<MeshRenderer>();
+                meshR->init(ctx, scene, resolvedBase, opts.width, opts.height);
+                meshR->render(ctx);
+
+                splatR->preloadBackground(ctx, meshR->getOutputImage(), meshR->getOutputFormat(),
+                                           meshR->getWidth(), meshR->getHeight());
+                // No preloadDepth — mesh shader renders to offscreen without accessible depth
+                meshR->cleanup(ctx);
+
+                splatR->render(ctx);
+                std::cout << "[info] Hybrid render complete (mesh shader + splat)" << std::endl;
             } else {
                 // Splat-only rendering
                 splatR->render(ctx);
@@ -757,7 +809,10 @@ static int runInteractive(CLIOptions opts) {
     bool useRT = needRT;
     bool useMesh = needMesh;
     bool useSplat = needSplat;
-    bool isHybrid = false;  // set true when scene has both meshes and splats
+    bool isHybrid = false;       // set true when scene has both meshes and splats
+    bool isHybridRaster = false;  // raster + splat
+    bool isHybridRT = false;      // ray tracing + splat
+    bool isHybridMesh = false;    // mesh shader + splat
 
     // Track whether this is a Sponza scene for torch animation
     bool useSponzaLights = opts.sponzaLights;
@@ -830,12 +885,13 @@ static int runInteractive(CLIOptions opts) {
             }
         }
 
-        // Initialize splat renderer if scene has gaussian splat data
-        if (useSplat && scene.hasSplatData()) {
-            // Auto-upgrade to SH degree 3 shader if scene needs higher SH evaluation
-            std::string splatBase = resolvedBase;
+        // Initialize splat renderer if scene has gaussian splat data.
+        // For splat-primary pipelines, use the main resolved base.
+        // For RT/mesh pipelines with splat data in the scene, use a separate splat pipeline.
+        auto initSplatFromBaseInteractive = [&](const std::string& base) {
+            std::string splatBase = base;
             if (scene.getGltfScene().splat_data.sh_degree > 0) {
-                std::string sh3Base = resolvedBase + "_sh3";
+                std::string sh3Base = base + "_sh3";
                 if (fs::exists(sh3Base + ".comp.spv")) {
                     std::cout << "[info] Scene SH degree " << scene.getGltfScene().splat_data.sh_degree
                               << " > 0, upgrading to " << sh3Base << std::endl;
@@ -843,18 +899,40 @@ static int runInteractive(CLIOptions opts) {
                 }
             }
             scene.initSplatRenderer(ctx, splatBase, opts.width, opts.height);
+        };
+
+        if (useSplat && scene.hasSplatData()) {
+            initSplatFromBaseInteractive(resolvedBase);
+        } else if ((useRT || useMesh) && scene.hasSplatData()) {
+            // Auto-detect splat pipeline for hybrid RT/mesh + splat rendering
+            std::string splatPipelineBase = opts.splatPipeline;
+            if (splatPipelineBase.empty()) {
+                if (fs::exists("examples/gaussian_splat.comp.spv"))
+                    splatPipelineBase = "examples/gaussian_splat";
+                else if (fs::exists("shadercache/gaussian_splat.comp.spv"))
+                    splatPipelineBase = "shadercache/gaussian_splat";
+            }
+            if (!splatPipelineBase.empty() && fs::exists(splatPipelineBase + ".comp.spv")) {
+                std::cout << "[info] Scene has splat data + " << renderPath
+                          << " pipeline, enabling hybrid " << renderPath << "+splat" << std::endl;
+                initSplatFromBaseInteractive(splatPipelineBase);
+            }
         }
 
-        // Detect hybrid scene: both triangle meshes AND gaussian splats
+        // Detect hybrid scene variants
         bool hasRasterMeshes = scene.hasGltfScene() && !scene.getGltfScene().meshes.empty();
-        isHybrid = hasRasterMeshes && useSplat && scene.getSplatRenderer() != nullptr;
+        bool hasSplatRenderer = scene.getSplatRenderer() != nullptr;
+        isHybridRaster = hasRasterMeshes && useSplat && hasSplatRenderer;
+        isHybridRT = useRT && hasSplatRenderer;
+        isHybridMesh = useMesh && hasSplatRenderer;
+        isHybrid = isHybridRaster || isHybridRT || isHybridMesh;
 
         if (isHybrid) {
-            std::cout << "[info] Hybrid scene detected: "
-                      << scene.getGltfScene().meshes.size() << " mesh primitive(s) + splats"
-                      << std::endl;
+            std::string hybridType = isHybridRT ? "RT" : (isHybridMesh ? "mesh shader" : "raster");
+            std::cout << "[info] Hybrid scene detected: " << hybridType << " + splats" << std::endl;
         }
 
+        // Create the primary renderer (RT, mesh, or raster)
         if (useRT) {
             auto rt = std::make_unique<RTRenderer>();
             std::string rgenPath = resolvedBase + ".rgen.spv";
@@ -868,14 +946,11 @@ static int runInteractive(CLIOptions opts) {
             meshR->init(ctx, scene, resolvedBase,
                         opts.width, opts.height);
             renderer = std::move(meshR);
-        } else if (!useSplat || isHybrid) {
-            // Create raster renderer for non-splat scenes, OR for hybrid scenes
-            // (hybrid: raster renders meshes, splat renderer overlays splats)
+        } else if (!useSplat || isHybridRaster) {
+            // Create raster renderer for non-splat scenes, OR for hybrid raster+splat scenes
             auto raster = std::make_unique<RasterRenderer>();
-            // For hybrid scenes, the main pipeline is splat-specific (compute+vert+frag for
-            // Gaussian splatting). Use a default PBR pipeline for the mesh primitives.
-            std::string rasterBase = isHybrid ? "examples/gltf_pbr" : opts.shaderBase;
-            std::string rasterPath = isHybrid ? "raster" : renderPath;
+            std::string rasterBase = isHybridRaster ? "examples/gltf_pbr" : opts.shaderBase;
+            std::string rasterPath = isHybridRaster ? "raster" : renderPath;
             raster->init(ctx, scene, rasterBase, rasterPath,
                          opts.width, opts.height);
             renderer = std::move(raster);
@@ -1010,7 +1085,7 @@ static int runInteractive(CLIOptions opts) {
                                        g_orbit.up, g_orbit.fovY, aspect,
                                        g_orbit.nearPlane, g_orbit.farPlane);
             }
-            if (useSplat && scene.getSplatRenderer()) {
+            if (scene.getSplatRenderer()) {
                 scene.getSplatRenderer()->updateCamera(g_orbit.getEye(), g_orbit.target,
                                                         g_orbit.up, g_orbit.fovY, aspect,
                                                         g_orbit.nearPlane, g_orbit.farPlane);
@@ -1023,92 +1098,65 @@ static int runInteractive(CLIOptions opts) {
         // The fence is only signaled by the last submit (editor if active, scene otherwise)
         VkFence sceneSubmitFence = editorActive ? VK_NULL_HANDLE : inFlightFence;
 
+        // Helper: blit an offscreen image to swapchain and submit with semaphore sync
+        auto blitAndSubmit = [&](auto blitFn) {
+            rtBlitCmd = ctx.beginSingleTimeCommands();
+            VkCommandBuffer cmd = rtBlitCmd;
+            blitFn(cmd);
+            vkEndCommandBuffer(cmd);
+
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSubmitInfo submitInfo = {};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.waitSemaphoreCount = 1;
+            submitInfo.pWaitSemaphores = &imageAvailableSem;
+            submitInfo.pWaitDstStageMask = &waitStage;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &cmd;
+            submitInfo.signalSemaphoreCount = 1;
+            submitInfo.pSignalSemaphores = &sceneSignalSem;
+            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, sceneSubmitFence);
+        };
+
         if (isHybrid && renderer && scene.getSplatRenderer()) {
-            // Hybrid rendering: raster meshes + splats composited together
-            // 1. Render raster offscreen (synchronous)
+            // Hybrid rendering: primary renderer + splats composited on top
             renderer->render(ctx);
 
-            // 2. Blit raster color + depth into splat buffers for compositing
+            // Blit primary renderer color into splat framebuffer
             scene.getSplatRenderer()->preloadBackground(ctx,
                 renderer->getOutputImage(), renderer->getOutputFormat(),
                 renderer->getWidth(), renderer->getHeight());
-            scene.getSplatRenderer()->preloadDepth(ctx,
-                static_cast<RasterRenderer*>(renderer.get())->getDepthImage(),
-                renderer->getWidth(), renderer->getHeight());
 
-            // 3. Render splats on top (LOAD render pass preserves raster background)
+            // Raster hybrid also copies depth for proper occlusion
+            if (isHybridRaster) {
+                scene.getSplatRenderer()->preloadDepth(ctx,
+                    static_cast<RasterRenderer*>(renderer.get())->getDepthImage(),
+                    renderer->getWidth(), renderer->getHeight());
+            }
+            // RT and mesh shader hybrids: color-only compositing (no accessible depth buffer)
+
             scene.getSplatRenderer()->render(ctx);
 
-            // 4. Blit composited result to swapchain
-            rtBlitCmd = ctx.beginSingleTimeCommands();
-            VkCommandBuffer cmd = rtBlitCmd;
-
-            scene.getSplatRenderer()->blitToSwapchain(ctx, cmd,
-                ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
-
-            vkEndCommandBuffer(cmd);
-
-            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-            VkSubmitInfo submitInfo = {};
-            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            submitInfo.waitSemaphoreCount = 1;
-            submitInfo.pWaitSemaphores = &imageAvailableSem;
-            submitInfo.pWaitDstStageMask = &waitStage;
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            submitInfo.signalSemaphoreCount = 1;
-            submitInfo.pSignalSemaphores = &sceneSignalSem;
-
-            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, sceneSubmitFence);
-        } else if (useSplat && scene.getSplatRenderer()) {
-            // Gaussian splatting compute path: render to storage image and blit to swapchain
+            blitAndSubmit([&](VkCommandBuffer cmd) {
+                scene.getSplatRenderer()->blitToSwapchain(ctx, cmd,
+                    ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
+            });
+        } else if (scene.getSplatRenderer()) {
+            // Splat-only rendering
             scene.getSplatRenderer()->render(ctx);
 
-            rtBlitCmd = ctx.beginSingleTimeCommands();
-            VkCommandBuffer cmd = rtBlitCmd;
-
-            scene.getSplatRenderer()->blitToSwapchain(ctx, cmd,
-                ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
-
-            vkEndCommandBuffer(cmd);
-
-            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-            VkSubmitInfo submitInfo = {};
-            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            submitInfo.waitSemaphoreCount = 1;
-            submitInfo.pWaitSemaphores = &imageAvailableSem;
-            submitInfo.pWaitDstStageMask = &waitStage;
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            submitInfo.signalSemaphoreCount = 1;
-            submitInfo.pSignalSemaphores = &sceneSignalSem;
-
-            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, sceneSubmitFence);
+            blitAndSubmit([&](VkCommandBuffer cmd) {
+                scene.getSplatRenderer()->blitToSwapchain(ctx, cmd,
+                    ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
+            });
         } else if (useRT) {
-            // RT rendering: render to storage image (synchronous)
+            // RT rendering: render to storage image, blit to swapchain
             renderer->render(ctx);
 
-            // Blit RT output to swapchain with proper semaphore synchronization
-            rtBlitCmd = ctx.beginSingleTimeCommands();
-            VkCommandBuffer cmd = rtBlitCmd;
-
-            renderer->blitToSwapchain(ctx, cmd, ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
-
-            vkEndCommandBuffer(cmd);
-
-            // Submit with semaphore sync: wait on imageAvailable, signal sceneSignalSem + fence
-            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-            VkSubmitInfo submitInfo = {};
-            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            submitInfo.waitSemaphoreCount = 1;
-            submitInfo.pWaitSemaphores = &imageAvailableSem;
-            submitInfo.pWaitDstStageMask = &waitStage;
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            submitInfo.signalSemaphoreCount = 1;
-            submitInfo.pSignalSemaphores = &sceneSignalSem;
-
-            vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, sceneSubmitFence);
+            blitAndSubmit([&](VkCommandBuffer cmd) {
+                renderer->blitToSwapchain(ctx, cmd,
+                    ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
+            });
         } else if (useMesh) {
             // Mesh shader rendering to swapchain
             auto* meshPtr = static_cast<MeshRenderer*>(renderer.get());
@@ -1119,7 +1167,6 @@ static int runInteractive(CLIOptions opts) {
                 imageAvailableSem, sceneSignalSem, sceneSubmitFence);
         } else {
             // Raster rendering to swapchain
-            // Cast to RasterRenderer for renderToSwapchain (uses internal command buffer)
             auto* rasterPtr = static_cast<RasterRenderer*>(renderer.get());
             rasterPtr->renderToSwapchain(ctx,
                 ctx.swapchainImages[imageIndex],

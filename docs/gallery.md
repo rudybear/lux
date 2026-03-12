@@ -133,6 +133,30 @@ Full support for the Khronos `KHR_gaussian_splatting` glTF extension — all 11 
 </p>
 <p align="center"><em>RotationsY, RotationsZ, ScaledScales, ScalesX, MeshInSplats (hybrid mesh + splat rendering)</em></p>
 
+#### Hybrid Rendering — Splats + Any Backend
+
+Gaussian splats composite with all three rendering backends: raster, ray tracing, and mesh shaders. The engine auto-detects scenes containing both triangle meshes and splat data, renders the mesh geometry first, then overlays splats using `preloadBackground` compositing. Use `--splat-pipeline` to specify a custom splat shader, or let the engine auto-detect `examples/gaussian_splat`.
+
+<p align="center">
+<img src="../screenshots/hybrid/hybrid_raster_splat.png" width="250">
+<img src="../screenshots/hybrid/hybrid_rt_splat.png" width="250">
+<img src="../screenshots/hybrid/hybrid_mesh_splat.png" width="250">
+</p>
+<p align="center"><em>Same hybrid scene rendered with raster (left), ray tracing (center), and mesh shaders (right) — splats composited on top of each backend's output</em></p>
+
+```
+# Raster + splat (auto-detected)
+lux-playground --scene hybrid.glb --pipeline examples/gaussian_splat
+
+# RT + splat (explicit splat pipeline)
+lux-playground --scene hybrid.glb --pipeline shadercache/gltf_pbr_layered --mode rt --splat-pipeline examples/gaussian_splat
+
+# Mesh shader + splat
+lux-playground --scene hybrid.glb --pipeline shadercache/gltf_pbr_layered --mode mesh --splat-pipeline examples/gaussian_splat
+```
+
+Raster hybrid uses full color + depth compositing (splats respect mesh depth). RT and mesh shader hybrids use color-only compositing since those renderers use storage images without accessible depth buffers. Future work: true RT splat integration with analytic ray-Gaussian intersection (P28).
+
 ### Compute Shaders — GPU General-Purpose Computation
 
 Standalone `compute` stage for data-parallel GPU work — `for`/`while` loops with `break`/`continue`, native integer arithmetic, workgroup shared memory with atomic operations, SSBO read/write, storage image output, configurable workgroup sizes, and `barrier()` synchronization.
