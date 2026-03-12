@@ -1,5 +1,43 @@
 # Lux v0.2 — From Shader Language to Rendering Specification Language
 
+## Status Overview (2026-03-12)
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| P0 | Shader Playground | ✅ Complete |
+| P1 | Mathematical Core | ✅ Complete |
+| P2 | Standard Library | ✅ Complete |
+| P3 | Schedule Separation & Compiler Intelligence | ✅ Complete |
+| P4 | Differentiable Rendering + AI Pipeline | ✅ Complete |
+| P5 | glTF PBR Compliance & MaterialX Parity | ✅ Complete |
+| P5.5 | Layered Surface Shader System | ✅ Complete |
+| P5.6 | Compile-Time Features & Permutations | ✅ Complete |
+| P6 | Coat & Sheen Layers | ✅ Complete (via P22 OpenPBR) |
+| P7 | Transmission Layer | ✅ Complete (via P22 OpenPBR) |
+| P8 | @layer Custom Functions | ✅ Complete |
+| P9 | Deferred Pipeline Mode | Planned |
+| P10 | Ray Tracing Pipeline | ✅ Complete (core; SDF→intersection, callable dispatch deferred) |
+| P11 | Metal Backend | ✅ Complete |
+| P12 | glTF Extensions in Engines | ✅ Partial (permutation selection done; extension textures remaining) |
+| P13 | Mesh Shader Support | ✅ Complete |
+| P14 | Gaussian Splatting | ✅ Complete (SH 0-3, KHR conformance, all engines) |
+| P15 | BRDF & Layer Visualization | ✅ Complete |
+| P16 | AI Features | ✅ Complete (16.1-16.3; training pipeline 16.4 deferred) |
+| P17 | Light & Shadow Management | ✅ Partial (17.1-17.3 done; area lights, PCSS, volumetric deferred) |
+| P18 | Material Property Pipeline + Bindless | ✅ Complete |
+| P19 | Per-Material Permutation Selection | ✅ Complete |
+| P19b | Linux Support | Planned |
+| P20 | Validation & Debugging | ✅ Complete |
+| P21 | Shared Stdlib Refactoring | ✅ Complete |
+| P22 | OpenPBR Surface v1.1 | ✅ Complete (incl. P22.5 bindless, P22.6 schedules) |
+| P23 | Interactive Scene Editor + Compute Shaders | ✅ Complete (P23.1-P23.2; gizmos, lighting editor deferred) |
+| P24 | KHR_gaussian_splatting Conformance | ✅ Complete |
+| P25 | PLY-to-glTF Converter | ✅ Complete |
+
+**Test suite: 1383+ tests passing. Compiler: 160+ stdlib functions, 15 modules.**
+
+---
+
 ## The Problem With v0.1
 
 We built GLSL-with-nicer-syntax. That's not the vision. The vision is:
@@ -276,7 +314,7 @@ This allows the same `.lux` source to target different backends without modifyin
 
 ---
 
-## Phase 5.6: Compile-Time Features & Shader Permutations (Completed)
+## Phase 5.6: Compile-Time Features & Shader Permutations ✅ COMPLETE
 
 General-purpose compile-time feature system for shader permutation generation.
 
@@ -299,26 +337,15 @@ General-purpose compile-time feature system for shader permutation generation.
 
 ---
 
-## Phase 6: Coat & Sheen Layers
+## Phase 6: Coat & Sheen Layers ✅ COMPLETE (subsumed by P22 OpenPBR)
 
-Extends the layered surface system with additional physically-based layers.
-
-| Layer | Purpose | glTF Extension |
-|-------|---------|----------------|
-| `coat` | Clearcoat: second GGX lobe with independent roughness and optional normal | `KHR_materials_clearcoat` |
-| `sheen` | Fabric sheen via Charlie NDF + fitted visibility | `KHR_materials_sheen` |
-
-The stdlib already contains `clearcoat_brdf()` and `sheen_brdf()` / `charlie_ndf()`; this phase wires them into the layer system so they compose automatically with energy conservation.
+Originally planned as standalone layer extensions. Now fully implemented as part of the OpenPBR Surface v1.1 integration (Phase 22), which includes coat darkening/absorption/roughening, fuzz BRDF, and 9 composable layers with energy conservation. The stdlib `clearcoat_brdf()`, `sheen_brdf()`, and `charlie_ndf()` are available both standalone and through the OpenPBR compose pipeline.
 
 ---
 
-## Phase 7: Transmission Layer
+## Phase 7: Transmission Layer ✅ COMPLETE (subsumed by P22 OpenPBR)
 
-| Layer | Purpose | glTF Extension |
-|-------|---------|----------------|
-| `transmission` | Microfacet BTDF for glass, liquids, thin surfaces | `KHR_materials_transmission` + `KHR_materials_volume` |
-
-Requires LOD-aware background sampling for raster mode and recursive tracing for RT mode. The stdlib already provides `transmission_btdf()`, `transmission_color()`, and `volume_attenuation()`.
+Originally planned as standalone transmission BTDF. Now fully implemented as part of OpenPBR Surface v1.1 (Phase 22), which includes transmission with volume absorption, IOR modulation, and thin-surface support. The stdlib `transmission_btdf()`, `transmission_color()`, and `volume_attenuation()` are integrated into the OpenPBR layer composition.
 
 ---
 
@@ -365,9 +392,9 @@ The compiler expands `surface` declarations into a G-buffer write pass and a def
 
 ---
 
-## Phase 10: Ray Tracing Pipeline (Full)
+## Phase 10: Ray Tracing Pipeline (Full) ✅ COMPLETE (core)
 
-The `surface` declaration is a natural fit for ray tracing — the BRDF math is identical, only data sourcing and output mechanism change.
+The `surface` declaration is a natural fit for ray tracing — the BRDF math is identical, only data sourcing and output mechanism change. Core RT pipeline implemented: 6 RT shader stages (raygen, closest-hit, any-hit, miss, intersection, callable), SPV_KHR_ray_tracing, acceleration structures, surface→closest-hit expansion, environment→miss expansion, both C++ and Rust engines. Remaining: SDF→intersection shaders, callable dispatch for multi-material (deferred to future).
 
 ### Architecture: Surface → RT Stage Mapping
 
@@ -440,26 +467,15 @@ procedural MetaBalls {
 
 ---
 
-### Phase 11: Metal Backend via SPIR-V Cross-Compilation
+### Phase 11: Metal Backend via SPIR-V Cross-Compilation ✅ COMPLETE
 
-Create a Metal shading language backend by cross-compiling from SPIR-V using SPIRV-Cross. Implementation target: macOS agent with Xcode/Metal toolchain.
+Native Metal backend for macOS implemented via SPIRV-Cross (SPIR-V → MSL). Supports raster and mesh shader pipelines. C++/Metal engine with GLFW, argument buffer mapping, Metal-specific coordinate handling. Tested on macOS with Metal Performance Shaders.
 
-- Integrate SPIRV-Cross as a post-compilation step (SPIR-V → MSL)
-- Handle Metal-specific descriptor set mapping (argument buffers, texture indices)
-- Metal Shading Language differences: no separate sampler/texture in older Metal, different coordinate systems
-- RT support via Metal ray tracing API (intersection functions vs Vulkan closest_hit)
-- Test with Metal Performance Shaders for IBL preprocessing
-- Target: separate Mac agent for CI/testing since Metal requires macOS
+### Phase 12: Official glTF PBR Extensions in Engine Materials ✅ PARTIALLY COMPLETE
 
-### Phase 12: Official glTF PBR Extensions in Engine Materials
+Engine-side glTF extension detection and automatic permutation selection implemented (P19 commit). Engines parse glTF material extensions, map to Lux feature flags, and select the correct compiled shader variant via manifest JSON. Per-material permutation selection works across all three engines.
 
-Extend the three engine runtimes (Python/wgpu, C++/Vulkan, Rust/ash) to detect and bind glTF material extensions at load time:
-
-- Parse `KHR_materials_clearcoat`, `KHR_materials_sheen`, `KHR_materials_transmission`, `KHR_materials_volume`, `KHR_materials_ior`, `KHR_materials_specular`, `KHR_materials_iridescence`, `KHR_materials_emissive_strength`, `KHR_materials_unlit` from glTF JSON
-- Map detected extensions to Lux feature flags for permutation selection
-- Load extension-specific textures (clearcoat normal, sheen color LUT, transmission texture)
-- Automatic pipeline permutation selection: engine reads manifest JSON, matches asset extensions → picks correct compiled shader variant
-- Validation: render Khronos sample models with all extensions enabled
+Remaining: extension-specific texture loading (clearcoat normal map, sheen color LUT, transmission texture), runtime KHR_materials_volume/ior/iridescence parameter binding.
 
 ### Phase 13: Mesh Shader Support ✅ COMPLETE
 
@@ -479,16 +495,9 @@ Mesh shader pipeline mode alongside rasterization and ray tracing. Meshlet-based
 - Data-driven approach: engine queries hardware, builds meshlets, compiles shader with matching limits
 - Meshlet generation utility for glTF assets (offline preprocessing step)
 
-### Phase 14: Gaussian Splatting Representation
+### Phase 14: Gaussian Splatting Representation ✅ COMPLETE
 
-Discuss and design how Gaussian splats should be represented in Lux, then implement:
-
-- Research: investigate how 3D Gaussian splatting rendering pipelines work (point-based rendering, alpha blending, spherical harmonics for view-dependent color)
-- Design: determine whether Gaussian splats fit as a new `geometry` type (e.g., `mode: gaussian_splat`), a new pipeline mode, or a new declaration type
-- Key technical decisions: SH coefficient storage, covariance matrix representation, tile-based sorting/rasterization approach
-- Integration with existing features system for optional SH bands, opacity culling, etc.
-- Implementation: splat sorting compute shader, tile-based rasterizer, SH evaluation
-- Target: real-time rendering of pre-trained Gaussian splat scenes (.ply format)
+First-class `splat` declaration — one block generates a complete 3-stage pipeline (compute preprocess, instanced vertex, alpha-composited fragment). SH degrees 0–3 (1/4/9/16 coefficients), CPU depth sorting, `KHR_gaussian_splatting` glTF extension, all 11 Khronos conformance test scenes pass. Dynamic SH descriptor layouts, per-coefficient SH buffer binding, auto-shader selection, hybrid mesh+splat rendering. All three engines (C++/Vulkan, Rust/ash, Python/numpy) render Gaussian splats with interactive orbit cameras. PLY↔glTF conversion tools included.
 
 ### Phase 15: BRDF & Layer Visualization ✅ COMPLETE
 
@@ -518,7 +527,7 @@ python -m tools.visualize_brdf --shader transfer     # Single shader
 python -m tools.visualize_brdf --skip-compile         # Use cached SPIR-V
 ```
 
-### Phase 16: AI Features for Lux
+### Phase 16: AI Features for Lux ✅ COMPLETE (16.1-16.3)
 
 Design and implement AI-powered authoring capabilities for the Lux ecosystem — from material generation to intelligent shader assistance.
 
@@ -550,7 +559,7 @@ Design and implement AI-powered authoring capabilities for the Lux ecosystem —
 - **BRDF parameter estimation dataset**: Pairs of (material photo, ground-truth PBR parameters) for training the image-to-shader pipeline
 - **Evaluation benchmark**: Standardized test suite of material descriptions → expected shader quality metrics (PSNR against reference, parameter accuracy, energy conservation)
 
-### Phase 17: Light & Shadow Management System
+### Phase 17: Light & Shadow Management System (17.1-17.3 ✅ COMPLETE, 17.4+ planned)
 
 A comprehensive, declarative light and shadow system that integrates with Lux's surface/pipeline/schedule architecture. Light sources become first-class language constructs; the compiler automatically generates the required shadow passes, culling structures, and volumetric effects.
 
@@ -889,7 +898,11 @@ This is the foundation for GPU-driven rendering where draw calls are batched and
 
 ---
 
-### Phase 19: Linux Support
+### Phase 19: Per-Material Shader Permutation Selection ✅ COMPLETE
+
+Automatic per-material shader permutation selection across all engines. Engine reads manifest JSON, detects scene features from glTF material extensions, selects the best matching compiled shader variant. Multi-material scenes with different feature combinations work correctly.
+
+### Phase 19b: Linux Support (Planned)
 
 Add first-class Linux build and run support for the C++ and Rust engines.
 
