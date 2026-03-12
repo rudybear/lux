@@ -12,38 +12,9 @@
 #include <unordered_map>
 #include "material_ubo.h"
 #include "splat_renderer.h"
+#include "scene_light.h"
 #include <glm/glm.hpp>
 #include <memory>
-
-// GPU-compatible scene light representation (64 bytes per light, std430 layout)
-struct SceneLight {
-    enum Type { Directional = 0, Point = 1, Spot = 2 };
-    Type type = Directional;
-    glm::vec3 position{0.0f};
-    glm::vec3 direction{0.0f, -1.0f, 0.0f};
-    glm::vec3 color{1.0f};
-    float intensity = 1.0f;
-    float range = 0.0f;          // 0 = infinite
-    float innerConeAngle = 0.0f;
-    float outerConeAngle = 0.7854f; // pi/4
-    bool castsShadow = false;
-    int shadowIndex = -1;
-};
-
-// Shadow cascade data for directional light CSM
-struct ShadowCascade {
-    glm::mat4 viewProjection;
-    float splitDepth;
-};
-
-// Shadow map entry: packed for GPU (std430 layout, 80 bytes)
-struct ShadowEntry {
-    glm::mat4 viewProjection{1.0f};
-    float bias = 0.005f;
-    float normalBias = 0.02f;
-    float resolution = 1024.0f;
-    float light_size = 0.02f;
-};
 
 // Bindless texture array: all unique textures from the scene for descriptor binding
 struct BindlessTextureArray {

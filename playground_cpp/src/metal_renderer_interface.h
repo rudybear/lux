@@ -16,6 +16,12 @@ public:
     // Render to a CAMetalDrawable (interactive mode)
     virtual void renderToDrawable(MetalContext& ctx, CA::MetalDrawable* drawable) = 0;
 
+    // Render scene to a drawable's texture without presenting (for editor overlay).
+    // Default implementation calls renderToDrawable (subclasses can override).
+    virtual void renderToDrawableNoPresent(MetalContext& ctx, CA::MetalDrawable* drawable) {
+        renderToDrawable(ctx, drawable);
+    }
+
     // Offscreen output access (for screenshot)
     virtual MTL::Texture* getOutputTexture() const = 0;
     virtual uint32_t getWidth() const = 0;

@@ -168,6 +168,17 @@ if(APPLE)
     # Metal-cpp headers (vendored, header-only)
     set(METAL_CPP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/deps/metal-cpp)
 
+    # ImGui source files for Metal backend (core + GLFW + Metal backends)
+    set(IMGUI_METAL_SOURCES
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_demo.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm
+    )
+
     # Metal source files
     set(METAL_SOURCES
         src/metal_main.cpp
@@ -176,6 +187,7 @@ if(APPLE)
         src/metal_shader_transpiler.cpp
         src/metal_raster_renderer.cpp
         src/metal_mesh_renderer.cpp
+        src/metal_splat_renderer.cpp
         src/metal_scene.cpp
         src/metal_scene_manager.cpp
         src/metal_screenshot.cpp
@@ -185,6 +197,10 @@ if(APPLE)
         src/camera.cpp
         src/reflected_pipeline.cpp
         src/scene_geometry.cpp
+        # Editor (backend-agnostic panel drawing)
+        src/editor_panels.cpp
+        # ImGui
+        ${IMGUI_METAL_SOURCES}
     )
 
     # One translation unit must define the Metal-cpp implementations
@@ -198,16 +214,38 @@ if(APPLE)
         COMPILE_FLAGS "-fobjc-arc"
     )
 
+    # ImGui Metal backend is ObjC++ (NO ARC - imgui uses manual retain/release with IMGUI_IMPL_METAL_CPP)
+    set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm PROPERTIES
+        LANGUAGE OBJCXX
+        COMPILE_FLAGS "-fno-objc-arc -DIMGUI_IMPL_METAL_CPP"
+    )
+
     add_executable(lux-playground-metal ${METAL_SOURCES})
 
     target_include_directories(lux-playground-metal PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/deps
         ${METAL_CPP_DIR}
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/backends
+        ${spirv-cross_SOURCE_DIR}/..
+        ${spirv-cross_SOURCE_DIR}
+    )
+
+    # SPIRV-Cross exports its source root as a public include dir, but the code
+    # includes <spirv_cross/spirv_msl.hpp>. Create a compatibility symlink so
+    # the include resolves from the parent directory.
+    if(NOT EXISTS "${spirv-cross_SOURCE_DIR}/../spirv_cross")
+        file(CREATE_LINK "${spirv-cross_SOURCE_DIR}" "${spirv-cross_SOURCE_DIR}/../spirv_cross" SYMBOLIC)
+    endif()
+    target_include_directories(lux-playground-metal PRIVATE
+        "${spirv-cross_SOURCE_DIR}/.."
     )
 
     target_compile_definitions(lux-playground-metal PRIVATE
         LUX_METAL_BACKEND
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
+        IMGUI_IMPL_METAL_CPP
     )
 
     # Link frameworks and libraries

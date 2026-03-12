@@ -166,8 +166,8 @@ void MetalMeshRenderer::createPipeline(MetalContext& ctx) {
     }
 
     // Load reflection data for uniform binding
-    std::string meshJson = m_pipelineBase + ".mesh.lux.json";
-    std::string fragJson = m_pipelineBase + ".frag.lux.json";
+    std::string meshJson = m_pipelineBase + ".mesh.json";
+    std::string fragJson = m_pipelineBase + ".frag.json";
     ReflectionData meshRefl, fragRefl;
     if (fs::exists(meshJson)) meshRefl = parseReflectionJson(meshJson);
     if (fs::exists(fragJson)) fragRefl = parseReflectionJson(fragJson);

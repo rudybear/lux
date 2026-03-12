@@ -4,6 +4,9 @@
 #include "metal_context.h"
 #include "gltf_loader.h"
 #include "scene_geometry.h"
+#include "scene_light.h"
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <string>
 #include <vector>
 #include <set>
@@ -49,14 +52,44 @@ public:
     // Texture lookup for binding by name (checks per-material, named, IBL, defaults)
     MetalGPUTexture& getTextureForBinding(const std::string& name, int materialIndex = -1);
 
+    // Light management
+    void addLight(const SceneLight& light) { m_lights.push_back(light); }
+    void clearLights() { m_lights.clear(); }
+    const std::vector<SceneLight>& getLights() const { return m_lights; }
+    std::vector<SceneLight>& getLightsMutable() { return m_lights; }
+    int getLightCount() const { return static_cast<int>(m_lights.size()); }
+
+    // Convert glTF lights to SceneLights (called after scene load)
+    void populateLightsFromGltf(const GltfScene& gltfScene);
+
+    // Pack lights/shadow buffers for GPU upload
+    std::vector<float> packLightsBuffer() const { return ::packLightsBuffer(m_lights); }
+    std::vector<float> packShadowBuffer() const { return ::packShadowBuffer(m_shadowEntries); }
+
+    // Shadow map support
+    void computeShadowData(const glm::mat4& cameraView, const glm::mat4& cameraProj,
+                           float nearClip, float farClip);
+    const std::vector<ShadowEntry>& getShadowEntries() const { return m_shadowEntries; }
+    int getShadowMapCount() const { return static_cast<int>(m_shadowEntries.size()); }
+
     // Scene feature detection
     std::set<std::string> detectSceneFeatures() const;
     std::set<std::string> detectMaterialFeatures(int materialIndex) const;
     std::map<std::string, std::vector<int>> groupMaterialsByFeatures() const;
 
+    // Auto-camera override (for sponza lights interior camera)
+    void overrideAutoCamera(glm::vec3 eye, glm::vec3 target, glm::vec3 up, float farPlane) {
+        m_autoEye = eye; m_autoTarget = target; m_autoUp = up; m_autoFar = farPlane;
+        m_hasSceneBounds = true;
+    }
+
     // Vertex/index data access (for SoA uploads in mesh renderer)
     const std::vector<Vertex>& getVertices() const { return m_vertices; }
     const std::vector<uint32_t>& getIndices() const { return m_indices; }
+
+    // Gaussian splatting support
+    bool hasSplatData() const { return m_hasGltfScene && m_gltfScene.splat_data.has_splats; }
+    const GaussianSplatData& getSplatData() const { return m_gltfScene.splat_data; }
 
     void cleanup();
 
@@ -69,6 +102,12 @@ private:
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     MetalGPUMesh m_mesh = {};
+
+    // Scene lights (populated from glTF or added manually)
+    std::vector<SceneLight> m_lights;
+
+    // Shadow map entries (populated by computeShadowData)
+    std::vector<ShadowEntry> m_shadowEntries;
 
     // glTF scene data
     GltfScene m_gltfScene;

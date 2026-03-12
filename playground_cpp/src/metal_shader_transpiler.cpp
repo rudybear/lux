@@ -1,6 +1,10 @@
 #include "metal_shader_transpiler.h"
 #include "reflected_pipeline.h"
+#if __has_include(<spirv_cross/spirv_msl.hpp>)
 #include <spirv_cross/spirv_msl.hpp>
+#else
+#include <spirv_msl.hpp>
+#endif
 #include <fstream>
 #include <iostream>
 #include <stdexcept>

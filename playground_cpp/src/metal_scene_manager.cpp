@@ -64,6 +64,10 @@ void MetalSceneManager::loadScene(const std::string& sceneSource) {
             std::cout << "[metal] glTF has no meshes, falling back to sphere" << std::endl;
             Scene::generateSphere(32, 32, m_vertices, m_indices);
         }
+
+        // Populate SceneLights from glTF lights (KHR_lights_punctual)
+        populateLightsFromGltf(m_gltfScene);
+        std::cout << "[metal] Scene lights: " << m_lights.size() << std::endl;
     } else if (sceneSource == "sphere" || sceneSource == "triangle" ||
                sceneSource == "fullscreen") {
         if (sceneSource == "sphere") {
@@ -380,25 +384,42 @@ void MetalSceneManager::loadIBLAssets(MetalContext& ctx, const std::string& requ
 // --------------------------------------------------------------------------
 
 MetalGPUTexture& MetalSceneManager::getTextureForBinding(const std::string& name, int materialIndex) {
-    // Check per-material textures first
+    // SPIRV-Cross may add ".__texture" or ".__sampler" suffix when splitting
+    // combined image/samplers. Strip it for lookup.
+    std::string cleanName = name;
+    auto dotPos = cleanName.find(".__");
+    if (dotPos != std::string::npos) {
+        cleanName = cleanName.substr(0, dotPos);
+    }
+
+    // Check per-material textures first (stored as "base_color_tex[N]" with material index)
     if (materialIndex >= 0 && materialIndex < static_cast<int>(m_perMaterialTextures.size())) {
         auto& texMap = m_perMaterialTextures[materialIndex];
-        auto it = texMap.find(name);
+        // Try exact match first
+        auto it = texMap.find(cleanName);
         if (it != texMap.end()) return it->second;
+        // Try with material index suffix (e.g., "base_color_tex[0]")
+        std::string indexedName = cleanName + "[" + std::to_string(materialIndex) + "]";
+        it = texMap.find(indexedName);
+        if (it != texMap.end()) return it->second;
+        // Try prefix match (binding name may be just "base_color_tex" but stored as "base_color_tex[0]")
+        for (auto& [key, tex] : texMap) {
+            if (key.find(cleanName) == 0) return tex;
+        }
     }
 
     // Check named textures
-    auto it = m_namedTextures.find(name);
+    auto it = m_namedTextures.find(cleanName);
     if (it != m_namedTextures.end()) return it->second;
 
     // Check IBL textures
-    it = m_iblTextures.find(name);
+    it = m_iblTextures.find(cleanName);
     if (it != m_iblTextures.end()) return it->second;
 
     // Return default textures based on name
-    if (name.find("normal") != std::string::npos) return m_defaultNormalTexture;
-    if (name.find("occlusion") != std::string::npos) return m_defaultWhiteTexture;
-    if (name.find("emissive") != std::string::npos) return m_defaultBlackTexture;
+    if (cleanName.find("normal") != std::string::npos) return m_defaultNormalTexture;
+    if (cleanName.find("occlusion") != std::string::npos) return m_defaultWhiteTexture;
+    if (cleanName.find("emissive") != std::string::npos) return m_defaultBlackTexture;
     return m_defaultWhiteTexture;
 }
 
@@ -417,6 +438,15 @@ std::set<std::string> MetalSceneManager::detectSceneFeatures() const {
         if (mat.hasSheen) features.insert("has_sheen");
         if (mat.hasTransmission) features.insert("has_transmission");
     }
+
+    // Detect shadow support: if any light casts shadows, enable has_shadows
+    for (auto& l : m_lights) {
+        if (l.castsShadow) {
+            features.insert("has_shadows");
+            break;
+        }
+    }
+
     return features;
 }
 
@@ -431,6 +461,15 @@ std::set<std::string> MetalSceneManager::detectMaterialFeatures(int materialInde
     if (mat.hasClearcoat) features.insert("has_clearcoat");
     if (mat.hasSheen) features.insert("has_sheen");
     if (mat.hasTransmission) features.insert("has_transmission");
+
+    // Detect shadow support for per-material permutation selection
+    for (auto& l : m_lights) {
+        if (l.castsShadow) {
+            features.insert("has_shadows");
+            break;
+        }
+    }
+
     return features;
 }
 
@@ -472,6 +511,137 @@ void MetalSceneManager::computeAutoCamera(const std::vector<Vertex>& vertices) {
 
     std::cout << "[metal] Auto-camera: center=(" << center.x << "," << center.y << "," << center.z
               << "), radius=" << radius << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// Light management
+// --------------------------------------------------------------------------
+
+void MetalSceneManager::populateLightsFromGltf(const GltfScene& gltfScene) {
+    m_lights.clear();
+    for (const auto& gl : gltfScene.lights) {
+        SceneLight sl;
+        if (gl.type == "directional") sl.type = SceneLight::Directional;
+        else if (gl.type == "point") sl.type = SceneLight::Point;
+        else if (gl.type == "spot") sl.type = SceneLight::Spot;
+        sl.position = gl.position;
+        sl.direction = gl.direction;
+        sl.color = gl.color;
+        sl.intensity = gl.intensity;
+        sl.range = gl.range;
+        sl.innerConeAngle = gl.innerConeAngle;
+        sl.outerConeAngle = gl.outerConeAngle;
+        m_lights.push_back(sl);
+    }
+    // Add a default directional light if scene has none
+    if (m_lights.empty()) {
+        SceneLight defaultLight;
+        defaultLight.type = SceneLight::Directional;
+        defaultLight.direction = glm::normalize(glm::vec3(1.0f, 0.8f, 0.6f));
+        defaultLight.color = glm::vec3(1.0f, 0.98f, 0.95f);
+        defaultLight.intensity = 1.0f;
+        m_lights.push_back(defaultLight);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Shadow data computation
+// --------------------------------------------------------------------------
+
+void MetalSceneManager::computeShadowData(const glm::mat4& cameraView, const glm::mat4& cameraProj,
+                                           float nearClip, float farClip) {
+    m_shadowEntries.clear();
+    int shadowIdx = 0;
+    const int MAX_SHADOW_MAPS = 8;
+
+    for (auto& light : m_lights) {
+        light.shadowIndex = -1;  // Reset
+        if (!light.castsShadow) continue;
+        if (shadowIdx >= MAX_SHADOW_MAPS) break;
+
+        ShadowEntry entry;
+
+        if (light.type == SceneLight::Directional) {
+            // Compute orthographic shadow projection that encompasses the camera frustum
+            glm::mat4 invCam = glm::inverse(cameraProj * cameraView);
+
+            // NDC corners of the camera frustum
+            glm::vec3 frustumCorners[8] = {
+                {-1, -1, 0}, { 1, -1, 0}, { 1,  1, 0}, {-1,  1, 0},  // near
+                {-1, -1, 1}, { 1, -1, 1}, { 1,  1, 1}, {-1,  1, 1}   // far
+            };
+
+            // Transform to world space
+            glm::vec3 center(0.0f);
+            for (int i = 0; i < 8; i++) {
+                glm::vec4 ws = invCam * glm::vec4(frustumCorners[i], 1.0f);
+                frustumCorners[i] = glm::vec3(ws) / ws.w;
+                center += frustumCorners[i];
+            }
+            center /= 8.0f;
+
+            // Build light view matrix
+            glm::vec3 lightDir = glm::normalize(light.direction);
+            glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f);
+            if (std::abs(glm::dot(lightDir, up)) > 0.99f) {
+                up = glm::vec3(0.0f, 0.0f, 1.0f);
+            }
+            glm::mat4 lightView = glm::lookAt(center + lightDir, center, up);
+
+            // Find bounding box in light space
+            float minX =  FLT_MAX, maxX = -FLT_MAX;
+            float minY =  FLT_MAX, maxY = -FLT_MAX;
+            float minZ =  FLT_MAX, maxZ = -FLT_MAX;
+            for (int i = 0; i < 8; i++) {
+                glm::vec4 ls = lightView * glm::vec4(frustumCorners[i], 1.0f);
+                minX = std::min(minX, ls.x); maxX = std::max(maxX, ls.x);
+                minY = std::min(minY, ls.y); maxY = std::max(maxY, ls.y);
+                minZ = std::min(minZ, ls.z); maxZ = std::max(maxZ, ls.z);
+            }
+
+            // Extend depth range to catch shadow casters behind the camera
+            float zRange = maxZ - minZ;
+            minZ -= zRange * 0.5f;
+            maxZ += zRange * 0.5f;
+
+            glm::mat4 lightProj = glm::ortho(minX, maxX, minY, maxY, -maxZ, -minZ);
+            entry.viewProjection = lightProj * lightView;
+        } else if (light.type == SceneLight::Spot) {
+            // Perspective shadow projection for spot lights
+            float outerAngle = light.outerConeAngle;
+            float fov = outerAngle * 2.0f;
+            float range = (light.range > 0.0f) ? light.range : 100.0f;
+
+            glm::vec3 lightDir = glm::normalize(light.direction);
+            glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f);
+            if (std::abs(glm::dot(lightDir, up)) > 0.99f) {
+                up = glm::vec3(0.0f, 0.0f, 1.0f);
+            }
+
+            glm::mat4 lightView = glm::lookAt(light.position,
+                                                light.position + lightDir, up);
+            glm::mat4 lightProj = glm::perspective(fov, 1.0f, 0.1f, range);
+
+            entry.viewProjection = lightProj * lightView;
+        } else {
+            // Point lights: skip shadows for now (would need cube maps)
+            continue;
+        }
+
+        entry.bias = 0.005f;
+        entry.normalBias = 0.02f;
+        entry.resolution = 1024.0f;
+        entry.light_size = 0.02f;
+
+        light.shadowIndex = shadowIdx;
+        m_shadowEntries.push_back(entry);
+        shadowIdx++;
+    }
+
+    if (!m_shadowEntries.empty()) {
+        std::cout << "[metal] Computed shadow data: " << m_shadowEntries.size()
+                  << " shadow map(s)" << std::endl;
+    }
 }
 
 // --------------------------------------------------------------------------
