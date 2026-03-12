@@ -15,7 +15,7 @@
 | P6 | Coat & Sheen Layers | ✅ Complete (via P22 OpenPBR) |
 | P7 | Transmission Layer | ✅ Complete (via P22 OpenPBR) |
 | P8 | @layer Custom Functions | ✅ Complete |
-| P9 | Deferred Pipeline Mode | Planned |
+| P9 | Deferred Pipeline Mode | Designed (full spec ready) |
 | P10 | Ray Tracing Pipeline | ✅ Complete (core; SDF→intersection, callable dispatch deferred) |
 | P11 | Metal Backend | ✅ Complete |
 | P12 | glTF Extensions in Engines | ✅ Partial (permutation selection done; extension textures remaining) |
@@ -383,15 +383,120 @@ New files: `luxc/stdlib/toon.lux`, `examples/cartoon_toon.lux`, `tests/test_cust
 
 ---
 
-## Phase 9: Deferred Pipeline Mode
+## Phase 9: Deferred Pipeline Mode [DESIGNED]
 
-A third pipeline mode alongside raster and raytrace:
+`mode: deferred` — the compiler auto-generates a multi-pass pipeline from the same `surface` + `lighting` declarations used for raster/RT. No manual G-buffer management. Works with all geometry backends (vertex, mesh shader, splat).
 
-```bash
-luxc shader.lux --pipeline deferred
+### Design Principles
+
+- **`surface` layers → G-buffer layout** — the compiler inspects `layers [base, normal_map, emission, ...]` and auto-derives render targets. Unused layers = fewer RTs.
+- **`lighting` block → lighting pass** — the existing `multi_light()` / `ibl()` layers drive the deferred lighting pass instead of being inlined in the fragment shader.
+- **`schedule` → quality knobs** — tiled vs clustered culling, G-buffer precision, normal encoding, RT effects.
+- **No new grammar** — `mode: deferred` in the pipeline, new schedule slots. Same `surface`/`lighting`/`schedule` declarations.
+
+### G-Buffer Layout (Auto-Generated)
+
+| G-Buffer RT | Format | Source Layer | Channels |
+|---|---|---|---|
+| RT0 | RGBA8_SRGB | `base` | albedo.rgb + metallic.a |
+| RT1 | RGB10A2_UNORM | `normal_map` | octahedron normal.rg + roughness.b + material_id.a |
+| RT2 | RGBA16F | `emission` | emission.rgb + occlusion.a |
+| Depth | D32_SFLOAT | built-in | hardware depth |
+
+Optional layers (`coat`, `sheen`, `transmission`) conditionally add RT3/RT4. Reflection JSON emits a `gbuffer` section describing the exact layout for engine-side pipeline creation.
+
+### Generated Passes
+
+From one `pipeline { mode: deferred }` declaration:
+
+1. **Geometry pass** (vertex + fragment → G-buffer MRT) — evaluates material layers, writes to multiple render targets. No BRDF evaluation, no light loop.
+2. **Light culling pass** (compute, optional) — only when `light_culling: tiled` or `clustered`. Reads depth, builds per-tile/cluster light index lists in SSBO.
+3. **Lighting pass** (compute or fullscreen fragment) — reads G-buffer + light lists, evaluates full BRDF for every light + IBL, writes final lit color.
+
+### User-Facing Syntax
+
+```lux
+// Same surface and lighting declarations as raster — zero changes needed
+surface DeferredMaterial {
+    sampler2d albedo_tex,
+    sampler2d normal_tex,
+    sampler2d metallic_roughness_tex,
+    layers [
+        base(albedo: srgb_to_linear(sample(albedo_tex, uv).xyz),
+             roughness: sample(metallic_roughness_tex, uv).y,
+             metallic: sample(metallic_roughness_tex, uv).z),
+        normal_map(map: sample(normal_tex, uv).xyz),
+    ]
+}
+
+lighting SceneLights {
+    samplerCube env_specular, samplerCube env_irradiance, sampler2d brdf_lut,
+    layers [
+        multi_light(count: LightData.light_count, max_lights: 32),
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance, brdf_lut: brdf_lut),
+    ]
+}
+
+schedule TiledDeferred {
+    light_culling: tiled,
+    tile_size: 16,
+    gbuffer_precision: standard,
+    normal_encoding: octahedron,
+    lighting_pass: compute,
+    tonemap: aces,
+}
+
+// One declaration → geometry pass + light cull compute + lighting compute
+pipeline MainDeferred {
+    mode: deferred,
+    geometry: StandardMesh,
+    surface: DeferredMaterial,
+    lighting: SceneLights,
+    schedule: TiledDeferred,
+}
 ```
 
-The compiler expands `surface` declarations into a G-buffer write pass and a deferred lighting pass. Layers that depend on lighting (IBL, emission) are deferred to the second pass; geometry-only layers (base params, normal_map) are written in the first pass.
+### Schedule Slots for Deferred
+
+| Slot | Values | Default | Effect |
+|---|---|---|---|
+| `light_culling` | `none` / `tiled` / `clustered` | `none` | Whether a culling compute pass is generated |
+| `tile_size` | 8 / 16 / 32 | 16 | Tile dimensions in pixels |
+| `cluster_slices` | 1–64 | 24 | Depth slices for clustered mode |
+| `cluster_depth_distribution` | `exponential` / `linear` | `exponential` | How depth slices are spaced |
+| `gbuffer_precision` | `standard` / `high` | `standard` | 8-bit vs 16-bit G-buffer formats |
+| `normal_encoding` | `octahedron` / `xyz` / `spheremap` | `octahedron` | Normal compression |
+| `lighting_pass` | `fragment` / `compute` | `compute` | How final lighting is evaluated |
+| `transparency` | `none` / `forward` / `oit_weighted` | `forward` | Transparent object handling |
+| `rt_shadows` | true / false | false | Ray-traced shadow pass |
+| `rt_reflections` | true / false | false | Ray-traced reflection pass |
+
+### Deferred + All Backends
+
+**Mesh shader geometry pass:** Same G-buffer fragment, but geometry comes from task+mesh stages instead of vertex. Pipeline adds `geometry_pass: mesh_shader`.
+
+**Hybrid deferred + RT:** Raster fills G-buffer, then RT passes trace shadow/reflection rays reading world_pos + normal from G-buffer. Lighting pass composites RT results with direct lighting.
+
+```lux
+schedule HybridRT {
+    light_culling: clustered,
+    rt_shadows: true,
+    rt_reflections: true,
+    rt_reflection_roughness_cutoff: 0.4,
+}
+```
+
+**Splat deferred (DeferredGS approach):** Alpha-blend each material property into G-buffer channels using same Gaussian compositing formula. Per-pixel result is front-to-back composited average of overlapping splats. Lighting pass processes pixels where accumulated alpha > threshold. New stdlib: `octahedron_encode()/decode()`, G-buffer pack/unpack.
+
+**Transparency:** Forward pass after deferred lighting for transparent objects (standard approach used by UE5/Unity HDRP/Frostbite). Optional weighted-blended OIT via `transparency: oit_weighted`.
+
+### Implementation
+
+1. **New file: `luxc/expansion/deferred_expander.py`** — `expand_deferred_pipeline()`, called from `surface_expander.py` when `mode == "deferred"`
+2. **New stdlib: `luxc/stdlib/gbuffer.lux`** — octahedron encode/decode, G-buffer pack/unpack, tile/cluster index lookup
+3. **Extension to `surface_expander.py`** — `elif mode == "deferred":` branch dispatching to new expander
+4. **Reflection JSON** — `gbuffer` section with RT formats/channels, `deferred_passes` listing each generated stage and its role
+5. **Engine-side** — reflection-driven pipeline creation: create render pass with N color attachments, bind G-buffer textures to lighting pass
 
 ---
 
@@ -850,7 +955,7 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P6** | Coat & sheen layers (clearcoat, sheen as composable layers) | ✅ Complete |
 | **P7** | Transmission layer (microfacet BTDF, volume attenuation) | ✅ Complete |
 | **P8** | `@layer` custom functions (user-defined layer extensibility) | ✅ Complete |
-| **P9** | Deferred pipeline mode (`--pipeline deferred`, G-buffer pass) | Planned |
+| **P9** | Deferred pipeline mode (G-buffer auto-gen, tiled/clustered lighting, hybrid RT, mesh shader, splat deferred) | Designed |
 | **P10** | Ray tracing pipeline — full (RT stages, SPIR-V codegen, surface→RT expansion) | ✅ Complete |
 | **P11** | Metal backend via SPIR-V cross-compilation (SPIRV-Cross → MSL) | ✅ Complete |
 | **P12** | Official glTF PBR extensions in engine materials (auto-detect, permutation selection) | ✅ Complete |
