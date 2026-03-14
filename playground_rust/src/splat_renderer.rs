@@ -199,7 +199,10 @@ impl GaussianSplatRenderer {
         let framebuffer_load_depth = create_fb(render_pass_load_depth)?;
 
         // --- Descriptor set layouts ---
-        let compute_set_layout = Self::create_compute_set_layout(&device)?;
+        // Compute bindings: 4 input (pos,rot,scale,opacity) + N SH buffers + 5 output
+        let num_sh_buffers = splat_data.sh_coefficients.len().max(1) as u32;
+        let num_compute_bindings = 4 + num_sh_buffers + 5;
+        let compute_set_layout = Self::create_compute_set_layout(&device, num_compute_bindings)?;
         let render_set_layout = Self::create_render_set_layout(&device)?;
 
         // --- Pipeline layouts ---
@@ -272,9 +275,10 @@ impl GaussianSplatRenderer {
         }
 
         // --- Descriptor pool ---
+        // Need enough descriptors for compute (num_compute_bindings) + render (4)
         let pool_size = vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(20);
+            .descriptor_count(num_compute_bindings + 4);
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(2)
             .pool_sizes(std::slice::from_ref(&pool_size));
@@ -389,25 +393,33 @@ impl GaussianSplatRenderer {
             unsafe { device.update_descriptor_sets(&[write], &[]); }
         };
 
-        // Compute set bindings 0-9
+        // Compute set bindings: 0-3 input, 4..4+N SH, then output buffers
         write_ssbo(compute_desc_set, 0, pos_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(compute_desc_set, 1, rot_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(compute_desc_set, 2, scale_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(compute_desc_set, 3, opacity_buffer.buffer, (n * 4) as u64);
 
-        let sh_buf = if sh_buffers.is_empty() { pos_buffer.buffer } else { sh_buffers[0].buffer };
-        let sh_size = if sh_buffers.is_empty() || splat_data.sh_coefficients.is_empty() {
-            16u64
-        } else {
-            (splat_data.sh_coefficients[0].len() * 16) as u64
-        };
-        write_ssbo(compute_desc_set, 4, sh_buf, sh_size.max(16));
+        // Bind ALL SH coefficient buffers at bindings 4..4+num_sh_buffers
+        for (i, sh_buf) in sh_buffers.iter().enumerate() {
+            let sh_size = if i < splat_data.sh_coefficients.len() {
+                (splat_data.sh_coefficients[i].len() * 16) as u64
+            } else {
+                16u64
+            };
+            write_ssbo(compute_desc_set, 4 + i as u32, sh_buf.buffer, sh_size.max(16));
+        }
+        if sh_buffers.is_empty() {
+            // Bind dummy SH buffer
+            write_ssbo(compute_desc_set, 4, pos_buffer.buffer, 16);
+        }
 
-        write_ssbo(compute_desc_set, 5, proj_center_buffer.buffer, (n * 4 * 4) as u64);
-        write_ssbo(compute_desc_set, 6, proj_conic_buffer.buffer, (n * 4 * 4) as u64);
-        write_ssbo(compute_desc_set, 7, proj_color_buffer.buffer, (n * 4 * 4) as u64);
-        write_ssbo(compute_desc_set, 8, sort_keys_buffer.buffer, (n * 4) as u64);
-        write_ssbo(compute_desc_set, 9, visible_count_buffer.buffer, 4);
+        // Output buffers start after SH buffers
+        let out_base = 4 + num_sh_buffers;
+        write_ssbo(compute_desc_set, out_base, proj_center_buffer.buffer, (n * 4 * 4) as u64);
+        write_ssbo(compute_desc_set, out_base + 1, proj_conic_buffer.buffer, (n * 4 * 4) as u64);
+        write_ssbo(compute_desc_set, out_base + 2, proj_color_buffer.buffer, (n * 4 * 4) as u64);
+        write_ssbo(compute_desc_set, out_base + 3, sort_keys_buffer.buffer, (n * 4) as u64);
+        write_ssbo(compute_desc_set, out_base + 4, visible_count_buffer.buffer, 4);
 
         // Render set bindings 0-3
         write_ssbo(render_desc_set, 0, proj_center_buffer.buffer, (n * 4 * 4) as u64);
@@ -694,8 +706,8 @@ impl GaussianSplatRenderer {
     }
 
     // --- Helper: create compute descriptor set layout ---
-    fn create_compute_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout, String> {
-        let bindings: Vec<_> = (0..10u32)
+    fn create_compute_set_layout(device: &ash::Device, num_bindings: u32) -> Result<vk::DescriptorSetLayout, String> {
+        let bindings: Vec<_> = (0..num_bindings)
             .map(|i| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(i)

@@ -854,8 +854,15 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
 
             // Parse spherical harmonics coefficients
             // Extension format: "sh": [{"coefficients": <accessor_idx>, "degree": <N>}, ...]
+            // KHR format stores all coefficients for a degree in one flat accessor.
+            // The shader expects individual coefficient buffers (one per SH basis function).
+            // Degree 0: 1 coeff  -> buffer index 0
+            // Degree 1: 3 coeffs -> buffer indices 1,2,3
+            // Degree 2: 5 coeffs -> buffer indices 4,5,6,7,8
+            // Degree 3: 7 coeffs -> buffer indices 9,10,11,12,13,14,15
             let mut prim_sh_degree = 0u32;
             let mut prim_sh_coefficients: Vec<Vec<[f32; 4]>> = Vec::new();
+            let coeff_base: [usize; 4] = [0, 1, 4, 9];
             if let Some(sh_arr) = ext.get("sh").and_then(|v| v.as_array()) {
                 for sh_entry in sh_arr {
                     let degree = sh_entry.get("degree")
@@ -865,17 +872,50 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                     }
                     if let Some(acc_idx) = sh_entry.get("coefficients").and_then(|v| v.as_u64()) {
                         let raw = read_accessor_f32(acc_idx as usize);
-                        // Pad to vec4: source may be vec3 (3 floats per splat)
-                        let comp = if raw.len() == prim_num_splats as usize * 3 { 3 } else { 4 };
-                        let coeffs: Vec<[f32; 4]> = raw.chunks(comp)
-                            .map(|c| [
-                                c.first().copied().unwrap_or(0.0),
-                                c.get(1).copied().unwrap_or(0.0),
-                                c.get(2).copied().unwrap_or(0.0),
-                                if comp >= 4 { c.get(3).copied().unwrap_or(0.0) } else { 0.0 },
-                            ])
-                            .collect();
-                        prim_sh_coefficients.push(coeffs);
+                        let n = prim_num_splats as usize;
+                        let num_coeffs = (2 * degree + 1) as usize; // coefficients per degree
+                        let floats_per_splat = num_coeffs * 3; // 3 channels (RGB) per coefficient
+
+                        if degree == 0 {
+                            // DC term: vec3 per splat -> 1 buffer
+                            let base_idx = coeff_base[0];
+                            if base_idx >= prim_sh_coefficients.len() {
+                                prim_sh_coefficients.resize(base_idx + 1, Vec::new());
+                            }
+                            prim_sh_coefficients[base_idx] = raw.chunks(3)
+                                .map(|c| [
+                                    c.first().copied().unwrap_or(0.0),
+                                    c.get(1).copied().unwrap_or(0.0),
+                                    c.get(2).copied().unwrap_or(0.0),
+                                    0.0,
+                                ])
+                                .collect();
+                        } else {
+                            // Higher degrees: flat scalar array, split into individual coefficients
+                            // Layout per splat: [c0_r, c0_g, c0_b, c1_r, c1_g, c1_b, ...]
+                            let base_idx = coeff_base[degree as usize];
+                            let total_coeffs = base_idx + num_coeffs;
+                            if total_coeffs > prim_sh_coefficients.len() {
+                                prim_sh_coefficients.resize(total_coeffs, Vec::new());
+                            }
+                            // Initialize individual coefficient buffers
+                            for ci in 0..num_coeffs {
+                                prim_sh_coefficients[base_idx + ci] = Vec::with_capacity(n);
+                            }
+                            // Unpack: for each splat, extract individual vec3 coefficients
+                            for si in 0..n {
+                                let splat_offset = si * floats_per_splat;
+                                for ci in 0..num_coeffs {
+                                    let off = splat_offset + ci * 3;
+                                    prim_sh_coefficients[base_idx + ci].push([
+                                        raw.get(off).copied().unwrap_or(0.0),
+                                        raw.get(off + 1).copied().unwrap_or(0.0),
+                                        raw.get(off + 2).copied().unwrap_or(0.0),
+                                        0.0,
+                                    ]);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -945,10 +985,23 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
     if scene.splat_data.has_splats {
         scene.splat_data.sh_degree = global_max_sh_degree;
 
-        // Convert KHR linear opacity [0,1] to logit for shader compatibility
-        // logit(p) = log(p / (1 - p))
-        // Only for KHR format; internal format (_OPACITY) already stores logit values
+        // Convert KHR linear values to log/logit space for shader compatibility.
+        // The compute shader applies exp() to scales and sigmoid() to opacity,
+        // so we must store raw log-space scales and logit-space opacity.
+        // Only for KHR format; internal format (_SCALE, _OPACITY) already stores raw values.
         if scene.splat_data.khr_format {
+            // Convert linear scales to log-space: ln(scale)
+            for scale in &mut scene.splat_data.scales {
+                scale[0] = scale[0].max(1e-7).ln();
+                scale[1] = scale[1].max(1e-7).ln();
+                scale[2] = scale[2].max(1e-7).ln();
+            }
+            info!(
+                "Converted KHR linear scales to log-space for {} splats",
+                scene.splat_data.scales.len()
+            );
+
+            // Convert linear opacity [0,1] to logit: ln(p / (1 - p))
             for opacity in &mut scene.splat_data.opacities {
                 let p = opacity.clamp(1e-6, 1.0 - 1e-6);
                 *opacity = (p / (1.0 - p)).ln();

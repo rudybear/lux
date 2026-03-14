@@ -514,13 +514,17 @@ def load_splat_glb(path: Path) -> dict:
         sh_coeffs_list.append(merged)
 
     # -----------------------------------------------------------------------
-    # KHR opacity logit conversion
+    # KHR linear → log/logit conversion
     # -----------------------------------------------------------------------
-    # KHR_gaussian_splatting stores opacity in linear [0,1] space.
-    # The CPU rasterizer applies sigmoid, so we need logit(p) = log(p/(1-p))
-    # to produce the correct value after sigmoid is applied.
-    # Non-KHR formats already store logit values.
+    # KHR_gaussian_splatting stores scales and opacity in linear space.
+    # The rasterizer applies exp() to scales and sigmoid() to opacity,
+    # so we must convert back to log/logit space.
+    # Non-KHR formats already store log/logit values.
     if khr_format:
+        # Convert linear scales to log-space: log(scale)
+        merged_scales = np.log(np.maximum(merged_scales, 1e-7)).astype(np.float32)
+
+        # Convert linear opacity [0,1] to logit: log(p / (1-p))
         p = np.clip(merged_opacities, 1e-6, 1.0 - 1e-6)
         merged_opacities = np.log(p / (1.0 - p)).astype(np.float32)
 

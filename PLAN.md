@@ -34,7 +34,7 @@
 | P24 | KHR_gaussian_splatting Conformance | ✅ Complete |
 | P25 | PLY-to-glTF Converter | ✅ Complete |
 | P26 | Hybrid Rendering (RT+Splat, Mesh+Splat) | ✅ Complete (C++; Rust partial) |
-| P27 | WebGPU Backend | Planned |
+| P27 | WebGPU Backend | Designed (full spec ready) |
 | P28 | RT Gaussian Splats (Elliptic Intersections) | Research |
 
 **Test suite: 1424+ tests passing. Compiler: 160+ stdlib functions, 15 modules.**
@@ -2226,3 +2226,141 @@ This is NOT a quadratic intersection — it's a closed-form maximum-density eval
 6. Schedule-driven quality knobs
 
 **Alternative: "Don't Splat Your Gaussians" (Meta/FAIR, SIGGRAPH 2025)** — treats Gaussians as true volumetric densities with closed-form transmittance via error function. More physically correct but more expensive. Could be exposed as `splat_method: volumetric` schedule option.
+
+---
+
+## Phase 27: WebGPU Backend [DESIGNED]
+
+Browser-based rendering via native WebGPU API. TypeScript web application with WGSL shaders transpiled from SPIR-V via Naga.
+
+### Key Architecture Decisions
+
+1. **SPIR-V → WGSL via Naga** — Naga (wgpu ecosystem's shader translator) is the only mature SPIR-V-to-WGSL path. SPIRV-Cross does NOT support WGSL output. Tint (Dawn/Chrome) is tightly coupled to Chrome.
+2. **TypeScript web application** — Native WebGPU API with `@webgpu/types`. The existing Python engine (`playground/engine.py`) serves as the reference implementation. Rust/wasm-bindgen deferred to future optimization.
+3. **Push constant emulation** — WebGPU has no push constants. Add `--webgpu` compiler flag that transforms push constant blocks into uniform buffers at a dedicated descriptor set.
+4. **Separate sampler/texture bindings already correct** — The Lux SPIR-V codegen already emits separate `OpTypeSampler` and `OpTypeImage` with distinct bindings, exactly matching WebGPU's requirement. No translation issues.
+5. **Reflection JSON maps directly** — `uniform_buffer` → `buffer: {type: 'uniform'}`, `sampler` → `sampler: {type: 'filtering'}`, `sampled_image` → `texture: {sampleType: 'float'}`, etc.
+
+### Supported Pipeline Modes
+
+| Pipeline Mode | WebGPU Support | Notes |
+|---|---|---|
+| Forward raster | ✅ Full | vertex + fragment |
+| Deferred rendering | ✅ Full | multiple render targets |
+| Gaussian splatting | ✅ Full | compute + instanced draw, push constant emulation |
+| Compute shaders | ✅ Full | storage buffers, shared memory |
+| Fullscreen fragment | ✅ Full | — |
+| Ray tracing | ❌ Not available | No RT in WebGPU spec |
+| Mesh shaders | ❌ Not available | No mesh shaders in WebGPU spec |
+| Bindless rendering | ❌ Limited | No runtime descriptor arrays |
+
+### Sub-Phases
+
+#### P27.1 — WGSL Transpilation Pipeline
+
+Add `--target wgsl` and `--webgpu` flags to the Lux compiler.
+
+- `--target wgsl`: Post-process `.spv` files through naga-cli to produce `.wgsl` files (same pattern as spirv-opt invocation).
+- `--webgpu`: Enable WebGPU-compatible codegen:
+  - Transform push constant blocks to uniform buffers at descriptor set N+1.
+  - Update reflection JSON with `push_emulated` metadata and WGSL filename.
+  - Avoid SPIR-V features unsupported by Naga (e.g., `DemoteToHelperInvocationEXT`).
+- Validate WGSL output via naga validation.
+- Build script `tools/compile_webgpu.py` compiles example shaders to `web/shaders/` with `.wgsl` + `.json` pairs.
+
+Files: `luxc/cli.py`, `luxc/compiler.py`, `luxc/codegen/spirv_builder.py`, `luxc/codegen/reflection.py`, `luxc/analysis/layout_assigner.py`.
+
+#### P27.2 — Core TypeScript Viewer
+
+Scaffold the web application with Vite + TypeScript.
+
+```
+playground_web/
+    package.json
+    tsconfig.json
+    vite.config.ts
+    index.html
+    src/
+        main.ts              # Entry point
+        gpu-context.ts       # WebGPU device/adapter init
+        reflected-pipeline.ts # Port of playground/reflected_pipeline.py
+        render-engine.ts     # Core render loop
+        camera.ts            # Orbit camera (mouse + touch)
+        scene.ts             # Scene data structures
+        math.ts              # mat4/vec3 utilities (or gl-matrix)
+        shader-loader.ts     # Load .wgsl + .json from server
+    shaders/                 # Pre-compiled .wgsl + .json
+    public/assets/           # glTF models, IBL data
+```
+
+Port `ReflectedPipeline` from Python (357 lines) to TypeScript. Implement basic render loop with `requestAnimationFrame`. Port orbit camera from C++ engine.
+
+#### P27.3 — Reflection JSON → WebGPU Bind Groups
+
+Direct mapping from reflection JSON to WebGPU API:
+
+| Reflection `type` | `GPUBindGroupLayoutEntry` |
+|---|---|
+| `uniform_buffer` | `buffer: { type: 'uniform' }` |
+| `storage_buffer` | `buffer: { type: 'read-only-storage' }` |
+| `sampler` | `sampler: { type: 'filtering' }` |
+| `sampled_image` | `texture: { sampleType: 'float', viewDimension: '2d' }` |
+| `sampled_cube_image` | `texture: { sampleType: 'float', viewDimension: 'cube' }` |
+| `storage_image` | `storageTexture: { access: 'write-only' }` |
+| `push_emulated_uniform` | `buffer: { type: 'uniform' }` |
+
+Stage flags → `GPUShaderStageFlags` (`vertex` → `VERTEX`, `fragment` → `FRAGMENT`, `compute` → `COMPUTE`).
+
+Handle descriptor set gaps with empty bind group layouts (same pattern as Python engine).
+
+#### P27.4 — glTF Scene Loading
+
+Parse GLB/glTF in browser. Options: custom minimal loader (port of `playground/gltf_loader.py`, ~500 lines), or use glTF-Transform library.
+
+Extract: mesh data (positions, normals, UVs, tangents, indices), materials (PBR params + textures), node transforms, lights (`KHR_lights_punctual`). Upload vertex/index buffers, textures, uniform buffers to GPU.
+
+#### P27.5 — IBL Cubemap Loading
+
+Fetch preprocessed IBL binary files from server: `specular.bin` (float16 RGBA, 6 faces × 9 mips), `irradiance.bin` (float16 RGBA, 6 faces), `brdf_lut.bin` (float16 RG, 512×512), `manifest.json`. Upload cubemap textures via `device.queue.writeTexture()`. WebGPU supports `rgba16float` natively.
+
+#### P27.6 — Gaussian Splatting
+
+Port 3-stage splat pipeline:
+1. Preprocess compute (push constants → uniform buffer via `--webgpu`)
+2. Buffer readback via `mapAsync()` + CPU argsort in JavaScript
+3. Instanced quad draw (6 vertices × N visible splats)
+4. Alpha blending (premultiplied: src=ONE, dst=ONE_MINUS_SRC_ALPHA)
+
+Future: GPU radix sort via compute shaders to avoid readback latency.
+
+#### P27.7 — Interactive Features
+
+- Orbit camera: mouse drag rotation, scroll zoom, middle-click pan, touch support
+- Canvas resize via `ResizeObserver`
+- HTML/CSS sidebar: material property sliders, light controls, pipeline selector, FPS counter
+- Drag-and-drop .glb/.gltf files onto canvas
+- Scene selector dropdown (built-in + uploaded models)
+
+#### P27.8 — Build & Deploy
+
+Vite-based build system:
+```bash
+cd playground_web
+npm install
+npm run build-shaders   # python -m luxc --webgpu --target wgsl
+npm run dev             # Vite dev server with hot reload
+npm run build           # Static dist/ for deployment
+```
+
+Deploy via GitHub Pages or Netlify CI. Service worker for offline caching of shaders and assets.
+
+### Implementation Order
+
+P27.1 → P27.2 + P27.3 (parallel) → P27.4 → P27.5 → P27.7 → P27.8 → P27.6
+
+### Risks
+
+1. **Naga SPIR-V compatibility** — some Lux SPIR-V features may not transpile. Mitigate with `--webgpu` mode that avoids problematic extensions.
+2. **Push constant emulation** — layout must match std140 rules. Test with splat pipeline.
+3. **CPU splat sort latency** — `mapAsync()` readback is slow. GPU radix sort as follow-up.
+4. **Browser availability** — Chrome 113+, Firefox Nightly, Safari TP. Add graceful feature detection.
