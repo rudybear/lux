@@ -65,7 +65,7 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 ## Features
 
 **Language**
-- Declarative `surface` + `geometry` + `pipeline` blocks expand to full shader stages
+- Declarative `surface` + `geometry` + `pipeline` blocks expand to full shader stages; `mode: deferred` auto-generates G-buffer geometry + fullscreen lighting passes from the same declarations
 - **Gaussian splatting**: first-class `splat` declaration — one block generates a complete 3-stage pipeline (compute preprocess, instanced vertex, alpha-composited fragment), SH degrees 0–3, CPU depth sorting, glTF `KHR_gaussian_splatting`, **hybrid rendering** (splats composited with raster, ray tracing, or mesh shaders), interactive orbit viewers in all engines
 - **OpenPBR Surface v1.1**: `import openpbr;` enables the full Adobe/ASWF material model — F82-tint metal Fresnel, energy-preserving Oren-Nayar diffuse, coat darkening, fuzz, thin-film iridescence, transmission with volume absorption, 9 composable layers, bindless uber-shader support, schedule-based quality tiers (desktop/mobile fast variants)
 - Layered surfaces with `layers [base, normal_map, sheen, coat, emission, ibl]` — unified `compose_pbr_layers` compositing, energy conservation, raster + RT from one declaration
@@ -80,7 +80,7 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 - Built-in optimizer: mem2reg, AST-level inlining, CSE, constant vector hoisting — **21.7% fewer instructions than hand-written GLSL** out of the box
 - Auto-type precision: `--auto-type=relaxed` emits RelaxedPrecision for 2x mobile throughput
 - `@differentiable` automatic differentiation, GLSL transpiler (`--transpile`)
-- Ray tracing (`mode: raytrace`), mesh shaders (`mode: mesh_shader`), compute shaders, Gaussian splatting (`mode: gaussian_splat`), hybrid RT+splat / mesh+splat compositing
+- Ray tracing (`mode: raytrace`), mesh shaders (`mode: mesh_shader`), compute shaders, Gaussian splatting (`mode: gaussian_splat`), **deferred rendering** (`mode: deferred`), hybrid RT+splat / mesh+splat compositing
 - Bindless rendering (`--bindless`), hot reload (`--watch`), feature permutations (`--all-permutations`)
 - 39 GLSL.std.450 builtins + texture sampling (7 variants) + image queries + RT/mesh/compute intrinsics
 
@@ -136,6 +136,9 @@ python -m luxc examples/pbr_surface.lux --auto-type=report
 
 # Generate a shader with AI
 python -m luxc --ai "frosted glass with subsurface scattering" -o generated.lux
+
+# Compile a deferred pipeline (G-buffer vertex/fragment + lighting vertex/fragment)
+python -m luxc examples/deferred_basic.lux
 
 # Compile a Gaussian splat pipeline (compute + vertex + fragment)
 python -m luxc examples/gaussian_splat.lux
@@ -222,6 +225,7 @@ input.lux
   -> Feature Stripping    (compile-time conditional removal)
   -> Import Resolver      (stdlib + local .lux modules)
   -> Surface Expander     (surface/geometry/pipeline -> stage blocks)
+  -> Deferred Expander    (mode: deferred -> G-buffer + lighting passes)
   -> Splat Expander       (splat/gaussian_splat -> compute + vertex + fragment)
   -> Autodiff Expander    (@differentiable -> gradient functions)
   -> Type Checker         (resolve types, check operators, validate semantic types)
@@ -250,7 +254,7 @@ Alternative path (--debug-run):
 luxc/            Compiler (parser, type checker, codegen, optimizer, autotype, debug)
 docs/            Documentation (language ref, gallery, usage, rendering engines)
 examples/        Example .lux shaders
-tests/           Test suite (1383+ tests)
+tests/           Test suite (1424+ tests)
 playground/      Python/wgpu rendering engine + screenshot tests
 playground_cpp/  C++/Vulkan + Metal rendering engines
 playground_rust/ Rust/Vulkan rendering engine
@@ -298,6 +302,7 @@ See [full project structure](docs/project-structure.md) for the complete directo
 | `openpbr_ref_aluminum.lux` | OpenPBR ASWF reference: brushed aluminum (metalness=1, specular color tint) |
 | `openpbr_ref_pearl.lux` | OpenPBR ASWF reference: pearl (coat + thin-film iridescence) |
 | `openpbr_ref_velvet.lux` | OpenPBR ASWF reference: velvet (fuzz layer, dark base) |
+| `deferred_basic.lux` | Deferred rendering: `mode: deferred` auto-generates G-buffer + lighting passes from standard glTF PBR declarations |
 | `debug_playground.lux` | CPU debugger playground: PBR with intentional NaN trap, 8 labeled stages for breakpoint exploration |
 
 ## Running Tests
@@ -305,7 +310,7 @@ See [full project structure](docs/project-structure.md) for the complete directo
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 1383+ tests
+# 1424+ tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.

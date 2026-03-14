@@ -1,0 +1,237 @@
+{
+  "version": 1,
+  "source": "gaussian_splat_sh1.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "splat_pos",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "splat_rot",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_buffer",
+        "name": "splat_scale",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "storage_buffer",
+        "name": "splat_opacity",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "storage_buffer",
+        "name": "splat_sh0",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 5,
+        "type": "storage_buffer",
+        "name": "splat_sh1",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 6,
+        "type": "storage_buffer",
+        "name": "splat_sh2",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 7,
+        "type": "storage_buffer",
+        "name": "splat_sh3",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 8,
+        "type": "storage_buffer",
+        "name": "projected_center",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 9,
+        "type": "storage_buffer",
+        "name": "projected_conic",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 10,
+        "type": "storage_buffer",
+        "name": "projected_color",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 11,
+        "type": "storage_buffer",
+        "name": "sort_keys",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 12,
+        "type": "storage_buffer",
+        "name": "visible_count",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "push",
+      "fields": [
+        {
+          "name": "view_matrix",
+          "type": "mat4",
+          "offset": 0,
+          "size": 64
+        },
+        {
+          "name": "proj_matrix",
+          "type": "mat4",
+          "offset": 64,
+          "size": 64
+        },
+        {
+          "name": "cam_pos",
+          "type": "vec3",
+          "offset": 128,
+          "size": 12
+        },
+        {
+          "name": "screen_size",
+          "type": "vec2",
+          "offset": 144,
+          "size": 8
+        },
+        {
+          "name": "total_splats",
+          "type": "uint",
+          "offset": 152,
+          "size": 4
+        },
+        {
+          "name": "focal_x",
+          "type": "scalar",
+          "offset": 156,
+          "size": 4
+        },
+        {
+          "name": "focal_y",
+          "type": "scalar",
+          "offset": 160,
+          "size": 4
+        },
+        {
+          "name": "sh_degree",
+          "type": "int",
+          "offset": 164,
+          "size": 4
+        }
+      ],
+      "size": 176,
+      "stage_flags": [
+        "compute"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      256,
+      1,
+      1
+    ]
+  },
+  "gaussian_splatting": {
+    "splat_name": "GaussianCloud",
+    "sh_degree": 1,
+    "kernel": "ellipse",
+    "color_space": "srgb",
+    "sort": "camera_distance",
+    "alpha_cutoff": 0.004,
+    "workgroup_size": [
+      256,
+      1,
+      1
+    ],
+    "input_buffers": [
+      "splat_pos",
+      "splat_rot",
+      "splat_scale",
+      "splat_opacity",
+      "splat_sh0",
+      "splat_sh1",
+      "splat_sh2",
+      "splat_sh3"
+    ],
+    "output_buffers": [
+      "projected_center",
+      "projected_conic",
+      "projected_color",
+      "sort_keys",
+      "visible_count"
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 483,
+    "alu_ops": 154,
+    "texture_samples": 0,
+    "branches": 3,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

@@ -1,0 +1,79 @@
+// G-buffer packing/unpacking utilities for deferred rendering.
+//
+// Layout:
+//   RT0: albedo.rgb + metallic     (RGBA8_SRGB)
+//   RT1: oct_normal.rg + roughness (RGB10A2_UNORM)
+//   RT2: emission.rgb + occlusion  (RGBA16F)
+//
+// Normal encoding uses octahedron mapping (Survey of Efficient
+// Representations for Independent Unit Vectors, Cigolle et al. 2014).
+
+fn octahedron_wrap(v: vec2) -> vec2 {
+    let signs = vec2(
+        step(0.0, v.x) * 2.0 - 1.0,
+        step(0.0, v.y) * 2.0 - 1.0
+    );
+    return (vec2(1.0) - abs(v.yx)) * signs;
+}
+
+fn octahedron_encode(n: vec3) -> vec2 {
+    let s = abs(n.x) + abs(n.y) + abs(n.z);
+    let oct = vec2(n.x / s, n.y / s);
+    let wrapped = octahedron_wrap(oct);
+    let result = vec2(
+        step(0.0, n.z) * oct.x + (1.0 - step(0.0, n.z)) * wrapped.x,
+        step(0.0, n.z) * oct.y + (1.0 - step(0.0, n.z)) * wrapped.y
+    );
+    return result * 0.5 + vec2(0.5);
+}
+
+fn octahedron_decode(oct: vec2) -> vec3 {
+    let f = oct * 2.0 - vec2(1.0);
+    let n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    let t = max(-n.z, 0.0);
+    let signs = vec2(
+        step(0.0, n.x) * 2.0 - 1.0,
+        step(0.0, n.y) * 2.0 - 1.0
+    );
+    let adjusted = vec3(
+        n.x + signs.x * (-t),
+        n.y + signs.y * (-t),
+        n.z
+    );
+    return normalize(adjusted);
+}
+
+fn pack_gbuffer_rt0(albedo: vec3, metallic: scalar) -> vec4 {
+    return vec4(albedo, metallic);
+}
+
+fn unpack_gbuffer_rt0_albedo(data: vec4) -> vec3 {
+    return data.xyz;
+}
+
+fn unpack_gbuffer_rt0_metallic(data: vec4) -> scalar {
+    return data.w;
+}
+
+fn pack_gbuffer_rt1(normal: vec3, roughness: scalar) -> vec4 {
+    let oct = octahedron_encode(normal);
+    return vec4(oct, roughness, 0.0);
+}
+
+fn unpack_gbuffer_rt1_normal(data: vec4) -> vec3 {
+    return octahedron_decode(data.xy);
+}
+
+fn unpack_gbuffer_rt1_roughness(data: vec4) -> scalar {
+    return data.z;
+}
+
+fn pack_gbuffer_rt2(emission: vec3, occlusion: scalar) -> vec4 {
+    return vec4(emission, occlusion);
+}
+
+fn reconstruct_world_pos(uv: vec2, depth: scalar, inv_vp: mat4) -> vec3 {
+    let ndc = vec4(uv * 2.0 - vec2(1.0), depth, 1.0);
+    let world_h = inv_vp * ndc;
+    return world_h.xyz / world_h.www;
+}

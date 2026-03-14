@@ -254,6 +254,11 @@ def compile_source(
         suffix = _SUFFIX_MAP[stage_name]
         out_stem = f"{stem}{feature_suffix}"
 
+        # Deferred pipeline: use stem suffix to distinguish gbuf/light passes
+        stem_suffix = getattr(stage, '_output_stem_suffix', None)
+        if stem_suffix:
+            out_stem = f"{stem}{feature_suffix}.{stem_suffix}"
+
         # Build precision_map for this stage if auto_type=relaxed
         stage_precision_map = None
         if auto_type == "relaxed" and idx in precision_maps:

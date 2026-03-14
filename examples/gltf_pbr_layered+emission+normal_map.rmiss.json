@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "source": "gltf_pbr_layered.lux",
+  "stage": "miss",
+  "execution_model": "MissKHR",
+  "features": {
+    "has_normal_map": true,
+    "has_clearcoat": false,
+    "has_sheen": false,
+    "has_emission": true,
+    "has_transmission": false,
+    "has_shadows": false
+  },
+  "feature_suffix": "+emission+normal_map",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {},
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "ray_payloads": [
+    {
+      "name": "payload",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "performance_hints": {
+    "instruction_count": 39,
+    "alu_ops": 0,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "low"
+  }
+}

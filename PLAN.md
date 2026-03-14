@@ -15,7 +15,7 @@
 | P6 | Coat & Sheen Layers | ✅ Complete (via P22 OpenPBR) |
 | P7 | Transmission Layer | ✅ Complete (via P22 OpenPBR) |
 | P8 | @layer Custom Functions | ✅ Complete |
-| P9 | Deferred Pipeline Mode | Designed (full spec ready) |
+| P9 | Deferred Pipeline Mode | ✅ Complete (compiler + C++/Rust/Python engines) |
 | P10 | Ray Tracing Pipeline | ✅ Complete (core; SDF→intersection, callable dispatch deferred) |
 | P11 | Metal Backend | ✅ Complete |
 | P12 | glTF Extensions in Engines | ✅ Partial (permutation selection done; extension textures remaining) |
@@ -37,7 +37,7 @@
 | P27 | WebGPU Backend | Planned |
 | P28 | RT Gaussian Splats (Elliptic Intersections) | Research |
 
-**Test suite: 1383+ tests passing. Compiler: 160+ stdlib functions, 15 modules.**
+**Test suite: 1424+ tests passing. Compiler: 160+ stdlib functions, 15 modules.**
 
 ---
 
@@ -383,7 +383,7 @@ New files: `luxc/stdlib/toon.lux`, `examples/cartoon_toon.lux`, `tests/test_cust
 
 ---
 
-## Phase 9: Deferred Pipeline Mode [DESIGNED]
+## Phase 9: Deferred Pipeline Mode ✅ COMPLETE
 
 `mode: deferred` — the compiler auto-generates a multi-pass pipeline from the same `surface` + `lighting` declarations used for raster/RT. No manual G-buffer management. Works with all geometry backends (vertex, mesh shader, splat).
 

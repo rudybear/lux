@@ -1,0 +1,176 @@
+{
+  "version": 1,
+  "source": "gltf_pbr_layered.lux",
+  "stage": "mesh",
+  "execution_model": "MeshEXT",
+  "features": {
+    "has_normal_map": true,
+    "has_clearcoat": false,
+    "has_sheen": false,
+    "has_emission": true,
+    "has_transmission": false,
+    "has_shadows": false
+  },
+  "feature_suffix": "+emission+normal_map",
+  "inputs": [],
+  "outputs": [
+    {
+      "name": "world_pos",
+      "type": "vec3",
+      "location": 0
+    },
+    {
+      "name": "world_normal",
+      "type": "vec3",
+      "location": 1
+    },
+    {
+      "name": "world_tangent",
+      "type": "vec3",
+      "location": 2
+    },
+    {
+      "name": "world_bitangent",
+      "type": "vec3",
+      "location": 3
+    },
+    {
+      "name": "frag_uv",
+      "type": "vec2",
+      "location": 4
+    }
+  ],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "uniform_buffer",
+        "name": "MVP",
+        "fields": [
+          {
+            "name": "model",
+            "type": "mat4",
+            "offset": 0,
+            "size": 64
+          },
+          {
+            "name": "view",
+            "type": "mat4",
+            "offset": 64,
+            "size": 64
+          },
+          {
+            "name": "projection",
+            "type": "mat4",
+            "offset": 128,
+            "size": 64
+          }
+        ],
+        "size": 192,
+        "stage_flags": [
+          "mesh"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "meshlet_descriptors",
+        "element_type": "uvec4",
+        "stage_flags": [
+          "mesh"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_buffer",
+        "name": "meshlet_vertices",
+        "element_type": "uint",
+        "stage_flags": [
+          "mesh"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "storage_buffer",
+        "name": "meshlet_triangles",
+        "element_type": "uint",
+        "stage_flags": [
+          "mesh"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "storage_buffer",
+        "name": "positions",
+        "element_type": "vec4",
+        "stage_flags": [
+          "mesh"
+        ]
+      },
+      {
+        "binding": 5,
+        "type": "storage_buffer",
+        "name": "normals",
+        "element_type": "vec4",
+        "stage_flags": [
+          "mesh"
+        ]
+      },
+      {
+        "binding": 6,
+        "type": "storage_buffer",
+        "name": "tex_coords",
+        "element_type": "vec2",
+        "stage_flags": [
+          "mesh"
+        ]
+      },
+      {
+        "binding": 7,
+        "type": "storage_buffer",
+        "name": "tangents",
+        "element_type": "vec4",
+        "stage_flags": [
+          "mesh"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "mesh_params",
+      "fields": [
+        {
+          "name": "meshletOffset",
+          "type": "uint",
+          "offset": 0,
+          "size": 4
+        }
+      ],
+      "size": 16,
+      "stage_flags": [
+        "mesh"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "mesh_output": {
+    "max_vertices": 64,
+    "max_primitives": 124,
+    "workgroup_size": [
+      32,
+      1,
+      1
+    ],
+    "output_topology": "triangles"
+  },
+  "performance_hints": {
+    "instruction_count": 385,
+    "alu_ops": 14,
+    "texture_samples": 0,
+    "branches": 6,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

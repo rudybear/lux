@@ -1,0 +1,405 @@
+{
+  "version": 1,
+  "source": "gltf_pbr_layered.lux",
+  "stage": "closest_hit",
+  "execution_model": "ClosestHitKHR",
+  "features": {
+    "has_normal_map": true,
+    "has_clearcoat": false,
+    "has_sheen": false,
+    "has_emission": true,
+    "has_transmission": false,
+    "has_shadows": false
+  },
+  "feature_suffix": "+emission+normal_map",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "1": [
+      {
+        "binding": 0,
+        "type": "uniform_buffer",
+        "name": "SceneLight",
+        "fields": [
+          {
+            "name": "view_pos",
+            "type": "vec3",
+            "offset": 0,
+            "size": 12,
+            "default": [
+              0.0,
+              0.0,
+              3.0
+            ]
+          },
+          {
+            "name": "light_count",
+            "type": "int",
+            "offset": 12,
+            "size": 4,
+            "default": 0
+          }
+        ],
+        "size": 16,
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "uniform_buffer",
+        "name": "Material",
+        "fields": [
+          {
+            "name": "base_color_factor",
+            "type": "vec4",
+            "offset": 0,
+            "size": 16,
+            "default": [
+              1.0,
+              1.0,
+              1.0,
+              1.0
+            ]
+          },
+          {
+            "name": "emissive_factor",
+            "type": "vec3",
+            "offset": 16,
+            "size": 12,
+            "default": [
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "name": "metallic_factor",
+            "type": "scalar",
+            "offset": 28,
+            "size": 4,
+            "default": 1.0
+          },
+          {
+            "name": "roughness_factor",
+            "type": "scalar",
+            "offset": 32,
+            "size": 4,
+            "default": 1.0
+          },
+          {
+            "name": "emissive_strength",
+            "type": "scalar",
+            "offset": 36,
+            "size": 4,
+            "default": 1.0
+          },
+          {
+            "name": "ior",
+            "type": "scalar",
+            "offset": 40,
+            "size": 4,
+            "default": 1.5
+          },
+          {
+            "name": "clearcoat_factor",
+            "type": "scalar",
+            "offset": 44,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "clearcoat_roughness_factor",
+            "type": "scalar",
+            "offset": 48,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "sheen_roughness_factor",
+            "type": "scalar",
+            "offset": 52,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "transmission_factor",
+            "type": "scalar",
+            "offset": 56,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "sheen_color_factor",
+            "type": "vec3",
+            "offset": 64,
+            "size": 12,
+            "default": [
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "name": "base_color_uv_st",
+            "type": "vec4",
+            "offset": 80,
+            "size": 16,
+            "default": [
+              0.0,
+              0.0,
+              1.0,
+              1.0
+            ]
+          },
+          {
+            "name": "normal_uv_st",
+            "type": "vec4",
+            "offset": 96,
+            "size": 16,
+            "default": [
+              0.0,
+              0.0,
+              1.0,
+              1.0
+            ]
+          },
+          {
+            "name": "mr_uv_st",
+            "type": "vec4",
+            "offset": 112,
+            "size": 16,
+            "default": [
+              0.0,
+              0.0,
+              1.0,
+              1.0
+            ]
+          },
+          {
+            "name": "base_color_uv_rot",
+            "type": "scalar",
+            "offset": 128,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "normal_uv_rot",
+            "type": "scalar",
+            "offset": 132,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "mr_uv_rot",
+            "type": "scalar",
+            "offset": 136,
+            "size": 4,
+            "default": 0.0
+          }
+        ],
+        "size": 144,
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "sampler",
+        "name": "base_color_tex",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "sampled_image",
+        "name": "base_color_tex",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "sampler",
+        "name": "normal_tex",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 5,
+        "type": "sampled_image",
+        "name": "normal_tex",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 6,
+        "type": "sampler",
+        "name": "metallic_roughness_tex",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 7,
+        "type": "sampled_image",
+        "name": "metallic_roughness_tex",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 8,
+        "type": "sampler",
+        "name": "occlusion_tex",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 9,
+        "type": "sampled_image",
+        "name": "occlusion_tex",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 10,
+        "type": "sampler",
+        "name": "emissive_tex",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 11,
+        "type": "sampled_image",
+        "name": "emissive_tex",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 12,
+        "type": "sampler",
+        "name": "env_specular",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 13,
+        "type": "sampled_cube_image",
+        "name": "env_specular",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 14,
+        "type": "sampler",
+        "name": "env_irradiance",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 15,
+        "type": "sampled_cube_image",
+        "name": "env_irradiance",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 16,
+        "type": "sampler",
+        "name": "brdf_lut",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 17,
+        "type": "sampled_image",
+        "name": "brdf_lut",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 18,
+        "type": "storage_buffer",
+        "name": "positions",
+        "element_type": "vec4",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 19,
+        "type": "storage_buffer",
+        "name": "normals",
+        "element_type": "vec4",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 20,
+        "type": "storage_buffer",
+        "name": "tex_coords",
+        "element_type": "vec2",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 21,
+        "type": "storage_buffer",
+        "name": "indices",
+        "element_type": "uint",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      },
+      {
+        "binding": 22,
+        "type": "storage_buffer",
+        "name": "lights",
+        "element_type": "LightData",
+        "stage_flags": [
+          "closest_hit"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "ray_payloads": [
+    {
+      "name": "payload",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "hit_attributes": [
+    {
+      "name": "bary",
+      "type": "vec2"
+    }
+  ],
+  "performance_hints": {
+    "instruction_count": 3139,
+    "alu_ops": 1491,
+    "texture_samples": 7,
+    "branches": 16,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

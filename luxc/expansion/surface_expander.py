@@ -46,6 +46,12 @@ _DEFAULT_STRATEGIES = {
     "fuzz_model": "charlie",
     "specular_fresnel": "exact",
     "coat_fresnel": "exact",
+    # Deferred pipeline slots
+    "light_culling": "none",
+    "tile_size": "16",
+    "gbuffer_precision": "standard",
+    "normal_encoding": "octahedron",
+    "lighting_pass": "fragment",
 }
 
 _STRATEGY_FUNCTIONS = {
@@ -192,6 +198,20 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
                     f"splat declaration found (splat: {splat_name})"
                 )
             stages = expand_splat_pipeline(splat, pipeline, module)
+            module.stages.extend(stages)
+        elif mode == "deferred":
+            surface = surfaces.get(surf_name) if surf_name else None
+            geometry = geometries.get(geo_name) if geo_name else None
+            if surface is None:
+                raise ValueError(
+                    f"Pipeline '{pipeline.name}' has mode: deferred but no "
+                    f"surface declaration found (surface: {surf_name})"
+                )
+            from luxc.expansion.deferred_expander import expand_deferred_pipeline
+            stages = expand_deferred_pipeline(
+                surface, geometry, module, schedule,
+                lighting=lighting, bindless=bindless,
+            )
             module.stages.extend(stages)
         elif mode == "compute":
             pass  # Compute stages are written directly, no expansion needed

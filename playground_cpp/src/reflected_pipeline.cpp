@@ -639,11 +639,23 @@ VkPipelineLayout createReflectedPipelineLayoutMultiStage(
         maxSet = std::max(maxSet, idx);
     }
 
+    // Create empty set layouts for gaps (Vulkan requires contiguous set indices)
     std::vector<VkDescriptorSetLayout> orderedLayouts;
+    std::vector<VkDescriptorSetLayout> emptyLayouts; // track for cleanup
     for (int i = 0; i <= maxSet; i++) {
         auto it = setLayouts.find(i);
         if (it != setLayouts.end()) {
             orderedLayouts.push_back(it->second);
+        } else {
+            // Create an empty descriptor set layout for this gap
+            VkDescriptorSetLayoutCreateInfo emptyInfo = {};
+            emptyInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            emptyInfo.bindingCount = 0;
+            emptyInfo.pBindings = nullptr;
+            VkDescriptorSetLayout emptyLayout;
+            vkCreateDescriptorSetLayout(device, &emptyInfo, nullptr, &emptyLayout);
+            orderedLayouts.push_back(emptyLayout);
+            emptyLayouts.push_back(emptyLayout);
         }
     }
 
@@ -668,7 +680,17 @@ VkPipelineLayout createReflectedPipelineLayoutMultiStage(
 
     VkPipelineLayout pipelineLayout;
     if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
+        // Clean up empty layouts on failure
+        for (auto layout : emptyLayouts) {
+            vkDestroyDescriptorSetLayout(device, layout, nullptr);
+        }
         throw std::runtime_error("Failed to create pipeline layout from reflection (multi-stage)");
+    }
+
+    // Empty gap layouts can be destroyed after pipeline layout creation
+    // (Vulkan spec: set layouts only need to be valid during pipeline layout creation)
+    for (auto layout : emptyLayouts) {
+        vkDestroyDescriptorSetLayout(device, layout, nullptr);
     }
 
     return pipelineLayout;

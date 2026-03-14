@@ -84,6 +84,23 @@ python -m playground.render_harness --splat-scene tests/assets/test_splats.glb -
 
 The splat pipeline uses CPU-side depth sorting and instanced quad drawing. Input data is loaded from glTF files with the `KHR_gaussian_splatting` extension. The `tools/glb_to_ply.py` converter exports `.glb` splat data to standard `.ply` format for validation in external viewers (SuperSplat, gsplat.tech).
 
+**Deferred rendering (all engines):**
+```bash
+# Compile deferred shaders (G-buffer vertex/fragment + lighting vertex/fragment)
+python -m luxc examples/deferred_basic.lux
+
+# C++ (Vulkan) — interactive deferred renderer
+run_deferred_cpp.bat
+
+# Rust (ash) — interactive deferred renderer
+run_deferred_rust.bat
+
+# Python (wgpu) — interactive deferred renderer
+run_deferred_python.bat
+```
+
+The deferred pipeline uses the same `surface` + `lighting` declarations as forward rendering — `mode: deferred` auto-generates a G-buffer geometry pass (3 MRT: albedo+metallic, octahedron normal+roughness, emission+occlusion) and a fullscreen lighting pass with IBL + multi-light support.
+
 **Batch/shell scripts for quick launch:**
 ```bash
 run_interactive_cpp.bat     # Interactive C++ raster viewer
@@ -92,6 +109,9 @@ run_interactive_cpp_rt.bat  # Interactive C++ RT viewer
 run_interactive_rust_rt.bat # Interactive Rust RT viewer
 run_interactive_metal.sh    # Interactive Metal raster viewer (macOS)
 run_mesh_interactive_metal.sh  # Interactive Metal mesh shader viewer (macOS)
+run_deferred_cpp.bat         # Deferred renderer (C++)
+run_deferred_rust.bat        # Deferred renderer (Rust)
+run_deferred_python.bat      # Deferred renderer (Python)
 compile_gltf_rt.bat         # Compile + render glTF RT (headless, both engines)
 compile_gltf_forward.bat    # Compile + render glTF raster (all 3 engines)
 compile_gltf_all.bat        # Compile + render all pipeline variants

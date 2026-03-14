@@ -1,0 +1,110 @@
+// Deferred rendering — full glTF PBR with IBL, multi-light, and texture-driven
+// material properties. Same declarations as gltf_pbr_layered.lux but mode: deferred.
+//
+// Compile:
+//   python -m luxc examples/deferred_basic.lux
+//
+// Produces:
+//   deferred_basic.gbuf.vert.spv   — G-buffer vertex
+//   deferred_basic.gbuf.frag.spv   — G-buffer fragment (3 MRT outputs)
+//   deferred_basic.light.vert.spv  — Fullscreen triangle vertex
+//   deferred_basic.light.frag.spv  — Deferred lighting fragment
+
+import brdf;
+import color;
+import compositing;
+import ibl;
+import lighting;
+import texture;
+
+geometry StandardMesh {
+    position: vec3,
+    normal: vec3,
+    uv: vec2,
+    tangent: vec4,
+    transform: MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+    outputs {
+        world_pos: (model * vec4(position, 1.0)).xyz,
+        world_normal: normalize((model * vec4(normal, 0.0)).xyz),
+        world_tangent: normalize((model * vec4(tangent.xyz, 0.0)).xyz),
+        world_bitangent: cross(world_normal, world_tangent) * tangent.w,
+        frag_uv: uv,
+        clip_pos: projection * view * model * vec4(position, 1.0),
+    }
+}
+
+surface GltfPBR {
+    sampler2d base_color_tex,
+    sampler2d normal_tex,
+    sampler2d metallic_roughness_tex,
+    sampler2d emissive_tex,
+
+    properties Material {
+        base_color_factor: vec4 = vec4(1.0, 1.0, 1.0, 1.0),
+        emissive_factor: vec3 = vec3(0.0),
+        metallic_factor: scalar = 1.0,
+        roughness_factor: scalar = 1.0,
+        emissive_strength: scalar = 1.0,
+        // Layout-compatible fields (match MaterialUBOData C++ struct)
+        ior: scalar = 1.5,
+        clearcoat_factor: scalar = 0.0,
+        clearcoat_roughness_factor: scalar = 0.0,
+        sheen_roughness_factor: scalar = 0.0,
+        transmission_factor: scalar = 0.0,
+        _pad_sheen: scalar = 0.0,
+        sheen_color_factor: vec3 = vec3(0.0),
+        // KHR_texture_transform
+        base_color_uv_st: vec4 = vec4(0.0, 0.0, 1.0, 1.0),
+        normal_uv_st: vec4 = vec4(0.0, 0.0, 1.0, 1.0),
+        mr_uv_st: vec4 = vec4(0.0, 0.0, 1.0, 1.0),
+        base_color_uv_rot: scalar = 0.0,
+        normal_uv_rot: scalar = 0.0,
+        mr_uv_rot: scalar = 0.0,
+    },
+
+    layers [
+        base(albedo: srgb_to_linear(sample(base_color_tex, transform_uv(uv, Material.base_color_uv_st, Material.base_color_uv_rot)).xyz)
+                     * Material.base_color_factor.xyz,
+             roughness: sample(metallic_roughness_tex, transform_uv(uv, Material.mr_uv_st, Material.mr_uv_rot)).y
+                        * Material.roughness_factor,
+             metallic: sample(metallic_roughness_tex, transform_uv(uv, Material.mr_uv_st, Material.mr_uv_rot)).z
+                        * Material.metallic_factor),
+        normal_map(map: sample(normal_tex, transform_uv(uv, Material.normal_uv_st, Material.normal_uv_rot)).xyz),
+        emission(color: srgb_to_linear(sample(emissive_tex, uv).xyz)
+                        * Material.emissive_factor
+                        * Material.emissive_strength),
+    ]
+}
+
+lighting SceneLighting {
+    samplerCube env_specular,
+    samplerCube env_irradiance,
+    sampler2d brdf_lut,
+
+    properties SceneLight {
+        view_pos: vec3 = vec3(0.0, 0.0, 3.0),
+        light_count: int = 0,
+    },
+
+    layers [
+        multi_light(count: SceneLight.light_count, max_lights: 16),
+        ibl(specular_map: env_specular, irradiance_map: env_irradiance,
+            brdf_lut: brdf_lut),
+    ]
+}
+
+schedule HighQuality {
+    tonemap: aces,
+}
+
+pipeline DeferredPipeline {
+    mode: deferred,
+    geometry: StandardMesh,
+    surface: GltfPBR,
+    lighting: SceneLighting,
+    schedule: HighQuality,
+}

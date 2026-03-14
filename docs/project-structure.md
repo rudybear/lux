@@ -49,6 +49,7 @@ luxc/
         io.py                # input loading (JSON, semantic defaults)
     expansion/
         surface_expander.py  # surface/geometry/pipeline expansion
+        deferred_expander.py # deferred pipeline expansion (G-buffer + lighting passes)
         splat_expander.py    # splat/gaussian_splat pipeline expansion (3-stage)
     features/
         __init__.py
@@ -76,6 +77,7 @@ luxc/
         pbr_pipeline.lux     # PBR orchestration: pbr_shade() single-call entry point
         debug.lux            # debug visualization helpers (normal, depth, heatmap, checkerboard)
         gaussian.lux         # Gaussian splatting helpers (SH, covariance, quad radius)
+        gbuffer.lux          # G-buffer utilities (octahedron encode/decode, pack/unpack, reconstruct)
         openpbr.lux          # OpenPBR Surface v1.1 material model (F82-tint, EON diffuse, coat darkening)
     transpiler/
         glsl_ast.py          # GLSL AST nodes
@@ -117,6 +119,7 @@ examples/
     openpbr_carpaint.lux     # OpenPBR: metallic car paint with clearcoat + thin-film
     openpbr_velvet.lux       # OpenPBR: velvet with fuzz layer + Oren-Nayar diffuse
     openpbr_glass.lux        # OpenPBR: amber glass with transmission + volume absorption
+    deferred_basic.lux       # deferred rendering: G-buffer + lighting from standard glTF PBR declarations
     openpbr_simple.lux       # OpenPBR: simple no-texture surface for quick testing
     openpbr_reference.lux    # OpenPBR ASWF reference: car paint (exact values from OpenPBR viewer)
     openpbr_ref_aluminum.lux # OpenPBR ASWF reference: brushed aluminum (metalness=1)
@@ -126,6 +129,7 @@ examples/
     debug_playground_inputs.json  # custom input values for debug_playground
 playground/
     engine.py                # unified rendering engine (scene/pipeline separation)
+    deferred_engine.py       # wgpu deferred renderer (G-buffer + lighting, reflection-driven)
     reflected_pipeline.py    # reflection-driven descriptor binding
     gltf_loader.py           # glTF 2.0 scene loader (meshes, materials, textures)
     scene_utils.py           # procedural scene generators
@@ -133,12 +137,14 @@ playground/
     test_*.py                # screenshot tests (15 tests)
 assets/                      # glTF models, IBL maps (downloaded separately, gitignored)
 playground_cpp/
-    src/                     # native Vulkan C++ renderer (raster + RT + mesh + splat, GLFW)
+    src/                     # native Vulkan C++ renderer (raster + RT + mesh + splat + deferred, GLFW)
     src/editor_ui.h/cpp      # interactive scene editor UI (Dear ImGui: scene tree, properties, pipeline hot-swap)
+    src/deferred_renderer.cpp/h  # deferred renderer (G-buffer MRT + fullscreen lighting)
     src/splat_renderer.cpp/h # Gaussian splat renderer (compute + instanced draw)
     src/metal_*.cpp/h/mm     # native Metal renderer (raster + mesh, macOS, SPIRV-Cross)
 playground_rust/
-    src/                     # native Vulkan Rust renderer (ash, winit, raster + RT + mesh + splat)
+    src/                     # native Vulkan Rust renderer (ash, winit, raster + RT + mesh + splat + deferred)
+    src/deferred_renderer.rs # deferred renderer (G-buffer MRT + fullscreen lighting)
     src/splat_renderer.rs    # Gaussian splat renderer (compute + instanced draw)
 run_interactive_cpp.bat      # launch interactive C++ raster viewer
 run_interactive_rust.bat     # launch interactive Rust raster viewer
@@ -151,6 +157,9 @@ run_mesh_headless_*.bat      # headless mesh shader rendering (C++ + Rust)
 run_mesh_headless_metal.sh   # headless Metal mesh shader rendering (macOS)
 run_mesh_interactive_*.bat   # interactive mesh shader viewers (C++ + Rust)
 run_mesh_interactive_metal.sh  # interactive Metal mesh shader viewer (macOS)
+run_deferred_cpp.bat         # Deferred renderer (C++)
+run_deferred_rust.bat        # Deferred renderer (Rust)
+run_deferred_python.bat      # Deferred renderer (Python)
 run_splat_cpp.bat            # Gaussian splat viewer (C++)
 run_splat_rust.bat           # Gaussian splat viewer (Rust)
 run_splat_python.bat         # Gaussian splat viewer (Python)
@@ -182,6 +191,7 @@ tests/
     test_autotype.py            # auto-type precision optimization tests (50 tests)
     test_gaussian_splatting.py  # Gaussian splatting tests (33 tests: parser, config, expansion, compilation)
     test_stdlib_refactoring.py  # Shared stdlib refactoring tests (13 tests: compose_pbr_layers, coat IBL, helpers)
+    test_deferred_rendering.py  # Deferred rendering tests (expansion, compilation, reflection, edge cases)
     test_openpbr.py             # OpenPBR material model tests (35 tests: parser, stdlib, expansion, compilation, imports)
     test_khr_splat_conformance.py  # KHR_gaussian_splatting conformance tests (226 tests: asset loading, data validation, compilation)
     test_ply_to_gltf.py         # PLY-to-glTF converter tests (73 tests: parsing, transforms, round-trip, edge cases)

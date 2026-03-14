@@ -464,6 +464,27 @@ def generate_reflection(
             "splat_name": stage._splat_name,
         }
 
+    # --- Deferred rendering metadata ---
+    deferred_pass = getattr(stage, '_deferred_pass', None)
+    if deferred_pass is not None:
+        deferred_config = getattr(stage, '_deferred_config', {})
+        deferred_meta = {"pass": deferred_pass}
+        if deferred_pass == "gbuffer":
+            deferred_meta["render_targets"] = [
+                {"index": 0, "name": "rt0", "format": "RGBA8_SRGB",
+                 "channels": "albedo.rgb + metallic"},
+                {"index": 1, "name": "rt1", "format": "RGB10A2_UNORM",
+                 "channels": "oct_normal.rg + roughness"},
+                {"index": 2, "name": "rt2", "format": "RGBA16F",
+                 "channels": "emission.rgb + occlusion"},
+            ]
+            deferred_meta["depth_format"] = "D32_SFLOAT"
+            deferred_meta["normal_encoding"] = deferred_config.get(
+                "normal_encoding", "octahedron")
+            deferred_meta["precision"] = deferred_config.get(
+                "gbuffer_precision", "standard")
+        result["deferred"] = deferred_meta
+
     return result
 
 

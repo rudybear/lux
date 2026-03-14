@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "source": "gltf_pbr_layered.lux",
+  "stage": "raygen",
+  "execution_model": "RayGenerationKHR",
+  "features": {
+    "has_normal_map": true,
+    "has_clearcoat": false,
+    "has_sheen": false,
+    "has_emission": true,
+    "has_transmission": false,
+    "has_shadows": false
+  },
+  "feature_suffix": "+emission+normal_map",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "uniform_buffer",
+        "name": "Camera",
+        "fields": [
+          {
+            "name": "inv_view",
+            "type": "mat4",
+            "offset": 0,
+            "size": 64
+          },
+          {
+            "name": "inv_proj",
+            "type": "mat4",
+            "offset": 64,
+            "size": 64
+          }
+        ],
+        "size": 128,
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "acceleration_structure",
+        "name": "tlas",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_image",
+        "name": "result_color",
+        "stage_flags": [
+          "raygen"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "ray_payloads": [
+    {
+      "name": "payload",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "performance_hints": {
+    "instruction_count": 128,
+    "alu_ops": 7,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

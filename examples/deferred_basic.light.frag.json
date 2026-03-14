@@ -1,0 +1,213 @@
+{
+  "version": 1,
+  "source": "deferred_basic.lux",
+  "stage": "fragment",
+  "execution_model": "Fragment",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [
+    {
+      "name": "frag_uv",
+      "type": "vec2",
+      "location": 0
+    }
+  ],
+  "outputs": [
+    {
+      "name": "color",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "uniform_buffer",
+        "name": "DeferredCamera",
+        "fields": [
+          {
+            "name": "inv_view_proj",
+            "type": "mat4",
+            "offset": 0,
+            "size": 64
+          },
+          {
+            "name": "view_pos",
+            "type": "vec3",
+            "offset": 64,
+            "size": 12
+          }
+        ],
+        "size": 80,
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "uniform_buffer",
+        "name": "SceneLight",
+        "fields": [
+          {
+            "name": "view_pos",
+            "type": "vec3",
+            "offset": 0,
+            "size": 12,
+            "default": [
+              0.0,
+              0.0,
+              3.0
+            ]
+          },
+          {
+            "name": "light_count",
+            "type": "int",
+            "offset": 12,
+            "size": 4,
+            "default": 0
+          }
+        ],
+        "size": 16,
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "sampler",
+        "name": "gbuf_tex0",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "sampled_image",
+        "name": "gbuf_tex0",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "sampler",
+        "name": "gbuf_tex1",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 5,
+        "type": "sampled_image",
+        "name": "gbuf_tex1",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 6,
+        "type": "sampler",
+        "name": "gbuf_tex2",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 7,
+        "type": "sampled_image",
+        "name": "gbuf_tex2",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 8,
+        "type": "sampler",
+        "name": "gbuf_depth",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 9,
+        "type": "sampled_image",
+        "name": "gbuf_depth",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 10,
+        "type": "sampler",
+        "name": "env_specular",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 11,
+        "type": "sampled_cube_image",
+        "name": "env_specular",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 12,
+        "type": "sampler",
+        "name": "env_irradiance",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 13,
+        "type": "sampled_cube_image",
+        "name": "env_irradiance",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 14,
+        "type": "sampler",
+        "name": "brdf_lut",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 15,
+        "type": "sampled_image",
+        "name": "brdf_lut",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 16,
+        "type": "storage_buffer",
+        "name": "lights",
+        "element_type": "LightData",
+        "stage_flags": [
+          "fragment"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "deferred": {
+    "pass": "lighting"
+  },
+  "performance_hints": {
+    "instruction_count": 2972,
+    "alu_ops": 1497,
+    "texture_samples": 7,
+    "branches": 16,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

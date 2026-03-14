@@ -1,0 +1,322 @@
+{
+  "version": 1,
+  "source": "deferred_basic.lux",
+  "stage": "fragment",
+  "execution_model": "Fragment",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [
+    {
+      "name": "world_pos",
+      "type": "vec3",
+      "location": 0
+    },
+    {
+      "name": "world_normal",
+      "type": "vec3",
+      "location": 1
+    },
+    {
+      "name": "world_tangent",
+      "type": "vec3",
+      "location": 2
+    },
+    {
+      "name": "world_bitangent",
+      "type": "vec3",
+      "location": 3
+    },
+    {
+      "name": "frag_uv",
+      "type": "vec2",
+      "location": 4
+    }
+  ],
+  "outputs": [
+    {
+      "name": "gbuf_rt0",
+      "type": "vec4",
+      "location": 0
+    },
+    {
+      "name": "gbuf_rt1",
+      "type": "vec4",
+      "location": 1
+    },
+    {
+      "name": "gbuf_rt2",
+      "type": "vec4",
+      "location": 2
+    }
+  ],
+  "descriptor_sets": {
+    "1": [
+      {
+        "binding": 0,
+        "type": "uniform_buffer",
+        "name": "Material",
+        "fields": [
+          {
+            "name": "base_color_factor",
+            "type": "vec4",
+            "offset": 0,
+            "size": 16,
+            "default": [
+              1.0,
+              1.0,
+              1.0,
+              1.0
+            ]
+          },
+          {
+            "name": "emissive_factor",
+            "type": "vec3",
+            "offset": 16,
+            "size": 12,
+            "default": [
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "name": "metallic_factor",
+            "type": "scalar",
+            "offset": 28,
+            "size": 4,
+            "default": 1.0
+          },
+          {
+            "name": "roughness_factor",
+            "type": "scalar",
+            "offset": 32,
+            "size": 4,
+            "default": 1.0
+          },
+          {
+            "name": "emissive_strength",
+            "type": "scalar",
+            "offset": 36,
+            "size": 4,
+            "default": 1.0
+          },
+          {
+            "name": "ior",
+            "type": "scalar",
+            "offset": 40,
+            "size": 4,
+            "default": 1.5
+          },
+          {
+            "name": "clearcoat_factor",
+            "type": "scalar",
+            "offset": 44,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "clearcoat_roughness_factor",
+            "type": "scalar",
+            "offset": 48,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "sheen_roughness_factor",
+            "type": "scalar",
+            "offset": 52,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "transmission_factor",
+            "type": "scalar",
+            "offset": 56,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "_pad_sheen",
+            "type": "scalar",
+            "offset": 60,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "sheen_color_factor",
+            "type": "vec3",
+            "offset": 64,
+            "size": 12,
+            "default": [
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "name": "base_color_uv_st",
+            "type": "vec4",
+            "offset": 80,
+            "size": 16,
+            "default": [
+              0.0,
+              0.0,
+              1.0,
+              1.0
+            ]
+          },
+          {
+            "name": "normal_uv_st",
+            "type": "vec4",
+            "offset": 96,
+            "size": 16,
+            "default": [
+              0.0,
+              0.0,
+              1.0,
+              1.0
+            ]
+          },
+          {
+            "name": "mr_uv_st",
+            "type": "vec4",
+            "offset": 112,
+            "size": 16,
+            "default": [
+              0.0,
+              0.0,
+              1.0,
+              1.0
+            ]
+          },
+          {
+            "name": "base_color_uv_rot",
+            "type": "scalar",
+            "offset": 128,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "normal_uv_rot",
+            "type": "scalar",
+            "offset": 132,
+            "size": 4,
+            "default": 0.0
+          },
+          {
+            "name": "mr_uv_rot",
+            "type": "scalar",
+            "offset": 136,
+            "size": 4,
+            "default": 0.0
+          }
+        ],
+        "size": 144,
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "sampler",
+        "name": "base_color_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "sampled_image",
+        "name": "base_color_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "sampler",
+        "name": "normal_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "sampled_image",
+        "name": "normal_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 5,
+        "type": "sampler",
+        "name": "metallic_roughness_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 6,
+        "type": "sampled_image",
+        "name": "metallic_roughness_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 7,
+        "type": "sampler",
+        "name": "emissive_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 8,
+        "type": "sampled_image",
+        "name": "emissive_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "deferred": {
+    "pass": "gbuffer",
+    "render_targets": [
+      {
+        "index": 0,
+        "name": "rt0",
+        "format": "RGBA8_SRGB",
+        "channels": "albedo.rgb + metallic"
+      },
+      {
+        "index": 1,
+        "name": "rt1",
+        "format": "RGB10A2_UNORM",
+        "channels": "oct_normal.rg + roughness"
+      },
+      {
+        "index": 2,
+        "name": "rt2",
+        "format": "RGBA16F",
+        "channels": "emission.rgb + occlusion"
+      }
+    ],
+    "depth_format": "D32_SFLOAT",
+    "normal_encoding": "octahedron",
+    "precision": "standard"
+  },
+  "performance_hints": {
+    "instruction_count": 357,
+    "alu_ops": 65,
+    "texture_samples": 5,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

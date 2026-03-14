@@ -1,6 +1,7 @@
 #include "vulkan_context.h"
 #include "spv_loader.h"
 #include "raster_renderer.h"
+#include "deferred_renderer.h"
 #include "rt_renderer.h"
 #include "mesh_renderer.h"
 #include "scene_manager.h"
@@ -404,6 +405,10 @@ static std::string detectRenderPath(const std::string& base, const std::string& 
     if (forceMode == "mesh" && fs::exists(base + ".mesh.spv") && fs::exists(base + ".frag.spv")) return "mesh";
     // Detect gaussian splatting compute pipeline
     if (hasGaussianSplattingKey(base)) return "splat";
+    // Detect deferred pipeline (4-stage: gbuf.vert + gbuf.frag + light.vert + light.frag)
+    if (fs::exists(base + ".gbuf.vert.spv") && fs::exists(base + ".gbuf.frag.spv") &&
+        fs::exists(base + ".light.vert.spv") && fs::exists(base + ".light.frag.spv"))
+        return "deferred";
     // Prefer raster over RT when both exist (raster supports per-material draw calls)
     if (fs::exists(base + ".vert.spv") && fs::exists(base + ".frag.spv")) return "raster";
     if (fs::exists(base + ".mesh.spv") && fs::exists(base + ".frag.spv")) return "mesh";
@@ -659,6 +664,10 @@ static int runHeadless(const CLIOptions& opts) {
                 auto meshR = std::make_unique<MeshRenderer>();
                 meshR->init(ctx, scene, resolvedBase, opts.width, opts.height);
                 renderer = std::move(meshR);
+            } else if (renderPath == "deferred") {
+                auto deferred = std::make_unique<DeferredRenderer>();
+                deferred->init(ctx, scene, opts.shaderBase, opts.width, opts.height);
+                renderer = std::move(deferred);
             } else {
                 auto raster = std::make_unique<RasterRenderer>();
                 raster->init(ctx, scene, opts.shaderBase, renderPath, opts.width, opts.height);
@@ -946,6 +955,10 @@ static int runInteractive(CLIOptions opts) {
             meshR->init(ctx, scene, resolvedBase,
                         opts.width, opts.height);
             renderer = std::move(meshR);
+        } else if (renderPath == "deferred") {
+            auto deferred = std::make_unique<DeferredRenderer>();
+            deferred->init(ctx, scene, opts.shaderBase, opts.width, opts.height);
+            renderer = std::move(deferred);
         } else if (!useSplat || isHybridRaster) {
             // Create raster renderer for non-splat scenes, OR for hybrid raster+splat scenes
             auto raster = std::make_unique<RasterRenderer>();
@@ -1161,6 +1174,14 @@ static int runInteractive(CLIOptions opts) {
             // Mesh shader rendering to swapchain
             auto* meshPtr = static_cast<MeshRenderer*>(renderer.get());
             meshPtr->renderToSwapchain(ctx,
+                ctx.swapchainImages[imageIndex],
+                ctx.swapchainImageViews[imageIndex],
+                ctx.swapchainFormat, ctx.swapchainExtent,
+                imageAvailableSem, sceneSignalSem, sceneSubmitFence);
+        } else if (renderPath == "deferred") {
+            // Deferred rendering to swapchain
+            auto* deferredPtr = static_cast<DeferredRenderer*>(renderer.get());
+            deferredPtr->renderToSwapchain(ctx,
                 ctx.swapchainImages[imageIndex],
                 ctx.swapchainImageViews[imageIndex],
                 ctx.swapchainFormat, ctx.swapchainExtent,

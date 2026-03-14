@@ -90,6 +90,7 @@ if(Vulkan_FOUND)
         src/vulkan_context.cpp
         src/spv_loader.cpp
         src/raster_renderer.cpp
+        src/deferred_renderer.cpp
         src/rt_renderer.cpp
         src/scene_manager.cpp
         src/scene.cpp
