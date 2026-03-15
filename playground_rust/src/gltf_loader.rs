@@ -853,8 +853,12 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                 .unwrap_or_else(|| vec![1.0; prim_num_splats as usize]);
 
             // Parse spherical harmonics coefficients
-            // Extension format: "sh": [{"coefficients": <accessor_idx>, "degree": <N>}, ...]
-            // KHR format stores all coefficients for a degree in one flat accessor.
+            // Extension format: "sh": [{"coefficients": <idx_or_array>, "degree": <N>}, ...]
+            //
+            // Two sub-formats for "coefficients":
+            //   1. Single accessor index (legacy): flat scalar array with all coeffs for degree
+            //   2. Array of accessor indices (KHR conformant): one VEC3 accessor per coefficient
+            //
             // The shader expects individual coefficient buffers (one per SH basis function).
             // Degree 0: 1 coeff  -> buffer index 0
             // Degree 1: 3 coeffs -> buffer indices 1,2,3
@@ -870,14 +874,37 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                     if degree > prim_sh_degree {
                         prim_sh_degree = degree;
                     }
-                    if let Some(acc_idx) = sh_entry.get("coefficients").and_then(|v| v.as_u64()) {
+                    let coefficients_val = sh_entry.get("coefficients");
+
+                    // Check if coefficients is an array of accessor indices (KHR conformant)
+                    if let Some(acc_arr) = coefficients_val.and_then(|v| v.as_array()) {
+                        // KHR conformant: each element is an accessor index for one VEC3 coefficient
+                        let base_idx = coeff_base[degree as usize];
+                        let total_coeffs = base_idx + acc_arr.len();
+                        if total_coeffs > prim_sh_coefficients.len() {
+                            prim_sh_coefficients.resize(total_coeffs, Vec::new());
+                        }
+                        for (ci, acc_val) in acc_arr.iter().enumerate() {
+                            if let Some(acc_idx) = acc_val.as_u64() {
+                                let raw = read_accessor_f32(acc_idx as usize);
+                                prim_sh_coefficients[base_idx + ci] = raw.chunks(3)
+                                    .map(|c| [
+                                        c.first().copied().unwrap_or(0.0),
+                                        c.get(1).copied().unwrap_or(0.0),
+                                        c.get(2).copied().unwrap_or(0.0),
+                                        0.0,
+                                    ])
+                                    .collect();
+                            }
+                        }
+                    } else if let Some(acc_idx) = coefficients_val.and_then(|v| v.as_u64()) {
+                        // Legacy format: single accessor with all coefficients for this degree
                         let raw = read_accessor_f32(acc_idx as usize);
                         let n = prim_num_splats as usize;
-                        let num_coeffs = (2 * degree + 1) as usize; // coefficients per degree
-                        let floats_per_splat = num_coeffs * 3; // 3 channels (RGB) per coefficient
+                        let num_coeffs = (2 * degree + 1) as usize;
+                        let floats_per_splat = num_coeffs * 3;
 
                         if degree == 0 {
-                            // DC term: vec3 per splat -> 1 buffer
                             let base_idx = coeff_base[0];
                             if base_idx >= prim_sh_coefficients.len() {
                                 prim_sh_coefficients.resize(base_idx + 1, Vec::new());
@@ -891,18 +918,14 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                                 ])
                                 .collect();
                         } else {
-                            // Higher degrees: flat scalar array, split into individual coefficients
-                            // Layout per splat: [c0_r, c0_g, c0_b, c1_r, c1_g, c1_b, ...]
                             let base_idx = coeff_base[degree as usize];
                             let total_coeffs = base_idx + num_coeffs;
                             if total_coeffs > prim_sh_coefficients.len() {
                                 prim_sh_coefficients.resize(total_coeffs, Vec::new());
                             }
-                            // Initialize individual coefficient buffers
                             for ci in 0..num_coeffs {
                                 prim_sh_coefficients[base_idx + ci] = Vec::with_capacity(n);
                             }
-                            // Unpack: for each splat, extract individual vec3 coefficients
                             for si in 0..n {
                                 let splat_offset = si * floats_per_splat;
                                 for ci in 0..num_coeffs {
@@ -985,22 +1008,11 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
     if scene.splat_data.has_splats {
         scene.splat_data.sh_degree = global_max_sh_degree;
 
-        // Convert KHR linear values to log/logit space for shader compatibility.
-        // The compute shader applies exp() to scales and sigmoid() to opacity,
-        // so we must store raw log-space scales and logit-space opacity.
+        // Convert KHR linear opacity to logit space for shader compatibility.
+        // The compute shader applies sigmoid() to opacity, so we store logit-space values.
+        // KHR scales are already in log-space per spec (no conversion needed).
         // Only for KHR format; internal format (_SCALE, _OPACITY) already stores raw values.
         if scene.splat_data.khr_format {
-            // Convert linear scales to log-space: ln(scale)
-            for scale in &mut scene.splat_data.scales {
-                scale[0] = scale[0].max(1e-7).ln();
-                scale[1] = scale[1].max(1e-7).ln();
-                scale[2] = scale[2].max(1e-7).ln();
-            }
-            info!(
-                "Converted KHR linear scales to log-space for {} splats",
-                scene.splat_data.scales.len()
-            );
-
             // Convert linear opacity [0,1] to logit: ln(p / (1 - p))
             for opacity in &mut scene.splat_data.opacities {
                 let p = opacity.clamp(1e-6, 1.0 - 1e-6);

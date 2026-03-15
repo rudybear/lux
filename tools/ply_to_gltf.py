@@ -3,7 +3,9 @@
 Enhanced converter with:
 - Coordinate system conversion (Z-up -> Y-up)
 - Opacity transform (logit -> linear sigmoid)
-- Scale transform (log-space -> linear exp)
+- Scales kept in log-space per KHR spec (no transform)
+- SH channel reordering (3DGS channel-first -> KHR coefficient-first VEC3)
+- KHR-conformant attribute naming (KHR_gaussian_splatting:SH_DEGREE_N_COEF_M)
 - SH degree auto-detection
 - Round-trip verification
 - Batch processing
@@ -555,15 +557,10 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
     if convert_coords:
         scales = convert_scales_z_up_to_y_up(scales)
 
-    # Auto-detect or apply scale transform
-    if not raw_scale:
-        if auto_detect_scale_space(scales):
-            if not quiet:
-                print("Scales appear already linear, keeping as-is")
-        else:
-            scales = np.exp(scales)
-            if not quiet:
-                print("Applied exp() scale transform")
+    # KHR_gaussian_splatting spec stores scales in log-space (same as 3DGS PLY).
+    # No transform needed — pass through as-is.  The compute shader applies exp().
+    if not quiet:
+        print("Scales kept in log-space (KHR spec)")
     scale_buf = scales.astype(np.float32).tobytes()
 
     # Build opacity array
@@ -580,30 +577,54 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
                 print("Applied sigmoid() opacity transform")
     opa_buf = opacities.astype(np.float32).tobytes()
 
-    # SH DC band (degree 0): f_dc_0, f_dc_1, f_dc_2
+    # SH DC band (degree 0): f_dc_0, f_dc_1, f_dc_2 → 1 VEC3 per splat
     sh_dc = np.column_stack([data['f_dc_0'], data['f_dc_1'], data['f_dc_2']])
     sh_dc_buf = sh_dc.astype(np.float32).tobytes()
 
-    # Higher degree SH bands
-    sh_rest_bufs = []
+    # Higher degree SH bands — reorder from 3DGS channel-first to KHR coefficient-first.
+    #
+    # 3DGS PLY stores f_rest_* in GLOBAL channel-first order (due to .transpose(1,2)
+    # in the training code's save):
+    #   [R_coeff0, R_coeff1, ..., R_coeffK, G_coeff0, ..., G_coeffK, B_coeff0, ..., B_coeffK]
+    # where K = total higher-order coefficients across ALL degrees.
+    #
+    # KHR_gaussian_splatting spec stores per-coefficient VEC3:
+    #   each coefficient has (R, G, B) together as a VEC3 attribute.
+    sh_coeff_bufs = []  # list of (degree, coef_within_degree, bytes_buffer)
     if sh_degree >= 1:
         rest_names = sorted(
             [p for p in props if p.startswith('f_rest_')],
             key=lambda p: int(p.split('_')[-1])
         )
-        idx_offset = 0
-        for l in range(1, sh_degree + 1):
-            count = 3 * (2 * l + 1)
-            degree_names = rest_names[idx_offset:idx_offset + count]
-            idx_offset += count
+        total_rest = len(rest_names)
+        coeffs_per_channel = total_rest // 3
 
-            degree_data = np.column_stack([data[name] for name in degree_names])
-            buf = degree_data.astype(np.float32).tobytes()
-            sh_rest_bufs.append((l, count, buf))
+        # Read all f_rest as (N, total_rest) array
+        rest_data = np.column_stack([data[name] for name in rest_names])
+
+        # Reshape: (N, 3_channels, coeffs_per_channel) — channel-first layout
+        rest_data = rest_data.reshape(n, 3, coeffs_per_channel)
+
+        # Transpose to coefficient-first: (N, coeffs_per_channel, 3_rgb)
+        rest_data = rest_data.transpose(0, 2, 1)
+
+        # Split by degree and create individual VEC3 buffers per coefficient
+        coeff_idx = 0
+        for l in range(1, sh_degree + 1):
+            num_coeffs = 2 * l + 1
+            for c in range(num_coeffs):
+                coeff_vec3 = rest_data[:, coeff_idx, :]  # (N, 3)
+                buf = coeff_vec3.astype(np.float32).tobytes()
+                sh_coeff_bufs.append((l, c, buf))
+                coeff_idx += 1
+
+        if not quiet:
+            print(f"Reordered {total_rest} SH coefficients: channel-first -> "
+                  f"{len(sh_coeff_bufs)} coefficient-first VEC3 buffers")
 
     # Build buffer views and accessors
     buffer_parts = [pos_buf, rot_buf, scale_buf, opa_buf, sh_dc_buf]
-    for _, _, buf in sh_rest_bufs:
+    for _, _, buf in sh_coeff_bufs:
         buffer_parts.append(buf)
 
     offsets = []
@@ -634,16 +655,33 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
         {"bufferView": 4, "componentType": 5126, "count": n, "type": "VEC3"},   # sh_dc
     ]
 
-    sh_entries = [{"coefficients": 4, "degree": 0}]
-    for idx, (l, count, _) in enumerate(sh_rest_bufs):
-        acc_idx = 5 + idx
+    for idx in range(len(sh_coeff_bufs)):
         accessors.append({
             "bufferView": 5 + idx,
             "componentType": 5126,
-            "count": n * count,
-            "type": "SCALAR",
+            "count": n,
+            "type": "VEC3",
         })
-        sh_entries.append({"coefficients": acc_idx, "degree": l})
+
+    # Build KHR-conformant primitive attributes
+    attributes = {
+        "POSITION": 0,
+        "KHR_gaussian_splatting:ROTATION": 1,
+        "KHR_gaussian_splatting:SCALE": 2,
+        "KHR_gaussian_splatting:OPACITY": 3,
+        "KHR_gaussian_splatting:SH_DEGREE_0_COEF_0": 4,
+    }
+    for idx, (l, c, _) in enumerate(sh_coeff_bufs):
+        attributes[f"KHR_gaussian_splatting:SH_DEGREE_{l}_COEF_{c}"] = 5 + idx
+
+    # Build extension "sh" array with per-coefficient accessor indices per degree.
+    # coefficients is an array of accessor indices (one VEC3 accessor per coefficient).
+    sh_entries = [{"degree": 0, "coefficients": [4]}]
+    for l in range(1, sh_degree + 1):
+        degree_acc_indices = [
+            5 + idx for idx, (dl, _, _) in enumerate(sh_coeff_bufs) if dl == l
+        ]
+        sh_entries.append({"degree": l, "coefficients": degree_acc_indices})
 
     gltf_json = {
         "asset": {"version": "2.0", "generator": "lux-ply-to-gltf"},
@@ -654,12 +692,7 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
         "meshes": [{
             "primitives": [{
                 "mode": 0,
-                "attributes": dict([
-                    ("POSITION", 0),
-                    ("_ROTATION", 1),
-                    ("_SCALE", 2),
-                    ("_OPACITY", 3),
-                ] + [("_SH_%d" % e["degree"], e["coefficients"]) for e in sh_entries]),
+                "attributes": attributes,
                 "extensions": {
                     "KHR_gaussian_splatting": {
                         "attributes": {
@@ -763,15 +796,12 @@ def verify_round_trip(ply_path, glb_path, convert_coords=True,
         orig_rot_conv = np.column_stack([qx, qy, qz, w])
     errors['rotation'] = float(np.max(np.abs(glb_rotations - orig_rot_conv)))
 
-    # Compare scales
+    # Compare scales (kept in log-space per KHR spec, no transform)
     orig_scales = np.column_stack([
         orig['scale_0'], orig['scale_1'], orig['scale_2']
     ]).astype(np.float32)
     if convert_coords:
         orig_scales = convert_scales_z_up_to_y_up(orig_scales)
-    if not raw_scale:
-        if not auto_detect_scale_space(orig_scales):
-            orig_scales = np.exp(orig_scales)
     errors['scale'] = float(np.max(np.abs(glb_scales - orig_scales)))
 
     # Compare opacities
@@ -784,7 +814,9 @@ def verify_round_trip(ply_path, glb_path, convert_coords=True,
     # Compare SH DC
     sh_bands = ext.get('sh', [])
     if sh_bands:
-        sh0_idx = sh_bands[0]['coefficients']
+        coeffs = sh_bands[0]['coefficients']
+        # Handle both old (single index) and new (array of indices) formats
+        sh0_idx = coeffs[0] if isinstance(coeffs, list) else coeffs
         glb_sh0 = read_accessor(gltf, bin_data, sh0_idx)
         orig_sh0 = np.column_stack([
             orig['f_dc_0'], orig['f_dc_1'], orig['f_dc_2']

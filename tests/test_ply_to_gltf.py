@@ -395,7 +395,7 @@ class TestOpacityTransform:
 
         gltf, bin_data = load_glb(glb_path)
         attrs = gltf['meshes'][0]['primitives'][0]['attributes']
-        opa = read_accessor(gltf, bin_data, attrs['_OPACITY'])
+        opa = read_accessor(gltf, bin_data, attrs['KHR_gaussian_splatting:OPACITY'])
         assert float(opa[0]) == pytest.approx(expected, abs=1e-5)
 
     def test_raw_opacity_skips_transform(self, tmp_path):
@@ -407,7 +407,7 @@ class TestOpacityTransform:
 
         gltf, bin_data = load_glb(glb_path)
         attrs = gltf['meshes'][0]['primitives'][0]['attributes']
-        opa = read_accessor(gltf, bin_data, attrs['_OPACITY'])
+        opa = read_accessor(gltf, bin_data, attrs['KHR_gaussian_splatting:OPACITY'])
         assert float(opa[0]) == pytest.approx(0.75, abs=1e-5)
 
 
@@ -433,10 +433,9 @@ class TestScaleTransform:
         values = np.array([[0.5, 0.3, 15.0]])
         assert auto_detect_scale_space(values) is False
 
-    def test_scale_exp_transform_in_conversion(self, tmp_path):
-        """Log-space scales should be transformed via exp() in GLB output."""
-        log_scale = -3.0  # exp(-3) ~ 0.0498
-        expected = math.exp(log_scale)
+    def test_scale_kept_in_log_space(self, tmp_path):
+        """KHR spec: scales stay in log-space (no exp transform)."""
+        log_scale = -3.0
         splats = [_default_splat(scale_0=log_scale, scale_1=log_scale, scale_2=log_scale)]
         ply_path = _make_ply_binary(tmp_path, splats)
         glb_path = os.path.join(str(tmp_path), "test.glb")
@@ -444,10 +443,10 @@ class TestScaleTransform:
 
         gltf, bin_data = load_glb(glb_path)
         attrs = gltf['meshes'][0]['primitives'][0]['attributes']
-        scales = read_accessor(gltf, bin_data, attrs['_SCALE'])
-        # After coord conversion, axis order changes, but all same value
+        scales = read_accessor(gltf, bin_data, attrs['KHR_gaussian_splatting:SCALE'])
+        # Scales kept in log-space per KHR spec — all same value after coord swap
         for j in range(3):
-            assert float(scales[0, j]) == pytest.approx(expected, abs=1e-5)
+            assert float(scales[0, j]) == pytest.approx(log_scale, abs=1e-5)
 
     def test_raw_scale_skips_transform(self, tmp_path):
         """--raw-scale should pass through scale values unchanged."""
@@ -458,7 +457,7 @@ class TestScaleTransform:
 
         gltf, bin_data = load_glb(glb_path)
         attrs = gltf['meshes'][0]['primitives'][0]['attributes']
-        scales = read_accessor(gltf, bin_data, attrs['_SCALE'])
+        scales = read_accessor(gltf, bin_data, attrs['KHR_gaussian_splatting:SCALE'])
         # With convert_coords=True, axes reorder: (0.5, 0.3, 0.1) -> (0.5, 0.1, 0.3)
         assert float(scales[0, 0]) == pytest.approx(0.5, abs=1e-5)
         assert float(scales[0, 1]) == pytest.approx(0.1, abs=1e-5)
@@ -653,7 +652,7 @@ class TestAutoDetection:
 
         gltf, bin_data = load_glb(glb_path)
         attrs = gltf['meshes'][0]['primitives'][0]['attributes']
-        opa = read_accessor(gltf, bin_data, attrs['_OPACITY'])
+        opa = read_accessor(gltf, bin_data, attrs['KHR_gaussian_splatting:OPACITY'])
         # 0.8 is in [0,1] -> auto-detect says linear -> kept as-is
         assert float(opa[0]) == pytest.approx(0.8, abs=1e-5)
 
@@ -686,7 +685,7 @@ class TestEdgeCases:
         assert len(gltf['accessors']) == 5
 
     def test_sh_degree_1_extra_accessors(self, tmp_path):
-        """SH degree 1 should have 6 accessors (5 + 1 rest band)."""
+        """SH degree 1 should have 8 accessors (5 base + 3 per-coefficient VEC3)."""
         splats = [_default_splat()]
         ply_path = _make_ply_binary(tmp_path, splats, sh_degree=1,
                                     extra_rest_coeffs=[[0.01 * i for i in range(9)]])
@@ -694,7 +693,8 @@ class TestEdgeCases:
         ply_to_gltf(ply_path, glb_path, quiet=True)
 
         gltf, _ = load_glb(glb_path)
-        assert len(gltf['accessors']) == 6
+        # 5 base (pos, rot, scale, opa, sh_dc) + 3 VEC3 per-coefficient for degree 1
+        assert len(gltf['accessors']) == 8
 
     def test_center_positions(self, tmp_path):
         """--center should center the point cloud at origin."""

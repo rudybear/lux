@@ -354,7 +354,14 @@ def load_splat_glb(path: Path) -> dict:
                 if gs_ext is not None:
                     for sh_entry in gs_ext.get('sh', []):
                         degree = sh_entry['degree']
-                        coeffs = read_accessor(sh_entry['coefficients'])
+                        coeff_val = sh_entry['coefficients']
+                        if isinstance(coeff_val, list):
+                            # KHR conformant: array of accessor indices, one VEC3 per coefficient
+                            parts = [read_accessor(idx) for idx in coeff_val]
+                            coeffs = np.hstack(parts) if parts else np.zeros((prim_n, 3), dtype=np.float32)
+                        else:
+                            # Legacy: single accessor index
+                            coeffs = read_accessor(coeff_val)
                         if degree not in prim_sh:
                             prim_sh[degree] = coeffs
                         if degree > global_max_sh_degree:
@@ -370,7 +377,14 @@ def load_splat_glb(path: Path) -> dict:
                 # SH from extension sh list
                 for sh_entry in gs_ext.get('sh', []):
                     degree = sh_entry['degree']
-                    coeffs = read_accessor(sh_entry['coefficients'])
+                    coeff_val = sh_entry['coefficients']
+                    if isinstance(coeff_val, list):
+                        # KHR conformant: array of accessor indices, one VEC3 per coefficient
+                        parts = [read_accessor(idx) for idx in coeff_val]
+                        coeffs = np.hstack(parts) if parts else np.zeros((prim_n, 3), dtype=np.float32)
+                    else:
+                        # Legacy: single accessor index
+                        coeffs = read_accessor(coeff_val)
                     prim_sh[degree] = coeffs
                     if degree > global_max_sh_degree:
                         global_max_sh_degree = degree
@@ -457,7 +471,12 @@ def load_splat_glb(path: Path) -> dict:
                 prim_sh = {}
                 for sh_entry in gs_ext.get('sh', []):
                     degree = sh_entry['degree']
-                    coeffs = read_accessor(sh_entry['coefficients'])
+                    coeff_val = sh_entry['coefficients']
+                    if isinstance(coeff_val, list):
+                        parts = [read_accessor(idx) for idx in coeff_val]
+                        coeffs = np.hstack(parts) if parts else np.zeros((prim_n, 3), dtype=np.float32)
+                    else:
+                        coeffs = read_accessor(coeff_val)
                     prim_sh[degree] = coeffs
                     if degree > global_max_sh_degree:
                         global_max_sh_degree = degree
@@ -514,16 +533,13 @@ def load_splat_glb(path: Path) -> dict:
         sh_coeffs_list.append(merged)
 
     # -----------------------------------------------------------------------
-    # KHR linear → log/logit conversion
+    # KHR linear opacity → logit conversion
     # -----------------------------------------------------------------------
-    # KHR_gaussian_splatting stores scales and opacity in linear space.
-    # The rasterizer applies exp() to scales and sigmoid() to opacity,
-    # so we must convert back to log/logit space.
+    # KHR_gaussian_splatting stores opacity in linear [0,1] space.
+    # The rasterizer applies sigmoid() to opacity, so we convert to logit.
+    # KHR scales are already in log-space per spec (no conversion needed).
     # Non-KHR formats already store log/logit values.
     if khr_format:
-        # Convert linear scales to log-space: log(scale)
-        merged_scales = np.log(np.maximum(merged_scales, 1e-7)).astype(np.float32)
-
         # Convert linear opacity [0,1] to logit: log(p / (1-p))
         p = np.clip(merged_opacities, 1e-6, 1.0 - 1e-6)
         merged_opacities = np.log(p / (1.0 - p)).astype(np.float32)
@@ -982,23 +998,38 @@ def render_splats_from_data(
     opacities_logit = splat['opacities']  # (N,) logit-space
     sh_coeffs = splat['sh_coeffs']      # list of (N, 3) arrays
 
-    # --- Camera setup (matches C++/Rust auto-camera) ---
-    bb_min, bb_max = positions.min(axis=0), positions.max(axis=0)
-    center = (bb_min + bb_max) / 2.0
-    radius = float(np.linalg.norm(bb_max - bb_min)) * 0.5
+    # --- Camera setup (IQR-based to handle outlier splats) ---
+    if n > 100:
+        # Use median center and IQR (P25-P75) for tight framing.
+        # Real 3DGS scenes have extreme outlier background splats.
+        median_center = np.median(positions, axis=0).astype(np.float32)
+        p25 = np.percentile(positions, 25, axis=0)
+        p75 = np.percentile(positions, 75, axis=0)
+        iqr_extent = p75 - p25
+        # Use max IQR axis as base radius for camera placement
+        radius = float(np.max(np.abs(iqr_extent)))
+        # Use full bbox for far plane
+        bb_min, bb_max = positions.min(axis=0), positions.max(axis=0)
+        full_radius = float(np.linalg.norm(bb_max - bb_min)) * 0.5
+        center = median_center
+    else:
+        bb_min, bb_max = positions.min(axis=0), positions.max(axis=0)
+        center = ((bb_min + bb_max) / 2.0).astype(np.float32)
+        radius = float(np.linalg.norm(bb_max - bb_min)) * 0.5
+        full_radius = radius
     if radius < 0.001:
         radius = 1.0
 
     if target is None:
         target = center
     if eye is None:
-        eye = center + np.array([0.0, radius * 0.5, radius * 2.5], dtype=np.float32)
+        eye = center + np.array([radius * 0.6, radius * 0.3, radius * 1.2], dtype=np.float32)
 
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
     fov_y = math.radians(45.0)
     aspect = width / height
     near_plane = 0.01
-    far_plane = radius * 10.0
+    far_plane = full_radius * 5.0
 
     view = _look_at(eye, target, up)
     proj = _perspective(fov_y, aspect, near_plane, far_plane)
@@ -1054,10 +1085,11 @@ def render_splats_from_data(
                 cov3d[a, b] = val
                 cov3d[b, a] = val
 
-        # Jacobian of projection
+        # Jacobian: maps view-space (X-right, Y-up, Z-out) to pixel-space (Y-down)
+        # sx = fx * vx / t, sy = -fy * vy / t (Y-flip for pixel space)
         j00 = focal_x / t
-        j02 = -focal_x * vx / t2
-        j11 = focal_y / t
+        j02 = focal_x * vx / t2
+        j11 = -focal_y / t
         j12 = -focal_y * vy / t2
 
         # J = [[j00, 0, j02], [0, j11, j12]]

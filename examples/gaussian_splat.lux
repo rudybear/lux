@@ -4,7 +4,7 @@
 splat GaussianCloud {
     sh_degree: 0,
     kernel: ellipse,
-    color_space: srgb,
+    color_space: linear,
     sort: camera_distance,
     alpha_cutoff: 0.004,
 }

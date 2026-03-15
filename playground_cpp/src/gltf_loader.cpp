@@ -579,19 +579,11 @@ GltfScene loadGltf(const std::string& path) {
     if (scene.splat_data.has_splats) {
         scene.splat_data.sh_degree = globalMaxSHDegree;
 
-        // Convert KHR linear values to log/logit space for shader compatibility.
-        // The compute shader applies exp() to scales and sigmoid() to opacity,
-        // so we must store raw log-space scales and logit-space opacity.
+        // Convert KHR linear opacity to logit space for shader compatibility.
+        // The compute shader applies sigmoid() to opacity, so we store logit-space values.
+        // KHR scales are already in log-space per spec (no conversion needed).
         // Only for KHR format; internal format (_SCALE, _OPACITY) already stores raw values.
         if (scene.splat_data.khr_format) {
-            // Convert linear scales to log-space: log(scale)
-            for (size_t i = 0; i < scene.splat_data.scales.size(); ++i) {
-                float s = std::max(scene.splat_data.scales[i], 1e-7f);
-                scene.splat_data.scales[i] = std::log(s);
-            }
-            std::cout << "[info] Converted KHR linear scales to log-space for "
-                      << scene.splat_data.scales.size() / 3 << " splats" << std::endl;
-
             // Convert linear opacity [0,1] to logit: log(p / (1 - p))
             for (size_t i = 0; i < scene.splat_data.opacities.size(); ++i) {
                 float p = std::clamp(scene.splat_data.opacities[i], 1e-6f, 1.0f - 1e-6f);

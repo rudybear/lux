@@ -428,19 +428,81 @@ impl GaussianSplatRenderer {
         write_ssbo(render_desc_set, 3, sorted_indices_buffer.buffer, (n * 4) as u64);
 
         // --- Compute bounding box and auto-camera ---
+        // Use median center and IQR (P25-P75) radius for tight framing.
+        // Real 3DGS scenes have extreme outlier background splats that make
+        // P5-P95 or full bbox camera placement far too distant.
         let (auto_eye, auto_target, auto_up, auto_far, has_scene_bounds) = {
-            let mut min_b = glam::Vec3::splat(f32::MAX);
-            let mut max_b = glam::Vec3::splat(f32::MIN);
-            for pos in &splat_data.positions {
-                let p = glam::Vec3::new(pos[0], pos[1], pos[2]);
-                min_b = min_b.min(p);
-                max_b = max_b.max(p);
+            let n_splats = splat_data.positions.len();
+            if n_splats > 100 {
+                let mut xs: Vec<f32> = splat_data.positions.iter().map(|p| p[0]).collect();
+                let mut ys: Vec<f32> = splat_data.positions.iter().map(|p| p[1]).collect();
+                let mut zs: Vec<f32> = splat_data.positions.iter().map(|p| p[2]).collect();
+                xs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                ys.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                zs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+                // IQR (interquartile range) for robust scene extent
+                let p25 = n_splats * 25 / 100;
+                let p75 = n_splats * 75 / 100;
+                let center = glam::Vec3::new(
+                    xs[n_splats / 2], ys[n_splats / 2], zs[n_splats / 2],
+                );
+                let extent = glam::Vec3::new(
+                    xs[p75] - xs[p25], ys[p75] - ys[p25], zs[p75] - zs[p25],
+                );
+                // Use max IQR axis as base radius for camera placement
+                let max_iqr = extent.x.max(extent.y).max(extent.z);
+                let r = if max_iqr < 0.001 { 1.0 } else { max_iqr };
+
+                // Full bbox for far plane
+                let full_radius = glam::Vec3::new(
+                    xs[n_splats - 1] - xs[0], ys[n_splats - 1] - ys[0], zs[n_splats - 1] - zs[0],
+                ).length() * 0.5;
+
+                // Detect the "up" axis: the shortest IQR extent is likely the vertical axis.
+                // Use negative direction for Y (COLMAP convention: Y points down).
+                let (up_vec, up_idx) = if extent.y <= extent.x && extent.y <= extent.z {
+                    (glam::Vec3::NEG_Y, 1usize)
+                } else if extent.z <= extent.x && extent.z <= extent.y {
+                    (glam::Vec3::Z, 2usize)
+                } else {
+                    (glam::Vec3::X, 0usize)
+                };
+
+                // For 3DGS scenes, place camera at eye-level near training distance.
+                // Training cameras are typically 3-6× the object radius from center.
+                // Use the up-axis extent as height reference (don't elevate too much).
+                let up_extent = [extent.x, extent.y, extent.z][up_idx];
+                let ground_r = r; // largest IQR extent = ground plane radius
+                let cam_dist = ground_r * 0.4; // close to match training distance
+
+                // Build eye offset: on the two ground axes, slightly elevated in up
+                let mut off = [0.0f32; 3];
+                let ground_axes: Vec<usize> = (0..3).filter(|&i| i != up_idx).collect();
+                off[ground_axes[0]] = cam_dist * 0.7;
+                off[ground_axes[1]] = cam_dist * 0.7;
+                off[up_idx] = up_extent * 0.1; // slight elevation
+                let eye = center + glam::Vec3::new(off[0], off[1], off[2]);
+
+                let up_name = ["X", "Y", "Z"][up_idx];
+                info!("AUTO-CAM: center=({:.2},{:.2},{:.2}) extent=({:.2},{:.2},{:.2}) r={:.2} up={} eye=({:.2},{:.2},{:.2})",
+                    center.x, center.y, center.z, extent.x, extent.y, extent.z, r,
+                    up_name, eye.x, eye.y, eye.z);
+                (eye, center, up_vec, full_radius * 5.0, true)
+            } else {
+                let mut min_b = glam::Vec3::splat(f32::MAX);
+                let mut max_b = glam::Vec3::splat(f32::MIN);
+                for pos in &splat_data.positions {
+                    let p = glam::Vec3::new(pos[0], pos[1], pos[2]);
+                    min_b = min_b.min(p);
+                    max_b = max_b.max(p);
+                }
+                let center = (min_b + max_b) * 0.5;
+                let radius = (max_b - min_b).length() * 0.5;
+                let r = if radius < 0.001 { 1.0 } else { radius };
+                let eye = center + glam::Vec3::new(0.0, r * 0.5, r * 2.5);
+                (eye, center, glam::Vec3::Y, r * 10.0, true)
             }
-            let center = (min_b + max_b) * 0.5;
-            let radius = (max_b - min_b).length() * 0.5;
-            let r = if radius < 0.001 { 1.0 } else { radius };
-            let eye = center + glam::Vec3::new(0.0, r * 0.5, r * 2.5);
-            (eye, center, glam::Vec3::Y, r * 10.0, true)
         };
 
         // Default camera
@@ -1208,6 +1270,130 @@ impl GaussianSplatRenderer {
         }
     }
 
+    /// Read back and print projected buffer values after GPU compute (debug helper).
+    /// Call AFTER the command buffer containing the compute dispatch has been
+    /// submitted and the fence has been waited on (GPU is idle).
+    #[allow(dead_code)]
+    pub fn debug_dump_projected(&self) {
+        let n = self.num_splats as usize;
+        let entries = 20.min(n);
+
+        // --- visible_count ---
+        if let Some(ref alloc) = self.visible_count_buffer.allocation {
+            if let Some(mapped) = alloc.mapped_slice() {
+                if mapped.len() >= 4 {
+                    let count = u32::from_le_bytes([mapped[0], mapped[1], mapped[2], mapped[3]]);
+                    info!("DEBUG visible_count = {} (num_splats = {})", count, self.num_splats);
+                }
+            } else {
+                info!("DEBUG visible_count_buffer: not mapped");
+            }
+        }
+
+        // --- sort_keys (first entries) ---
+        if let Some(ref alloc) = self.sort_keys_buffer.allocation {
+            if let Some(mapped) = alloc.mapped_slice() {
+                let floats: &[f32] = bytemuck::cast_slice(&mapped[..entries * 4]);
+                info!("DEBUG sort_keys[0..{}]: {:?}", entries, &floats[..entries]);
+            }
+        }
+
+        // --- sorted_indices (first entries) ---
+        if let Some(ref alloc) = self.sorted_indices_buffer.allocation {
+            if let Some(mapped) = alloc.mapped_slice() {
+                let indices: &[u32] = bytemuck::cast_slice(&mapped[..entries * 4]);
+                info!("DEBUG sorted_indices[0..{}]: {:?}", entries, &indices[..entries]);
+            }
+        }
+
+        // --- proj_center (vec4 per splat) ---
+        if let Some(ref alloc) = self.proj_center_buffer.allocation {
+            if let Some(mapped) = alloc.mapped_slice() {
+                let floats: &[f32] = bytemuck::cast_slice(&mapped[..entries * 16]);
+                for i in 0..entries {
+                    let base = i * 4;
+                    info!(
+                        "DEBUG proj_center[{}]: ({:.4}, {:.4}, {:.4}, {:.4})",
+                        i, floats[base], floats[base + 1], floats[base + 2], floats[base + 3]
+                    );
+                }
+            } else {
+                info!("DEBUG proj_center_buffer: not mapped");
+            }
+        }
+
+        // --- proj_conic (vec4 per splat) ---
+        if let Some(ref alloc) = self.proj_conic_buffer.allocation {
+            if let Some(mapped) = alloc.mapped_slice() {
+                let floats: &[f32] = bytemuck::cast_slice(&mapped[..entries * 16]);
+                for i in 0..entries {
+                    let base = i * 4;
+                    info!(
+                        "DEBUG proj_conic[{}]: ({:.6}, {:.6}, {:.6}, {:.6})",
+                        i, floats[base], floats[base + 1], floats[base + 2], floats[base + 3]
+                    );
+                }
+            } else {
+                info!("DEBUG proj_conic_buffer: not mapped");
+            }
+        }
+
+        // --- proj_color (vec4 per splat) ---
+        if let Some(ref alloc) = self.proj_color_buffer.allocation {
+            if let Some(mapped) = alloc.mapped_slice() {
+                let floats: &[f32] = bytemuck::cast_slice(&mapped[..entries * 16]);
+                for i in 0..entries {
+                    let base = i * 4;
+                    info!(
+                        "DEBUG proj_color[{}]: ({:.4}, {:.4}, {:.4}, {:.4})",
+                        i, floats[base], floats[base + 1], floats[base + 2], floats[base + 3]
+                    );
+                }
+            } else {
+                info!("DEBUG proj_color_buffer: not mapped");
+            }
+        }
+
+        // --- Summary: count non-zero projected centers ---
+        if let Some(ref alloc) = self.proj_center_buffer.allocation {
+            if let Some(mapped) = alloc.mapped_slice() {
+                let max_check = n.min(mapped.len() / 16);
+                let floats: &[f32] = bytemuck::cast_slice(&mapped[..max_check * 16]);
+                let mut nonzero = 0u32;
+                let mut nan_count = 0u32;
+                let mut inf_count = 0u32;
+                let mut offscreen = 0u32;
+                for i in 0..max_check {
+                    let x = floats[i * 4];
+                    let y = floats[i * 4 + 1];
+                    if x.is_nan() || y.is_nan() {
+                        nan_count += 1;
+                    } else if x.is_infinite() || y.is_infinite() {
+                        inf_count += 1;
+                    } else if x != 0.0 || y != 0.0 {
+                        nonzero += 1;
+                        if x < 0.0 || x > self.width as f32 || y < 0.0 || y > self.height as f32 {
+                            offscreen += 1;
+                        }
+                    }
+                }
+                info!(
+                    "DEBUG proj_center summary ({} checked): {} nonzero, {} NaN, {} Inf, {} offscreen",
+                    max_check, nonzero, nan_count, inf_count, offscreen
+                );
+            }
+        }
+
+        // --- Also dump push constant values used ---
+        info!("DEBUG camera: eye=({:.3}, {:.3}, {:.3})", self.cam_pos.x, self.cam_pos.y, self.cam_pos.z);
+        info!("DEBUG screen: {}x{}, focal=({:.1}, {:.1}), sh_degree={}",
+              self.width, self.height, self.focal_x, self.focal_y, self.sh_degree);
+        info!("DEBUG view_matrix row0: {:?}", self.view_matrix.row(0));
+        info!("DEBUG view_matrix row1: {:?}", self.view_matrix.row(1));
+        info!("DEBUG view_matrix row2: {:?}", self.view_matrix.row(2));
+        info!("DEBUG view_matrix row3: {:?}", self.view_matrix.row(3));
+    }
+
     pub fn cleanup(&mut self, ctx: &mut VulkanContext) {
         let device = ctx.device.clone();
 
@@ -1348,7 +1534,7 @@ impl Renderer for GaussianSplatRenderer {
                 screen_width: self.width as f32,
                 screen_height: self.height as f32,
                 visible_count: self.num_splats,
-                alpha_cutoff: 0.004,
+                alpha_cutoff: 1.0 / 255.0,
             };
             ctx.device.cmd_push_constants(
                 cmd, self.render_layout,

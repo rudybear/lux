@@ -70,7 +70,7 @@
     "splat_name": "GaussianCloud"
   },
   "performance_hints": {
-    "instruction_count": 107,
+    "instruction_count": 99,
     "alu_ops": 14,
     "texture_samples": 0,
     "branches": 2,

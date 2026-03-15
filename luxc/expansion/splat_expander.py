@@ -329,28 +329,43 @@ def _build_preprocess_body(config: dict) -> list:
             _call("exp", [_swizzle(_ref("log_scale"), "z")]),
         ])))
 
-    # --- Compute 3D covariance matrix (upper triangle) ---
-    # Sigma = R * S * S^T * R^T, where S = diag(scale)
-    # Since S is diagonal, M = R * S, then Sigma = M * M^T
-    # M columns: m0 = R_col0 * s.x, m1 = R_col1 * s.y, m2 = R_col2 * s.z
+    # --- Transform rotation matrix to view space ---
+    # The 3DGS covariance projection requires Sigma_view = V * Sigma_world * V^T
+    # where V is the 3x3 view rotation.  Instead of computing world-space cov and
+    # then transforming, we transform the rotation columns first:
+    #   vr_col_k = V * rot_col_k  (mat4 * vec4 with w=0 to transform direction)
+    # Then cov_view = (VR * S) * (VR * S)^T, using the same formula as cov3d
+    # but with view-space rotation elements vr_ij.
+    for col in range(3):
+        body.append(_let(f"vr_col{col}", "vec3",
+            _swizzle(
+                _binop("*", _push_field("view_matrix"),
+                       _ctor("vec4", [
+                           _ref(f"rot_0{col}"), _ref(f"rot_1{col}"),
+                           _ref(f"rot_2{col}"), _lit("0.0"),
+                       ])),
+                "xyz")))
+    for col in range(3):
+        for row in range(3):
+            body.append(_let(f"vr_{row}{col}", "scalar",
+                _swizzle(_ref(f"vr_col{col}"), "xyz"[row])))
+
+    # --- Compute view-space covariance (upper triangle) ---
+    # Sigma_view = (V*R) * S^2 * (V*R)^T
+    # cov_ij = sum_k vr_ik * vr_jk * s_k^2
     body.append(_let("sx", "scalar", _swizzle(_ref("scale"), "x")))
     body.append(_let("sy", "scalar", _swizzle(_ref("scale"), "y")))
     body.append(_let("sz", "scalar", _swizzle(_ref("scale"), "z")))
-
-    # M row vectors (m_ij = rot_ij * scale_j)
-    # Cov3D upper triangle: c00, c01, c02, c11, c12, c22
-    # c_ij = sum_k(rot_ik * scale_k) * (rot_jk * scale_k)
-    #       = sum_k(rot_ik * rot_jk * scale_k^2)
     body.append(_let("sx2", "scalar", _binop("*", _ref("sx"), _ref("sx"))))
     body.append(_let("sy2", "scalar", _binop("*", _ref("sy"), _ref("sy"))))
     body.append(_let("sz2", "scalar", _binop("*", _ref("sz"), _ref("sz"))))
 
     def _cov3d_elem(i: int, j: int) -> BinaryOp:
-        """Sigma_ij = sum_k rot_ik * rot_jk * s_k^2."""
+        """cov_view_ij = sum_k vr_ik * vr_jk * s_k^2."""
         terms = []
         for k, s2 in enumerate(["sx2", "sy2", "sz2"]):
             term = _binop("*",
-                          _binop("*", _ref(f"rot_{i}{k}"), _ref(f"rot_{j}{k}")),
+                          _binop("*", _ref(f"vr_{i}{k}"), _ref(f"vr_{j}{k}")),
                           _ref(s2))
             terms.append(term)
         return _binop("+", _binop("+", terms[0], terms[1]), terms[2])
@@ -362,10 +377,11 @@ def _build_preprocess_body(config: dict) -> list:
     body.append(_let("cov3d_12", "scalar", _cov3d_elem(1, 2)))
     body.append(_let("cov3d_22", "scalar", _cov3d_elem(2, 2)))
 
-    # --- Project 3D covariance to 2D screen space ---
+    # --- Project view-space covariance to 2D screen space ---
     # Standard 3DGS Jacobian with positive depth t = -vz:
     #   J = [[focal_x / t, 0, -focal_x * x / t^2],
     #        [0, focal_y / t, -focal_y * y / t^2]]
+    # Since cov3d is already in view space, cov2d = J * cov3d * J^T
     body.append(_let("vz", "scalar", _swizzle(_ref("view_pos"), "z")))
     body.append(_let("vx", "scalar", _swizzle(_ref("view_pos"), "x")))
     body.append(_let("vy", "scalar", _swizzle(_ref("view_pos"), "y")))
@@ -375,11 +391,17 @@ def _build_preprocess_body(config: dict) -> list:
     body.append(_let("fx", "scalar", _push_field("focal_x")))
     body.append(_let("fy", "scalar", _push_field("focal_y")))
 
-    # Jacobian elements (standard 3DGS formulation with positive depth)
+    # Jacobian: maps view-space (X-right, Y-up, Z-out) to pixel-space (Y-down).
+    # sx = fx * vx / t           → ∂sx/∂vx = fx/t,  ∂sx/∂vz = fx*vx/t²
+    # sy = -fy * vy / t (Y-flip) → ∂sy/∂vy = -fy/t, ∂sy/∂vz = -fy*vy/t²
+    # Note: reference 3DGS uses Z-forward (tz>0) convention where the signs
+    # differ.  Our Z-out convention (vz<0, t=-vz) flips ∂/∂vz signs, and
+    # the Y-down pixel convention flips the Y-row signs.
     body.append(_let("j00", "scalar", _binop("/", _ref("fx"), _ref("t"))))
     body.append(_let("j02", "scalar",
-        _neg(_binop("/", _binop("*", _ref("fx"), _ref("vx")), _ref("t2")))))
-    body.append(_let("j11", "scalar", _binop("/", _ref("fy"), _ref("t"))))
+        _binop("/", _binop("*", _ref("fx"), _ref("vx")), _ref("t2"))))
+    body.append(_let("j11", "scalar",
+        _neg(_binop("/", _ref("fy"), _ref("t")))))
     body.append(_let("j12", "scalar",
         _neg(_binop("/", _binop("*", _ref("fy"), _ref("vy")), _ref("t2")))))
 
@@ -411,6 +433,12 @@ def _build_preprocess_body(config: dict) -> list:
                              _ref("cov3d_12"))),
                _binop("*", _binop("*", _ref("j12"), _ref("j12")), _ref("cov3d_22")))))
 
+    # Determinant of the ORIGINAL 2D covariance (before low-pass filter)
+    body.append(_let("det_orig", "scalar",
+        _binop("-",
+               _binop("*", _ref("cov2d_00"), _ref("cov2d_11")),
+               _binop("*", _ref("cov2d_01"), _ref("cov2d_01")))))
+
     # Add low-pass filter to prevent aliasing on very small splats
     body.append(_let("cov2d_00f", "scalar",
         _binop("+", _ref("cov2d_00"), _lit("0.3"))))
@@ -430,12 +458,21 @@ def _build_preprocess_body(config: dict) -> list:
         _cull_writes() + [ReturnStmt(None)],
     ))
 
+    # Opacity compensation: reduce opacity proportionally to how much the
+    # low-pass filter enlarged the splat (matches reference 3DGS implementation).
+    # compensation = sqrt(max(det_orig / det, 0.0))
+    body.append(_let("compensation", "scalar",
+        _call("sqrt", [_call("max", [
+            _binop("/", _ref("det_orig"), _ref("det")),
+            _lit("0.0"),
+        ])])))
+
     body.append(_let("inv_det", "scalar", _binop("/", _lit("1.0"), _ref("det"))))
 
-    # Conic = inverse of 2D covariance (symmetric 2x2):
-    #   conic.x = cov2d_11f * inv_det
-    #   conic.y = -cov2d_01 * inv_det
-    #   conic.z = cov2d_00f * inv_det
+    # Conic = inverse of 2D covariance (symmetric 2x2).
+    # Standard 2x2 inverse: [[c11, -c01], [-c01, c00]] / det
+    # The Jacobian already maps to Y-down pixel space (j11 = -fy/t), so the
+    # covariance is in pixel-space and the standard inverse formula applies.
     body.append(_let("conic_x", "scalar",
         _binop("*", _ref("cov2d_11f"), _ref("inv_det"))))
     body.append(_let("conic_y", "scalar",
@@ -458,9 +495,22 @@ def _build_preprocess_body(config: dict) -> list:
         ])])))
     body.append(_let("lambda_max", "scalar",
         _binop("+", _ref("mid"), _ref("half_diff"))))
-    body.append(_let("radius", "scalar",
+    body.append(_let("raw_radius", "scalar",
         _call("ceil", [_binop("*", _lit("3.0"),
                                _call("sqrt", [_ref("lambda_max")]))])))
+    # Clamp radius to prevent huge background splats from dominating
+    body.append(_let("radius", "scalar",
+        _call("min", [_ref("raw_radius"), _lit("256.0")])))
+
+    # Cull splats whose projected size is excessively large (background sky/noise).
+    # Splats covering more than 1/8 of the screen are almost always background.
+    body.append(_if(
+        _binop(">", _ref("radius"),
+               _binop("*", _lit("0.25"),
+                      _call("min", [_swizzle(_push_field("screen_size"), "x"),
+                                    _swizzle(_push_field("screen_size"), "y")]))),
+        _cull_writes() + [ReturnStmt(None)],
+    ))
 
     # --- Project center to NDC ---
     # let clip_pos = push.proj_matrix * vec4(view_pos, 1.0);
@@ -477,15 +527,44 @@ def _build_preprocess_body(config: dict) -> list:
         _binop("/", _swizzle(_ref("clip_pos"), "z"),
                _swizzle(_ref("clip_pos"), "w"))))
 
+    # --- Viewport frustum culling ---
+    # Cull splats whose NDC center is too far outside the viewport.
+    # Margin accounts for the splat radius in NDC space.
+    body.append(_let("ndc_margin", "scalar",
+        _binop("+", _lit("1.0"),
+               _binop("/", _ref("radius"),
+                      _call("min", [_swizzle(_push_field("screen_size"), "x"),
+                                    _swizzle(_push_field("screen_size"), "y")])))))
+    body.append(_if(
+        _binop("||",
+               _binop("||",
+                      _binop(">", _ref("ndc_x"), _ref("ndc_margin")),
+                      _binop("<", _ref("ndc_x"), _neg(_ref("ndc_margin")))),
+               _binop("||",
+                      _binop(">", _ref("ndc_y"), _ref("ndc_margin")),
+                      _binop("<", _ref("ndc_y"), _neg(_ref("ndc_margin"))))),
+        _cull_writes() + [ReturnStmt(None)],
+    ))
+
     # --- Read opacity (sigmoid activation) ---
     # let raw_opacity = splat_opacity[gid];
     # let opacity = 1.0 / (1.0 + exp(-raw_opacity));
     body.append(_let("raw_opacity", "scalar",
         _idx("splat_opacity", _ref("gid"))))
-    body.append(_let("opacity", "scalar",
+    body.append(_let("raw_sigmoid", "scalar",
         _binop("/", _lit("1.0"),
                _binop("+", _lit("1.0"),
                       _call("exp", [_neg(_ref("raw_opacity"))])))))
+    # Apply anti-aliasing compensation: reduce opacity for splats enlarged by filter
+    body.append(_let("opacity", "scalar",
+        _binop("*", _ref("raw_sigmoid"), _ref("compensation"))))
+
+    # --- Cull low-opacity splats early (before SH eval) ---
+    # Splats with opacity < 1/255 after compensation are invisible.
+    body.append(_if(
+        _binop("<", _ref("opacity"), _lit("0.00392157")),
+        _cull_writes() + [ReturnStmt(None)],
+    ))
 
     # --- Evaluate spherical harmonics for view-dependent color ---
     body.extend(_build_sh_evaluation(sh_degree))
@@ -525,11 +604,12 @@ def _build_sh_evaluation(sh_degree: int) -> list:
     """
     stmts = []
 
-    # Direction from splat center to camera (normalised)
-    # let cam_dir = normalize(push.cam_pos - world_pos);
+    # Direction from camera to splat (matches 3DGS reference convention).
+    # Odd-degree SH basis functions are odd functions of direction — sign matters.
+    # let cam_dir = normalize(world_pos - push.cam_pos);
     stmts.append(_let("cam_dir", "vec3",
         _call("normalize", [
-            _binop("-", _push_field("cam_pos"), _ref("world_pos")),
+            _binop("-", _ref("world_pos"), _push_field("cam_pos")),
         ])))
 
     # Degree 0: DC term (constant)
@@ -561,14 +641,17 @@ def _build_sh_evaluation(sh_degree: int) -> list:
     stmts.append(_let("sh3_val", "vec3",
         _swizzle(_idx("splat_sh3", _ref("gid")), "xyz")))
 
-    # Accumulate degree 1
+    # Accumulate degree 1 (Condon-Shortley phase: negative on y and x terms)
+    # color += -SH_C1*dy*sh1 + SH_C1*dz*sh2 - SH_C1*dx*sh3
     stmts.append(_let("sh_color_1", "vec3",
         _binop("+", _ref("sh_color_0"),
-               _binop("*", _lit("0.48860251"),
+               _binop("+",
                       _binop("+",
-                             _binop("+",
-                                    _binop("*", _ref("dy"), _ref("sh1_val")),
-                                    _binop("*", _ref("dz"), _ref("sh2_val"))),
+                             _binop("*", _lit("-0.48860251"),
+                                    _binop("*", _ref("dy"), _ref("sh1_val"))),
+                             _binop("*", _lit("0.48860251"),
+                                    _binop("*", _ref("dz"), _ref("sh2_val")))),
+                      _binop("*", _lit("-0.48860251"),
                              _binop("*", _ref("dx"), _ref("sh3_val")))))))
 
     if sh_degree == 1:

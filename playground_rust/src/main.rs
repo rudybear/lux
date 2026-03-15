@@ -185,7 +185,7 @@ fn run(args: Args) -> Result<(), String> {
         "sphere".to_string() // default
     };
 
-    let pipeline_base = if let Some(p) = &args.pipeline {
+    let mut pipeline_base = if let Some(p) = &args.pipeline {
         p.clone()
     } else if let Some(shader) = &args.shader {
         shader.clone()
@@ -201,8 +201,8 @@ fn run(args: Args) -> Result<(), String> {
     };
     let mut render_path = detect_render_path(&pipeline_base, force_mode);
 
-    // Pre-scan glTF files for KHR_gaussian_splatting data to override render path.
-    // Uses our loader (which bypasses strict validation) so KHR conformance files work.
+    // Pre-scan glTF files for KHR_gaussian_splatting data to override render path
+    // and auto-select the correct splat shader based on SH degree.
     if (scene_source.ends_with(".glb") || scene_source.ends_with(".gltf"))
         && (force_mode.is_empty() || force_mode == "splat")
     {
@@ -210,6 +210,23 @@ fn run(args: Args) -> Result<(), String> {
             if scene.splat_data.has_splats {
                 info!("Detected KHR_gaussian_splatting in scene, switching to splat render path");
                 render_path = "splat";
+
+                // Auto-select splat pipeline based on SH degree (if user didn't specify)
+                if args.pipeline.is_none() && args.shader.is_none() {
+                    let sh_deg = scene.splat_data.sh_degree;
+                    // Try shadercache first, then examples
+                    let candidates = [
+                        format!("shadercache/gaussian_splat_sh{}", sh_deg),
+                        format!("examples/gaussian_splat_sh{}", sh_deg),
+                    ];
+                    for candidate in &candidates {
+                        if Path::new(&format!("{}.comp.spv", candidate)).exists() {
+                            info!("Auto-selected splat pipeline: {} (SH degree {})", candidate, sh_deg);
+                            pipeline_base = candidate.clone();
+                            break;
+                        }
+                    }
+                }
             }
         }
     }

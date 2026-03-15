@@ -69,10 +69,12 @@ float3 computeCov2D(float3 mean, float3x3 cov3D,
     float txtz = min(limx, max(-limx, t.x / tz));
     float tytz = min(limy, max(-limy, t.y / tz));
 
-    // Jacobian of projection with positive depth (matches Lux stdlib convention)
+    // Jacobian: maps view-space (X-right, Y-up, Z-out) to pixel-space (Y-down).
+    // j02 sign: ∂sx/∂vz = +focalX*vx/tz² (Z-out convention flips vs Z-forward)
+    // j11 sign: -focalY/tz (Y-flip from view Y-up to pixel Y-down)
     float3x3 J = float3x3(
-        float3(focalX / tz, 0.0, -(focalX * txtz) / tz),
-        float3(0.0, focalY / tz, -(focalY * tytz) / tz),
+        float3(focalX / tz, 0.0, (focalX * txtz) / tz),
+        float3(0.0, -focalY / tz, -(focalY * tytz) / tz),
         float3(0.0, 0.0, 0.0)
     );
 
