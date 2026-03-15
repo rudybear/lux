@@ -1,7 +1,7 @@
 //! Gaussian splat renderer using ash/Vulkan.
 //!
 //! Implements the `Renderer` trait for unified interactive/headless rendering.
-//! Pipeline: compute projection → CPU depth sort → instanced quad draw.
+//! Pipeline: compute projection → GPU radix sort → instanced quad draw.
 
 use ash::vk;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
@@ -52,6 +52,23 @@ struct RenderPush {
 unsafe impl bytemuck::Pod for RenderPush {}
 unsafe impl bytemuck::Zeroable for RenderPush {}
 
+/// GPU radix sort push constants: 8 bytes.
+/// For histogram/scatter: num_elements + bit_offset.
+/// For prefix_sum: num_entries + pass_id.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SortPush {
+    num_elements: u32,
+    bit_offset: u32,
+}
+unsafe impl bytemuck::Pod for SortPush {}
+unsafe impl bytemuck::Zeroable for SortPush {}
+
+/// Radix sort tile size: 256 threads * 15 elements per thread.
+const SORT_TILE_SIZE: u32 = 3840;
+/// Prefix sum block size: 1024 threads * 2 elements per thread.
+const PREFIX_SUM_BLOCK_SIZE: u32 = 2048;
+
 // --------------------------------------------------------------------------
 // GaussianSplatRenderer
 // --------------------------------------------------------------------------
@@ -101,10 +118,39 @@ pub struct GaussianSplatRenderer {
     proj_conic_buffer: GpuBuffer,
     proj_color_buffer: GpuBuffer,
 
-    // Sort buffers
+    // Sort buffers (buffer A = primary)
     sort_keys_buffer: GpuBuffer,
     sorted_indices_buffer: GpuBuffer,
     visible_count_buffer: GpuBuffer,
+
+    // GPU radix sort resources
+    sort_keys_b_buffer: GpuBuffer,      // ping-pong buffer B for keys
+    sort_vals_b_buffer: GpuBuffer,      // ping-pong buffer B for values (indices)
+    histogram_buffer: GpuBuffer,        // 256 * num_wg entries
+    partition_sums_buffer: GpuBuffer,   // ceil(256 * num_wg / 2048) entries
+
+    // Sort pipelines (3 compute stages)
+    sort_histogram_pipeline: vk::Pipeline,
+    sort_prefix_sum_pipeline: vk::Pipeline,
+    sort_scatter_pipeline: vk::Pipeline,
+
+    // Sort pipeline layouts (per-shader, each with its own descriptor set layout)
+    sort_histogram_layout: vk::PipelineLayout,
+    sort_prefix_sum_layout: vk::PipelineLayout,
+    sort_scatter_layout: vk::PipelineLayout,
+
+    // Sort descriptor set layouts
+    sort_histogram_set_layout: vk::DescriptorSetLayout,
+    sort_prefix_sum_set_layout: vk::DescriptorSetLayout,
+    sort_scatter_set_layout: vk::DescriptorSetLayout,
+
+    // Sort descriptor sets: [0]=A->B, [1]=B->A for histogram and scatter; [0] only for prefix_sum
+    sort_histogram_desc_sets: [vk::DescriptorSet; 2],
+    sort_prefix_sum_desc_set: vk::DescriptorSet,
+    sort_scatter_desc_sets: [vk::DescriptorSet; 2],
+
+    // Precomputed sort workgroup count
+    sort_num_wg: u32,
 
     // Camera state
     view_matrix: glam::Mat4,
@@ -127,9 +173,6 @@ pub struct GaussianSplatRenderer {
 
     // SH degree
     sh_degree: u32,
-
-    // Cached host positions for CPU sort
-    host_positions: Vec<[f32; 4]>,
 }
 
 impl GaussianSplatRenderer {
@@ -199,9 +242,10 @@ impl GaussianSplatRenderer {
         let framebuffer_load_depth = create_fb(render_pass_load_depth)?;
 
         // --- Descriptor set layouts ---
-        // Compute bindings: 4 input (pos,rot,scale,opacity) + N SH buffers + 5 output
+        // Compute bindings: 4 input (pos,rot,scale,opacity) + N SH buffers + 6 output
+        // Output: proj_center, proj_conic, proj_color, sort_keys, sorted_indices, visible_count
         let num_sh_buffers = splat_data.sh_coefficients.len().max(1) as u32;
-        let num_compute_bindings = 4 + num_sh_buffers + 5;
+        let num_compute_bindings = 4 + num_sh_buffers + 6;
         let compute_set_layout = Self::create_compute_set_layout(&device, num_compute_bindings)?;
         let render_set_layout = Self::create_render_set_layout(&device)?;
 
@@ -274,19 +318,103 @@ impl GaussianSplatRenderer {
             device.destroy_shader_module(frag_module, None);
         }
 
+        // --- GPU Radix Sort pipelines ---
+        // Load sort shader SPIR-V from shaders/radix_sort/ relative to working directory
+        let sort_shader_dir = Path::new("shaders/radix_sort");
+        let hist_spv = spv_loader::load_spirv(&sort_shader_dir.join("histogram.comp.spv"))?;
+        let prefix_spv = spv_loader::load_spirv(&sort_shader_dir.join("prefix_sum.comp.spv"))?;
+        let scatter_spv = spv_loader::load_spirv(&sort_shader_dir.join("scatter.comp.spv"))?;
+        let hist_module = spv_loader::create_shader_module(&device, &hist_spv)?;
+        let prefix_module = spv_loader::create_shader_module(&device, &prefix_spv)?;
+        let scatter_module = spv_loader::create_shader_module(&device, &scatter_spv)?;
+
+        // Sort descriptor set layouts (matching GLSL binding declarations)
+        // histogram.comp: binding 0 = keys_in, binding 1 = histograms
+        let sort_histogram_set_layout = Self::create_sort_set_layout(&device, 2)?;
+        // prefix_sum.comp: binding 0 = histograms, binding 1 = partition_sums
+        let sort_prefix_sum_set_layout = Self::create_sort_set_layout(&device, 2)?;
+        // scatter.comp: binding 0-4 = keys_in, keys_out, vals_in, vals_out, histograms
+        let sort_scatter_set_layout = Self::create_sort_set_layout(&device, 5)?;
+
+        // Sort pipeline layouts (push constant: SortPush = 8 bytes)
+        let sort_push_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(std::mem::size_of::<SortPush>() as u32);
+
+        let sort_histogram_layout = {
+            let layout_info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(std::slice::from_ref(&sort_histogram_set_layout))
+                .push_constant_ranges(std::slice::from_ref(&sort_push_range));
+            unsafe {
+                device.create_pipeline_layout(&layout_info, None)
+                    .map_err(|e| format!("Failed to create sort histogram layout: {:?}", e))?
+            }
+        };
+        let sort_prefix_sum_layout = {
+            let layout_info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(std::slice::from_ref(&sort_prefix_sum_set_layout))
+                .push_constant_ranges(std::slice::from_ref(&sort_push_range));
+            unsafe {
+                device.create_pipeline_layout(&layout_info, None)
+                    .map_err(|e| format!("Failed to create sort prefix_sum layout: {:?}", e))?
+            }
+        };
+        let sort_scatter_layout = {
+            let layout_info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(std::slice::from_ref(&sort_scatter_set_layout))
+                .push_constant_ranges(std::slice::from_ref(&sort_push_range));
+            unsafe {
+                device.create_pipeline_layout(&layout_info, None)
+                    .map_err(|e| format!("Failed to create sort scatter layout: {:?}", e))?
+            }
+        };
+
+        // Sort compute pipelines
+        let create_sort_pipeline = |module: vk::ShaderModule, layout: vk::PipelineLayout, name: &str| -> Result<vk::Pipeline, String> {
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main");
+            let ci = vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(layout);
+            unsafe {
+                device.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None)
+                    .map_err(|e| format!("Failed to create sort {} pipeline: {:?}", name, e.1))
+                    .map(|p| p[0])
+            }
+        };
+
+        let sort_histogram_pipeline = create_sort_pipeline(hist_module, sort_histogram_layout, "histogram")?;
+        let sort_prefix_sum_pipeline = create_sort_pipeline(prefix_module, sort_prefix_sum_layout, "prefix_sum")?;
+        let sort_scatter_pipeline = create_sort_pipeline(scatter_module, sort_scatter_layout, "scatter")?;
+
+        unsafe {
+            device.destroy_shader_module(hist_module, None);
+            device.destroy_shader_module(prefix_module, None);
+            device.destroy_shader_module(scatter_module, None);
+        }
+
         // --- Descriptor pool ---
-        // Need enough descriptors for compute (num_compute_bindings) + render (4)
+        // Need enough descriptors for:
+        //   compute (num_compute_bindings) + render (4)
+        //   + sort histogram (2 sets * 2 bindings = 4)
+        //   + sort prefix_sum (1 set * 2 bindings = 2)
+        //   + sort scatter (2 sets * 5 bindings = 10)
+        let total_sort_descriptors: u32 = 4 + 2 + 10;
         let pool_size = vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(num_compute_bindings + 4);
+            .descriptor_count(num_compute_bindings + 4 + total_sort_descriptors);
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(2)
+            .max_sets(2 + 5)  // compute, render, + 2 histogram + 1 prefix_sum + 2 scatter
             .pool_sizes(std::slice::from_ref(&pool_size));
         let descriptor_pool = unsafe {
             device.create_descriptor_pool(&pool_info, None)
                 .map_err(|e| format!("Failed to create descriptor pool: {:?}", e))?
         };
 
+        // Allocate compute + render descriptor sets
         let layouts = [compute_set_layout, render_set_layout];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
@@ -297,6 +425,25 @@ impl GaussianSplatRenderer {
         };
         let compute_desc_set = sets[0];
         let render_desc_set = sets[1];
+
+        // Allocate sort descriptor sets
+        let sort_layouts = [
+            sort_histogram_set_layout,  // A->B
+            sort_histogram_set_layout,  // B->A
+            sort_prefix_sum_set_layout, // single
+            sort_scatter_set_layout,    // A->B
+            sort_scatter_set_layout,    // B->A
+        ];
+        let sort_alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&sort_layouts);
+        let sort_sets = unsafe {
+            device.allocate_descriptor_sets(&sort_alloc_info)
+                .map_err(|e| format!("Failed to allocate sort descriptor sets: {:?}", e))?
+        };
+        let sort_histogram_desc_sets = [sort_sets[0], sort_sets[1]];
+        let sort_prefix_sum_desc_set = sort_sets[2];
+        let sort_scatter_desc_sets = [sort_sets[3], sort_sets[4]];
 
         // --- Upload splat data to GPU buffers ---
         let n = num_splats as usize;
@@ -362,7 +509,7 @@ impl GaussianSplatRenderer {
             vk::BufferUsageFlags::STORAGE_BUFFER, "proj_colors",
         )?;
 
-        // Sort buffers
+        // Sort buffers (buffer A = primary, written by compute shader)
         let sort_keys_buffer = scene_manager::create_buffer_with_data(
             &device, ctx.allocator_mut(),
             &vec![0u8; n * 4],
@@ -378,6 +525,38 @@ impl GaussianSplatRenderer {
             &[0u8; 4],
             vk::BufferUsageFlags::STORAGE_BUFFER, "visible_count",
         )?;
+
+        // Ping-pong sort buffers (buffer B)
+        let sort_keys_b_buffer = scene_manager::create_buffer_with_data(
+            &device, ctx.allocator_mut(),
+            &vec![0u8; n * 4],
+            vk::BufferUsageFlags::STORAGE_BUFFER, "sort_keys_b",
+        )?;
+        let sort_vals_b_buffer = scene_manager::create_buffer_with_data(
+            &device, ctx.allocator_mut(),
+            &vec![0u8; n * 4],
+            vk::BufferUsageFlags::STORAGE_BUFFER, "sort_vals_b",
+        )?;
+
+        // Radix sort histogram and partition buffers
+        let sort_num_wg = (num_splats + SORT_TILE_SIZE - 1) / SORT_TILE_SIZE;
+        let histogram_size = (256 * sort_num_wg as usize * 4).max(4);
+        let histogram_buffer = scene_manager::create_buffer_with_data(
+            &device, ctx.allocator_mut(),
+            &vec![0u8; histogram_size],
+            vk::BufferUsageFlags::STORAGE_BUFFER, "sort_histograms",
+        )?;
+        let total_histogram_entries = 256 * sort_num_wg;
+        let num_partitions = (total_histogram_entries + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
+        let partition_sums_size = (num_partitions as usize * 4).max(4);
+        let partition_sums_buffer = scene_manager::create_buffer_with_data(
+            &device, ctx.allocator_mut(),
+            &vec![0u8; partition_sums_size],
+            vk::BufferUsageFlags::STORAGE_BUFFER, "sort_partition_sums",
+        )?;
+
+        info!("GPU radix sort: {} splats, {} workgroups, {} histogram entries, {} partitions",
+              num_splats, sort_num_wg, total_histogram_entries, num_partitions);
 
         // --- Update descriptor sets ---
         let write_ssbo = |set: vk::DescriptorSet, binding: u32, buffer: vk::Buffer, size: u64| {
@@ -414,18 +593,51 @@ impl GaussianSplatRenderer {
         }
 
         // Output buffers start after SH buffers
+        // Order: proj_center, proj_conic, proj_color, sort_keys, sorted_indices, visible_count
         let out_base = 4 + num_sh_buffers;
         write_ssbo(compute_desc_set, out_base, proj_center_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(compute_desc_set, out_base + 1, proj_conic_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(compute_desc_set, out_base + 2, proj_color_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(compute_desc_set, out_base + 3, sort_keys_buffer.buffer, (n * 4) as u64);
-        write_ssbo(compute_desc_set, out_base + 4, visible_count_buffer.buffer, 4);
+        write_ssbo(compute_desc_set, out_base + 4, sorted_indices_buffer.buffer, (n * 4) as u64);
+        write_ssbo(compute_desc_set, out_base + 5, visible_count_buffer.buffer, 4);
 
         // Render set bindings 0-3
         write_ssbo(render_desc_set, 0, proj_center_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(render_desc_set, 1, proj_conic_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(render_desc_set, 2, proj_color_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(render_desc_set, 3, sorted_indices_buffer.buffer, (n * 4) as u64);
+
+        // --- Sort descriptor sets ---
+        let sort_buf_size = (n * 4) as u64;
+        let hist_buf_size = histogram_size as u64;
+        let part_buf_size = partition_sums_size as u64;
+
+        // Histogram descriptor sets: binding 0 = keys_in, binding 1 = histograms
+        // [0] = A->B direction (reads from keys A)
+        write_ssbo(sort_histogram_desc_sets[0], 0, sort_keys_buffer.buffer, sort_buf_size);
+        write_ssbo(sort_histogram_desc_sets[0], 1, histogram_buffer.buffer, hist_buf_size);
+        // [1] = B->A direction (reads from keys B)
+        write_ssbo(sort_histogram_desc_sets[1], 0, sort_keys_b_buffer.buffer, sort_buf_size);
+        write_ssbo(sort_histogram_desc_sets[1], 1, histogram_buffer.buffer, hist_buf_size);
+
+        // Prefix sum descriptor set: binding 0 = histograms, binding 1 = partition_sums
+        write_ssbo(sort_prefix_sum_desc_set, 0, histogram_buffer.buffer, hist_buf_size);
+        write_ssbo(sort_prefix_sum_desc_set, 1, partition_sums_buffer.buffer, part_buf_size);
+
+        // Scatter descriptor sets: binding 0=keys_in, 1=keys_out, 2=vals_in, 3=vals_out, 4=histograms
+        // [0] = A->B direction
+        write_ssbo(sort_scatter_desc_sets[0], 0, sort_keys_buffer.buffer, sort_buf_size);
+        write_ssbo(sort_scatter_desc_sets[0], 1, sort_keys_b_buffer.buffer, sort_buf_size);
+        write_ssbo(sort_scatter_desc_sets[0], 2, sorted_indices_buffer.buffer, sort_buf_size);
+        write_ssbo(sort_scatter_desc_sets[0], 3, sort_vals_b_buffer.buffer, sort_buf_size);
+        write_ssbo(sort_scatter_desc_sets[0], 4, histogram_buffer.buffer, hist_buf_size);
+        // [1] = B->A direction
+        write_ssbo(sort_scatter_desc_sets[1], 0, sort_keys_b_buffer.buffer, sort_buf_size);
+        write_ssbo(sort_scatter_desc_sets[1], 1, sort_keys_buffer.buffer, sort_buf_size);
+        write_ssbo(sort_scatter_desc_sets[1], 2, sort_vals_b_buffer.buffer, sort_buf_size);
+        write_ssbo(sort_scatter_desc_sets[1], 3, sorted_indices_buffer.buffer, sort_buf_size);
+        write_ssbo(sort_scatter_desc_sets[1], 4, histogram_buffer.buffer, hist_buf_size);
 
         // --- Compute bounding box and auto-camera ---
         // Use median center and IQR (P25-P75) radius for tight framing.
@@ -516,10 +728,7 @@ impl GaussianSplatRenderer {
         let focal_y = 0.5 * height as f32 / (fov_y * 0.5).tan();
         let focal_x = focal_y;
 
-        // Cache host positions for CPU sort
-        let host_positions = splat_data.positions.clone();
-
-        info!("GaussianSplatRenderer initialized: {} splats, {}x{}", num_splats, width, height);
+        info!("GaussianSplatRenderer initialized: {} splats, {}x{} (GPU radix sort)", num_splats, width, height);
 
         Ok(Self {
             compute_pipeline,
@@ -554,6 +763,23 @@ impl GaussianSplatRenderer {
             sort_keys_buffer,
             sorted_indices_buffer,
             visible_count_buffer,
+            sort_keys_b_buffer,
+            sort_vals_b_buffer,
+            histogram_buffer,
+            partition_sums_buffer,
+            sort_histogram_pipeline,
+            sort_prefix_sum_pipeline,
+            sort_scatter_pipeline,
+            sort_histogram_layout,
+            sort_prefix_sum_layout,
+            sort_scatter_layout,
+            sort_histogram_set_layout,
+            sort_prefix_sum_set_layout,
+            sort_scatter_set_layout,
+            sort_histogram_desc_sets,
+            sort_prefix_sum_desc_set,
+            sort_scatter_desc_sets,
+            sort_num_wg,
             view_matrix,
             proj_matrix,
             cam_pos: auto_eye,
@@ -568,7 +794,6 @@ impl GaussianSplatRenderer {
             height,
             num_splats,
             sh_degree: splat_data.sh_degree,
-            host_positions,
         })
     }
 
@@ -803,6 +1028,24 @@ impl GaussianSplatRenderer {
         }
     }
 
+    // --- Helper: create sort descriptor set layout (all COMPUTE SSBOs) ---
+    fn create_sort_set_layout(device: &ash::Device, num_bindings: u32) -> Result<vk::DescriptorSetLayout, String> {
+        let bindings: Vec<_> = (0..num_bindings)
+            .map(|i| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(i)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            })
+            .collect();
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        unsafe {
+            device.create_descriptor_set_layout(&layout_info, None)
+                .map_err(|e| format!("Failed to create sort set layout: {:?}", e))
+        }
+    }
+
     // --- Helper: create graphics pipeline ---
     fn create_render_pipeline(
         device: &ash::Device,
@@ -884,38 +1127,6 @@ impl GaussianSplatRenderer {
         };
 
         Ok(pipeline)
-    }
-
-    /// CPU depth sort: argsort positions by view-space depth, upload sorted indices.
-    fn cpu_sort(&mut self, ctx: &VulkanContext) {
-        if self.num_splats == 0 { return; }
-
-        let vm = self.view_matrix;
-        let n = self.num_splats as usize;
-
-        // Compute view-space depth for each splat
-        let mut depths: Vec<f32> = Vec::with_capacity(n);
-        for pos in &self.host_positions {
-            // View matrix row 2 (column-major): [2],[6],[10],[14] mapped to glam
-            let depth = vm.col(0).z * pos[0] + vm.col(1).z * pos[1] + vm.col(2).z * pos[2] + vm.col(3).z;
-            depths.push(depth);
-        }
-
-        // Argsort back-to-front: most negative Z (farthest) first
-        let mut indices: Vec<u32> = (0..n as u32).collect();
-        indices.sort_unstable_by(|&a, &b| {
-            depths[a as usize]
-                .partial_cmp(&depths[b as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Upload sorted indices
-        if let Some(ref mut alloc) = self.sorted_indices_buffer.allocation {
-            if let Some(mapped) = alloc.mapped_slice_mut() {
-                let bytes = bytemuck::cast_slice::<u32, u8>(&indices);
-                mapped[..bytes.len()].copy_from_slice(bytes);
-            }
-        }
     }
 
     /// Access to the depth image (for hybrid compositing).
@@ -1414,6 +1625,19 @@ impl GaussianSplatRenderer {
             device.destroy_pipeline_layout(self.render_layout, None);
             device.destroy_descriptor_set_layout(self.compute_set_layout, None);
             device.destroy_descriptor_set_layout(self.render_set_layout, None);
+
+            // Sort pipelines and layouts
+            device.destroy_pipeline(self.sort_histogram_pipeline, None);
+            device.destroy_pipeline(self.sort_prefix_sum_pipeline, None);
+            device.destroy_pipeline(self.sort_scatter_pipeline, None);
+            device.destroy_pipeline_layout(self.sort_histogram_layout, None);
+            device.destroy_pipeline_layout(self.sort_prefix_sum_layout, None);
+            device.destroy_pipeline_layout(self.sort_scatter_layout, None);
+            device.destroy_descriptor_set_layout(self.sort_histogram_set_layout, None);
+            device.destroy_descriptor_set_layout(self.sort_prefix_sum_set_layout, None);
+            device.destroy_descriptor_set_layout(self.sort_scatter_set_layout, None);
+
+            // Descriptor pool (frees all descriptor sets)
             device.destroy_descriptor_pool(self.descriptor_pool, None);
         }
 
@@ -1432,6 +1656,10 @@ impl GaussianSplatRenderer {
         self.sort_keys_buffer.destroy(&device, ctx.allocator_mut());
         self.sorted_indices_buffer.destroy(&device, ctx.allocator_mut());
         self.visible_count_buffer.destroy(&device, ctx.allocator_mut());
+        self.sort_keys_b_buffer.destroy(&device, ctx.allocator_mut());
+        self.sort_vals_b_buffer.destroy(&device, ctx.allocator_mut());
+        self.histogram_buffer.destroy(&device, ctx.allocator_mut());
+        self.partition_sums_buffer.destroy(&device, ctx.allocator_mut());
     }
 }
 
@@ -1446,13 +1674,10 @@ impl Renderer for GaussianSplatRenderer {
             return Ok(cmd);
         }
 
-        // CPU sort before recording commands
-        self.cpu_sort(ctx);
-
         let cmd = ctx.begin_single_commands()?;
 
         unsafe {
-            // --- Compute dispatch ---
+            // --- Compute dispatch (projection + sort key generation) ---
             let push = ComputePush {
                 view: self.view_matrix.to_cols_array_2d(),
                 proj: self.proj_matrix.to_cols_array_2d(),
@@ -1480,8 +1705,137 @@ impl Renderer for GaussianSplatRenderer {
             let groups = (self.num_splats + 255) / 256;
             ctx.device.cmd_dispatch(cmd, groups, 1, 1);
 
-            // Barrier: compute -> vertex/fragment
-            let barrier = vk::MemoryBarrier::default()
+            // Barrier: compute writes -> sort reads
+            let compute_to_sort_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            ctx.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[compute_to_sort_barrier], &[], &[],
+            );
+
+            // --- GPU Radix Sort (4 passes, 8 bits per pass = 32-bit keys) ---
+            let num_elements = self.num_splats;
+            let num_wg = self.sort_num_wg;
+            let total_histogram = 256 * num_wg;
+            let num_parts = (total_histogram + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
+
+            let sort_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+
+            for pass in 0..4u32 {
+                let bit_offset = pass * 8;
+                let ping = (pass % 2) as usize;  // 0 = A->B, 1 = B->A
+
+                // --- Phase 1: Histogram ---
+                ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.sort_histogram_pipeline);
+                ctx.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, self.sort_histogram_layout,
+                    0, &[self.sort_histogram_desc_sets[ping]], &[],
+                );
+                let hist_push = SortPush { num_elements, bit_offset };
+                ctx.device.cmd_push_constants(
+                    cmd, self.sort_histogram_layout, vk::ShaderStageFlags::COMPUTE,
+                    0, bytemuck::bytes_of(&hist_push),
+                );
+                ctx.device.cmd_dispatch(cmd, num_wg, 1, 1);
+
+                // Barrier: histogram write -> prefix sum read
+                ctx.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[sort_barrier], &[], &[],
+                );
+
+                // --- Phase 2: Prefix Sum (3 sub-passes) ---
+                ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.sort_prefix_sum_pipeline);
+                ctx.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, self.sort_prefix_sum_layout,
+                    0, &[self.sort_prefix_sum_desc_set], &[],
+                );
+
+                // Sub-pass 0: Local scan
+                let ps_push_0 = SortPush { num_elements: total_histogram, bit_offset: 0 };
+                ctx.device.cmd_push_constants(
+                    cmd, self.sort_prefix_sum_layout, vk::ShaderStageFlags::COMPUTE,
+                    0, bytemuck::bytes_of(&ps_push_0),
+                );
+                ctx.device.cmd_dispatch(cmd, num_parts, 1, 1);
+
+                ctx.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[sort_barrier], &[], &[],
+                );
+
+                // Sub-pass 1: Spine scan
+                let ps_push_1 = SortPush { num_elements: num_parts, bit_offset: 1 };
+                ctx.device.cmd_push_constants(
+                    cmd, self.sort_prefix_sum_layout, vk::ShaderStageFlags::COMPUTE,
+                    0, bytemuck::bytes_of(&ps_push_1),
+                );
+                ctx.device.cmd_dispatch(cmd, 1, 1, 1);
+
+                ctx.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[sort_barrier], &[], &[],
+                );
+
+                // Sub-pass 2: Propagate
+                let ps_push_2 = SortPush { num_elements: total_histogram, bit_offset: 2 };
+                ctx.device.cmd_push_constants(
+                    cmd, self.sort_prefix_sum_layout, vk::ShaderStageFlags::COMPUTE,
+                    0, bytemuck::bytes_of(&ps_push_2),
+                );
+                ctx.device.cmd_dispatch(cmd, num_parts, 1, 1);
+
+                ctx.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[sort_barrier], &[], &[],
+                );
+
+                // --- Phase 3: Scatter ---
+                ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.sort_scatter_pipeline);
+                ctx.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE, self.sort_scatter_layout,
+                    0, &[self.sort_scatter_desc_sets[ping]], &[],
+                );
+                let scatter_push = SortPush { num_elements, bit_offset };
+                ctx.device.cmd_push_constants(
+                    cmd, self.sort_scatter_layout, vk::ShaderStageFlags::COMPUTE,
+                    0, bytemuck::bytes_of(&scatter_push),
+                );
+                ctx.device.cmd_dispatch(cmd, num_wg, 1, 1);
+
+                // Barrier between sort passes (and final pass -> render)
+                ctx.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[sort_barrier], &[], &[],
+                );
+            }
+
+            // After 4 passes (even count), sorted results are in buffer A
+            // (sort_keys_buffer, sorted_indices_buffer) which is what render reads.
+
+            // Barrier: sort compute -> vertex/fragment shader reads
+            let sort_to_render_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ);
             ctx.device.cmd_pipeline_barrier(
@@ -1489,7 +1843,7 @@ impl Renderer for GaussianSplatRenderer {
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::DependencyFlags::empty(),
-                &[barrier], &[], &[],
+                &[sort_to_render_barrier], &[], &[],
             );
 
             // --- Render pass ---

@@ -1,0 +1,206 @@
+#version 450
+
+//
+// Radix Sort — Phase 2: Exclusive Prefix Sum (3-pass hierarchical Blelloch)
+//
+// Transforms the histogram table in-place into global scatter offsets
+// via an exclusive prefix sum over the entire flattened array.
+//
+// The histogram has (256 * num_blocks) entries in column-major order.
+// After the prefix sum, histograms[digit * num_blocks + block_id] contains
+// the global output index at which (block_id) should begin writing keys
+// whose digit equals (digit).
+//
+// Strategy — hierarchical scan in 3 dispatches:
+//
+//   Pass 0 (LOCAL_SCAN):
+//     Dispatch: ceil(total_entries / BLOCK_SIZE) workgroups.
+//     Push constants: num_entries = 256 * num_blocks, pass_id = 0.
+//     Each workgroup loads BLOCK_SIZE elements (2 per thread), performs a
+//     Blelloch exclusive scan in shared memory, writes scanned data back,
+//     and saves its partition total to partition_sums[workgroup_id].
+//
+//   Pass 1 (SPINE_SCAN):
+//     Dispatch: 1 workgroup.
+//     Push constants: num_entries = number_of_partitions_from_pass0, pass_id = 1.
+//     Scans partition_sums[] to produce exclusive prefix sums of partition totals.
+//     Supports up to 2048 partitions (sufficient for 4M+ elements).
+//
+//   Pass 2 (PROPAGATE):
+//     Dispatch: same as pass 0.
+//     Push constants: num_entries = 256 * num_blocks, pass_id = 2.
+//     Each workgroup adds partition_sums[workgroup_id] to all its elements.
+//
+// Requirements:
+//   - histograms buffer: 256 * num_blocks uints (read/write)
+//   - partition_sums buffer: ceil(256 * num_blocks / BLOCK_SIZE) uints
+//   - Shared memory: BLOCK_SIZE uints = 8 KB per workgroup
+//
+// Host pseudo-code:
+//   uint total = 256 * num_histogram_workgroups;
+//   uint num_parts = (total + 2047) / 2048;
+//   dispatch(num_parts, 1, 1) with {num_entries=total, pass_id=0}
+//   dispatch(1,         1, 1) with {num_entries=num_parts, pass_id=1}
+//   dispatch(num_parts, 1, 1) with {num_entries=total, pass_id=2}
+//
+
+layout(local_size_x = 1024) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_entries;       // Pass 0,2: 256*num_blocks; Pass 1: num_partitions
+    uint pass_id;           // 0 = local scan, 1 = spine scan, 2 = propagate
+};
+
+layout(std430, binding = 0) buffer Histograms {
+    uint histograms[];
+};
+
+layout(std430, binding = 1) buffer PartitionSums {
+    uint partition_sums[];
+};
+
+#define BLOCK_SIZE  2048u   // 2 elements per thread * 1024 threads
+
+shared uint s_data[BLOCK_SIZE];
+
+// ---------------------------------------------------------------
+// Blelloch exclusive prefix sum on s_data[0..n-1]
+// n MUST be a power of two. Elements >= actual count must be zero.
+// After this call, s_data[i] = sum of s_data[0..i-1] (original).
+// ---------------------------------------------------------------
+// Returns the total sum (captured before clearing the root).
+// Only thread 0's return value is meaningful.
+uint blelloch_exclusive_scan(uint tid, uint n) {
+    // ---- Up-sweep (reduce) ----
+    uint offset = 1u;
+    for (uint d = n >> 1u; d > 0u; d >>= 1u) {
+        barrier();
+        if (tid < d) {
+            uint ai = offset * (2u * tid + 1u) - 1u;
+            uint bi = offset * (2u * tid + 2u) - 1u;
+            s_data[bi] += s_data[ai];
+        }
+        offset <<= 1u;
+    }
+
+    barrier();
+
+    // Capture total (stored at root after up-sweep)
+    uint total = s_data[n - 1u];
+
+    barrier();
+
+    // Clear root for exclusive scan
+    if (tid == 0u) {
+        s_data[n - 1u] = 0u;
+    }
+
+    // ---- Down-sweep ----
+    for (uint d = 1u; d < n; d <<= 1u) {
+        offset >>= 1u;
+        barrier();
+        if (tid < d) {
+            uint ai = offset * (2u * tid + 1u) - 1u;
+            uint bi = offset * (2u * tid + 2u) - 1u;
+            uint temp = s_data[ai];
+            s_data[ai] = s_data[bi];
+            s_data[bi] += temp;
+        }
+    }
+    barrier();
+
+    return total;
+}
+
+// Round up to the next power of two (minimum 2)
+uint next_pow2(uint v) {
+    v = max(v, 2u);
+    v--;
+    v |= v >> 1u;
+    v |= v >> 2u;
+    v |= v >> 4u;
+    v |= v >> 8u;
+    v |= v >> 16u;
+    v++;
+    return v;
+}
+
+void main() {
+    uint tid      = gl_LocalInvocationID.x;
+    uint group_id = gl_WorkGroupID.x;
+
+    // ================================================================
+    // Pass 0: Local exclusive scan of each BLOCK_SIZE-element partition
+    // ================================================================
+    if (pass_id == 0u) {
+        uint base = group_id * BLOCK_SIZE;
+
+        // Each thread loads 2 elements
+        uint idx0 = base + tid;
+        uint idx1 = base + tid + 1024u;
+
+        s_data[tid]         = (idx0 < num_entries) ? histograms[idx0] : 0u;
+        s_data[tid + 1024u] = (idx1 < num_entries) ? histograms[idx1] : 0u;
+        barrier();
+
+        uint total = blelloch_exclusive_scan(tid, BLOCK_SIZE);
+
+        // Thread 0 saves this partition's total
+        if (tid == 0u) {
+            partition_sums[group_id] = total;
+        }
+
+        // Write scanned values back to global memory
+        if (idx0 < num_entries) histograms[idx0] = s_data[tid];
+        if (idx1 < num_entries) histograms[idx1] = s_data[tid + 1024u];
+    }
+
+    // ================================================================
+    // Pass 1: Exclusive scan of the spine (partition totals)
+    // ================================================================
+    else if (pass_id == 1u) {
+        // num_entries = number of partitions from pass 0
+        // Dispatch exactly 1 workgroup.
+        uint num_partitions = num_entries;
+        uint n = next_pow2(num_partitions);
+
+        // Load partition totals — pad with zeros to power-of-two
+        if (tid < num_partitions) {
+            s_data[tid] = partition_sums[tid];
+        } else if (tid < n) {
+            s_data[tid] = 0u;
+        }
+        // Handle case where n > 1024 (very unlikely: would need 2048+ partitions
+        // = 4M+ histogram entries = 16K+ blocks = 61M+ elements, well beyond spec)
+        if (tid + 1024u < n) {
+            s_data[tid + 1024u] = (tid + 1024u < num_partitions)
+                ? partition_sums[tid + 1024u]
+                : 0u;
+        }
+        barrier();
+
+        blelloch_exclusive_scan(tid, n);
+
+        // Write scanned spine back
+        if (tid < num_partitions) {
+            partition_sums[tid] = s_data[tid];
+        }
+    }
+
+    // ================================================================
+    // Pass 2: Propagate spine offsets into each partition
+    // ================================================================
+    else {
+        uint base      = group_id * BLOCK_SIZE;
+        uint spine_val = partition_sums[group_id];
+
+        // Only add if offset is non-zero (skip partition 0 entirely)
+        if (spine_val != 0u) {
+            uint idx0 = base + tid;
+            uint idx1 = base + tid + 1024u;
+
+            if (idx0 < num_entries) histograms[idx0] += spine_val;
+            if (idx1 < num_entries) histograms[idx1] += spine_val;
+        }
+    }
+}

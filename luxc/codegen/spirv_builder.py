@@ -2682,6 +2682,17 @@ class SpvGenerator:
                 lines.append(f"{result} = {op} {bool_type} {arg_ids[0]}")
             return result, lines
 
+        # float_bits_to_uint / uint_bits_to_float -> OpBitcast
+        if fname == "float_bits_to_uint":
+            uint_type = self.reg.uint32()
+            lines.append(f"{result} = OpBitcast {uint_type} {arg_ids[0]}")
+            return result, lines
+
+        if fname == "uint_bits_to_float":
+            float_type = self.reg.float32()
+            lines.append(f"{result} = OpBitcast {float_type} {arg_ids[0]}")
+            return result, lines
+
         # User-defined function — inline it
         fn_def = self._find_user_function(fname)
         if fn_def is not None:

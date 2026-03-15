@@ -73,6 +73,13 @@ def _lit(v) -> NumberLit:
     return NumberLit(str(v))
 
 
+def _uint_lit(v) -> NumberLit:
+    """Create a uint NumberLit."""
+    n = NumberLit(str(v))
+    n.resolved_type = "uint"
+    return n
+
+
 def _ref(name: str) -> VarRef:
     return VarRef(name)
 
@@ -183,7 +190,8 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
     stage.storage_buffers.append(StorageBufferDecl("projected_center", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("projected_conic", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("projected_color", "vec4"))
-    stage.storage_buffers.append(StorageBufferDecl("sort_keys", "scalar"))
+    stage.storage_buffers.append(StorageBufferDecl("sort_keys", "uint"))
+    stage.storage_buffers.append(StorageBufferDecl("sorted_indices", "uint"))
     stage.storage_buffers.append(StorageBufferDecl("visible_count", "uint"))
 
     # --- Push constants ---
@@ -215,11 +223,12 @@ def _cull_writes() -> list:
     output buffers, causing flickering / garbage in the render pass.
     """
     zero4 = _ctor("vec4", [_lit("0.0"), _lit("0.0"), _lit("0.0"), _lit("0.0")])
+    # Culled splats get max uint sort key so they sort to the end.
     return [
         _assign_idx("projected_center", _ref("gid"), zero4),
         _assign_idx("projected_conic", _ref("gid"), zero4),
         _assign_idx("projected_color", _ref("gid"), zero4),
-        _assign_idx("sort_keys", _ref("gid"), _lit("1000000.0")),
+        _assign_idx("sort_keys", _ref("gid"), _uint_lit("4294967295")),
     ]
 
 
@@ -587,8 +596,24 @@ def _build_preprocess_body(config: dict) -> list:
     body.append(_assign_idx("projected_color", _ref("gid"),
         _ctor("vec4", [_ref("clamped_r"), _ref("clamped_g"), _ref("clamped_b"), _ref("opacity")])))
 
-    # --- Sort key (view-space depth for front-to-back or back-to-front) ---
-    body.append(_assign_idx("sort_keys", _ref("gid"), _ref("vz")))
+    # --- Sort key: convert float depth to sortable uint for GPU radix sort ---
+    # float_bits_to_uint gives the IEEE 754 bit pattern.  Negative floats have
+    # reversed ordering in uint, so we flip: negative → ~bits, positive → flip
+    # sign bit.  Result: uint comparison preserves float ordering (ascending).
+    body.append(_let("key_bits", "uint", _call("float_bits_to_uint", [_ref("vz")])))
+    # sign_mask = (key_bits >> 31) * 0xFFFFFFFF  (all-ones if negative)
+    body.append(_let("sign_mask", "uint",
+        _binop("*",
+            _binop(">>", _ref("key_bits"), _uint_lit("31")),
+            _uint_lit("4294967295"))))
+    # sort_key = key_bits ^ (sign_mask | 0x80000000)
+    body.append(_let("sort_key", "uint",
+        _binop("^", _ref("key_bits"),
+            _binop("|", _ref("sign_mask"), _uint_lit("2147483648")))))
+    body.append(_assign_idx("sort_keys", _ref("gid"), _ref("sort_key")))
+
+    # Initialize sorted_indices to identity (radix sort reads this as input)
+    body.append(_assign_idx("sorted_indices", _ref("gid"), _ref("gid")))
 
     return body
 

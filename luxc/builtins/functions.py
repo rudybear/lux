@@ -227,6 +227,12 @@ def _build_builtins() -> dict[str, list[FuncSig]]:
     add([FuncSig("atomic_store", (UINT, UINT), VOID)])
     add([FuncSig("atomic_store", (INT, INT), VOID)])
 
+    # --- Bitcast functions ---
+    # float_bits_to_uint(scalar) -> uint (reinterpret float bits as uint)
+    add([FuncSig("float_bits_to_uint", (SCALAR,), UINT)])
+    # uint_bits_to_float(uint) -> scalar (reinterpret uint bits as float)
+    add([FuncSig("uint_bits_to_float", (UINT,), SCALAR)])
+
     return table
 
 

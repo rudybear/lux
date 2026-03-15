@@ -1,0 +1,69 @@
+#version 450
+
+//
+// Radix Sort — Phase 1: Histogram
+//
+// Builds per-workgroup histograms of 8-bit digit frequencies.
+// Each workgroup processes a tile of TILE_SIZE elements, accumulating
+// a 256-bin histogram in shared memory, then writes it to global memory.
+//
+// Global histogram layout (column-major):
+//   histograms[digit * num_workgroups + workgroup_id]
+//
+// This interleaving means a flat exclusive prefix sum over the entire
+// histogram array produces correct global scatter offsets for each
+// (digit, block) pair.
+//
+// Max elements: 4M. Tile size: 3840 (256 threads * 15 elements).
+// Max workgroups: ceil(4M / 3840) = 1042.
+//
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_elements;
+    uint bit_offset;    // 0, 8, 16, or 24
+};
+
+layout(std430, binding = 0) readonly buffer KeysIn {
+    uint keys_in[];
+};
+
+layout(std430, binding = 1) writeonly buffer Histograms {
+    uint histograms[];
+};
+
+#define TILE_SIZE       3840u
+#define ELEMENTS_PER_THREAD 15u
+#define RADIX           256u
+
+shared uint s_histogram[RADIX];
+
+void main() {
+    uint local_id   = gl_LocalInvocationID.x;
+    uint group_id   = gl_WorkGroupID.x;
+    uint num_groups = gl_NumWorkGroups.x;
+
+    // Clear shared histogram — one bin per thread (256 threads = 256 bins)
+    s_histogram[local_id] = 0u;
+    barrier();
+
+    // Base index for this workgroup's tile
+    uint tile_start = group_id * TILE_SIZE;
+
+    // Each thread processes ELEMENTS_PER_THREAD sequential elements
+    for (uint i = 0u; i < ELEMENTS_PER_THREAD; i++) {
+        uint idx = tile_start + local_id + i * 256u;
+        if (idx < num_elements) {
+            uint key   = keys_in[idx];
+            uint digit = (key >> bit_offset) & 0xFFu;
+            atomicAdd(s_histogram[digit], 1u);
+        }
+    }
+
+    barrier();
+
+    // Write this workgroup's histogram to global memory (column-major layout)
+    // histograms[digit * num_groups + group_id]
+    histograms[local_id * num_groups + group_id] = s_histogram[local_id];
+}
