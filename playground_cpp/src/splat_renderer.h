@@ -102,12 +102,41 @@ private:
     VkBuffer projConicBuffer_ = VK_NULL_HANDLE;   VmaAllocation projConicAlloc_ = VK_NULL_HANDLE;
     VkBuffer projColorBuffer_ = VK_NULL_HANDLE;   VmaAllocation projColorAlloc_ = VK_NULL_HANDLE;
 
-    // Sort buffers
+    // Sort buffers (buffer A = primary, written by compute shader)
     VkBuffer sortKeysBuffer_ = VK_NULL_HANDLE;      VmaAllocation sortKeysAlloc_ = VK_NULL_HANDLE;
     VkBuffer sortedIndicesBuffer_ = VK_NULL_HANDLE;  VmaAllocation sortedIndicesAlloc_ = VK_NULL_HANDLE;
 
     // Visible count (atomic counter)
     VkBuffer visibleCountBuffer_ = VK_NULL_HANDLE;  VmaAllocation visibleCountAlloc_ = VK_NULL_HANDLE;
+
+    // GPU radix sort resources
+    VkBuffer sortKeysBBuffer_ = VK_NULL_HANDLE;      VmaAllocation sortKeysBAlloc_ = VK_NULL_HANDLE;
+    VkBuffer sortValsBBuffer_ = VK_NULL_HANDLE;      VmaAllocation sortValsBAlloc_ = VK_NULL_HANDLE;
+    VkBuffer histogramBuffer_ = VK_NULL_HANDLE;      VmaAllocation histogramAlloc_ = VK_NULL_HANDLE;
+    VkBuffer partitionSumsBuffer_ = VK_NULL_HANDLE;  VmaAllocation partitionSumsAlloc_ = VK_NULL_HANDLE;
+
+    // Sort pipelines (3 compute stages)
+    VkPipeline sortHistogramPipeline_ = VK_NULL_HANDLE;
+    VkPipeline sortPrefixSumPipeline_ = VK_NULL_HANDLE;
+    VkPipeline sortScatterPipeline_ = VK_NULL_HANDLE;
+
+    // Sort pipeline layouts
+    VkPipelineLayout sortHistogramLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout sortPrefixSumLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout sortScatterLayout_ = VK_NULL_HANDLE;
+
+    // Sort descriptor set layouts
+    VkDescriptorSetLayout sortHistogramSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout sortPrefixSumSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout sortScatterSetLayout_ = VK_NULL_HANDLE;
+
+    // Sort descriptor sets: [0]=A->B, [1]=B->A for histogram and scatter; single for prefix_sum
+    VkDescriptorSet sortHistogramDescSets_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorSet sortPrefixSumDescSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet sortScatterDescSets_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+
+    // Precomputed sort workgroup count
+    uint32_t sortNumWg_ = 0;
 
     // Camera state
     glm::mat4 viewMatrix_{1.0f};
@@ -118,9 +147,6 @@ private:
     uint32_t shDegree_ = 0;        // scene's actual SH degree (for push constant)
     uint32_t shaderShDegree_ = 0;  // shader's compiled SH degree (for descriptor layout)
 
-    // Cached positions for CPU sort
-    std::vector<float> hostPositions_;
-
     // Helpers
     void createOffscreenTarget(VulkanContext& ctx);
     void createRenderPass(VkDevice device);
@@ -130,5 +156,6 @@ private:
     void createFramebufferLoad(VkDevice device);
     void createFramebufferLoadDepth(VkDevice device);
     void createPipelines(VkDevice device, const std::string& shaderBase);
+    void createSortPipelines(VkDevice device);
     void createBuffers(VulkanContext& ctx, const GaussianSplatData& data);
 };

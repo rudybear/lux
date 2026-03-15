@@ -121,9 +121,10 @@ void main() {
         // Update row offsets: count occurrences of each digit in this row.
         // Thread `local_id` updates digit `local_id` by scanning s_digits.
         {
+            uint row_valid = (i * 256u < tile_count) ? min(tile_count - i * 256u, 256u) : 0u;
             uint cnt = 0u;
-            for (uint j = 0u; j < 256u; j++) {
-                if (j < tile_count - i * 256u && s_digits[j] == local_id) cnt++;
+            for (uint j = 0u; j < row_valid; j++) {
+                if (s_digits[j] == local_id) cnt++;
             }
             s_row_offset[local_id] += cnt;
         }

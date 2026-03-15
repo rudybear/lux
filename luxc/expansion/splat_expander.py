@@ -224,11 +224,15 @@ def _cull_writes() -> list:
     """
     zero4 = _ctor("vec4", [_lit("0.0"), _lit("0.0"), _lit("0.0"), _lit("0.0")])
     # Culled splats get max uint sort key so they sort to the end.
+    # sorted_indices must also be reset to identity — otherwise stale permuted
+    # values from a previous frame's sort cause visible splats to be rendered
+    # twice (once correctly, once at end via stale reference → "disco" flicker).
     return [
         _assign_idx("projected_center", _ref("gid"), zero4),
         _assign_idx("projected_conic", _ref("gid"), zero4),
         _assign_idx("projected_color", _ref("gid"), zero4),
         _assign_idx("sort_keys", _ref("gid"), _uint_lit("4294967295")),
+        _assign_idx("sorted_indices", _ref("gid"), _ref("gid")),
     ]
 
 

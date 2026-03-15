@@ -3,7 +3,6 @@
 #include "gltf_loader.h"
 #include "spv_loader.h"
 #include <algorithm>
-#include <numeric>
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
@@ -404,9 +403,10 @@ void SplatRenderer::createFramebufferLoadDepth(VkDevice device) {
 void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBase) {
     // --- Descriptor set layouts ---
 
-    // Compute: 4 input + N SH coefficients + 5 output SSBOs
+    // Compute: 4 input + N SH coefficients + 6 output SSBOs
+    // Output order: proj_center, proj_conic, proj_color, sort_keys, sorted_indices, visible_count
     uint32_t numShCoeffs = numShCoeffsForDegree(shaderShDegree_);
-    uint32_t numComputeBindings = 4 + numShCoeffs + 5;
+    uint32_t numComputeBindings = 4 + numShCoeffs + 6;
     std::vector<VkDescriptorSetLayoutBinding> computeBindings(numComputeBindings);
     for (uint32_t i = 0; i < numComputeBindings; ++i) {
         computeBindings[i] = {};
@@ -576,13 +576,14 @@ void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBa
     vkDestroyShaderModule(device, fragModule, nullptr);
 
     // --- Descriptor pool ---
+    // Need descriptors for: compute + render + sort (2*2 histogram + 1*2 prefix + 2*5 scatter = 16)
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = numComputeBindings + 4 + 4; // compute + render + margin
+    poolSize.descriptorCount = numComputeBindings + 4 + 16 + 4; // compute + render + sort + margin
 
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 2;
+    poolInfo.maxSets = 2 + 5;  // compute, render + 2 histogram + 1 prefix_sum + 2 scatter
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
 
@@ -602,6 +603,112 @@ void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBa
 }
 
 // --------------------------------------------------------------------------
+// GPU radix sort pipeline creation
+// --------------------------------------------------------------------------
+
+static VkDescriptorSetLayout createSortSetLayout(VkDevice device, uint32_t numBindings) {
+    std::vector<VkDescriptorSetLayoutBinding> bindings(numBindings);
+    for (uint32_t i = 0; i < numBindings; ++i) {
+        bindings[i] = {};
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = numBindings;
+    layoutInfo.pBindings = bindings.data();
+
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &layout);
+    return layout;
+}
+
+static VkPipelineLayout createSortPipelineLayout(VkDevice device, VkDescriptorSetLayout setLayout) {
+    VkPushConstantRange pushRange = {};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.offset = 0;
+    pushRange.size = 8;  // SortPush: num_elements(4) + bit_offset(4)
+
+    VkPipelineLayoutCreateInfo layoutInfo = {};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &setLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pushRange;
+
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    vkCreatePipelineLayout(device, &layoutInfo, nullptr, &layout);
+    return layout;
+}
+
+static VkPipeline createSortComputePipeline(VkDevice device, VkPipelineLayout layout,
+                                              const std::string& spvPath) {
+    auto code = SpvLoader::loadSPIRV(spvPath);
+    VkShaderModule module = SpvLoader::createShaderModule(device, code);
+
+    VkComputePipelineCreateInfo pipeInfo = {};
+    pipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeInfo.stage.module = module;
+    pipeInfo.stage.pName = "main";
+    pipeInfo.layout = layout;
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &pipeline);
+    vkDestroyShaderModule(device, module, nullptr);
+    return pipeline;
+}
+
+void SplatRenderer::createSortPipelines(VkDevice device) {
+    // Descriptor set layouts
+    // histogram.comp: binding 0 = keys_in, binding 1 = histograms
+    sortHistogramSetLayout_ = createSortSetLayout(device, 2);
+    // prefix_sum.comp: binding 0 = histograms, binding 1 = partition_sums
+    sortPrefixSumSetLayout_ = createSortSetLayout(device, 2);
+    // scatter.comp: binding 0-4 = keys_in, keys_out, vals_in, vals_out, histograms
+    sortScatterSetLayout_ = createSortSetLayout(device, 5);
+
+    // Pipeline layouts
+    sortHistogramLayout_ = createSortPipelineLayout(device, sortHistogramSetLayout_);
+    sortPrefixSumLayout_ = createSortPipelineLayout(device, sortPrefixSumSetLayout_);
+    sortScatterLayout_ = createSortPipelineLayout(device, sortScatterSetLayout_);
+
+    // Compute pipelines (load pre-compiled SPIR-V from shaders/radix_sort/)
+    std::string sortDir = "shaders/radix_sort/";
+    sortHistogramPipeline_ = createSortComputePipeline(device, sortHistogramLayout_, sortDir + "histogram.comp.spv");
+    sortPrefixSumPipeline_ = createSortComputePipeline(device, sortPrefixSumLayout_, sortDir + "prefix_sum.comp.spv");
+    sortScatterPipeline_ = createSortComputePipeline(device, sortScatterLayout_, sortDir + "scatter.comp.spv");
+
+    // Allocate sort descriptor sets from the shared pool
+    VkDescriptorSetLayout sortLayouts[5] = {
+        sortHistogramSetLayout_,   // A->B
+        sortHistogramSetLayout_,   // B->A
+        sortPrefixSumSetLayout_,   // single
+        sortScatterSetLayout_,     // A->B
+        sortScatterSetLayout_,     // B->A
+    };
+    VkDescriptorSetAllocateInfo sortAllocInfo = {};
+    sortAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    sortAllocInfo.descriptorPool = descriptorPool_;
+    sortAllocInfo.descriptorSetCount = 5;
+    sortAllocInfo.pSetLayouts = sortLayouts;
+
+    VkDescriptorSet sortSets[5];
+    vkAllocateDescriptorSets(device, &sortAllocInfo, sortSets);
+    sortHistogramDescSets_[0] = sortSets[0];
+    sortHistogramDescSets_[1] = sortSets[1];
+    sortPrefixSumDescSet_ = sortSets[2];
+    sortScatterDescSets_[0] = sortSets[3];
+    sortScatterDescSets_[1] = sortSets[4];
+
+    std::cout << "[info] GPU radix sort pipelines created" << std::endl;
+}
+
+// --------------------------------------------------------------------------
 // Buffer creation and data upload
 // --------------------------------------------------------------------------
 
@@ -615,7 +722,6 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     // Input buffers (CPU-visible for upload)
     // Positions: loader stores as vec4 (x,y,z,1) already
     const auto& pos4 = data.positions;  // already numSplats * 4 floats
-    hostPositions_ = pos4;  // cache for CPU sort
 
     createVmaBuffer(ctx.allocator, pos4.size() * sizeof(float), ssbo,
                     VMA_MEMORY_USAGE_CPU_TO_GPU, posBuffer_, posAlloc_);
@@ -681,17 +787,40 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     createVmaBuffer(ctx.allocator, numSplats_ * 4 * sizeof(float), ssbo,
                     VMA_MEMORY_USAGE_GPU_ONLY, projColorBuffer_, projColorAlloc_);
 
-    // Sort keys (GPU only, written by compute, read back for CPU sort)
-    createVmaBuffer(ctx.allocator, numSplats_ * sizeof(float), ssbo,
+    // Sort keys (buffer A, GPU only)
+    createVmaBuffer(ctx.allocator, numSplats_ * sizeof(uint32_t), ssbo,
                     VMA_MEMORY_USAGE_GPU_ONLY, sortKeysBuffer_, sortKeysAlloc_);
 
-    // Sorted indices (CPU-visible for upload after sort)
+    // Sorted indices (buffer A, GPU only — GPU radix sort, no CPU upload)
     createVmaBuffer(ctx.allocator, numSplats_ * sizeof(uint32_t), ssbo,
-                    VMA_MEMORY_USAGE_CPU_TO_GPU, sortedIndicesBuffer_, sortedIndicesAlloc_);
+                    VMA_MEMORY_USAGE_GPU_ONLY, sortedIndicesBuffer_, sortedIndicesAlloc_);
 
     // Visible count (GPU only, atomic counter)
     createVmaBuffer(ctx.allocator, sizeof(uint32_t), ssbo,
                     VMA_MEMORY_USAGE_GPU_ONLY, visibleCountBuffer_, visibleCountAlloc_);
+
+    // Ping-pong sort buffers (buffer B)
+    createVmaBuffer(ctx.allocator, numSplats_ * sizeof(uint32_t), ssbo,
+                    VMA_MEMORY_USAGE_GPU_ONLY, sortKeysBBuffer_, sortKeysBAlloc_);
+    createVmaBuffer(ctx.allocator, numSplats_ * sizeof(uint32_t), ssbo,
+                    VMA_MEMORY_USAGE_GPU_ONLY, sortValsBBuffer_, sortValsBAlloc_);
+
+    // Radix sort histogram and partition buffers
+    static const uint32_t SORT_TILE_SIZE = 3840;
+    static const uint32_t PREFIX_SUM_BLOCK_SIZE = 2048;
+    sortNumWg_ = (numSplats_ + SORT_TILE_SIZE - 1) / SORT_TILE_SIZE;
+    uint32_t histogramSize = std::max(256u * sortNumWg_ * 4u, 4u);
+    createVmaBuffer(ctx.allocator, histogramSize, ssbo,
+                    VMA_MEMORY_USAGE_GPU_ONLY, histogramBuffer_, histogramAlloc_);
+    uint32_t totalHistEntries = 256 * sortNumWg_;
+    uint32_t numPartitions = (totalHistEntries + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
+    uint32_t partitionSumsSize = std::max(numPartitions * 4u, 4u);
+    createVmaBuffer(ctx.allocator, partitionSumsSize, ssbo,
+                    VMA_MEMORY_USAGE_GPU_ONLY, partitionSumsBuffer_, partitionSumsAlloc_);
+
+    std::cout << "[info] GPU radix sort: " << numSplats_ << " splats, "
+              << sortNumWg_ << " workgroups, " << totalHistEntries << " histogram entries, "
+              << numPartitions << " partitions" << std::endl;
 
     // --- Update descriptor sets ---
     auto writeSSBO = [&](VkDescriptorSet set, uint32_t binding, VkBuffer buffer, VkDeviceSize size) {
@@ -714,7 +843,8 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     // Compute set layout:
     //   0: positions, 1: rotations, 2: scales, 3: opacities,
     //   4..4+numShCoeffs-1: SH coefficient buffers,
-    //   4+numShCoeffs: projected_centers, +1: conics, +2: colors, +3: sort_keys, +4: visible_count
+    //   4+numShCoeffs: projected_centers, +1: conics, +2: colors, +3: sort_keys,
+    //   +4: sorted_indices, +5: visible_count
     uint32_t numShCoeffs = numShCoeffsForDegree(shaderShDegree_);
     uint32_t outputBase = 4 + numShCoeffs;
 
@@ -755,14 +885,46 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     writeSSBO(computeDescSet_, outputBase + 0, projCenterBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(computeDescSet_, outputBase + 1, projConicBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(computeDescSet_, outputBase + 2, projColorBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(computeDescSet_, outputBase + 3, sortKeysBuffer_, numSplats_ * sizeof(float));
-    writeSSBO(computeDescSet_, outputBase + 4, visibleCountBuffer_, sizeof(uint32_t));
+    writeSSBO(computeDescSet_, outputBase + 3, sortKeysBuffer_, numSplats_ * sizeof(uint32_t));
+    writeSSBO(computeDescSet_, outputBase + 4, sortedIndicesBuffer_, numSplats_ * sizeof(uint32_t));
+    writeSSBO(computeDescSet_, outputBase + 5, visibleCountBuffer_, sizeof(uint32_t));
 
     // Render set: projected_centers(0), conics(1), colors(2), sorted_indices(3)
     writeSSBO(renderDescSet_, 0, projCenterBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(renderDescSet_, 1, projConicBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(renderDescSet_, 2, projColorBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(renderDescSet_, 3, sortedIndicesBuffer_, numSplats_ * sizeof(uint32_t));
+
+    // --- Sort descriptor sets ---
+    VkDeviceSize sortBufSize = numSplats_ * sizeof(uint32_t);
+    VkDeviceSize histBufSize = histogramSize;
+    VkDeviceSize partBufSize = partitionSumsSize;
+
+    // Histogram sets: binding 0 = keys_in, binding 1 = histograms
+    // [0] = A->B (reads keys A)
+    writeSSBO(sortHistogramDescSets_[0], 0, sortKeysBuffer_, sortBufSize);
+    writeSSBO(sortHistogramDescSets_[0], 1, histogramBuffer_, histBufSize);
+    // [1] = B->A (reads keys B)
+    writeSSBO(sortHistogramDescSets_[1], 0, sortKeysBBuffer_, sortBufSize);
+    writeSSBO(sortHistogramDescSets_[1], 1, histogramBuffer_, histBufSize);
+
+    // Prefix sum set: binding 0 = histograms, binding 1 = partition_sums
+    writeSSBO(sortPrefixSumDescSet_, 0, histogramBuffer_, histBufSize);
+    writeSSBO(sortPrefixSumDescSet_, 1, partitionSumsBuffer_, partBufSize);
+
+    // Scatter sets: binding 0=keys_in, 1=keys_out, 2=vals_in, 3=vals_out, 4=histograms
+    // [0] = A->B
+    writeSSBO(sortScatterDescSets_[0], 0, sortKeysBuffer_, sortBufSize);
+    writeSSBO(sortScatterDescSets_[0], 1, sortKeysBBuffer_, sortBufSize);
+    writeSSBO(sortScatterDescSets_[0], 2, sortedIndicesBuffer_, sortBufSize);
+    writeSSBO(sortScatterDescSets_[0], 3, sortValsBBuffer_, sortBufSize);
+    writeSSBO(sortScatterDescSets_[0], 4, histogramBuffer_, histBufSize);
+    // [1] = B->A
+    writeSSBO(sortScatterDescSets_[1], 0, sortKeysBBuffer_, sortBufSize);
+    writeSSBO(sortScatterDescSets_[1], 1, sortKeysBuffer_, sortBufSize);
+    writeSSBO(sortScatterDescSets_[1], 2, sortValsBBuffer_, sortBufSize);
+    writeSSBO(sortScatterDescSets_[1], 3, sortedIndicesBuffer_, sortBufSize);
+    writeSSBO(sortScatterDescSets_[1], 4, histogramBuffer_, histBufSize);
 }
 
 // --------------------------------------------------------------------------
@@ -791,6 +953,7 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
     createFramebufferLoad(ctx.device);
     createFramebufferLoadDepth(ctx.device);
     createPipelines(ctx.device, shaderBase);
+    createSortPipelines(ctx.device);
     createBuffers(ctx, data);
 
     // Default camera from bounding box
@@ -828,7 +991,7 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
     }
 
     std::cout << "[info] SplatRenderer initialized: " << numSplats_ << " splats, "
-              << width << "x" << height << std::endl;
+              << width << "x" << height << " (GPU radix sort)" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -854,28 +1017,9 @@ void SplatRenderer::updateCamera(glm::vec3 eye, glm::vec3 target, glm::vec3 up,
 void SplatRenderer::render(VulkanContext& ctx) {
     if (numSplats_ == 0) return;
 
-    // CPU sort (uses cached host positions + current view matrix)
-    {
-        const float* vm = &viewMatrix_[0][0];
-        std::vector<float> depths(numSplats_);
-        for (uint32_t i = 0; i < numSplats_; ++i) {
-            float x = hostPositions_[i * 4 + 0];
-            float y = hostPositions_[i * 4 + 1];
-            float z = hostPositions_[i * 4 + 2];
-            depths[i] = vm[2] * x + vm[6] * y + vm[10] * z + vm[14];
-        }
-        std::vector<uint32_t> indices(numSplats_);
-        std::iota(indices.begin(), indices.end(), 0u);
-        std::sort(indices.begin(), indices.end(), [&](uint32_t a, uint32_t b) {
-            return depths[a] < depths[b];  // back-to-front (most negative Z = farthest first)
-        });
-        uploadVmaBuffer(ctx.allocator, sortedIndicesAlloc_,
-                        indices.data(), numSplats_ * sizeof(uint32_t));
-    }
-
     VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
 
-    // --- Compute dispatch ---
+    // --- Compute dispatch (projection + sort key generation) ---
     struct ComputePush {
         float view[16];       // offset 0
         float proj[16];       // offset 64
@@ -910,9 +1054,105 @@ void SplatRenderer::render(VulkanContext& ctx) {
     uint32_t groupCount = (numSplats_ + 255) / 256;
     vkCmdDispatch(cmd, groupCount, 1, 1);
 
-    // Barrier: compute -> vertex/fragment read
+    // Barrier: compute writes -> sort reads
     VkMemoryBarrier barrier = {};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+    // --- GPU Radix Sort (4 passes, 8 bits per pass = 32-bit keys) ---
+    {
+        static const uint32_t PREFIX_SUM_BLOCK_SIZE = 2048;
+        uint32_t numElements = numSplats_;
+        uint32_t numWg = sortNumWg_;
+        uint32_t totalHistogram = 256 * numWg;
+        uint32_t numParts = (totalHistogram + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
+
+        VkMemoryBarrier sortBarrier = {};
+        sortBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        sortBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        sortBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+        struct SortPush {
+            uint32_t numElements;
+            uint32_t bitOffset;
+        };
+
+        for (uint32_t pass = 0; pass < 4; ++pass) {
+            uint32_t bitOffset = pass * 8;
+            uint32_t ping = pass % 2;  // 0 = A->B, 1 = B->A
+
+            // --- Phase 1: Histogram ---
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortHistogramPipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortHistogramLayout_,
+                                    0, 1, &sortHistogramDescSets_[ping], 0, nullptr);
+            SortPush histPush = {numElements, bitOffset};
+            vkCmdPushConstants(cmd, sortHistogramLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(histPush), &histPush);
+            vkCmdDispatch(cmd, numWg, 1, 1);
+
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &sortBarrier, 0, nullptr, 0, nullptr);
+
+            // --- Phase 2: Prefix Sum (3 sub-passes) ---
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortPrefixSumPipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortPrefixSumLayout_,
+                                    0, 1, &sortPrefixSumDescSet_, 0, nullptr);
+
+            // Sub-pass 0: Local scan
+            SortPush psPush0 = {totalHistogram, 0};
+            vkCmdPushConstants(cmd, sortPrefixSumLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(psPush0), &psPush0);
+            vkCmdDispatch(cmd, numParts, 1, 1);
+
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &sortBarrier, 0, nullptr, 0, nullptr);
+
+            // Sub-pass 1: Spine scan
+            SortPush psPush1 = {numParts, 1};
+            vkCmdPushConstants(cmd, sortPrefixSumLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(psPush1), &psPush1);
+            vkCmdDispatch(cmd, 1, 1, 1);
+
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &sortBarrier, 0, nullptr, 0, nullptr);
+
+            // Sub-pass 2: Propagate
+            SortPush psPush2 = {totalHistogram, 2};
+            vkCmdPushConstants(cmd, sortPrefixSumLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(psPush2), &psPush2);
+            vkCmdDispatch(cmd, numParts, 1, 1);
+
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &sortBarrier, 0, nullptr, 0, nullptr);
+
+            // --- Phase 3: Scatter ---
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortScatterPipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortScatterLayout_,
+                                    0, 1, &sortScatterDescSets_[ping], 0, nullptr);
+            SortPush scatterPush = {numElements, bitOffset};
+            vkCmdPushConstants(cmd, sortScatterLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(scatterPush), &scatterPush);
+            vkCmdDispatch(cmd, numWg, 1, 1);
+
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &sortBarrier, 0, nullptr, 0, nullptr);
+        }
+    }
+
+    // After 4 passes (even count), sorted results are in buffer A
+    // (sortKeysBuffer_, sortedIndicesBuffer_) which is what render reads.
+
+    // Barrier: sort compute -> vertex/fragment shader reads
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
@@ -1277,10 +1517,21 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     if (computeLayout_ != VK_NULL_HANDLE)   vkDestroyPipelineLayout(ctx.device, computeLayout_, nullptr);
     if (renderLayout_ != VK_NULL_HANDLE)    vkDestroyPipelineLayout(ctx.device, renderLayout_, nullptr);
 
+    // Sort pipelines
+    if (sortHistogramPipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(ctx.device, sortHistogramPipeline_, nullptr);
+    if (sortPrefixSumPipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(ctx.device, sortPrefixSumPipeline_, nullptr);
+    if (sortScatterPipeline_ != VK_NULL_HANDLE)   vkDestroyPipeline(ctx.device, sortScatterPipeline_, nullptr);
+    if (sortHistogramLayout_ != VK_NULL_HANDLE)   vkDestroyPipelineLayout(ctx.device, sortHistogramLayout_, nullptr);
+    if (sortPrefixSumLayout_ != VK_NULL_HANDLE)   vkDestroyPipelineLayout(ctx.device, sortPrefixSumLayout_, nullptr);
+    if (sortScatterLayout_ != VK_NULL_HANDLE)     vkDestroyPipelineLayout(ctx.device, sortScatterLayout_, nullptr);
+
     // Descriptor layouts and pool
-    if (computeSetLayout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(ctx.device, computeSetLayout_, nullptr);
-    if (renderSetLayout_ != VK_NULL_HANDLE)  vkDestroyDescriptorSetLayout(ctx.device, renderSetLayout_, nullptr);
-    if (descriptorPool_ != VK_NULL_HANDLE)   vkDestroyDescriptorPool(ctx.device, descriptorPool_, nullptr);
+    if (computeSetLayout_ != VK_NULL_HANDLE)       vkDestroyDescriptorSetLayout(ctx.device, computeSetLayout_, nullptr);
+    if (renderSetLayout_ != VK_NULL_HANDLE)        vkDestroyDescriptorSetLayout(ctx.device, renderSetLayout_, nullptr);
+    if (sortHistogramSetLayout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(ctx.device, sortHistogramSetLayout_, nullptr);
+    if (sortPrefixSumSetLayout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(ctx.device, sortPrefixSumSetLayout_, nullptr);
+    if (sortScatterSetLayout_ != VK_NULL_HANDLE)   vkDestroyDescriptorSetLayout(ctx.device, sortScatterSetLayout_, nullptr);
+    if (descriptorPool_ != VK_NULL_HANDLE)         vkDestroyDescriptorPool(ctx.device, descriptorPool_, nullptr);
 
     // Buffers (VMA)
     destroyVmaBuffer(ctx.allocator, posBuffer_, posAlloc_);
@@ -1293,6 +1544,10 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     destroyVmaBuffer(ctx.allocator, sortKeysBuffer_, sortKeysAlloc_);
     destroyVmaBuffer(ctx.allocator, sortedIndicesBuffer_, sortedIndicesAlloc_);
     destroyVmaBuffer(ctx.allocator, visibleCountBuffer_, visibleCountAlloc_);
+    destroyVmaBuffer(ctx.allocator, sortKeysBBuffer_, sortKeysBAlloc_);
+    destroyVmaBuffer(ctx.allocator, sortValsBBuffer_, sortValsBAlloc_);
+    destroyVmaBuffer(ctx.allocator, histogramBuffer_, histogramAlloc_);
+    destroyVmaBuffer(ctx.allocator, partitionSumsBuffer_, partitionSumsAlloc_);
 
     for (size_t i = 0; i < shBuffers_.size(); ++i) {
         destroyVmaBuffer(ctx.allocator, shBuffers_[i], shAllocs_[i]);
@@ -1319,5 +1574,14 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     renderLayout_ = VK_NULL_HANDLE;
     computeSetLayout_ = VK_NULL_HANDLE;
     renderSetLayout_ = VK_NULL_HANDLE;
+    sortHistogramPipeline_ = VK_NULL_HANDLE;
+    sortPrefixSumPipeline_ = VK_NULL_HANDLE;
+    sortScatterPipeline_ = VK_NULL_HANDLE;
+    sortHistogramLayout_ = VK_NULL_HANDLE;
+    sortPrefixSumLayout_ = VK_NULL_HANDLE;
+    sortScatterLayout_ = VK_NULL_HANDLE;
+    sortHistogramSetLayout_ = VK_NULL_HANDLE;
+    sortPrefixSumSetLayout_ = VK_NULL_HANDLE;
+    sortScatterSetLayout_ = VK_NULL_HANDLE;
     descriptorPool_ = VK_NULL_HANDLE;
 }
