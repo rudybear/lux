@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "source": "gaussian_splat_linear.lux",
+  "stage": "fragment",
+  "execution_model": "Fragment",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [
+    {
+      "name": "frag_conic",
+      "type": "vec3",
+      "location": 0
+    },
+    {
+      "name": "frag_color",
+      "type": "vec4",
+      "location": 1
+    },
+    {
+      "name": "frag_center",
+      "type": "vec2",
+      "location": 2
+    },
+    {
+      "name": "frag_offset",
+      "type": "vec2",
+      "location": 3
+    }
+  ],
+  "outputs": [
+    {
+      "name": "out_color",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "descriptor_sets": {},
+  "push_constants": [
+    {
+      "name": "push",
+      "fields": [
+        {
+          "name": "screen_size",
+          "type": "vec2",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "visible_count",
+          "type": "uint",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "alpha_cutoff",
+          "type": "scalar",
+          "offset": 12,
+          "size": 4
+        }
+      ],
+      "size": 16,
+      "stage_flags": [
+        "fragment"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "gaussian_splatting": {
+    "splat_name": "GaussianCloud"
+  },
+  "performance_hints": {
+    "instruction_count": 101,
+    "alu_ops": 14,
+    "texture_samples": 0,
+    "branches": 2,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  },
+  "wgsl_file": "gaussian_splat_linear.frag.wgsl",
+  "push_emulated": {
+    "set": 2,
+    "binding": 0,
+    "fields": [
+      {
+        "name": "screen_size",
+        "type": "vec2",
+        "offset": 0,
+        "size": 8
+      },
+      {
+        "name": "visible_count",
+        "type": "uint",
+        "offset": 8,
+        "size": 4
+      },
+      {
+        "name": "alpha_cutoff",
+        "type": "scalar",
+        "offset": 12,
+        "size": 4
+      }
+    ],
+    "size": 16
+  }
+}

@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "source": "debug_playground.lux",
+  "stage": "fragment",
+  "execution_model": "Fragment",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [
+    {
+      "name": "world_normal",
+      "type": "vec3",
+      "location": 0
+    },
+    {
+      "name": "world_position",
+      "type": "vec3",
+      "location": 1
+    },
+    {
+      "name": "uv",
+      "type": "vec2",
+      "location": 2
+    }
+  ],
+  "outputs": [
+    {
+      "name": "color",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "sampler",
+        "name": "albedo_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "sampled_image",
+        "name": "albedo_tex",
+        "stage_flags": [
+          "fragment"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "Material",
+      "fields": [
+        {
+          "name": "roughness",
+          "type": "scalar",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "metallic",
+          "type": "scalar",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "exposure",
+          "type": "scalar",
+          "offset": 8,
+          "size": 4
+        }
+      ],
+      "size": 16,
+      "stage_flags": [
+        "fragment"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "performance_hints": {
+    "instruction_count": 193,
+    "alu_ops": 59,
+    "texture_samples": 1,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  },
+  "wgsl_file": "debug_playground.frag.wgsl",
+  "push_emulated": {
+    "set": 1,
+    "binding": 0,
+    "fields": [
+      {
+        "name": "roughness",
+        "type": "scalar",
+        "offset": 0,
+        "size": 4
+      },
+      {
+        "name": "metallic",
+        "type": "scalar",
+        "offset": 4,
+        "size": 4
+      },
+      {
+        "name": "exposure",
+        "type": "scalar",
+        "offset": 8,
+        "size": 4
+      }
+    ],
+    "size": 16
+  }
+}

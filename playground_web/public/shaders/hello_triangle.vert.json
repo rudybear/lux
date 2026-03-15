@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "source": "hello_triangle.lux",
+  "stage": "vertex",
+  "execution_model": "Vertex",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [
+    {
+      "name": "position",
+      "type": "vec3",
+      "location": 0
+    },
+    {
+      "name": "color",
+      "type": "vec3",
+      "location": 1
+    }
+  ],
+  "outputs": [
+    {
+      "name": "frag_color",
+      "type": "vec3",
+      "location": 0
+    }
+  ],
+  "descriptor_sets": {},
+  "push_constants": [],
+  "vertex_attributes": [
+    {
+      "location": 0,
+      "type": "vec3",
+      "name": "position",
+      "format": "R32G32B32_SFLOAT",
+      "offset": 0
+    },
+    {
+      "location": 1,
+      "type": "vec3",
+      "name": "color",
+      "format": "R32G32B32_SFLOAT",
+      "offset": 12
+    }
+  ],
+  "vertex_stride": 24,
+  "performance_hints": {
+    "instruction_count": 63,
+    "alu_ops": 0,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "medium"
+  },
+  "wgsl_file": "hello_triangle.vert.wgsl"
+}

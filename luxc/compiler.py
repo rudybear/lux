@@ -155,6 +155,8 @@ def compile_source(
     assert_kill: bool = False,
     rich_debug: bool = False,
     auto_type: str | None = None,
+    target: str = "spirv",
+    webgpu: bool = False,
 ) -> None:
     # Clear type aliases from previous compilations
     clear_type_aliases()
@@ -220,9 +222,25 @@ def compile_source(
             from luxc.autotype.report import format_report
             print(format_report(precision_maps))
 
-    assign_layouts(module)
+    assign_layouts(module, webgpu=webgpu)
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # WebGPU compatibility: check for unsupported modes and set per-stage flag
+    if webgpu:
+        for stage in module.stages:
+            _UNSUPPORTED_WEBGPU = {"raygen", "closest_hit", "any_hit", "miss",
+                                   "intersection", "callable", "mesh", "task"}
+            if stage.stage_type in _UNSUPPORTED_WEBGPU:
+                raise RuntimeError(
+                    f"--webgpu: stage type '{stage.stage_type}' is not supported "
+                    f"by WebGPU (no ray tracing, mesh shaders, or bindless descriptors)"
+                )
+            if getattr(stage, 'bindless_texture_arrays', []):
+                raise RuntimeError(
+                    "--webgpu: bindless descriptors are not supported in WebGPU"
+                )
+            stage._webgpu = True
 
     _SUFFIX_MAP = {
         "vertex": "vert",
@@ -271,7 +289,8 @@ def compile_source(
 
         asm_text = generate_spirv(module, stage, debug=debug, source_name=source_name or f"{stem}.lux",
                                   assert_kill=assert_kill, source_text=source if debug else "",
-                                  rich_debug=rich_debug, precision_map=stage_precision_map)
+                                  rich_debug=rich_debug, precision_map=stage_precision_map,
+                                  webgpu=webgpu)
 
         if emit_asm:
             asm_path = output_dir / f"{out_stem}.{suffix}.spvasm"
@@ -288,6 +307,14 @@ def compile_source(
 
         print(f"Wrote {spv_path}")
 
+        # WGSL transpilation (--target wgsl)
+        # Note: --webgpu implies --target wgsl at the CLI level
+        wgsl_path = None
+        if target == "wgsl":
+            wgsl_path = output_dir / f"{out_stem}.{suffix}.wgsl"
+            _transpile_to_wgsl(spv_path, wgsl_path)
+            print(f"Wrote {wgsl_path}")
+
         if emit_reflection or analyze:
             reflection = generate_reflection(
                 module, stage,
@@ -298,6 +325,12 @@ def compile_source(
             # Add performance hints from SPIR-V analysis
             add_performance_hints(reflection, asm_text)
 
+            # Add WebGPU-specific metadata to reflection
+            if webgpu:
+                if wgsl_path:
+                    reflection["wgsl_file"] = wgsl_path.name
+                _add_push_emulated(reflection, stage)
+
             if emit_reflection:
                 json_path = output_dir / f"{out_stem}.{suffix}.json"
                 json_path.write_text(emit_reflection_json(reflection), encoding="utf-8")
@@ -307,6 +340,59 @@ def compile_source(
                 from luxc.analysis.cost_estimator import format_cost_summary, estimate_cost
                 costs = estimate_cost(asm_text)
                 print(format_cost_summary(costs, stage_name))
+
+
+def _transpile_to_wgsl(spv_path: Path, wgsl_path: Path) -> None:
+    """Transpile SPIR-V binary to WGSL via naga-cli."""
+    import subprocess
+    import tempfile
+
+    for tool in ("naga", "naga-cli"):
+        try:
+            result = subprocess.run(
+                [tool, str(spv_path), str(wgsl_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                return
+            # naga failed — report error
+            raise RuntimeError(
+                f"WGSL transpilation failed ({tool}):\n{result.stderr.strip()}"
+            )
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"WGSL transpilation timed out ({tool})")
+
+    raise RuntimeError(
+        "Cannot transpile to WGSL: naga/naga-cli not found on PATH. "
+        "Install via: cargo install naga-cli"
+    )
+
+
+def _add_push_emulated(reflection: dict, stage) -> None:
+    """Add push_emulated section to reflection JSON for WebGPU consumers."""
+    if not reflection.get("push_constants"):
+        return
+
+    # The emulated push constant uniform is at the set assigned by layout_assigner
+    push_emu_set = getattr(stage, '_push_emulated_set', None)
+    if push_emu_set is None:
+        return
+
+    # Merge all push constant blocks into a single emulated uniform
+    all_fields = []
+    total_size = 0
+    for pc in reflection["push_constants"]:
+        all_fields.extend(pc["fields"])
+        total_size = max(total_size, pc["size"])
+
+    reflection["push_emulated"] = {
+        "set": push_emu_set,
+        "binding": 0,
+        "fields": all_fields,
+        "size": total_size,
+    }
 
 
 def _dump_ast(module):

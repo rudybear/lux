@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "source": "hello_triangle.lux",
+  "stage": "fragment",
+  "execution_model": "Fragment",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [
+    {
+      "name": "frag_color",
+      "type": "vec3",
+      "location": 0
+    }
+  ],
+  "outputs": [
+    {
+      "name": "color",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "descriptor_sets": {},
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "performance_hints": {
+    "instruction_count": 30,
+    "alu_ops": 0,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "low"
+  },
+  "wgsl_file": "hello_triangle.frag.wgsl"
+}

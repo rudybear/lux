@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "source": "deferred_basic.lux",
+  "stage": "vertex",
+  "execution_model": "Vertex",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [
+    {
+      "name": "frag_uv",
+      "type": "vec2",
+      "location": 0
+    }
+  ],
+  "descriptor_sets": {},
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "deferred": {
+    "pass": "lighting"
+  },
+  "performance_hints": {
+    "instruction_count": 67,
+    "alu_ops": 7,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "medium"
+  },
+  "wgsl_file": "deferred_basic.light.vert.wgsl"
+}

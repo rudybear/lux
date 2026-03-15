@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "source": "compute_reduction.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "input_data",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "output_data",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      64,
+      1,
+      1
+    ]
+  },
+  "shared_memory": [
+    {
+      "name": "scratch",
+      "type": "uint",
+      "size_bytes": 1024,
+      "array_size": 256
+    }
+  ],
+  "shared_memory_total_bytes": 1024,
+  "performance_hints": {
+    "instruction_count": 216,
+    "alu_ops": 16,
+    "texture_samples": 0,
+    "branches": 9,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  },
+  "wgsl_file": "compute_reduction.comp.wgsl"
+}

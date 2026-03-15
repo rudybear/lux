@@ -129,11 +129,13 @@ _SHADOW_ENTRY_FIELDS = [
 def generate_spirv(module: Module, stage: StageBlock, debug: bool = False, source_name: str = "",
                     assert_kill: bool = False, source_text: str = "",
                     rich_debug: bool = False,
-                    precision_map: dict[str, str] | None = None) -> str:
+                    precision_map: dict[str, str] | None = None,
+                    webgpu: bool = False) -> str:
     gen = SpvGenerator(module, stage, debug=debug, source_name=source_name)
     gen.assert_kill = assert_kill
     gen._dbg_source_text = source_text
     gen._enable_nonsemantic_debug = rich_debug
+    gen._webgpu = webgpu
     if precision_map:
         gen._precision_map = precision_map
     return gen.generate()
@@ -209,6 +211,10 @@ class SpvGenerator:
 
         # Assert kill mode: emit OpDemoteToHelperInvocation on assertion failure
         self.assert_kill: bool = False
+
+        # WebGPU compatibility mode: push constants become uniform buffers
+        self._webgpu: bool = False
+        self._push_emulated: bool = False
 
         # Auto-type precision map: var_name -> "fp16" for RelaxedPrecision decoration
         self._precision_map: dict[str, str] = {}
@@ -437,7 +443,7 @@ class SpvGenerator:
             lines.append("OpCapability SampledImageArrayNonUniformIndexing")
         if self._needs_image_query:
             lines.append("OpCapability ImageQuery")
-        if self.assert_kill and self.stage.stage_type == "fragment" and self._has_debug_printf:
+        if self.assert_kill and self.stage.stage_type == "fragment" and self._has_debug_printf and not self._webgpu:
             lines.append("OpCapability DemoteToHelperInvocationEXT")
         # StorageImageExtendedFormats needed for Rg16f, R32f, etc.
         _EXTENDED_FMTS = {"Rg16f", "Rg32f", "R16f", "R32f", "R32i", "R32ui", "R11fG11fB10f"}
@@ -455,7 +461,7 @@ class SpvGenerator:
             lines.append('OpExtension "SPV_EXT_mesh_shader"')
         if has_bindless:
             lines.append('OpExtension "SPV_EXT_descriptor_indexing"')
-        if self.assert_kill and self.stage.stage_type == "fragment" and self._has_debug_printf:
+        if self.assert_kill and self.stage.stage_type == "fragment" and self._has_debug_printf and not self._webgpu:
             lines.append('OpExtension "SPV_EXT_demote_to_helper_invocation"')
         if self._has_debug_printf or self._dbg_emitter:
             lines.append('OpExtension "SPV_KHR_non_semantic_info"')
@@ -682,6 +688,8 @@ class SpvGenerator:
                     self.decorations.append(f"OpMemberDecorate {struct_id} {i} MatrixStride 16")
 
         # --- Push constant blocks ---
+        # WebGPU mode: emit push constants as a Uniform block at set N+1
+        push_emu_set = getattr(self.stage, '_push_emulated_set', None)
         for pb in self.stage.push_constants:
             member_types = []
             for i, field in enumerate(pb.fields):
@@ -693,14 +701,31 @@ class SpvGenerator:
 
             struct_id = self.reg.struct(pb.name, member_types)
             self.push_struct_ids[pb.name] = struct_id
-            ptr_type = self.reg.pointer("PushConstant", struct_id)
-            var_id = self.reg.next_id()
-            self.global_vars.append(f"{var_id} = OpVariable {ptr_type} PushConstant")
-            self.push_var_ids[pb.name] = var_id
-            self.interface_ids.append(var_id)
-            self.interface_storage[var_id] = "PushConstant"
 
-            self.decorations.append(f"OpDecorate {struct_id} Block")
+            if self._webgpu and push_emu_set is not None:
+                # Emit as Uniform block instead of PushConstant
+                ptr_type = self.reg.pointer("Uniform", struct_id)
+                var_id = self.reg.next_id()
+                self.global_vars.append(f"{var_id} = OpVariable {ptr_type} Uniform")
+                self.push_var_ids[pb.name] = var_id
+                self.interface_ids.append(var_id)
+                self.interface_storage[var_id] = "Uniform"
+                # Tag as _push_emulated for pointer type lookups
+                self._push_emulated = True
+
+                self.decorations.append(f"OpDecorate {struct_id} Block")
+                self.decorations.append(f"OpDecorate {var_id} DescriptorSet {push_emu_set}")
+                self.decorations.append(f"OpDecorate {var_id} Binding 0")
+            else:
+                ptr_type = self.reg.pointer("PushConstant", struct_id)
+                var_id = self.reg.next_id()
+                self.global_vars.append(f"{var_id} = OpVariable {ptr_type} PushConstant")
+                self.push_var_ids[pb.name] = var_id
+                self.interface_ids.append(var_id)
+                self.interface_storage[var_id] = "PushConstant"
+
+                self.decorations.append(f"OpDecorate {struct_id} Block")
+
             offsets = compute_std140_offsets(pb.fields)
             for i, offset in enumerate(offsets):
                 self.decorations.append(f"OpMemberDecorate {struct_id} {i} Offset {offset}")
@@ -1642,7 +1667,10 @@ class SpvGenerator:
         lines.append(f"{result} = OpExtInst {void_type} {self._debug_printf_ext_id} 1 {fmt_id}")
         # Assert kill mode: demote the invocation on failure (fragment only)
         if self.assert_kill and self.stage.stage_type == "fragment":
-            lines.append("OpDemoteToHelperInvocation")
+            if self._webgpu:
+                lines.append("OpKill")
+            else:
+                lines.append("OpDemoteToHelperInvocation")
         lines.append(f"OpBranch {merge_label}")
 
         # OK block
@@ -1866,7 +1894,8 @@ class SpvGenerator:
             field_idx = self.push_field_indices[name]
             field_type = self.var_types[name]
             type_id = self.reg.lux_type_to_spirv(field_type)
-            ptr_type = self.reg.pointer("PushConstant", type_id)
+            storage_class = "Uniform" if getattr(self, '_push_emulated', False) else "PushConstant"
+            ptr_type = self.reg.pointer(storage_class, type_id)
             idx_id = self.reg.const_int(field_idx, signed=True)
             ac_id = self.reg.next_id()
             lines.append(f"{ac_id} = OpAccessChain {ptr_type} {var_id} {idx_id}")

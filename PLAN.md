@@ -34,7 +34,7 @@
 | P24 | KHR_gaussian_splatting Conformance | ✅ Complete |
 | P25 | PLY-to-glTF Converter | ✅ Complete |
 | P26 | Hybrid Rendering (RT+Splat, Mesh+Splat) | ✅ Complete (C++; Rust partial) |
-| P27 | WebGPU Backend | Designed (full spec ready) |
+| P27 | WebGPU Backend | ✅ In Progress (P27.1-P27.7 implemented) |
 | P28 | RT Gaussian Splats (Elliptic Intersections) | Research |
 
 **Test suite: 1424+ tests passing. Compiler: 160+ stdlib functions, 15 modules.**
@@ -2325,13 +2325,16 @@ Fetch preprocessed IBL binary files from server: `specular.bin` (float16 RGBA, 6
 
 #### P27.6 — Gaussian Splatting
 
-Port 3-stage splat pipeline:
+Port 4-stage splat pipeline:
 1. Preprocess compute (push constants → uniform buffer via `--webgpu`)
-2. Buffer readback via `mapAsync()` + CPU argsort in JavaScript
+2. GPU radix sort via compute shaders (histogram → prefix sum → scatter × 4 passes)
+   - Port existing `shaders/radix_sort/*.comp` to WGSL (via naga or manual)
+   - Push constants → uniform buffer for sort dispatches
+   - Ping-pong buffer pattern (A→B→A→B→A for 4 passes, result in A)
 3. Instanced quad draw (6 vertices × N visible splats)
 4. Alpha blending (premultiplied: src=ONE, dst=ONE_MINUS_SRC_ALPHA)
 
-Future: GPU radix sort via compute shaders to avoid readback latency.
+GPU radix sort is already implemented and tested in Rust/C++ viewers — direct port to WebGPU compute.
 
 #### P27.7 — Interactive Features
 

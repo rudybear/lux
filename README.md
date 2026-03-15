@@ -81,6 +81,7 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 - Auto-type precision: `--auto-type=relaxed` emits RelaxedPrecision for 2x mobile throughput
 - `@differentiable` automatic differentiation, GLSL transpiler (`--transpile`)
 - Ray tracing (`mode: raytrace`), mesh shaders (`mode: mesh_shader`), compute shaders, Gaussian splatting (`mode: gaussian_splat`), **deferred rendering** (`mode: deferred`), hybrid RT+splat / mesh+splat compositing
+- **WebGPU target** (`--target wgsl --webgpu`): SPIR-V -> WGSL via naga, push constant emulation as uniform buffers, browser-ready
 - Bindless rendering (`--bindless`), hot reload (`--watch`), feature permutations (`--all-permutations`)
 - 39 GLSL.std.450 builtins + texture sampling (7 variants) + image queries + RT/mesh/compute intrinsics
 
@@ -91,7 +92,8 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 - Static NaN analysis (`--warn-nan`), cost estimator, benchmark suite, A/B experiment runner
 
 **Ecosystem**
-- 4 rendering engines: Python/wgpu, C++/Vulkan, C++/Metal, Rust/ash — all reflection-driven
+- 5 rendering engines: Python/wgpu, C++/Vulkan, C++/Metal, Rust/ash, **WebGPU/browser** — all reflection-driven, same compiler pipeline
+- **WebGPU playground** (`playground_web/`): browser-based renderer — `.lux` compiles to SPIR-V, transpiles to WGSL via naga, loads at runtime from reflection JSON. glTF PBR, IBL cubemaps, drag-and-drop `.glb`, interactive orbit camera. No embedded shaders — same pipeline as desktop.
 - **Interactive scene editor** (`--editor`): Dear ImGui overlay with scene tree, material property sliders, pipeline hot-swap, transform inspector, viewport controls
 - AI material authoring: text-to-shader, image-to-material, video-to-animation, 5 providers
 - glTF 2.0 PBR with IBL, multi-material permutations, interactive viewers
@@ -258,6 +260,7 @@ tests/           Test suite (1424+ tests)
 playground/      Python/wgpu rendering engine + screenshot tests
 playground_cpp/  C++/Vulkan + Metal rendering engines
 playground_rust/ Rust/Vulkan rendering engine
+playground_web/  WebGPU/browser rendering engine (TypeScript + Vite)
 ```
 
 See [full project structure](docs/project-structure.md) for the complete directory tree.

@@ -165,6 +165,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Auto precision: report=analyze only, relaxed=emit OpDecorate RelaxedPrecision",
     )
     parser.add_argument(
+        "--target", choices=["spirv", "wgsl"], default="spirv",
+        help="Output target: spirv (default) or wgsl (SPIR-V -> WGSL via naga)",
+    )
+    parser.add_argument(
+        "--webgpu", action="store_true", default=False,
+        help="WebGPU compat mode (implies --target wgsl): push constants -> uniform buffer, no demote-to-helper",
+    )
+    parser.add_argument(
         "--debug-run", action="store_true",
         help="Run the shader in the CPU-side AST debugger (no GPU required)",
     )
@@ -634,6 +642,11 @@ def main(argv: list[str] | None = None) -> None:
     # --- Normal compilation ---
     from luxc.compiler import compile_source
 
+    # WebGPU implies wgsl target
+    target = args.target
+    if args.webgpu:
+        target = "wgsl"
+
     # Parse --define arguments
     defines = {}
     if args.define:
@@ -679,6 +692,8 @@ def main(argv: list[str] | None = None) -> None:
                     assert_kill=args.assert_kill,
                     rich_debug=args.rich_debug,
                     auto_type=args.auto_type,
+                    target=target,
+                    webgpu=args.webgpu,
                 )
             except Exception as e:
                 print(f"Error: {e}", file=sys.stderr)
@@ -716,6 +731,8 @@ def main(argv: list[str] | None = None) -> None:
                     assert_kill=args.assert_kill,
                     rich_debug=args.rich_debug,
                     auto_type=args.auto_type,
+                    target=target,
+                    webgpu=args.webgpu,
                 )
             except Exception as e:
                 print(f"Error (features={sorted(perm)}): {e}", file=sys.stderr)
@@ -755,6 +772,8 @@ def main(argv: list[str] | None = None) -> None:
             assert_kill=args.assert_kill,
             rich_debug=args.rich_debug,
             auto_type=args.auto_type,
+            target=target,
+            webgpu=args.webgpu,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

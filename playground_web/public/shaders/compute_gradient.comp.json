@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "source": "compute_gradient.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_image",
+        "name": "output_img",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      64,
+      1,
+      1
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 101,
+    "alu_ops": 27,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  },
+  "wgsl_file": "compute_gradient.comp.wgsl"
+}

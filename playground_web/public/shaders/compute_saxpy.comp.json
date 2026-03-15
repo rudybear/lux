@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "source": "compute_saxpy.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "x",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "y",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_buffer",
+        "name": "result",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "params",
+      "fields": [
+        {
+          "name": "a",
+          "type": "scalar",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "count",
+          "type": "scalar",
+          "offset": 4,
+          "size": 4
+        }
+      ],
+      "size": 16,
+      "stage_flags": [
+        "compute"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      64,
+      1,
+      1
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 100,
+    "alu_ops": 2,
+    "texture_samples": 0,
+    "branches": 1,
+    "function_calls": 0,
+    "vgpr_estimate": "medium"
+  },
+  "wgsl_file": "compute_saxpy.comp.wgsl",
+  "push_emulated": {
+    "set": 1,
+    "binding": 0,
+    "fields": [
+      {
+        "name": "a",
+        "type": "scalar",
+        "offset": 0,
+        "size": 4
+      },
+      {
+        "name": "count",
+        "type": "scalar",
+        "offset": 4,
+        "size": 4
+      }
+    ],
+    "size": 16
+  }
+}

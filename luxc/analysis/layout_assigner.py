@@ -5,7 +5,7 @@ from luxc.parser.ast_nodes import Module, StageBlock
 from luxc.builtins.types import resolve_type, MatrixType
 
 
-def assign_layouts(module: Module) -> None:
+def assign_layouts(module: Module, webgpu: bool = False) -> None:
     # Auto-assign descriptor set offsets for multi-stage shaders.
     # Each stage gets its own descriptor set to avoid binding conflicts.
     # Only applies if the offset wasn't already set (e.g. by surface_expander).
@@ -48,6 +48,25 @@ def assign_layouts(module: Module) -> None:
     binding_counter = 0
     for stage in module.stages:
         _assign_stage_layouts(stage, binding_counter)
+
+    # WebGPU: assign push-constant-as-uniform to set N+1
+    if webgpu:
+        for stage in module.stages:
+            if stage.push_constants:
+                # Find the max descriptor set used by this stage
+                max_set = getattr(stage, '_descriptor_set_offset', 0)
+                for ub in stage.uniforms:
+                    max_set = max(max_set, ub.set_number)
+                for sam in stage.samplers:
+                    max_set = max(max_set, sam.set_number)
+                for sb in getattr(stage, 'storage_buffers', []):
+                    max_set = max(max_set, sb.set_number)
+                for si in getattr(stage, 'storage_images', []):
+                    max_set = max(max_set, si.set_number)
+                for accel in stage.accel_structs:
+                    if accel.set_number is not None:
+                        max_set = max(max_set, accel.set_number)
+                stage._push_emulated_set = max_set + 1
 
 
 def _assign_stage_layouts(stage: StageBlock, binding_start: int) -> None:

@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "source": "compute_image.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_image",
+        "name": "output_img",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "params",
+      "fields": [
+        {
+          "name": "brightness",
+          "type": "scalar",
+          "offset": 0,
+          "size": 4
+        }
+      ],
+      "size": 16,
+      "stage_flags": [
+        "compute"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      64,
+      1,
+      1
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 70,
+    "alu_ops": 0,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "medium"
+  },
+  "wgsl_file": "compute_image.comp.wgsl",
+  "push_emulated": {
+    "set": 1,
+    "binding": 0,
+    "fields": [
+      {
+        "name": "brightness",
+        "type": "scalar",
+        "offset": 0,
+        "size": 4
+      }
+    ],
+    "size": 16
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "source": "compute_histogram.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "input_data",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "output_histogram",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      64,
+      1,
+      1
+    ]
+  },
+  "shared_memory": [
+    {
+      "name": "histogram",
+      "type": "uint",
+      "size_bytes": 1024,
+      "array_size": 256
+    }
+  ],
+  "shared_memory_total_bytes": 1024,
+  "performance_hints": {
+    "instruction_count": 61,
+    "alu_ops": 0,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "low"
+  },
+  "wgsl_file": "compute_histogram.comp.wgsl"
+}

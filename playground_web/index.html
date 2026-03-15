@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lux Playground — WebGPU</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; color: #e0e0e0; font-family: system-ui, -apple-system, sans-serif; }
+    #app { display: flex; width: 100%; height: 100%; }
+    #canvas-container { flex: 1; position: relative; }
+    canvas { width: 100%; height: 100%; display: block; }
+    #sidebar { width: 280px; background: #16213e; padding: 16px; overflow-y: auto; border-left: 1px solid #0f3460; }
+    #sidebar h2 { font-size: 14px; margin-bottom: 12px; color: #e94560; text-transform: uppercase; letter-spacing: 1px; }
+    #sidebar label { display: block; font-size: 12px; margin-top: 10px; color: #a0a0c0; }
+    #sidebar select, #sidebar input[type=range] { width: 100%; margin-top: 4px; }
+    #sidebar select { background: #0f3460; color: #e0e0e0; border: 1px solid #333; padding: 4px; border-radius: 4px; }
+    #fps { position: absolute; top: 8px; left: 8px; font-size: 12px; color: #0f0; font-family: monospace; background: rgba(0,0,0,0.5); padding: 2px 6px; border-radius: 3px; pointer-events: none; }
+    #no-webgpu { display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; max-width: 400px; }
+    #no-webgpu h1 { color: #e94560; margin-bottom: 12px; }
+    .slider-row { display: flex; align-items: center; gap: 8px; }
+    .slider-row input { flex: 1; }
+    .slider-row span { font-size: 11px; min-width: 36px; text-align: right; font-family: monospace; }
+    #drop-overlay { display: none; position: absolute; inset: 0; background: rgba(233,69,96,0.15); border: 3px dashed #e94560; z-index: 100; pointer-events: none; justify-content: center; align-items: center; font-size: 24px; color: #e94560; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="canvas-container">
+      <canvas id="canvas"></canvas>
+      <div id="fps">-- fps</div>
+      <div id="drop-overlay">Drop .glb / .gltf here</div>
+      <div id="no-webgpu">
+        <h1>WebGPU Not Available</h1>
+        <p>Your browser does not support WebGPU. Please use Chrome 113+, Firefox 130+, or Safari 18+.</p>
+      </div>
+    </div>
+    <div id="sidebar">
+      <h2>Lux Playground</h2>
+      <label for="scene-select">Scene</label>
+      <select id="scene-select">
+        <option value="damaged_helmet">Damaged Helmet</option>
+        <option value="pbr_sphere">PBR Sphere</option>
+      </select>
+
+      <label>Metallic</label>
+      <div class="slider-row">
+        <input type="range" id="metallic" min="0" max="1" step="0.01" value="0.0" />
+        <span id="metallic-val">0.00</span>
+      </div>
+
+      <label>Roughness</label>
+      <div class="slider-row">
+        <input type="range" id="roughness" min="0" max="1" step="0.01" value="0.5" />
+        <span id="roughness-val">0.50</span>
+      </div>
+
+      <label>Exposure</label>
+      <div class="slider-row">
+        <input type="range" id="exposure" min="0" max="5" step="0.05" value="1.0" />
+        <span id="exposure-val">1.00</span>
+      </div>
+
+      <label>Light Direction (Y)</label>
+      <div class="slider-row">
+        <input type="range" id="light-y" min="-1" max="1" step="0.01" value="0.7" />
+        <span id="light-y-val">0.70</span>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

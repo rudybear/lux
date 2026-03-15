@@ -1,0 +1,16 @@
+{
+  "specular": {
+    "size": 256,
+    "mipLevels": 9,
+    "format": "rgba16float"
+  },
+  "irradiance": {
+    "size": 32,
+    "format": "rgba16float"
+  },
+  "brdfLut": {
+    "width": 512,
+    "height": 512,
+    "format": "rg16float"
+  }
+}
