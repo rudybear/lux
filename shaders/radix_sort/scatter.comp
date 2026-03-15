@@ -1,35 +1,23 @@
 #version 450
 
 //
-// Radix Sort — Phase 3: Scatter
+// Radix Sort — Phase 3: Stable Scatter
 //
-// Re-reads each tile, extracts digits, and scatters key-value pairs to
-// their globally sorted positions using the prefix-summed histogram offsets.
+// Scatters key-value pairs to globally sorted positions using prefix-summed
+// histogram offsets.  Stability (equal keys preserve input order) is ensured
+// by processing elements in 15 sequential "rows" of 256 threads:
 //
-// Stability is critical for radix sort correctness: elements with the same
-// digit must maintain their relative order from the input. We achieve this
-// via a ranked scatter using per-digit atomic counters in shared memory,
-// processing elements in the same thread/iteration order as the histogram
-// phase.
+//   For each row i (0..14):
+//     - 256 threads each load one element from s_keys[local_id + i*256]
+//     - Each thread writes its digit to s_digits[local_id]
+//     - Each thread serially counts how many lower-indexed threads in this
+//       row share the same digit → deterministic intra-row rank
+//     - rank_in_tile = accumulated_offset[digit] + rank_in_row
+//     - global_position = global_offset[digit] + rank_in_tile
+//     - Scatter key and value to output
+//     - Update accumulated_offset[digit] += count of this digit in row
 //
-// Algorithm per workgroup:
-//   1. Load tile keys into shared memory, extract digits
-//   2. Build local per-digit histogram (shared memory atomics)
-//   3. Read global scatter offsets from prefix-summed histogram table
-//   4. Reset atomic counters, then re-traverse elements in same order:
-//      each element gets local_rank = atomicAdd(counter[digit], 1)
-//   5. out_index = global_offset[digit] + local_rank
-//   6. Scatter key and value to output at out_index
-//
-// Shared memory budget:
-//   s_keys:            3840 * 4 = 15,360 bytes
-//   s_local_histogram:  256 * 4 =  1,024 bytes
-//   s_global_offset:    256 * 4 =  1,024 bytes
-//   s_scatter_counter:  256 * 4 =  1,024 bytes
-//   Total:                       18,432 bytes (well within 48KB limit)
-//
-// Values are re-read from global memory during scatter (L1 cached) to
-// keep shared memory under budget.
+// This avoids atomics entirely for ranking, guaranteeing stability.
 //
 
 layout(local_size_x = 256) in;
@@ -65,10 +53,11 @@ layout(std430, binding = 4) readonly buffer Histograms {
 #define ELEMENTS_PER_THREAD 15u
 #define RADIX               256u
 
-shared uint s_keys[TILE_SIZE];              // keys for this tile
-shared uint s_local_histogram[RADIX];       // local digit frequency counts
-shared uint s_global_offset[RADIX];         // global base offset per digit
-shared uint s_scatter_counter[RADIX];       // running atomic counter for rank
+shared uint s_keys[TILE_SIZE];         // keys for this tile
+shared uint s_global_offset[RADIX];    // global base offset per digit
+shared uint s_row_offset[RADIX];       // accumulated count per digit from prior rows
+shared uint s_digits[256];             // digit for each thread in current row
+shared uint s_row_count[RADIX];        // per-digit count in current row
 
 void main() {
     uint local_id   = gl_LocalInvocationID.x;
@@ -88,50 +77,57 @@ void main() {
         }
     }
 
-    // Clear local histogram
-    s_local_histogram[local_id] = 0u;
-
-    barrier();
-
-    // ---- Step 2: Build local histogram (same traversal order as histogram.comp) ----
-    for (uint i = 0u; i < ELEMENTS_PER_THREAD; i++) {
-        uint local_idx = local_id + i * 256u;
-        if (local_idx < tile_count) {
-            uint digit = (s_keys[local_idx] >> bit_offset) & 0xFFu;
-            atomicAdd(s_local_histogram[digit], 1u);
-        }
-    }
-
-    barrier();
-
-    // ---- Step 3: Load global offset for this workgroup from prefix-summed histogram ----
-    // histograms[digit * num_groups + group_id] = global output base for this digit+block
+    // ---- Step 2: Load global offset and init row offset ----
     s_global_offset[local_id] = histograms[local_id * num_groups + group_id];
-
-    // ---- Step 4: Reset scatter counters ----
-    s_scatter_counter[local_id] = 0u;
+    s_row_offset[local_id] = 0u;
 
     barrier();
 
-    // ---- Step 5: Compute rank and scatter ----
-    // Process elements in the exact same order as step 2 to ensure stability.
-    // Each element atomically claims the next slot for its digit within this tile.
+    // ---- Step 3: Process 15 rows sequentially for stable scatter ----
     for (uint i = 0u; i < ELEMENTS_PER_THREAD; i++) {
         uint local_idx  = local_id + i * 256u;
         uint global_idx = tile_start + local_idx;
-        if (local_idx < tile_count) {
-            uint key   = s_keys[local_idx];
-            uint digit = (key >> bit_offset) & 0xFFu;
+        bool valid = (local_idx < tile_count);
 
-            // Local rank within this tile for this digit
-            uint local_rank = atomicAdd(s_scatter_counter[digit], 1u);
+        // Each thread writes its digit (or sentinel) to shared memory
+        uint digit = 0xFFFFFFFFu;
+        uint key = 0u;
+        if (valid) {
+            key = s_keys[local_idx];
+            digit = (key >> bit_offset) & 0xFFu;
+        }
+        s_digits[local_id] = digit;
+
+        barrier();
+
+        // Deterministic rank: count threads with lower ID that have same digit
+        uint rank_in_row = 0u;
+        if (valid) {
+            for (uint j = 0u; j < local_id; j++) {
+                if (s_digits[j] == digit) rank_in_row++;
+            }
 
             // Global output position
+            uint local_rank = s_row_offset[digit] + rank_in_row;
             uint out_idx = s_global_offset[digit] + local_rank;
 
             // Scatter key and value
             keys_out[out_idx] = key;
-            vals_out[out_idx] = vals_in[global_idx]; // re-read value from global memory
+            vals_out[out_idx] = vals_in[global_idx];
         }
+
+        barrier();
+
+        // Update row offsets: count occurrences of each digit in this row.
+        // Thread `local_id` updates digit `local_id` by scanning s_digits.
+        {
+            uint cnt = 0u;
+            for (uint j = 0u; j < 256u; j++) {
+                if (j < tile_count - i * 256u && s_digits[j] == local_id) cnt++;
+            }
+            s_row_offset[local_id] += cnt;
+        }
+
+        barrier();
     }
 }
