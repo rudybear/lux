@@ -2,13 +2,13 @@
 REM Render the truck PLY interactively with Gaussian splatting (C++ Vulkan engine)
 
 set PLY=C:\Users\rudyb\Downloads\point_cloud.ply
-set GLB=C:\Users\rudyb\Downloads\point_cloud_noconv.glb
+set GLB=C:\Users\rudyb\Downloads\point_cloud_khr.glb
 set PIPELINE=build\gaussian_splat_sh3
 
-REM Convert PLY if GLB doesn't exist
+REM Convert PLY if GLB doesn't exist (with SH convention conversion for KHR shaders)
 if not exist "%GLB%" (
     echo Converting PLY to GLB...
-    python tools\ply_to_gltf.py "%PLY%" "%GLB%" --no-convert
+    python tools\ply_to_gltf.py "%PLY%" "%GLB%" --no-convert --convert-sh
 )
 
 REM Always recompile shaders to pick up latest fixes

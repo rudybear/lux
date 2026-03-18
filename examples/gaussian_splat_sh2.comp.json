@@ -157,13 +157,22 @@
         "binding": 16,
         "type": "storage_buffer",
         "name": "sort_keys",
-        "element_type": "scalar",
+        "element_type": "uint",
         "stage_flags": [
           "compute"
         ]
       },
       {
         "binding": 17,
+        "type": "storage_buffer",
+        "name": "sorted_indices",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 18,
         "type": "storage_buffer",
         "name": "visible_count",
         "element_type": "uint",
@@ -277,8 +286,8 @@
     ]
   },
   "performance_hints": {
-    "instruction_count": 628,
-    "alu_ops": 187,
+    "instruction_count": 629,
+    "alu_ops": 185,
     "texture_samples": 0,
     "branches": 4,
     "function_calls": 0,

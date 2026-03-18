@@ -87,6 +87,176 @@ static std::vector<uint32_t> readIndexAccessor(const cgltf_accessor* accessor) {
 }
 
 // ===========================================================================
+// SH coefficient rotation for node transforms
+// ===========================================================================
+
+// Evaluate SH basis functions for a single degree L at direction d.
+// Constants match splat_expander.py exactly (Condon-Shortley phase convention).
+// out: array of (2*L+1) values
+static void evalSHBasisDegree(const glm::vec3& d, int L, float* out) {
+    float x = d.x, y = d.y, z = d.z;
+    switch (L) {
+    case 1: {
+        const float C1 = 0.48860251f;
+        out[0] = -C1 * y;   // sh1: Y_1^{-1}
+        out[1] =  C1 * z;   // sh2: Y_1^0
+        out[2] = -C1 * x;   // sh3: Y_1^1
+        break;
+    }
+    case 2: {
+        float x2 = x*x, y2 = y*y, z2 = z*z;
+        out[0] =  1.09254843f * x * y;                    // sh4
+        out[1] = -1.09254843f * y * z;                    // sh5
+        out[2] =  0.31539157f * (2.0f*z2 - x2 - y2);     // sh6
+        out[3] = -1.09254843f * x * z;                    // sh7
+        out[4] =  0.54627422f * (x2 - y2);                // sh8
+        break;
+    }
+    case 3: {
+        float x2 = x*x, y2 = y*y, z2 = z*z;
+        out[0] = -0.59004359f * y * (3.0f*x2 - y2);              // sh9
+        out[1] =  2.89061144f * x * y * z;                       // sh10
+        out[2] = -0.45704580f * y * (4.0f*z2 - x2 - y2);        // sh11
+        out[3] =  0.37317633f * z * (2.0f*z2 - 3.0f*x2 - 3.0f*y2); // sh12
+        out[4] = -0.45704580f * x * (4.0f*z2 - x2 - y2);        // sh13
+        out[5] =  1.44530572f * z * (x2 - y2);                   // sh14
+        out[6] = -0.59004359f * x * (x2 - 3.0f*y2);             // sh15
+        break;
+    }
+    }
+}
+
+// Solve NxN linear system via Gaussian elimination with partial pivoting.
+// aug: N x (N+1) augmented matrix [A | b], overwritten in-place.
+// x: output solution vector (N elements).
+static bool solveLinearSystem(float* aug, int N, float* x) {
+    for (int col = 0; col < N; col++) {
+        int maxRow = col;
+        float maxVal = std::abs(aug[col * (N+1) + col]);
+        for (int row = col + 1; row < N; row++) {
+            float val = std::abs(aug[row * (N+1) + col]);
+            if (val > maxVal) { maxVal = val; maxRow = row; }
+        }
+        if (maxVal < 1e-12f) return false;
+        if (maxRow != col) {
+            for (int j = col; j <= N; j++)
+                std::swap(aug[col * (N+1) + j], aug[maxRow * (N+1) + j]);
+        }
+        float pivot = aug[col * (N+1) + col];
+        for (int row = col + 1; row < N; row++) {
+            float factor = aug[row * (N+1) + col] / pivot;
+            for (int j = col; j <= N; j++)
+                aug[row * (N+1) + j] -= factor * aug[col * (N+1) + j];
+        }
+    }
+    for (int row = N - 1; row >= 0; row--) {
+        x[row] = aug[row * (N+1) + N];
+        for (int j = row + 1; j < N; j++)
+            x[row] -= aug[row * (N+1) + j] * x[j];
+        x[row] /= aug[row * (N+1) + row];
+    }
+    return true;
+}
+
+// Compute the (2L+1)x(2L+1) SH rotation matrix for degree L given rotation R.
+// The matrix M satisfies: c' = M * c, where evaluating c' with world-space
+// directions gives the same result as evaluating c with local-space directions.
+static void computeSHRotMatrix(int L, const glm::mat3& R, float* M) {
+    int N = 2 * L + 1;
+
+    // Well-distributed test directions on the unit sphere
+    const glm::vec3 rawDirs[] = {
+        {1, 0, 0}, {0, 1, 0}, {0, 0, 1},
+        {1, 1, 0}, {1, 0, 1}, {0, 1, 1}, {1, 1, 1}
+    };
+    glm::vec3 testDirs[7];
+    for (int i = 0; i < 7; i++) testDirs[i] = glm::normalize(rawDirs[i]);
+
+    // Build A[i][j] = B_j(d_i) and A_rot[i][j] = B_j(R^T * d_i)
+    std::vector<float> A(N * N), A_rot(N * N);
+    float basis[7], basis_rot[7];
+    glm::mat3 Rt = glm::transpose(R);
+
+    for (int i = 0; i < N; i++) {
+        evalSHBasisDegree(testDirs[i], L, basis);
+        evalSHBasisDegree(Rt * testDirs[i], L, basis_rot);
+        for (int j = 0; j < N; j++) {
+            A[i * N + j] = basis[j];
+            A_rot[i * N + j] = basis_rot[j];
+        }
+    }
+
+    // Solve A * M = A_rot column by column
+    std::vector<float> aug(N * (N + 1));
+    float x[7];
+    for (int col = 0; col < N; col++) {
+        for (int i = 0; i < N; i++) {
+            for (int k = 0; k < N; k++)
+                aug[i * (N+1) + k] = A[i * N + k];
+            aug[i * (N+1) + N] = A_rot[i * N + col];
+        }
+        solveLinearSystem(aug.data(), N, x);
+        for (int i = 0; i < N; i++)
+            M[i * N + col] = x[i];
+    }
+}
+
+// Rotate SH coefficients for a range of splats, for one degree.
+// startCoeff: first coefficient index (1 for L=1, 4 for L=2, 9 for L=3)
+static void rotateSHDegree(
+    const glm::mat3& R,
+    std::vector<std::vector<float>>& sh_coefficients,
+    int startCoeff, int degree,
+    size_t startSplat, size_t splatCount)
+{
+    int N = 2 * degree + 1;
+    float M[49]; // max 7x7 for degree 3
+    computeSHRotMatrix(degree, R, M);
+
+    for (size_t si = startSplat; si < startSplat + splatCount; si++) {
+        for (int ch = 0; ch < 3; ch++) {
+            float old_c[7];
+            for (int m = 0; m < N; m++) {
+                int idx = startCoeff + m;
+                if (idx < static_cast<int>(sh_coefficients.size()) &&
+                    (si * 3 + ch) < sh_coefficients[idx].size())
+                    old_c[m] = sh_coefficients[idx][si * 3 + ch];
+                else
+                    old_c[m] = 0.0f;
+            }
+            float new_c[7];
+            for (int i = 0; i < N; i++) {
+                new_c[i] = 0.0f;
+                for (int j = 0; j < N; j++)
+                    new_c[i] += M[i * N + j] * old_c[j];
+            }
+            for (int m = 0; m < N; m++) {
+                int idx = startCoeff + m;
+                if (idx < static_cast<int>(sh_coefficients.size()) &&
+                    (si * 3 + ch) < sh_coefficients[idx].size())
+                    sh_coefficients[idx][si * 3 + ch] = new_c[m];
+            }
+        }
+    }
+}
+
+// Rotate all SH coefficients for a range of splats (all applicable degrees).
+static void rotateSHCoeffs(
+    const glm::mat3& R,
+    std::vector<std::vector<float>>& sh_coefficients,
+    size_t startSplat, size_t splatCount,
+    uint32_t maxSHDegree)
+{
+    // Degree 0 is rotation-invariant (skip)
+    if (maxSHDegree >= 1 && sh_coefficients.size() > 3)
+        rotateSHDegree(R, sh_coefficients, 1, 1, startSplat, splatCount);
+    if (maxSHDegree >= 2 && sh_coefficients.size() > 8)
+        rotateSHDegree(R, sh_coefficients, 4, 2, startSplat, splatCount);
+    if (maxSHDegree >= 3 && sh_coefficients.size() > 15)
+        rotateSHDegree(R, sh_coefficients, 9, 3, startSplat, splatCount);
+}
+
+// ===========================================================================
 // Node transform
 // ===========================================================================
 
@@ -374,6 +544,7 @@ GltfScene loadGltf(const std::string& path) {
         size_t meshIndex;     // cgltf mesh index this primitive belongs to
         size_t startSplat;    // index of first splat in accumulated arrays
         size_t splatCount;    // number of splats in this primitive
+        int nodeIndex = -1;   // scene node index for per-instance transforms
     };
     std::vector<SplatPrimInfo> splatPrimInfos;
 
@@ -664,22 +835,105 @@ GltfScene loadGltf(const std::string& path) {
             }
         }
 
-        // Build mapping: cgltf mesh index -> node world transform
-        // (use the first node referencing each mesh)
-        std::unordered_map<size_t, glm::mat4> meshToWorldTransform;
+        // Build mapping: cgltf mesh index -> list of scene node indices
+        std::unordered_map<size_t, std::vector<size_t>> meshToNodeIndices;
         for (size_t ni = 0; ni < scene.nodes.size(); ni++) {
             int mi = scene.nodes[ni].meshIndex;
-            if (mi >= 0 && meshToWorldTransform.find(static_cast<size_t>(mi)) == meshToWorldTransform.end()) {
-                meshToWorldTransform[static_cast<size_t>(mi)] = scene.nodes[ni].worldTransform;
+            if (mi >= 0) {
+                meshToNodeIndices[static_cast<size_t>(mi)].push_back(ni);
             }
         }
 
-        // Apply transforms to each splat primitive's data
-        for (auto& info : splatPrimInfos) {
-            auto it = meshToWorldTransform.find(info.meshIndex);
-            if (it == meshToWorldTransform.end()) continue;
+        // For meshes referenced by multiple nodes, duplicate splat data per instance
+        {
+            size_t origNumSplats = scene.splat_data.num_splats;
+            std::vector<size_t> shFPS(scene.splat_data.sh_coefficients.size(), 0);
+            for (size_t d = 0; d < shFPS.size(); d++) {
+                if (!scene.splat_data.sh_coefficients[d].empty() && origNumSplats > 0) {
+                    shFPS[d] = scene.splat_data.sh_coefficients[d].size() / origNumSplats;
+                }
+            }
 
-            glm::mat4 world = it->second;
+            std::vector<SplatPrimInfo> expandedInfos;
+            for (auto& info : splatPrimInfos) {
+                auto it = meshToNodeIndices.find(info.meshIndex);
+                if (it == meshToNodeIndices.end() || it->second.empty()) {
+                    expandedInfos.push_back(info);
+                    continue;
+                }
+                auto& nodeList = it->second;
+
+                // First node uses existing data
+                SplatPrimInfo first = info;
+                first.nodeIndex = static_cast<int>(nodeList[0]);
+                expandedInfos.push_back(first);
+
+                if (nodeList.size() > 1) {
+                    // Copy original data into temporaries for safe self-insert
+                    std::vector<float> origPos(
+                        scene.splat_data.positions.begin() + info.startSplat * 4,
+                        scene.splat_data.positions.begin() + (info.startSplat + info.splatCount) * 4);
+                    std::vector<float> origRot(
+                        scene.splat_data.rotations.begin() + info.startSplat * 4,
+                        scene.splat_data.rotations.begin() + (info.startSplat + info.splatCount) * 4);
+                    std::vector<float> origScl(
+                        scene.splat_data.scales.begin() + info.startSplat * 3,
+                        scene.splat_data.scales.begin() + (info.startSplat + info.splatCount) * 3);
+                    std::vector<float> origOpa(
+                        scene.splat_data.opacities.begin() + info.startSplat,
+                        scene.splat_data.opacities.begin() + info.startSplat + info.splatCount);
+                    std::vector<std::vector<float>> origSH(scene.splat_data.sh_coefficients.size());
+                    for (size_t d = 0; d < origSH.size(); d++) {
+                        if (shFPS[d] > 0) {
+                            size_t s = info.startSplat * shFPS[d];
+                            size_t e = (info.startSplat + info.splatCount) * shFPS[d];
+                            origSH[d].assign(
+                                scene.splat_data.sh_coefficients[d].begin() + s,
+                                scene.splat_data.sh_coefficients[d].begin() + e);
+                        }
+                    }
+
+                    // Additional nodes: duplicate splat data
+                    for (size_t k = 1; k < nodeList.size(); k++) {
+                        SplatPrimInfo copy;
+                        copy.meshIndex = info.meshIndex;
+                        copy.nodeIndex = static_cast<int>(nodeList[k]);
+                        copy.startSplat = scene.splat_data.num_splats;
+                        copy.splatCount = info.splatCount;
+
+                        scene.splat_data.positions.insert(scene.splat_data.positions.end(),
+                            origPos.begin(), origPos.end());
+                        scene.splat_data.rotations.insert(scene.splat_data.rotations.end(),
+                            origRot.begin(), origRot.end());
+                        scene.splat_data.scales.insert(scene.splat_data.scales.end(),
+                            origScl.begin(), origScl.end());
+                        scene.splat_data.opacities.insert(scene.splat_data.opacities.end(),
+                            origOpa.begin(), origOpa.end());
+                        for (size_t d = 0; d < origSH.size(); d++) {
+                            if (!origSH[d].empty()) {
+                                scene.splat_data.sh_coefficients[d].insert(
+                                    scene.splat_data.sh_coefficients[d].end(),
+                                    origSH[d].begin(), origSH[d].end());
+                            }
+                        }
+
+                        scene.splat_data.num_splats += info.splatCount;
+                        expandedInfos.push_back(copy);
+                    }
+                }
+            }
+            splatPrimInfos = expandedInfos;
+
+            if (scene.splat_data.num_splats != origNumSplats) {
+                std::cout << "[info] Expanded multi-instance splat meshes: "
+                          << origNumSplats << " -> " << scene.splat_data.num_splats << " splats" << std::endl;
+            }
+        }
+
+        // Apply transforms to each splat entry using its specific node's world transform
+        for (auto& info : splatPrimInfos) {
+            if (info.nodeIndex < 0 || info.nodeIndex >= static_cast<int>(scene.nodes.size())) continue;
+            glm::mat4 world = scene.nodes[info.nodeIndex].worldTransform;
 
             // Check if transform is identity (skip if so)
             bool isIdentity = true;
@@ -781,6 +1035,25 @@ GltfScene loadGltf(const std::string& path) {
                 scene.splat_data.scales[base + 0] += logScale;
                 scene.splat_data.scales[base + 1] += logScale;
                 scene.splat_data.scales[base + 2] += logScale;
+            }
+
+            // Rotate SH coefficients for degrees 1+ when node has rotation
+            {
+                glm::mat3 identity(1.0f);
+                bool rotIsIdentity = true;
+                for (int c = 0; c < 3 && rotIsIdentity; c++)
+                    for (int r = 0; r < 3 && rotIsIdentity; r++)
+                        if (std::abs(rotMat[c][r] - identity[c][r]) > 1e-6f)
+                            rotIsIdentity = false;
+
+                if (!rotIsIdentity && scene.splat_data.sh_degree >= 1) {
+                    std::cout << "[info] Rotating SH coefficients (degree 1-"
+                              << scene.splat_data.sh_degree << ") for node "
+                              << info.nodeIndex << std::endl;
+                    rotateSHCoeffs(rotMat, scene.splat_data.sh_coefficients,
+                                   info.startSplat, info.splatCount,
+                                   scene.splat_data.sh_degree);
+                }
             }
         }
     }

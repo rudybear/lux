@@ -67,8 +67,21 @@ def read_accessor(gltf, bin_data, accessor_idx):
     else:
         raise ValueError(f"Unsupported componentType: {comp_type}")
 
-    data = np.frombuffer(bin_data, dtype=dtype,
-                         count=count * components, offset=offset)
+    byte_stride = bv.get('byteStride', 0)
+    elem_size = np.dtype(dtype).itemsize * components
+
+    if byte_stride and byte_stride != elem_size:
+        # Interleaved buffer: read element-by-element respecting stride
+        result = np.empty(count * components, dtype=dtype)
+        for i in range(count):
+            src_off = offset + i * byte_stride
+            elem = np.frombuffer(bin_data, dtype=dtype,
+                                 count=components, offset=src_off)
+            result[i * components:(i + 1) * components] = elem
+        data = result
+    else:
+        data = np.frombuffer(bin_data, dtype=dtype,
+                             count=count * components, offset=offset)
 
     if dtype != np.float32:
         data = data.astype(np.float32)

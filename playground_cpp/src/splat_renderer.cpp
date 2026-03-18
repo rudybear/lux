@@ -956,38 +956,124 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
     createSortPipelines(ctx.device);
     createBuffers(ctx, data);
 
-    // Default camera from bounding box
+    // Robust camera from IQR-based bounds (handles outlier splats)
     if (data.num_splats > 0) {
+        uint32_t n = data.num_splats;
+
+        // Collect per-axis coordinates
+        std::vector<float> xs(n), ys(n), zs(n);
         glm::vec3 minB(1e9f), maxB(-1e9f);
-        for (uint32_t i = 0; i < data.num_splats; ++i) {
-            float x = data.positions[i * 4 + 0];
-            float y = data.positions[i * 4 + 1];
-            float z = data.positions[i * 4 + 2];
-            minB = glm::min(minB, glm::vec3(x, y, z));
-            maxB = glm::max(maxB, glm::vec3(x, y, z));
+        for (uint32_t i = 0; i < n; ++i) {
+            xs[i] = data.positions[i * 4 + 0];
+            ys[i] = data.positions[i * 4 + 1];
+            zs[i] = data.positions[i * 4 + 2];
+            minB = glm::min(minB, glm::vec3(xs[i], ys[i], zs[i]));
+            maxB = glm::max(maxB, glm::vec3(xs[i], ys[i], zs[i]));
         }
-        glm::vec3 center = (minB + maxB) * 0.5f;
-        float radius = glm::length(maxB - minB) * 0.5f;
-        if (radius < 0.001f) radius = 1.0f;
 
-        camPos_ = center + glm::vec3(0.0f, radius * 0.5f, radius * 2.5f);
-        float aspect = static_cast<float>(width) / static_cast<float>(height);
-        float fov = glm::radians(45.0f);
-        viewMatrix_ = glm::lookAt(camPos_, center, glm::vec3(0.0f, 1.0f, 0.0f));
-        projMatrix_ = glm::perspective(fov, aspect, 0.01f, radius * 10.0f);
-        projMatrix_[1][1] *= -1.0f; // Vulkan Y-flip
+        float fullRadius = glm::length(maxB - minB) * 0.5f;
+        if (fullRadius < 0.001f) fullRadius = 1.0f;
 
-        // Focal lengths: fy = h/(2*tan(fov_y/2)), fx = w/(2*tan(fov_x/2))
-        // For square pixels: fx = fy = h/(2*tan(fov_y/2))
-        focalY_ = 0.5f * static_cast<float>(height) / tanf(fov * 0.5f);
-        focalX_ = focalY_;  // square pixels
+        // Use IQR camera only for large scenes with significant outliers
+        // (IQR extent < 50% of full bbox extent = lots of sky/background splats)
+        bool useIqr = false;
+        float maxIqrExt = 0.0f;
+        if (n >= 1000) {
+            std::sort(xs.begin(), xs.end());
+            std::sort(ys.begin(), ys.end());
+            std::sort(zs.begin(), zs.end());
+            uint32_t p25 = n * 25 / 100, p75 = n * 75 / 100;
+            glm::vec3 extent(xs[p75] - xs[p25], ys[p75] - ys[p25], zs[p75] - zs[p25]);
+            maxIqrExt = glm::max(extent.x, glm::max(extent.y, extent.z));
+            float fullExtent = glm::max(maxB.x - minB.x, glm::max(maxB.y - minB.y, maxB.z - minB.z));
+            useIqr = (maxIqrExt > 0.001f && maxIqrExt < fullExtent * 0.25f);
+        }
 
-        std::cout << "[info] Splat bounds: min=(" << minB.x << "," << minB.y << "," << minB.z
-                  << ") max=(" << maxB.x << "," << maxB.y << "," << maxB.z
-                  << ") center=(" << center.x << "," << center.y << "," << center.z
-                  << ") radius=" << radius
-                  << " cam=(" << camPos_.x << "," << camPos_.y << "," << camPos_.z
-                  << ") shBufs=" << data.sh_coefficients.size() << std::endl;
+        if (!useIqr) {
+            glm::vec3 center = (minB + maxB) * 0.5f;
+            glm::vec3 extent = maxB - minB;
+            // Detect flat/planar scenes: if one axis has near-zero extent,
+            // place camera perpendicular to the plane for a straight-on view.
+            // Otherwise, add a slight Y elevation for a more natural viewing angle.
+            glm::vec3 camOffset;
+            glm::vec3 upVec(0.0f, 1.0f, 0.0f);
+            float maxExt = glm::max(extent.x, glm::max(extent.y, extent.z));
+            if (extent.z < maxExt * 0.01f) {
+                // Flat in Z — place camera along +Z axis (looking at XY plane)
+                camOffset = glm::vec3(0.0f, 0.0f, fullRadius * 2.5f);
+            } else if (extent.y < maxExt * 0.01f) {
+                // Flat in Y — place camera along +Y axis
+                camOffset = glm::vec3(0.0f, fullRadius * 3.0f, 0.0f);
+                upVec = glm::vec3(0.0f, 0.0f, -1.0f);
+            } else if (extent.x < maxExt * 0.01f) {
+                // Flat in X — place camera along +X axis
+                camOffset = glm::vec3(fullRadius * 3.0f, 0.0f, 0.0f);
+            } else {
+                // 3D scene — use elevated camera
+                camOffset = glm::vec3(0.0f, fullRadius * 0.5f, fullRadius * 2.5f);
+            }
+            camPos_ = center + camOffset;
+            float aspect = static_cast<float>(width) / static_cast<float>(height);
+            float fov = glm::radians(45.0f);
+            viewMatrix_ = glm::lookAt(camPos_, center, upVec);
+            projMatrix_ = glm::perspective(fov, aspect, 0.01f, fullRadius * 10.0f);
+            projMatrix_[1][1] *= -1.0f;
+            focalY_ = 0.5f * static_cast<float>(height) / tanf(fov * 0.5f);
+            focalX_ = focalY_;
+            std::cout << "[info] Splat bounds: min=(" << minB.x << "," << minB.y << "," << minB.z
+                      << ") max=(" << maxB.x << "," << maxB.y << "," << maxB.z
+                      << ") center=(" << center.x << "," << center.y << "," << center.z
+                      << ") radius=" << fullRadius
+                      << " cam=(" << camPos_.x << "," << camPos_.y << "," << camPos_.z
+                      << ") shBufs=" << data.sh_coefficients.size() << std::endl;
+        } else {
+            // IQR-based robust camera for large real-world scenes
+            // (xs, ys, zs already sorted above)
+            uint32_t p25 = n * 25 / 100, p75 = n * 75 / 100;
+            glm::vec3 center(xs[n / 2], ys[n / 2], zs[n / 2]);
+            glm::vec3 extent(xs[p75] - xs[p25], ys[p75] - ys[p25], zs[p75] - zs[p25]);
+
+            // Detect up axis (shortest IQR extent)
+            int upIdx = 1; // default Y-up
+            glm::vec3 upVec(0.0f, 1.0f, 0.0f);
+            if (extent.y <= extent.x && extent.y <= extent.z) {
+                upIdx = 1; upVec = glm::vec3(0.0f, -1.0f, 0.0f); // Y shortest, COLMAP Y-down
+            } else if (extent.z <= extent.x && extent.z <= extent.y) {
+                upIdx = 2; upVec = glm::vec3(0.0f, 0.0f, 1.0f);
+            } else {
+                upIdx = 0; upVec = glm::vec3(1.0f, 0.0f, 0.0f);
+            }
+
+            float maxIqr = glm::max(extent.x, glm::max(extent.y, extent.z));
+            if (maxIqr < 0.001f) maxIqr = 1.0f;
+            float camDist = maxIqr * 0.4f;
+
+            // Build eye offset on ground axes with slight elevation
+            glm::vec3 off(0.0f);
+            int groundAxes[2];
+            int gi = 0;
+            for (int i = 0; i < 3; ++i) {
+                if (i != upIdx) groundAxes[gi++] = i;
+            }
+            off[groundAxes[0]] = camDist * 0.7f;
+            off[groundAxes[1]] = camDist * 0.7f;
+            off[upIdx] = extent[upIdx] * 0.1f;
+            camPos_ = center + off;
+
+            float aspect = static_cast<float>(width) / static_cast<float>(height);
+            float fov = glm::radians(45.0f);
+            viewMatrix_ = glm::lookAt(camPos_, center, upVec);
+            projMatrix_ = glm::perspective(fov, aspect, 0.01f, fullRadius * 5.0f);
+            projMatrix_[1][1] *= -1.0f;
+            focalY_ = 0.5f * static_cast<float>(height) / tanf(fov * 0.5f);
+            focalX_ = focalY_;
+
+            std::cout << "[info] Splat IQR camera: center=(" << center.x << "," << center.y << "," << center.z
+                      << ") extent=(" << extent.x << "," << extent.y << "," << extent.z
+                      << ") iqr=" << maxIqr << " up=" << upIdx
+                      << " cam=(" << camPos_.x << "," << camPos_.y << "," << camPos_.z
+                      << ") shBufs=" << data.sh_coefficients.size() << std::endl;
+        }
     }
 
     std::cout << "[info] SplatRenderer initialized: " << numSplats_ << " splats, "

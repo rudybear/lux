@@ -37,7 +37,7 @@
 | P27 | WebGPU Backend | ✅ In Progress (P27.1-P27.7 implemented) |
 | P28 | RT Gaussian Splats (Elliptic Intersections) | Research |
 
-**Test suite: 1424+ tests passing. Compiler: 160+ stdlib functions, 15 modules.**
+**Test suite: 1462+ tests passing. Compiler: 160+ stdlib functions, 15 modules.**
 
 ---
 

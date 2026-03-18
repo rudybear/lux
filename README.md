@@ -66,7 +66,7 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 
 **Language**
 - Declarative `surface` + `geometry` + `pipeline` blocks expand to full shader stages; `mode: deferred` auto-generates G-buffer geometry + fullscreen lighting passes from the same declarations
-- **Gaussian splatting**: first-class `splat` declaration — one block generates a complete 3-stage pipeline (compute preprocess, instanced vertex, alpha-composited fragment), SH degrees 0–3, CPU depth sorting, glTF `KHR_gaussian_splatting`, **hybrid rendering** (splats composited with raster, ray tracing, or mesh shaders), interactive orbit viewers in all engines
+- **Gaussian splatting**: first-class `splat` declaration — one block generates a complete 3-stage pipeline (compute preprocess, instanced vertex, alpha-composited fragment), SH degrees 0–3, **GPU radix sort** (4-pass parallel prefix sum, stable scatter), Jacobian clamping for wide-angle perspective correction, glTF `KHR_gaussian_splatting`, **hybrid rendering** (splats composited with raster, ray tracing, or mesh shaders), interactive orbit viewers in all engines
 - **OpenPBR Surface v1.1**: `import openpbr;` enables the full Adobe/ASWF material model — F82-tint metal Fresnel, energy-preserving Oren-Nayar diffuse, coat darkening, fuzz, thin-film iridescence, transmission with volume absorption, 9 composable layers, bindless uber-shader support, schedule-based quality tiers (desktop/mobile fast variants)
 - Layered surfaces with `layers [base, normal_map, sheen, coat, emission, ibl]` — unified `compose_pbr_layers` compositing, energy conservation, raster + RT from one declaration
 - `lighting` blocks separate illumination from material response; multi-light with shadows

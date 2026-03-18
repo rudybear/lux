@@ -223,10 +223,6 @@ def _cull_writes() -> list:
     output buffers, causing flickering / garbage in the render pass.
     """
     zero4 = _ctor("vec4", [_lit("0.0"), _lit("0.0"), _lit("0.0"), _lit("0.0")])
-    # Culled splats get max uint sort key so they sort to the end.
-    # sorted_indices must also be reset to identity — otherwise stale permuted
-    # values from a previous frame's sort cause visible splats to be rendered
-    # twice (once correctly, once at end via stale reference → "disco" flicker).
     return [
         _assign_idx("projected_center", _ref("gid"), zero4),
         _assign_idx("projected_conic", _ref("gid"), zero4),
@@ -344,11 +340,9 @@ def _build_preprocess_body(config: dict) -> list:
 
     # --- Transform rotation matrix to view space ---
     # The 3DGS covariance projection requires Sigma_view = V * Sigma_world * V^T
-    # where V is the 3x3 view rotation.  Instead of computing world-space cov and
-    # then transforming, we transform the rotation columns first:
+    # where V is the 3x3 view rotation.  Transform rotation columns first:
     #   vr_col_k = V * rot_col_k  (mat4 * vec4 with w=0 to transform direction)
-    # Then cov_view = (VR * S) * (VR * S)^T, using the same formula as cov3d
-    # but with view-space rotation elements vr_ij.
+    # Then cov_view = (VR * S) * (VR * S)^T
     for col in range(3):
         body.append(_let(f"vr_col{col}", "vec3",
             _swizzle(
@@ -390,26 +384,40 @@ def _build_preprocess_body(config: dict) -> list:
     body.append(_let("cov3d_12", "scalar", _cov3d_elem(1, 2)))
     body.append(_let("cov3d_22", "scalar", _cov3d_elem(2, 2)))
 
-    # --- Project view-space covariance to 2D screen space ---
+    # --- Project 3D covariance to 2D screen space ---
     # Standard 3DGS Jacobian with positive depth t = -vz:
     #   J = [[focal_x / t, 0, -focal_x * x / t^2],
     #        [0, focal_y / t, -focal_y * y / t^2]]
-    # Since cov3d is already in view space, cov2d = J * cov3d * J^T
     body.append(_let("vz", "scalar", _swizzle(_ref("view_pos"), "z")))
-    body.append(_let("vx", "scalar", _swizzle(_ref("view_pos"), "x")))
-    body.append(_let("vy", "scalar", _swizzle(_ref("view_pos"), "y")))
     # Use positive depth (objects have negative vz, so t = -vz > 0)
     body.append(_let("t", "scalar", _neg(_ref("vz"))))
     body.append(_let("t2", "scalar", _binop("*", _ref("t"), _ref("t"))))
     body.append(_let("fx", "scalar", _push_field("focal_x")))
     body.append(_let("fy", "scalar", _push_field("focal_y")))
 
-    # Jacobian: maps view-space (X-right, Y-up, Z-out) to pixel-space (Y-down).
-    # sx = fx * vx / t           → ∂sx/∂vx = fx/t,  ∂sx/∂vz = fx*vx/t²
-    # sy = -fy * vy / t (Y-flip) → ∂sy/∂vy = -fy/t, ∂sy/∂vz = -fy*vy/t²
-    # Note: reference 3DGS uses Z-forward (tz>0) convention where the signs
-    # differ.  Our Z-out convention (vz<0, t=-vz) flips ∂/∂vz signs, and
-    # the Y-down pixel convention flips the Y-row signs.
+    # Clamp view-space x/y for Jacobian computation (reference 3DGS trick).
+    # Prevents extreme perspective distortion for splats at wide angles.
+    # limx = 1.3 * (screen_w / (2 * fx)) * t  ≈ 1.3 * tan(fov_x/2) * depth
+    body.append(_let("half_sw", "scalar",
+        _binop("*", _lit("0.5"), _swizzle(_push_field("screen_size"), "x"))))
+    body.append(_let("half_sh", "scalar",
+        _binop("*", _lit("0.5"), _swizzle(_push_field("screen_size"), "y"))))
+    body.append(_let("limx", "scalar",
+        _binop("*", _lit("1.3"), _binop("*",
+            _binop("/", _ref("half_sw"), _ref("fx")), _ref("t")))))
+    body.append(_let("limy", "scalar",
+        _binop("*", _lit("1.3"), _binop("*",
+            _binop("/", _ref("half_sh"), _ref("fy")), _ref("t")))))
+    body.append(_let("vx", "scalar",
+        _call("clamp", [_swizzle(_ref("view_pos"), "x"),
+                        _neg(_ref("limx")), _ref("limx")])))
+    body.append(_let("vy", "scalar",
+        _call("clamp", [_swizzle(_ref("view_pos"), "y"),
+                        _neg(_ref("limy")), _ref("limy")])))
+
+    # Jacobian elements for Vulkan Y-down NDC convention.
+    # NDC: sx = fx*vx/t, sy = -fy*vy/t  (proj matrix flips Y)
+    # ∂sx/∂vz = fx*vx/t², ∂sy/∂vy = -fy/t, ∂sy/∂vz = -fy*vy/t²
     body.append(_let("j00", "scalar", _binop("/", _ref("fx"), _ref("t"))))
     body.append(_let("j02", "scalar",
         _binop("/", _binop("*", _ref("fx"), _ref("vx")), _ref("t2"))))
@@ -482,10 +490,10 @@ def _build_preprocess_body(config: dict) -> list:
 
     body.append(_let("inv_det", "scalar", _binop("/", _lit("1.0"), _ref("det"))))
 
-    # Conic = inverse of 2D covariance (symmetric 2x2).
-    # Standard 2x2 inverse: [[c11, -c01], [-c01, c00]] / det
-    # The Jacobian already maps to Y-down pixel space (j11 = -fy/t), so the
-    # covariance is in pixel-space and the standard inverse formula applies.
+    # Conic = inverse of 2D covariance (symmetric 2x2):
+    #   conic.x = cov2d_11f * inv_det
+    #   conic.y = -cov2d_01 * inv_det
+    #   conic.z = cov2d_00f * inv_det
     body.append(_let("conic_x", "scalar",
         _binop("*", _ref("cov2d_11f"), _ref("inv_det"))))
     body.append(_let("conic_y", "scalar",
@@ -511,19 +519,11 @@ def _build_preprocess_body(config: dict) -> list:
     body.append(_let("raw_radius", "scalar",
         _call("ceil", [_binop("*", _lit("3.0"),
                                _call("sqrt", [_ref("lambda_max")]))])))
-    # Clamp radius to prevent huge background splats from dominating
+    # Clamp radius to screen size (prevents excessively large quads)
     body.append(_let("radius", "scalar",
-        _call("min", [_ref("raw_radius"), _lit("256.0")])))
-
-    # Cull splats whose projected size is excessively large (background sky/noise).
-    # Splats covering more than 1/8 of the screen are almost always background.
-    body.append(_if(
-        _binop(">", _ref("radius"),
-               _binop("*", _lit("0.25"),
-                      _call("min", [_swizzle(_push_field("screen_size"), "x"),
-                                    _swizzle(_push_field("screen_size"), "y")]))),
-        _cull_writes() + [ReturnStmt(None)],
-    ))
+        _call("min", [_ref("raw_radius"),
+               _call("max", [_swizzle(_push_field("screen_size"), "x"),
+                              _swizzle(_push_field("screen_size"), "y")])])))
 
     # --- Project center to NDC ---
     # let clip_pos = push.proj_matrix * vec4(view_pos, 1.0);
@@ -601,16 +601,11 @@ def _build_preprocess_body(config: dict) -> list:
         _ctor("vec4", [_ref("clamped_r"), _ref("clamped_g"), _ref("clamped_b"), _ref("opacity")])))
 
     # --- Sort key: convert float depth to sortable uint for GPU radix sort ---
-    # float_bits_to_uint gives the IEEE 754 bit pattern.  Negative floats have
-    # reversed ordering in uint, so we flip: negative → ~bits, positive → flip
-    # sign bit.  Result: uint comparison preserves float ordering (ascending).
     body.append(_let("key_bits", "uint", _call("float_bits_to_uint", [_ref("vz")])))
-    # sign_mask = (key_bits >> 31) * 0xFFFFFFFF  (all-ones if negative)
     body.append(_let("sign_mask", "uint",
         _binop("*",
             _binop(">>", _ref("key_bits"), _uint_lit("31")),
             _uint_lit("4294967295"))))
-    # sort_key = key_bits ^ (sign_mask | 0x80000000)
     body.append(_let("sort_key", "uint",
         _binop("^", _ref("key_bits"),
             _binop("|", _ref("sign_mask"), _uint_lit("2147483648")))))
@@ -633,7 +628,7 @@ def _build_sh_evaluation(sh_degree: int) -> list:
     """
     stmts = []
 
-    # Direction from camera to splat (matches 3DGS reference convention).
+    # Direction from camera to splat (matches reference 3DGS convention).
     # Odd-degree SH basis functions are odd functions of direction — sign matters.
     # let cam_dir = normalize(world_pos - push.cam_pos);
     stmts.append(_let("cam_dir", "vec3",

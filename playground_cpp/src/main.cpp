@@ -601,7 +601,13 @@ static int runHeadless(const CLIOptions& opts) {
         std::unique_ptr<IRenderer> renderer;
         if (hasSplatRenderer) {
             auto* splatR = scene.getSplatRenderer();
-            syncSplatCamera();
+
+            // For hybrid scenes, sync splat camera to scene auto-camera.
+            // For pure splat scenes, keep the splat renderer's own camera
+            // (computed from splat bounding box with Z-forward view).
+            if (isHybrid) {
+                syncSplatCamera();
+            }
 
             if (isHybridRaster) {
                 // Hybrid raster + splat: full color + depth compositing

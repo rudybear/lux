@@ -481,7 +481,8 @@ def read_accessor(gltf, bin_data, accessor_idx):
 # ---------------------------------------------------------------------------
 
 def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
-                convert_coords=True, raw_opacity=False, raw_scale=False,
+                convert_coords=True, convert_sh=True,
+                raw_opacity=False, raw_scale=False,
                 do_center=False, decimate_count=None, quiet=False):
     """Convert PLY to glTF (.glb) with KHR_gaussian_splatting.
 
@@ -490,6 +491,7 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
         gltf_path: Output GLB file path.
         sh_degree: SH degree override (None = auto-detect).
         convert_coords: If True, convert Z-up to Y-up (default True).
+        convert_sh: If True, convert SH coefficients from 3DGS to KHR convention (default True).
         raw_opacity: If True, skip opacity sigmoid transform.
         raw_scale: If True, skip scale exp transform.
         do_center: If True, center point cloud at origin.
@@ -607,6 +609,27 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
 
         # Transpose to coefficient-first: (N, coeffs_per_channel, 3_rgb)
         rest_data = rest_data.transpose(0, 2, 1)
+
+        # Apply SH convention conversion: 3DGS -> KHR
+        #
+        # 3DGS trains with direction d' = camera-to-splat and Condon-Shortley phase.
+        # KHR shader evaluates with direction d = splat-to-camera (d = -d').
+        # Combined direction flip + CS phase differences require:
+        #   Degree 1, coef 1 (Y_1^0, Z component): negate
+        #   Degree 2: no change (even parity cancels direction flip, same CS phase)
+        #   Degree 3, all 7 coefficients: negate (odd parity direction flip)
+        if convert_sh:
+            coeff_offset = 0
+            for l in range(1, sh_degree + 1):
+                num_c = 2 * l + 1
+                if l == 1:
+                    rest_data[:, coeff_offset + 1, :] *= -1  # Y_1^0
+                elif l == 3:
+                    for ci in range(num_c):
+                        rest_data[:, coeff_offset + ci, :] *= -1
+                coeff_offset += num_c
+            if not quiet:
+                print("Applied SH convention conversion (3DGS -> KHR)")
 
         # Split by degree and create individual VEC3 buffers per coefficient
         coeff_idx = 0
@@ -922,6 +945,12 @@ Examples:
     coord_group.add_argument('--no-convert', action='store_false', dest='convert',
                              help='Skip coordinate conversion')
 
+    sh_group = parser.add_mutually_exclusive_group()
+    sh_group.add_argument('--convert-sh', action='store_true', default=True,
+                          help='Convert SH coefficients from 3DGS to KHR convention (default)')
+    sh_group.add_argument('--no-convert-sh', action='store_false', dest='convert_sh',
+                          help='Skip SH convention conversion (data already in KHR convention)')
+
     parser.add_argument('--raw-opacity', action='store_true', default=False,
                         help='Skip sigmoid opacity transform (PLY already in linear [0,1])')
     parser.add_argument('--raw-scale', action='store_true', default=False,
@@ -971,6 +1000,7 @@ def main(argv=None):
             output_dir=args.output_dir,
             sh_degree=args.sh_degree,
             convert_coords=args.convert,
+            convert_sh=args.convert_sh,
             raw_opacity=args.raw_opacity,
             raw_scale=args.raw_scale,
             do_center=args.center,
@@ -989,6 +1019,7 @@ def main(argv=None):
         args.input, args.output,
         sh_degree=args.sh_degree,
         convert_coords=args.convert,
+        convert_sh=args.convert_sh,
         raw_opacity=args.raw_opacity,
         raw_scale=args.raw_scale,
         do_center=args.center,
