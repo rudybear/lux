@@ -39,13 +39,13 @@ The compiler expands this into fully typed vertex + fragment SPIR-V — no manua
 <p align="center"><em>Left/center: Gaussian splatting — first-class <code>splat</code> declaration, 3-stage pipeline (compute + vertex + fragment), SH color, 2D Gaussian alpha compositing, interactive orbit camera in C++/Rust/Python. Right: glTF PBR ray tracing — one surface declaration generates both raster and RT pipelines.</em></p>
 
 <p align="center">
-<img src="screenshots/khr_splat_conformance/Depths.png" width="150">
-<img src="screenshots/khr_splat_conformance/MixedDegrees.png" width="150">
-<img src="screenshots/khr_splat_conformance/ShGrid.png" width="150">
 <img src="screenshots/khr_splat_conformance/RotationsX.png" width="150">
-<img src="screenshots/khr_splat_conformance/Scales.png" width="150">
+<img src="screenshots/khr_splat_conformance/RotationsZ.png" width="150">
+<img src="screenshots/khr_splat_conformance/MixedDegrees.png" width="150">
+<img src="screenshots/khr_splat_conformance/ScalesX.png" width="150">
+<img src="screenshots/khr_splat_conformance/Depths.png" width="150">
 </p>
-<p align="center"><em>KHR_gaussian_splatting conformance: all 11 official Khronos test scenes pass — SH degrees 0–3, rotations, scales, depth ordering, hybrid mesh+splat rendering</em></p>
+<p align="center"><em>KHR_gaussian_splatting conformance: all 13 official Khronos test scenes — rotations, scales, SH degrees 0–3, depth ordering, hybrid mesh+splat rendering. GPU radix sort, Jacobian clamping, view-space covariance projection.</em></p>
 
 <p align="center">
 <img src="screenshots/hybrid/hybrid_raster_splat.png" width="250">
