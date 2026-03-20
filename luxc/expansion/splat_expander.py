@@ -28,8 +28,9 @@ from luxc.parser.ast_nodes import (
     NumberLit, VarRef, BinaryOp, CallExpr, ConstructorExpr,
     SwizzleAccess, UnaryOp,
     AssignTarget, IndexAccess, FieldAccess,
-    StorageBufferDecl, IfStmt, DiscardStmt,
+    StorageBufferDecl, IfStmt, DiscardStmt, ForStmt, BreakStmt,
     SplatDecl, SplatMember,
+    RayPayloadDecl, HitAttributeDecl, AccelDecl, StorageImageDecl,
 )
 
 
@@ -1297,3 +1298,648 @@ def expand_splat_pipeline(
     fragment_stage._splat_name = splat.name
 
     return [compute_stage, vertex_stage, fragment_stage]
+
+
+# ---------------------------------------------------------------------------
+# RT Gaussian Splatting (3DGRT)
+# ---------------------------------------------------------------------------
+
+def expand_splat_rt_pipeline(
+    splat: SplatDecl,
+    pipeline,  # PipelineDecl
+    module: Module,
+) -> list[StageBlock]:
+    """Expand a splat declaration + RT pipeline into four RT shader stages.
+
+    Uses the 3DGRT algorithm: analytical ray-Gaussian intersection with
+    multi-round closest-hit accumulation in the raygen shader.
+
+    Returns [intersection, closest_hit, miss, raygen].
+    """
+    config = _get_splat_config(splat)
+    sh_degree = config["sh_degree"]
+
+    if sh_degree not in (0, 1, 2, 3):
+        raise ValueError(
+            f"Unsupported SH degree {sh_degree} in splat '{splat.name}'. "
+            f"Valid values are 0, 1, 2, or 3."
+        )
+
+    intersection = _build_rt_intersection_stage(config)
+    closest_hit = _build_rt_closest_hit_stage()
+    miss = _build_rt_miss_stage()
+    raygen = _build_rt_raygen_stage(config)
+
+    # Tag all stages with splat metadata for reflection.
+    # RT splat uses two descriptor sets: set 0 for raygen (camera, tlas,
+    # image, SH buffers), set 1 for intersection (splat geometry SSBOs).
+    # closest_hit and miss have no descriptors, but assign set 0 so the
+    # layout assigner doesn't auto-assign conflicting set numbers.
+    for stage in [intersection, closest_hit, miss, raygen]:
+        stage._splat_config = config
+        stage._splat_name = splat.name
+    raygen._descriptor_set_offset = 0
+    intersection._descriptor_set_offset = 1
+    closest_hit._descriptor_set_offset = 0
+    miss._descriptor_set_offset = 0
+
+    return [intersection, closest_hit, miss, raygen]
+
+
+def _build_rt_intersection_stage(config: dict) -> StageBlock:
+    """Generate the intersection shader for 3DGRT ray-Gaussian test.
+
+    Reads Gaussian parameters from SSBOs, transforms ray into local space,
+    computes analytical peak response tau_max, evaluates density, and
+    reports intersection if alpha exceeds cutoff.
+    """
+    stage = StageBlock(stage_type="intersection")
+
+    # Storage buffers for Gaussian attributes (read-only)
+    stage.storage_buffers.append(StorageBufferDecl("splat_pos", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("splat_rot", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("splat_scale", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("splat_opacity", "scalar"))
+
+    # Hit attribute: pass alpha to closest-hit shader
+    stage.hit_attributes.append(HitAttributeDecl("hit_alpha", "scalar"))
+
+    body = []
+
+    # --- Read Gaussian parameters using primitive_id ---
+    body.append(_let("gid", "uint", _ref("primitive_id")))
+    body.append(_let("center", "vec3",
+        _swizzle(_idx("splat_pos", _ref("gid")), "xyz")))
+    body.append(_let("raw_opacity", "scalar",
+        _idx("splat_opacity", _ref("gid"))))
+    # Sigmoid activation: opacity = 1.0 / (1.0 + exp(-raw_opacity))
+    body.append(_let("opacity", "scalar",
+        _binop("/", _lit("1.0"),
+               _binop("+", _lit("1.0"),
+                      _call("exp", [_neg(_ref("raw_opacity"))])))))
+
+    # --- Read rotation quaternion and build rotation matrix (R) ---
+    body.append(_let("quat", "vec4", _idx("splat_rot", _ref("gid"))))
+    body.append(_let("qr", "scalar", _swizzle(_ref("quat"), "w")))
+    body.append(_let("qi", "scalar", _swizzle(_ref("quat"), "x")))
+    body.append(_let("qj", "scalar", _swizzle(_ref("quat"), "y")))
+    body.append(_let("qk", "scalar", _swizzle(_ref("quat"), "z")))
+
+    # Precompute quadratic products
+    body.append(_let("qi2", "scalar", _binop("*", _ref("qi"), _ref("qi"))))
+    body.append(_let("qj2", "scalar", _binop("*", _ref("qj"), _ref("qj"))))
+    body.append(_let("qk2", "scalar", _binop("*", _ref("qk"), _ref("qk"))))
+    body.append(_let("qri", "scalar", _binop("*", _ref("qr"), _ref("qi"))))
+    body.append(_let("qrj", "scalar", _binop("*", _ref("qr"), _ref("qj"))))
+    body.append(_let("qrk", "scalar", _binop("*", _ref("qr"), _ref("qk"))))
+    body.append(_let("qij", "scalar", _binop("*", _ref("qi"), _ref("qj"))))
+    body.append(_let("qik", "scalar", _binop("*", _ref("qi"), _ref("qk"))))
+    body.append(_let("qjk", "scalar", _binop("*", _ref("qj"), _ref("qk"))))
+
+    # Rotation matrix rows (same pattern as _build_preprocess_body)
+    body.append(_let("rot_00", "scalar",
+        _binop("-", _lit("1.0"),
+               _binop("*", _lit("2.0"),
+                      _binop("+", _ref("qj2"), _ref("qk2"))))))
+    body.append(_let("rot_01", "scalar",
+        _binop("*", _lit("2.0"),
+               _binop("-", _ref("qij"), _ref("qrk")))))
+    body.append(_let("rot_02", "scalar",
+        _binop("*", _lit("2.0"),
+               _binop("+", _ref("qik"), _ref("qrj")))))
+    body.append(_let("rot_10", "scalar",
+        _binop("*", _lit("2.0"),
+               _binop("+", _ref("qij"), _ref("qrk")))))
+    body.append(_let("rot_11", "scalar",
+        _binop("-", _lit("1.0"),
+               _binop("*", _lit("2.0"),
+                      _binop("+", _ref("qi2"), _ref("qk2"))))))
+    body.append(_let("rot_12", "scalar",
+        _binop("*", _lit("2.0"),
+               _binop("-", _ref("qjk"), _ref("qri")))))
+    body.append(_let("rot_20", "scalar",
+        _binop("*", _lit("2.0"),
+               _binop("-", _ref("qik"), _ref("qrj")))))
+    body.append(_let("rot_21", "scalar",
+        _binop("*", _lit("2.0"),
+               _binop("+", _ref("qjk"), _ref("qri")))))
+    body.append(_let("rot_22", "scalar",
+        _binop("-", _lit("1.0"),
+               _binop("*", _lit("2.0"),
+                      _binop("+", _ref("qi2"), _ref("qj2"))))))
+
+    # --- Read scale (log-scale -> exp) ---
+    body.append(_let("log_scale", "vec3",
+        _swizzle(_idx("splat_scale", _ref("gid")), "xyz")))
+    body.append(_let("sx", "scalar",
+        _call("exp", [_swizzle(_ref("log_scale"), "x")])))
+    body.append(_let("sy", "scalar",
+        _call("exp", [_swizzle(_ref("log_scale"), "y")])))
+    body.append(_let("sz", "scalar",
+        _call("exp", [_swizzle(_ref("log_scale"), "z")])))
+
+    # --- Transform ray to Gaussian-local space ---
+    # o_local = R^T * (ray_origin - center)
+    body.append(_let("ro", "vec3",
+        _binop("-", _ref("world_ray_origin"), _ref("center"))))
+
+    # R^T * ro (transpose multiply: dot each row of R^T = each column of R)
+    def _dot3(ax, ay, az, bx, by, bz):
+        return _binop("+",
+            _binop("+",
+                _binop("*", _ref(ax), _ref(bx)),
+                _binop("*", _ref(ay), _ref(by))),
+            _binop("*", _ref(az), _ref(bz)))
+
+    body.append(_let("o_lx", "scalar",
+        _dot3("rot_00", "rot_10", "rot_20", "ro_x", "ro_y", "ro_z")))
+    # Need to extract ro components first
+    # Actually, let me extract components before the dot products
+    body.pop()  # remove premature o_lx
+
+    body.append(_let("ro_x", "scalar", _swizzle(_ref("ro"), "x")))
+    body.append(_let("ro_y", "scalar", _swizzle(_ref("ro"), "y")))
+    body.append(_let("ro_z", "scalar", _swizzle(_ref("ro"), "z")))
+
+    # o_local = R^T * ro
+    body.append(_let("o_lx", "scalar",
+        _dot3("rot_00", "rot_10", "rot_20", "ro_x", "ro_y", "ro_z")))
+    body.append(_let("o_ly", "scalar",
+        _dot3("rot_01", "rot_11", "rot_21", "ro_x", "ro_y", "ro_z")))
+    body.append(_let("o_lz", "scalar",
+        _dot3("rot_02", "rot_12", "rot_22", "ro_x", "ro_y", "ro_z")))
+
+    # d_local = R^T * ray_direction
+    body.append(_let("rd_x", "scalar",
+        _swizzle(_ref("world_ray_direction"), "x")))
+    body.append(_let("rd_y", "scalar",
+        _swizzle(_ref("world_ray_direction"), "y")))
+    body.append(_let("rd_z", "scalar",
+        _swizzle(_ref("world_ray_direction"), "z")))
+
+    body.append(_let("d_lx", "scalar",
+        _dot3("rot_00", "rot_10", "rot_20", "rd_x", "rd_y", "rd_z")))
+    body.append(_let("d_ly", "scalar",
+        _dot3("rot_01", "rot_11", "rot_21", "rd_x", "rd_y", "rd_z")))
+    body.append(_let("d_lz", "scalar",
+        _dot3("rot_02", "rot_12", "rot_22", "rd_x", "rd_y", "rd_z")))
+
+    # --- Scale to unit Gaussian: o_g = o_local / S, d_g = d_local / S ---
+    body.append(_let("o_gx", "scalar", _binop("/", _ref("o_lx"), _ref("sx"))))
+    body.append(_let("o_gy", "scalar", _binop("/", _ref("o_ly"), _ref("sy"))))
+    body.append(_let("o_gz", "scalar", _binop("/", _ref("o_lz"), _ref("sz"))))
+    body.append(_let("d_gx", "scalar", _binop("/", _ref("d_lx"), _ref("sx"))))
+    body.append(_let("d_gy", "scalar", _binop("/", _ref("d_ly"), _ref("sy"))))
+    body.append(_let("d_gz", "scalar", _binop("/", _ref("d_lz"), _ref("sz"))))
+
+    # --- Compute tau_max = -dot(o_g, d_g) / dot(d_g, d_g) ---
+    body.append(_let("od_dot", "scalar",
+        _binop("+",
+            _binop("+",
+                _binop("*", _ref("o_gx"), _ref("d_gx")),
+                _binop("*", _ref("o_gy"), _ref("d_gy"))),
+            _binop("*", _ref("o_gz"), _ref("d_gz")))))
+    body.append(_let("dd_dot", "scalar",
+        _binop("+",
+            _binop("+",
+                _binop("*", _ref("d_gx"), _ref("d_gx")),
+                _binop("*", _ref("d_gy"), _ref("d_gy"))),
+            _binop("*", _ref("d_gz"), _ref("d_gz")))))
+
+    body.append(_let("tau_max", "scalar",
+        _binop("/", _neg(_ref("od_dot")), _ref("dd_dot"))))
+
+    # --- Evaluate density at peak ---
+    # p = o_g + tau_max * d_g
+    body.append(_let("p_x", "scalar",
+        _binop("+", _ref("o_gx"), _binop("*", _ref("tau_max"), _ref("d_gx")))))
+    body.append(_let("p_y", "scalar",
+        _binop("+", _ref("o_gy"), _binop("*", _ref("tau_max"), _ref("d_gy")))))
+    body.append(_let("p_z", "scalar",
+        _binop("+", _ref("o_gz"), _binop("*", _ref("tau_max"), _ref("d_gz")))))
+
+    # rho = exp(-0.5 * dot(p, p))
+    body.append(_let("p_dot", "scalar",
+        _binop("+",
+            _binop("+",
+                _binop("*", _ref("p_x"), _ref("p_x")),
+                _binop("*", _ref("p_y"), _ref("p_y"))),
+            _binop("*", _ref("p_z"), _ref("p_z")))))
+    body.append(_let("rho", "scalar",
+        _call("exp", [_binop("*", _lit("-0.5"), _ref("p_dot"))])))
+
+    # alpha = opacity * rho
+    body.append(_let("alpha", "scalar",
+        _binop("*", _ref("opacity"), _ref("rho"))))
+
+    # --- Report intersection if alpha > cutoff ---
+    alpha_cutoff = config["alpha_cutoff"]
+    body.append(_if(
+        _binop(">", _ref("alpha"), _lit(str(alpha_cutoff))),
+        [
+            _assign("hit_alpha", _ref("alpha")),
+            ExprStmt(CallExpr(VarRef("report_intersection"), [
+                _ref("tau_max"),
+                _uint_lit("0"),  # hit_kind
+            ])),
+        ],
+    ))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
+def _build_rt_closest_hit_stage() -> StageBlock:
+    """Generate the closest-hit shader for RT Gaussian splatting.
+
+    Packs hit data into the vec4 payload:
+      .x = hit_t, .y = float(primitive_id), .z = alpha, .w = 1.0
+    """
+    stage = StageBlock(stage_type="closest_hit")
+
+    # Incoming ray payload
+    stage.ray_payloads.append(RayPayloadDecl("payload", "vec4"))
+
+    # Hit attribute from intersection shader
+    stage.hit_attributes.append(HitAttributeDecl("hit_alpha", "scalar"))
+
+    body = []
+
+    # Pack hit data into payload
+    body.append(_assign("payload",
+        _ctor("vec4", [
+            _ref("hit_t"),
+            _binop("*", _ref("primitive_id"), _lit("1.0")),  # uint -> float
+            _ref("hit_alpha"),
+            _lit("1.0"),  # hit indicator
+        ])))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
+def _build_rt_miss_stage() -> StageBlock:
+    """Generate the miss shader for RT Gaussian splatting.
+
+    Writes vec4(0) to payload (w=0 signals miss).
+    """
+    stage = StageBlock(stage_type="miss")
+
+    # Incoming ray payload
+    stage.ray_payloads.append(RayPayloadDecl("payload", "vec4"))
+
+    body = []
+    body.append(_assign("payload",
+        _ctor("vec4", [_lit("0.0"), _lit("0.0"), _lit("0.0"), _lit("0.0")])))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
+def _build_rt_raygen_stage(config: dict) -> StageBlock:
+    """Generate the raygen shader for RT Gaussian splatting.
+
+    Camera ray computation followed by a multi-round trace loop:
+    each iteration traces, extracts hit data, evaluates SH for color,
+    accumulates with alpha compositing, and advances tmin.
+    """
+    stage = StageBlock(stage_type="raygen")
+    sh_degree = config["sh_degree"]
+
+    # Acceleration structure
+    stage.accel_structs.append(AccelDecl("tlas"))
+
+    # Ray payload
+    stage.ray_payloads.append(RayPayloadDecl("payload", "vec4"))
+
+    # Camera uniform
+    stage.uniforms.append(UniformBlock("Camera", [
+        BlockField("inv_view", "mat4"),
+        BlockField("inv_proj", "mat4"),
+    ]))
+
+    # Output storage image
+    stage.storage_images.append(StorageImageDecl("result_color"))
+
+    # SH coefficient buffers (read-only)
+    for sh_name in _sh_buffer_names(sh_degree):
+        stage.storage_buffers.append(StorageBufferDecl(sh_name, "vec4"))
+
+    # Splat positions (needed for SH direction computation)
+    stage.storage_buffers.append(StorageBufferDecl("splat_pos", "vec4"))
+
+    body = []
+
+    # --- Camera ray computation (reuse pattern from surface_expander._expand_raygen) ---
+    body.append(LetStmt("pixel", "vec2",
+        ConstructorExpr("vec2", [SwizzleAccess(VarRef("launch_id"), "xy")])))
+    body.append(LetStmt("dims", "vec2",
+        ConstructorExpr("vec2", [SwizzleAccess(VarRef("launch_size"), "xy")])))
+    body.append(LetStmt("ndc", "vec2", BinaryOp("-",
+        BinaryOp("*",
+            BinaryOp("/",
+                BinaryOp("+", VarRef("pixel"),
+                         ConstructorExpr("vec2", [NumberLit("0.5")])),
+                VarRef("dims")),
+            NumberLit("2.0")),
+        ConstructorExpr("vec2", [NumberLit("1.0")]),
+    )))
+
+    # Initialize payload
+    body.append(AssignStmt(
+        AssignTarget(VarRef("payload")),
+        ConstructorExpr("vec4", [NumberLit("0.0")]),
+    ))
+
+    # Camera ray from inverse matrices
+    body.append(LetStmt("target", "vec4", BinaryOp("*",
+        VarRef("inv_proj"),
+        ConstructorExpr("vec4", [
+            SwizzleAccess(VarRef("ndc"), "x"),
+            SwizzleAccess(VarRef("ndc"), "y"),
+            NumberLit("1.0"),
+            NumberLit("1.0"),
+        ]),
+    )))
+    body.append(LetStmt("direction", "vec4", BinaryOp("*",
+        VarRef("inv_view"),
+        ConstructorExpr("vec4", [
+            CallExpr(VarRef("normalize"), [SwizzleAccess(VarRef("target"), "xyz")]),
+            NumberLit("0.0"),
+        ]),
+    )))
+    body.append(LetStmt("origin", "vec3", SwizzleAccess(
+        BinaryOp("*", VarRef("inv_view"),
+                 ConstructorExpr("vec4", [
+                     NumberLit("0.0"), NumberLit("0.0"),
+                     NumberLit("0.0"), NumberLit("1.0"),
+                 ])),
+        "xyz",
+    )))
+    body.append(LetStmt("dir", "vec3",
+        CallExpr(VarRef("normalize"), [
+            SwizzleAccess(VarRef("direction"), "xyz")])))
+
+    # --- Accumulation state ---
+    body.append(_let("accum_r", "scalar", _lit("0.0")))
+    body.append(_let("accum_g", "scalar", _lit("0.0")))
+    body.append(_let("accum_b", "scalar", _lit("0.0")))
+    body.append(_let("transmittance", "scalar", _lit("1.0")))
+    body.append(_let("t_min", "scalar", _lit("0.001")))
+
+    # --- Multi-round trace loop (max 32 iterations) ---
+    loop_body = []
+
+    # Reset payload before trace
+    loop_body.append(_assign("payload",
+        _ctor("vec4", [_lit("0.0"), _lit("0.0"), _lit("0.0"), _lit("0.0")])))
+
+    # trace_ray(tlas, 0, 255, 0, 0, 0, origin, t_min, dir, 10000.0, 0)
+    loop_body.append(ExprStmt(CallExpr(VarRef("trace_ray"), [
+        VarRef("tlas"),
+        NumberLit("0"),     # ray_flags
+        NumberLit("255"),   # cull_mask
+        NumberLit("0"),     # sbt_offset
+        NumberLit("0"),     # sbt_stride
+        NumberLit("0"),     # miss_index
+        VarRef("origin"),
+        VarRef("t_min"),
+        VarRef("dir"),
+        NumberLit("10000.0"),  # tmax
+        NumberLit("0"),     # payload location
+    ])))
+
+    # Check for miss: payload.w == 0.0
+    loop_body.append(_if(
+        _binop("<", _swizzle(_ref("payload"), "w"), _lit("0.5")),
+        [BreakStmt()],
+    ))
+
+    # Extract hit data
+    loop_body.append(_let("hit_t", "scalar", _swizzle(_ref("payload"), "x")))
+    loop_body.append(_let("gid", "scalar", _swizzle(_ref("payload"), "y")))
+    loop_body.append(_let("alpha", "scalar", _swizzle(_ref("payload"), "z")))
+
+    # --- SH evaluation (direction = ray dir, already normalized) ---
+    # cam_dir is the view direction (from camera toward splat)
+    loop_body.append(_let("cam_dir", "vec3", _ref("dir")))
+
+    sh_stmts = _build_rt_sh_evaluation(sh_degree)
+    loop_body.extend(sh_stmts)
+
+    # --- Alpha compositing ---
+    # accum_color += transmittance * alpha * sh_color
+    loop_body.append(_assign("accum_r",
+        _binop("+", _ref("accum_r"),
+            _binop("*", _ref("transmittance"),
+                _binop("*", _ref("alpha"),
+                    _swizzle(_ref("sh_color"), "x"))))))
+    loop_body.append(_assign("accum_g",
+        _binop("+", _ref("accum_g"),
+            _binop("*", _ref("transmittance"),
+                _binop("*", _ref("alpha"),
+                    _swizzle(_ref("sh_color"), "y"))))))
+    loop_body.append(_assign("accum_b",
+        _binop("+", _ref("accum_b"),
+            _binop("*", _ref("transmittance"),
+                _binop("*", _ref("alpha"),
+                    _swizzle(_ref("sh_color"), "z"))))))
+
+    # Update transmittance
+    loop_body.append(_assign("transmittance",
+        _binop("*", _ref("transmittance"),
+            _binop("-", _lit("1.0"), _ref("alpha")))))
+
+    # Early termination on near-opaque
+    loop_body.append(_if(
+        _binop("<", _ref("transmittance"), _lit("0.003")),
+        [BreakStmt()],
+    ))
+
+    # Advance t_min past this hit
+    loop_body.append(_assign("t_min",
+        _binop("+", _ref("hit_t"), _lit("0.0001"))))
+
+    # ForStmt: for (int i = 0; i < 32; i = i + 1) { ... }
+    body.append(ForStmt(
+        loop_var="i",
+        loop_var_type="int",
+        init_value=_lit("0"),
+        condition=_binop("<", _ref("i"), _lit("32")),
+        update_target=AssignTarget(_ref("i")),
+        update_value=_binop("+", _ref("i"), _lit("1")),
+        body=loop_body,
+    ))
+
+    # --- Store result to output image ---
+    # Alpha = 1.0 (opaque output); accumulated color already premultiplied.
+    # Background pixels (no splat hits) have accum=0, giving opaque black.
+    body.append(ExprStmt(CallExpr(VarRef("image_store"), [
+        VarRef("result_color"),
+        SwizzleAccess(VarRef("launch_id"), "xy"),
+        ConstructorExpr("vec4", [
+            VarRef("accum_r"),
+            VarRef("accum_g"),
+            VarRef("accum_b"),
+            NumberLit("1.0"),
+        ]),
+    ])))
+
+    stage.functions.append(FunctionDef("main", [], None, body))
+    return stage
+
+
+def _build_rt_sh_evaluation(sh_degree: int) -> list:
+    """Generate SH evaluation statements for the RT raygen shader.
+
+    Unlike _build_sh_evaluation(), this variant:
+    - Expects ``cam_dir`` and ``gid`` to already be defined in scope
+    - Returns only the SH computation statements + final ``sh_color``
+    """
+    stmts = []
+
+    # Degree 0: DC term
+    stmts.append(_let("sh0_val", "vec3",
+        _swizzle(_idx("splat_sh0", _ref("gid")), "xyz")))
+    stmts.append(_let("sh_color_0", "vec3",
+        _binop("+",
+               _binop("*", _lit("0.28209479"), _ref("sh0_val")),
+               _ctor("vec3", [_lit("0.5"), _lit("0.5"), _lit("0.5")]))))
+
+    if sh_degree == 0:
+        stmts.append(_let("sh_color", "vec3", _ref("sh_color_0")))
+        return stmts
+
+    # Direction components
+    stmts.append(_let("dx", "scalar", _swizzle(_ref("cam_dir"), "x")))
+    stmts.append(_let("dy", "scalar", _swizzle(_ref("cam_dir"), "y")))
+    stmts.append(_let("dz", "scalar", _swizzle(_ref("cam_dir"), "z")))
+
+    # Degree 1
+    stmts.append(_let("sh1_val", "vec3",
+        _swizzle(_idx("splat_sh1", _ref("gid")), "xyz")))
+    stmts.append(_let("sh2_val", "vec3",
+        _swizzle(_idx("splat_sh2", _ref("gid")), "xyz")))
+    stmts.append(_let("sh3_val", "vec3",
+        _swizzle(_idx("splat_sh3", _ref("gid")), "xyz")))
+
+    stmts.append(_let("sh_color_1", "vec3",
+        _binop("+", _ref("sh_color_0"),
+               _binop("+",
+                      _binop("+",
+                             _binop("*", _lit("-0.48860251"),
+                                    _binop("*", _ref("dy"), _ref("sh1_val"))),
+                             _binop("*", _lit("0.48860251"),
+                                    _binop("*", _ref("dz"), _ref("sh2_val")))),
+                      _binop("*", _lit("-0.48860251"),
+                             _binop("*", _ref("dx"), _ref("sh3_val")))))))
+
+    if sh_degree == 1:
+        stmts.append(_let("sh_color", "vec3", _ref("sh_color_1")))
+        return stmts
+
+    # Degree 2
+    stmts.append(_let("sh4_val", "vec3",
+        _swizzle(_idx("splat_sh4", _ref("gid")), "xyz")))
+    stmts.append(_let("sh5_val", "vec3",
+        _swizzle(_idx("splat_sh5", _ref("gid")), "xyz")))
+    stmts.append(_let("sh6_val", "vec3",
+        _swizzle(_idx("splat_sh6", _ref("gid")), "xyz")))
+    stmts.append(_let("sh7_val", "vec3",
+        _swizzle(_idx("splat_sh7", _ref("gid")), "xyz")))
+    stmts.append(_let("sh8_val", "vec3",
+        _swizzle(_idx("splat_sh8", _ref("gid")), "xyz")))
+
+    stmts.append(_let("dx2", "scalar", _binop("*", _ref("dx"), _ref("dx"))))
+    stmts.append(_let("dy2", "scalar", _binop("*", _ref("dy"), _ref("dy"))))
+    stmts.append(_let("dz2", "scalar", _binop("*", _ref("dz"), _ref("dz"))))
+    stmts.append(_let("dxy", "scalar", _binop("*", _ref("dx"), _ref("dy"))))
+    stmts.append(_let("dyz", "scalar", _binop("*", _ref("dy"), _ref("dz"))))
+    stmts.append(_let("dxz", "scalar", _binop("*", _ref("dx"), _ref("dz"))))
+
+    stmts.append(_let("sh_deg2", "vec3",
+        _binop("+",
+            _binop("+",
+                _binop("+",
+                    _binop("*", _binop("*", _lit("1.09254843"), _ref("dxy")), _ref("sh4_val")),
+                    _binop("*", _binop("*", _lit("-1.09254843"), _ref("dyz")), _ref("sh5_val"))),
+                _binop("+",
+                    _binop("*", _binop("*", _lit("0.31539157"),
+                        _binop("-", _binop("*", _lit("2.0"), _ref("dz2")),
+                               _binop("+", _ref("dx2"), _ref("dy2")))),
+                        _ref("sh6_val")),
+                    _binop("*", _binop("*", _lit("-1.09254843"), _ref("dxz")), _ref("sh7_val")))),
+            _binop("*", _binop("*", _lit("0.54627422"),
+                _binop("-", _ref("dx2"), _ref("dy2"))),
+                _ref("sh8_val")))))
+
+    stmts.append(_let("sh_color_2", "vec3",
+        _binop("+", _ref("sh_color_1"), _ref("sh_deg2"))))
+
+    if sh_degree == 2:
+        stmts.append(_let("sh_color", "vec3", _ref("sh_color_2")))
+        return stmts
+
+    # Degree 3
+    for i in range(9, 16):
+        stmts.append(_let(f"sh{i}_val", "vec3",
+            _swizzle(_idx(f"splat_sh{i}", _ref("gid")), "xyz")))
+
+    stmts.append(_let("dx3", "scalar", _binop("*", _ref("dx2"), _ref("dx"))))
+    stmts.append(_let("dy3", "scalar", _binop("*", _ref("dy2"), _ref("dy"))))
+    stmts.append(_let("dz3", "scalar", _binop("*", _ref("dz2"), _ref("dz"))))
+
+    stmts.append(_let("sh_deg3_a", "vec3",
+        _binop("+",
+            _binop("+",
+                _binop("*",
+                    _binop("*", _lit("-0.59004359"),
+                        _binop("*", _ref("dy"),
+                            _binop("-", _binop("*", _lit("3.0"), _ref("dx2")), _ref("dy2")))),
+                    _ref("sh9_val")),
+                _binop("*",
+                    _binop("*", _lit("2.89061144"),
+                        _binop("*", _ref("dx"), _binop("*", _ref("dy"), _ref("dz")))),
+                    _ref("sh10_val"))),
+            _binop("*",
+                _binop("*", _lit("-0.45704580"),
+                    _binop("*", _ref("dy"),
+                        _binop("-", _binop("*", _lit("4.0"), _ref("dz2")),
+                            _binop("+", _ref("dx2"), _ref("dy2"))))),
+                _ref("sh11_val")))))
+
+    stmts.append(_let("sh_deg3_b", "vec3",
+        _binop("+",
+            _binop("+",
+                _binop("*",
+                    _binop("*", _lit("0.37317633"),
+                        _binop("*", _ref("dz"),
+                            _binop("-", _binop("*", _lit("2.0"), _ref("dz2")),
+                                _binop("*", _lit("3.0"),
+                                    _binop("+", _ref("dx2"), _ref("dy2")))))),
+                    _ref("sh12_val")),
+                _binop("*",
+                    _binop("*", _lit("-0.45704580"),
+                        _binop("*", _ref("dx"),
+                            _binop("-", _binop("*", _lit("4.0"), _ref("dz2")),
+                                _binop("+", _ref("dx2"), _ref("dy2"))))),
+                    _ref("sh13_val"))),
+            _binop("+",
+                _binop("*",
+                    _binop("*", _lit("1.44530572"),
+                        _binop("*", _ref("dz"),
+                            _binop("-", _ref("dx2"), _ref("dy2")))),
+                    _ref("sh14_val")),
+                _binop("*",
+                    _binop("*", _lit("-0.59004359"),
+                        _binop("*", _ref("dx"),
+                            _binop("-", _ref("dx2"), _binop("*", _lit("3.0"), _ref("dy2"))))),
+                    _ref("sh15_val"))))))
+
+    stmts.append(_let("sh_deg3", "vec3",
+        _binop("+", _ref("sh_deg3_a"), _ref("sh_deg3_b"))))
+
+    stmts.append(_let("sh_color", "vec3",
+        _binop("+", _ref("sh_color_2"), _ref("sh_deg3"))))
+
+    return stmts

@@ -66,7 +66,7 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 
 **Language**
 - Declarative `surface` + `geometry` + `pipeline` blocks expand to full shader stages; `mode: deferred` auto-generates G-buffer geometry + fullscreen lighting passes from the same declarations
-- **Gaussian splatting**: first-class `splat` declaration — one block generates a complete 3-stage pipeline (compute preprocess, instanced vertex, alpha-composited fragment), SH degrees 0–3, **GPU radix sort** (4-pass parallel prefix sum, stable scatter), Jacobian clamping for wide-angle perspective correction, glTF `KHR_gaussian_splatting`, **hybrid rendering** (splats composited with raster, ray tracing, or mesh shaders), interactive orbit viewers in all engines
+- **Gaussian splatting**: first-class `splat` declaration — one block generates a complete 3-stage pipeline (compute preprocess, instanced vertex, alpha-composited fragment), SH degrees 0–3, **GPU radix sort** (4-pass parallel prefix sum, stable scatter), Jacobian clamping for wide-angle perspective correction, glTF `KHR_gaussian_splatting`, **hybrid rendering** (splats composited with raster, ray tracing, or mesh shaders), interactive orbit viewers in all engines. **RT splatting** (`mode: raytrace` + `splat:`) generates a 4-stage 3DGRT pipeline (intersection + closest_hit + miss + raygen) with analytical ray-Gaussian intersection, AABB BLAS, and multi-round alpha compositing
 - **OpenPBR Surface v1.1**: `import openpbr;` enables the full Adobe/ASWF material model — F82-tint metal Fresnel, energy-preserving Oren-Nayar diffuse, coat darkening, fuzz, thin-film iridescence, transmission with volume absorption, 9 composable layers, bindless uber-shader support, schedule-based quality tiers (desktop/mobile fast variants)
 - Layered surfaces with `layers [base, normal_map, sheen, coat, emission, ibl]` — unified `compose_pbr_layers` compositing, energy conservation, raster + RT from one declaration
 - `lighting` blocks separate illumination from material response; multi-light with shadows
@@ -80,7 +80,7 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 - Built-in optimizer: mem2reg, AST-level inlining, CSE, constant vector hoisting — **21.7% fewer instructions than hand-written GLSL** out of the box
 - Auto-type precision: `--auto-type=relaxed` emits RelaxedPrecision for 2x mobile throughput
 - `@differentiable` automatic differentiation, GLSL transpiler (`--transpile`)
-- Ray tracing (`mode: raytrace`), mesh shaders (`mode: mesh_shader`), compute shaders, Gaussian splatting (`mode: gaussian_splat`), **deferred rendering** (`mode: deferred`), hybrid RT+splat / mesh+splat compositing
+- Ray tracing (`mode: raytrace`), mesh shaders (`mode: mesh_shader`), compute shaders, Gaussian splatting (`mode: gaussian_splat`), **RT Gaussian splatting** (`mode: raytrace` + `splat:`), **deferred rendering** (`mode: deferred`), hybrid RT+splat / mesh+splat compositing
 - **WebGPU target** (`--target wgsl --webgpu`): SPIR-V -> WGSL via naga, push constant emulation as uniform buffers, browser-ready
 - Bindless rendering (`--bindless`), hot reload (`--watch`), feature permutations (`--all-permutations`)
 - 39 GLSL.std.450 builtins + texture sampling (7 variants) + image queries + RT/mesh/compute intrinsics
@@ -144,6 +144,9 @@ python -m luxc examples/deferred_basic.lux
 
 # Compile a Gaussian splat pipeline (compute + vertex + fragment)
 python -m luxc examples/gaussian_splat.lux
+
+# Compile an RT Gaussian splat pipeline (4 RT stages: raygen + intersection + closest_hit + miss)
+python -m luxc examples/gaussian_splat_rt.lux
 
 # Optimize with spirv-opt
 python -m luxc examples/hello_triangle.lux -O
@@ -228,7 +231,7 @@ input.lux
   -> Import Resolver      (stdlib + local .lux modules)
   -> Surface Expander     (surface/geometry/pipeline -> stage blocks)
   -> Deferred Expander    (mode: deferred -> G-buffer + lighting passes)
-  -> Splat Expander       (splat/gaussian_splat -> compute + vertex + fragment)
+  -> Splat Expander       (splat/gaussian_splat -> compute + vertex + fragment, or raytrace -> 4 RT stages)
   -> Autodiff Expander    (@differentiable -> gradient functions)
   -> Type Checker         (resolve types, check operators, validate semantic types)
   -> Debug Stripper       (remove debug_print/assert/@[debug] in release)
@@ -301,6 +304,7 @@ See [full project structure](docs/project-structure.md) for the complete directo
 | `compute_reduction.lux` | Parallel reduction: barrier-synchronized tree sum with shared memory |
 | `debug_features_demo.lux` | Debug instrumentation: `debug_print`, `assert`, `@[debug]` blocks, semantic types, `any_nan`/`any_inf` |
 | `gaussian_splat.lux` | Gaussian splatting: `splat` declaration, 3-stage pipeline (compute + vertex + fragment) |
+| `gaussian_splat_rt.lux` | RT Gaussian splatting (3DGRT): `mode: raytrace` + `splat:`, 4-stage RT pipeline (intersection + closest_hit + miss + raygen) |
 | `openpbr_reference.lux` | OpenPBR ASWF reference: car paint (coat + specular, exact values from OpenPBR viewer) |
 | `openpbr_ref_aluminum.lux` | OpenPBR ASWF reference: brushed aluminum (metalness=1, specular color tint) |
 | `openpbr_ref_pearl.lux` | OpenPBR ASWF reference: pearl (coat + thin-film iridescence) |

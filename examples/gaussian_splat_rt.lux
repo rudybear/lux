@@ -1,0 +1,15 @@
+// RT Gaussian Splatting — 3DGRT algorithm
+// Generates intersection + closest_hit + miss + raygen shaders
+// Uses analytical ray-Gaussian intersection with multi-round accumulation
+
+splat GaussianCloud {
+    sh_degree: 3,
+    kernel: ellipse,
+    color_space: srgb,
+    alpha_cutoff: 0.004,
+}
+
+pipeline RTGaussian {
+    mode: raytrace,
+    splat: GaussianCloud,
+}

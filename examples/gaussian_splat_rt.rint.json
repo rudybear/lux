@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "source": "gaussian_splat_rt.lux",
+  "stage": "intersection",
+  "execution_model": "IntersectionKHR",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "1": [
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "splat_pos",
+        "element_type": "vec4",
+        "stage_flags": [
+          "intersection"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "splat_rot",
+        "element_type": "vec4",
+        "stage_flags": [
+          "intersection"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_buffer",
+        "name": "splat_scale",
+        "element_type": "vec4",
+        "stage_flags": [
+          "intersection"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "storage_buffer",
+        "name": "splat_opacity",
+        "element_type": "scalar",
+        "stage_flags": [
+          "intersection"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "hit_attributes": [
+    {
+      "name": "hit_alpha",
+      "type": "scalar"
+    }
+  ],
+  "gaussian_splatting_rt": {
+    "splat_name": "GaussianCloud",
+    "sh_degree": 3,
+    "kernel": "ellipse",
+    "color_space": "srgb",
+    "alpha_cutoff": 0.004
+  },
+  "performance_hints": {
+    "instruction_count": 248,
+    "alu_ops": 95,
+    "texture_samples": 0,
+    "branches": 1,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

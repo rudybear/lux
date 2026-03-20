@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "source": "gaussian_splat_rt.lux",
+  "stage": "closest_hit",
+  "execution_model": "ClosestHitKHR",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {},
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "ray_payloads": [
+    {
+      "name": "payload",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "hit_attributes": [
+    {
+      "name": "hit_alpha",
+      "type": "scalar"
+    }
+  ],
+  "gaussian_splatting_rt": {
+    "splat_name": "GaussianCloud",
+    "sh_degree": 3,
+    "kernel": "ellipse",
+    "color_space": "srgb",
+    "alpha_cutoff": 0.004
+  },
+  "performance_hints": {
+    "instruction_count": 72,
+    "alu_ops": 0,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "medium"
+  }
+}

@@ -2559,9 +2559,15 @@ class SpvGenerator:
 
         if fname == "report_intersection":
             # report_intersection(hit_t, hit_kind) -> bool
+            # hit_kind must be uint; convert float literal 0.0 to uint 0 if needed
             bool_type = self.reg.bool_type()
+            hit_kind_id = arg_ids[1]
+            # Check if arg is a float constant and convert to uint
+            hit_kind_arg = expr.args[1] if len(expr.args) > 1 else None
+            if hit_kind_arg is not None and isinstance(hit_kind_arg, NumberLit):
+                hit_kind_id = self.reg.const_uint(int(float(hit_kind_arg.value)))
             result = self.reg.next_id()
-            lines.append(f"{result} = OpReportIntersectionKHR {bool_type} {arg_ids[0]} {arg_ids[1]}")
+            lines.append(f"{result} = OpReportIntersectionKHR {bool_type} {arg_ids[0]} {hit_kind_id}")
             return result, lines
 
         if fname == "execute_callable":

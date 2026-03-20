@@ -1,0 +1,250 @@
+{
+  "version": 1,
+  "source": "gaussian_splat_rt.lux",
+  "stage": "raygen",
+  "execution_model": "RayGenerationKHR",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "uniform_buffer",
+        "name": "Camera",
+        "fields": [
+          {
+            "name": "inv_view",
+            "type": "mat4",
+            "offset": 0,
+            "size": 64
+          },
+          {
+            "name": "inv_proj",
+            "type": "mat4",
+            "offset": 64,
+            "size": 64
+          }
+        ],
+        "size": 128,
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "acceleration_structure",
+        "name": "tlas",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_image",
+        "name": "result_color",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "storage_buffer",
+        "name": "splat_sh0",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "storage_buffer",
+        "name": "splat_sh1",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 5,
+        "type": "storage_buffer",
+        "name": "splat_sh2",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 6,
+        "type": "storage_buffer",
+        "name": "splat_sh3",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 7,
+        "type": "storage_buffer",
+        "name": "splat_sh4",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 8,
+        "type": "storage_buffer",
+        "name": "splat_sh5",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 9,
+        "type": "storage_buffer",
+        "name": "splat_sh6",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 10,
+        "type": "storage_buffer",
+        "name": "splat_sh7",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 11,
+        "type": "storage_buffer",
+        "name": "splat_sh8",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 12,
+        "type": "storage_buffer",
+        "name": "splat_sh9",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 13,
+        "type": "storage_buffer",
+        "name": "splat_sh10",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 14,
+        "type": "storage_buffer",
+        "name": "splat_sh11",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 15,
+        "type": "storage_buffer",
+        "name": "splat_sh12",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 16,
+        "type": "storage_buffer",
+        "name": "splat_sh13",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 17,
+        "type": "storage_buffer",
+        "name": "splat_sh14",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 18,
+        "type": "storage_buffer",
+        "name": "splat_sh15",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 19,
+        "type": "storage_buffer",
+        "name": "splat_pos",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "ray_payloads": [
+    {
+      "name": "payload",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "gaussian_splatting_rt": {
+    "splat_name": "GaussianCloud",
+    "sh_degree": 3,
+    "kernel": "ellipse",
+    "color_space": "srgb",
+    "alpha_cutoff": 0.004,
+    "input_buffers": [
+      "splat_sh0",
+      "splat_sh1",
+      "splat_sh2",
+      "splat_sh3",
+      "splat_sh4",
+      "splat_sh5",
+      "splat_sh6",
+      "splat_sh7",
+      "splat_sh8",
+      "splat_sh9",
+      "splat_sh10",
+      "splat_sh11",
+      "splat_sh12",
+      "splat_sh13",
+      "splat_sh14",
+      "splat_sh15",
+      "splat_pos"
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 547,
+    "alu_ops": 93,
+    "texture_samples": 0,
+    "branches": 3,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

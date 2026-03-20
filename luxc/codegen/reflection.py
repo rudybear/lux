@@ -441,7 +441,20 @@ def generate_reflection(
 
     # --- Gaussian splatting metadata ---
     splat_config = getattr(stage, '_splat_config', None)
-    if splat_config is not None:
+    _RT_STAGE_TYPES = {"raygen", "closest_hit", "miss", "intersection"}
+    if splat_config is not None and stage.stage_type in _RT_STAGE_TYPES:
+        # RT Gaussian splatting (3DGRT)
+        gs_rt_meta = {
+            "splat_name": getattr(stage, '_splat_name', ''),
+            "sh_degree": splat_config.get("sh_degree", 0),
+            "kernel": splat_config.get("kernel", "ellipse"),
+            "color_space": splat_config.get("color_space", "srgb"),
+            "alpha_cutoff": splat_config.get("alpha_cutoff", 0.004),
+        }
+        if stage.stage_type == "raygen":
+            gs_rt_meta["input_buffers"] = [sb.name for sb in stage.storage_buffers]
+        result["gaussian_splatting_rt"] = gs_rt_meta
+    elif splat_config is not None:
         gs_meta = {
             "splat_name": getattr(stage, '_splat_name', ''),
             "sh_degree": splat_config.get("sh_degree", 0),

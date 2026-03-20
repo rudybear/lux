@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "source": "gaussian_splat_rt_sh0.lux",
+  "stage": "miss",
+  "execution_model": "MissKHR",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {},
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "ray_payloads": [
+    {
+      "name": "payload",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "gaussian_splatting_rt": {
+    "splat_name": "GaussianCloud",
+    "sh_degree": 0,
+    "kernel": "ellipse",
+    "color_space": "srgb",
+    "alpha_cutoff": 0.004
+  },
+  "performance_hints": {
+    "instruction_count": 42,
+    "alu_ops": 0,
+    "texture_samples": 0,
+    "branches": 0,
+    "function_calls": 0,
+    "vgpr_estimate": "low"
+  }
+}

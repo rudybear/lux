@@ -4,6 +4,7 @@
 #include "deferred_renderer.h"
 #include "rt_renderer.h"
 #include "mesh_renderer.h"
+#include "rt_splat_renderer.h"
 #include "scene_manager.h"
 #include "renderer_interface.h"
 #include "reflected_pipeline.h"
@@ -409,6 +410,8 @@ static std::string detectRenderPath(const std::string& base, const std::string& 
     if (fs::exists(base + ".gbuf.vert.spv") && fs::exists(base + ".gbuf.frag.spv") &&
         fs::exists(base + ".light.vert.spv") && fs::exists(base + ".light.frag.spv"))
         return "deferred";
+    // RT Gaussian splatting (procedural AABB intersection)
+    if (fs::exists(base + ".rgen.spv") && fs::exists(base + ".rint.spv")) return "rt_splat";
     // Prefer raster over RT when both exist (raster supports per-material draw calls)
     if (fs::exists(base + ".vert.spv") && fs::exists(base + ".frag.spv")) return "raster";
     if (fs::exists(base + ".mesh.spv") && fs::exists(base + ".frag.spv")) return "mesh";
@@ -424,9 +427,10 @@ static std::string detectRenderPath(const std::string& base, const std::string& 
 static int runHeadless(const CLIOptions& opts) {
     std::string renderPath = detectRenderPath(opts.shaderBase, opts.forceMode);
     bool needRT = (renderPath == "rt");
+    bool needRTSplat = (renderPath == "rt_splat");
     bool needMesh = (renderPath == "mesh");
     bool needSplat = (renderPath == "splat");
-    VkPipelineStageFlags dstStage = needRT
+    VkPipelineStageFlags dstStage = (needRT || needRTSplat)
         ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
         : (needSplat ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
                      : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
@@ -439,13 +443,13 @@ static int runHeadless(const CLIOptions& opts) {
     // Initialize Vulkan context
     VulkanContext ctx;
     try {
-        ctx.init(needRT, true, nullptr, opts.forceValidation);
+        ctx.init(needRT || needRTSplat, true, nullptr, opts.forceValidation);
     } catch (const std::exception& e) {
         std::cerr << "[error] Failed to initialize Vulkan: " << e.what() << std::endl;
         return 1;
     }
 
-    if (needRT && !ctx.supportsRT()) {
+    if ((needRT || needRTSplat) && !ctx.supportsRT()) {
         std::cerr << "[error] RT mode requested but ray tracing is not supported on this device." << std::endl;
         ctx.cleanup();
         return 1;
@@ -660,6 +664,22 @@ static int runHeadless(const CLIOptions& opts) {
                                         splatR->getWidth(), splatR->getHeight(),
                                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, opts.output);
             scene.cleanup(ctx);
+        } else if (needRTSplat && scene.hasSplatData()) {
+            // RT Gaussian splatting (3DGRT) — standalone RT splat rendering
+            RTSplatRenderer rtSplat;
+            rtSplat.init(ctx, scene.getGltfScene().splat_data, resolvedBase,
+                         opts.width, opts.height);
+
+            float aspect = static_cast<float>(opts.width) / static_cast<float>(opts.height);
+            rtSplat.updateCamera(scene.getAutoEye(), scene.getAutoTarget(), scene.getAutoUp(),
+                                 glm::radians(45.0f), aspect, 0.1f, scene.getAutoFar());
+            rtSplat.render(ctx);
+
+            Screenshot::saveImageToPNG(ctx, rtSplat.getOutputImage(), rtSplat.getOutputFormat(),
+                                        rtSplat.getWidth(), rtSplat.getHeight(),
+                                        VK_IMAGE_LAYOUT_GENERAL, opts.output);
+            rtSplat.cleanup(ctx);
+            scene.cleanup(ctx);
         } else {
             if (needRT) {
                 auto rt = std::make_unique<RTRenderer>();
@@ -712,9 +732,10 @@ static int runInteractive(CLIOptions opts) {
     }
     std::string renderPath = detectRenderPath(opts.shaderBase, opts.forceMode);
     bool needRT = (renderPath == "rt");
+    bool needRTSplat = (renderPath == "rt_splat");
     bool needMesh = (renderPath == "mesh");
     bool needSplat = (renderPath == "splat");
-    VkPipelineStageFlags dstStage = needRT
+    VkPipelineStageFlags dstStage = (needRT || needRTSplat)
         ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
         : (needSplat ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
                      : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
@@ -747,7 +768,7 @@ static int runInteractive(CLIOptions opts) {
     // Initialize Vulkan context with surface
     VulkanContext ctx;
     try {
-        ctx.init(needRT, false, window, opts.forceValidation);
+        ctx.init(needRT || needRTSplat, false, window, opts.forceValidation);
     } catch (const std::exception& e) {
         std::cerr << "[error] Failed to initialize Vulkan: " << e.what() << std::endl;
         glfwDestroyWindow(window);
@@ -755,7 +776,7 @@ static int runInteractive(CLIOptions opts) {
         return 1;
     }
 
-    if (needRT && !ctx.supportsRT()) {
+    if ((needRT || needRTSplat) && !ctx.supportsRT()) {
         std::cerr << "[error] RT mode requested but ray tracing is not supported on this device." << std::endl;
         ctx.cleanup();
         glfwDestroyWindow(window);
@@ -821,7 +842,9 @@ static int runInteractive(CLIOptions opts) {
     // Initialize shared scene
     SceneManager scene;
     std::unique_ptr<IRenderer> renderer;
+    std::unique_ptr<RTSplatRenderer> rtSplatRenderer;
     bool useRT = needRT;
+    bool useRTSplat = needRTSplat;
     bool useMesh = needMesh;
     bool useSplat = needSplat;
     bool isHybrid = false;       // set true when scene has both meshes and splats
@@ -947,8 +970,12 @@ static int runInteractive(CLIOptions opts) {
             std::cout << "[info] Hybrid scene detected: " << hybridType << " + splats" << std::endl;
         }
 
-        // Create the primary renderer (RT, mesh, or raster)
-        if (useRT) {
+        // Create the primary renderer (RT splat, RT, mesh, or raster)
+        if (useRTSplat && scene.hasSplatData()) {
+            rtSplatRenderer = std::make_unique<RTSplatRenderer>();
+            rtSplatRenderer->init(ctx, scene.getGltfScene().splat_data, resolvedBase,
+                                  opts.width, opts.height);
+        } else if (useRT) {
             auto rt = std::make_unique<RTRenderer>();
             std::string rgenPath = resolvedBase + ".rgen.spv";
             std::string rmissPath = resolvedBase + ".rmiss.spv";
@@ -1104,6 +1131,11 @@ static int runInteractive(CLIOptions opts) {
                                        g_orbit.up, g_orbit.fovY, aspect,
                                        g_orbit.nearPlane, g_orbit.farPlane);
             }
+            if (rtSplatRenderer) {
+                rtSplatRenderer->updateCamera(g_orbit.getEye(), g_orbit.target,
+                                              g_orbit.up, g_orbit.fovY, aspect,
+                                              g_orbit.nearPlane, g_orbit.farPlane);
+            }
             if (scene.getSplatRenderer()) {
                 scene.getSplatRenderer()->updateCamera(g_orbit.getEye(), g_orbit.target,
                                                         g_orbit.up, g_orbit.fovY, aspect,
@@ -1137,7 +1169,15 @@ static int runInteractive(CLIOptions opts) {
             vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, sceneSubmitFence);
         };
 
-        if (isHybrid && renderer && scene.getSplatRenderer()) {
+        if (rtSplatRenderer) {
+            // RT Gaussian splatting: render to storage image, blit to swapchain
+            rtSplatRenderer->render(ctx);
+
+            blitAndSubmit([&](VkCommandBuffer cmd) {
+                rtSplatRenderer->blitToSwapchain(ctx, cmd,
+                    ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
+            });
+        } else if (isHybrid && renderer && scene.getSplatRenderer()) {
             // Hybrid rendering: primary renderer + splats composited on top
             renderer->render(ctx);
 
@@ -1417,6 +1457,9 @@ static int runInteractive(CLIOptions opts) {
         editorUI.cleanup(ctx);
     }
 
+    if (rtSplatRenderer) {
+        rtSplatRenderer->cleanup(ctx);
+    }
     if (renderer) {
         renderer->cleanup(ctx);
     }

@@ -52,6 +52,12 @@ def _dce_function(func: FunctionDef, stage: StageBlock | None) -> None:
         # Storage buffer writes are side effects — protect from DCE
         for sb in stage.storage_buffers:
             protected_vars.add(sb.name)
+        # Ray payload writes are outputs in hit/miss shaders — protect from DCE
+        for rp in stage.ray_payloads:
+            protected_vars.add(rp.name)
+        # Hit attribute writes are outputs in intersection shaders — protect from DCE
+        for ha in stage.hit_attributes:
+            protected_vars.add(ha.name)
 
     # Iterate until no changes
     for _ in range(20):  # safety bound

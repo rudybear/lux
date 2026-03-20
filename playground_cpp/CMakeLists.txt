@@ -101,6 +101,7 @@ if(Vulkan_FOUND)
         src/mesh_renderer.cpp
         src/meshlet.cpp
         src/splat_renderer.cpp
+        src/rt_splat_renderer.cpp
         src/editor_ui.cpp
         ${IMGUI_SOURCES}
     )

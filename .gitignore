@@ -29,6 +29,8 @@ splat_*.png
 output*.png
 deferred_*.png
 hybrid_*.png
+rt_splat_*.png
+raster_splat_*.png
 
 # C++/Rust build artifacts
 playground_cpp/build/

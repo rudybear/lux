@@ -1,0 +1,8 @@
+splat GaussianCloud {
+    sh_degree: 0,
+}
+
+pipeline RTGaussian {
+    mode: raytrace,
+    splat: GaussianCloud,
+}

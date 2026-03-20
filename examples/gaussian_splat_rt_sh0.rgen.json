@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "source": "gaussian_splat_rt_sh0.lux",
+  "stage": "raygen",
+  "execution_model": "RayGenerationKHR",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "uniform_buffer",
+        "name": "Camera",
+        "fields": [
+          {
+            "name": "inv_view",
+            "type": "mat4",
+            "offset": 0,
+            "size": 64
+          },
+          {
+            "name": "inv_proj",
+            "type": "mat4",
+            "offset": 64,
+            "size": 64
+          }
+        ],
+        "size": 128,
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "acceleration_structure",
+        "name": "tlas",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_image",
+        "name": "result_color",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "storage_buffer",
+        "name": "splat_sh0",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "storage_buffer",
+        "name": "splat_pos",
+        "element_type": "vec4",
+        "stage_flags": [
+          "raygen"
+        ]
+      }
+    ]
+  },
+  "push_constants": [],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "ray_payloads": [
+    {
+      "name": "payload",
+      "type": "vec4",
+      "location": 0
+    }
+  ],
+  "gaussian_splatting_rt": {
+    "splat_name": "GaussianCloud",
+    "sh_degree": 0,
+    "kernel": "ellipse",
+    "color_space": "srgb",
+    "alpha_cutoff": 0.004,
+    "input_buffers": [
+      "splat_sh0",
+      "splat_pos"
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 249,
+    "alu_ops": 22,
+    "texture_samples": 0,
+    "branches": 3,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

@@ -26,7 +26,7 @@ from luxc.parser.ast_nodes import (
     IfStmt, TaskPayloadDecl, PropertiesBlock,
     SplatDecl,
 )
-from luxc.expansion.splat_expander import expand_splat_pipeline
+from luxc.expansion.splat_expander import expand_splat_pipeline, expand_splat_rt_pipeline
 
 
 def _is_openpbr(module):
@@ -171,15 +171,26 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
             schedule = _resolve_schedule(module, schedule_name)
 
         if mode == "raytrace":
-            # RT pipeline expansion
-            surface = surfaces.get(surf_name) if surf_name else None
-            environment = environments.get(env_name) if env_name else None
-            procedural = procedurals.get(procedural_name) if procedural_name else None
-            stages = _expand_rt_pipeline(
-                surface, environment, procedural, module, schedule, max_bounces,
-                bindless=bindless, lighting=lighting,
-            )
-            module.stages.extend(stages)
+            if splat_name:
+                # RT Gaussian splatting (3DGRT)
+                splat = splats.get(splat_name)
+                if splat is None:
+                    raise ValueError(
+                        f"Pipeline '{pipeline.name}' has mode: raytrace with "
+                        f"splat: {splat_name} but no matching splat declaration found"
+                    )
+                stages = expand_splat_rt_pipeline(splat, pipeline, module)
+                module.stages.extend(stages)
+            else:
+                # Regular RT pipeline expansion (surface/environment/procedural)
+                surface = surfaces.get(surf_name) if surf_name else None
+                environment = environments.get(env_name) if env_name else None
+                procedural = procedurals.get(procedural_name) if procedural_name else None
+                stages = _expand_rt_pipeline(
+                    surface, environment, procedural, module, schedule, max_bounces,
+                    bindless=bindless, lighting=lighting,
+                )
+                module.stages.extend(stages)
         elif mode == "mesh_shader":
             # Mesh shader pipeline expansion
             surface = surfaces.get(surf_name) if surf_name else None
