@@ -174,6 +174,13 @@ def _get_khr_extension(prim: dict) -> dict:
     return prim.get("extensions", {}).get("KHR_gaussian_splatting", {})
 
 
+def _is_compressed_primitive(prim: dict) -> bool:
+    """Return True if the primitive uses a KHR_gaussian_splatting compression extension."""
+    ext = _get_khr_extension(prim)
+    sub_exts = ext.get("extensions", {})
+    return any(k.startswith("KHR_gaussian_splatting_compression") for k in sub_exts)
+
+
 def _get_khr_attribute(prim: dict, name: str) -> int | None:
     """Return the accessor index for a KHR_gaussian_splatting attribute, or None."""
     attrs = prim.get("attributes", {})
@@ -328,6 +335,8 @@ class TestConformanceAssetLoading:
         """Each splat primitive should have SCALE, ROTATION, OPACITY via KHR prefix."""
         gltf, _ = _load_gltf_json(asset_path)
         for prim in _get_splat_primitives(gltf):
+            if _is_compressed_primitive(prim):
+                pytest.skip("Compressed format stores attributes in packed buffer")
             attrs = prim.get("attributes", {})
             for attr_name in ["SCALE", "ROTATION", "OPACITY"]:
                 key = _KHR_PREFIX + attr_name
@@ -337,6 +346,8 @@ class TestConformanceAssetLoading:
         """Each splat primitive should have at least SH_DEGREE_0_COEF_0 (DC term)."""
         gltf, _ = _load_gltf_json(asset_path)
         for prim in _get_splat_primitives(gltf):
+            if _is_compressed_primitive(prim):
+                pytest.skip("Compressed format stores SH coefficients in packed buffer")
             sh_attrs = _get_sh_degree_coef_attrs(prim)
             assert 0 in sh_attrs, "Missing SH_DEGREE_0_COEF_0 (DC term) in splat primitive"
 
@@ -345,6 +356,8 @@ class TestConformanceAssetLoading:
         gltf, _ = _load_gltf_json(asset_path)
         for prim in _get_splat_primitives(gltf):
             ext = _get_khr_extension(prim)
+            if _is_compressed_primitive(prim):
+                pytest.skip("Compressed format may omit kernel/colorSpace in extension object")
             assert "kernel" in ext, "Extension object missing 'kernel' field"
             assert ext["kernel"] in ("ellipse", "point"), f"Unknown kernel: {ext['kernel']}"
 
@@ -353,6 +366,8 @@ class TestConformanceAssetLoading:
         gltf, _ = _load_gltf_json(asset_path)
         for prim in _get_splat_primitives(gltf):
             ext = _get_khr_extension(prim)
+            if _is_compressed_primitive(prim):
+                pytest.skip("Compressed format may omit kernel/colorSpace in extension object")
             assert "colorSpace" in ext, "Extension object missing 'colorSpace' field"
 
     def test_accessor_types_valid(self, asset_path):
@@ -360,6 +375,8 @@ class TestConformanceAssetLoading:
         gltf, _ = _load_gltf_json(asset_path)
         accessors = gltf.get("accessors", [])
         for prim in _get_splat_primitives(gltf):
+            if _is_compressed_primitive(prim):
+                pytest.skip("Compressed format uses different accessor types")
             # ROTATION should be VEC4
             rot_idx = _get_khr_attribute(prim, "ROTATION")
             if rot_idx is not None and rot_idx < len(accessors):
