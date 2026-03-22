@@ -277,7 +277,12 @@ export class SplatRenderer {
           }],
         },
         primitive: { topology: 'triangle-list' },
-        // No depth test for alpha-blended splats (back-to-front sorted)
+        // Depth read (no write) for hybrid splat+mesh: splats occluded by mesh geometry
+        depthStencil: {
+          format: 'depth24plus',
+          depthWriteEnabled: false,
+          depthCompare: 'less',
+        },
         label: 'splat_render_pipeline',
       });
     } catch {
@@ -455,6 +460,14 @@ export class SplatRenderer {
           loadOp: 'load',
           storeOp: 'store',
         }],
+        // Depth test for hybrid splat+mesh: splats behind mesh geometry are discarded.
+        // Splats don't write depth (they rely on sort order for mutual ordering).
+        depthStencilAttachment: depthView ? {
+          view: depthView,
+          depthLoadOp: 'load',
+          depthStoreOp: 'store',
+          depthReadOnly: true,
+        } : undefined,
         label: 'splat_render',
       });
 
