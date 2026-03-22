@@ -6,7 +6,7 @@
  */
 
 import { mat4, quat } from 'gl-matrix';
-import type { Scene, Mesh, Material, Light, SceneNode } from './scene';
+import type { Scene, Mesh, Material, Light, SceneNode, DrawRange } from './scene';
 
 // --------------------------------------------------------------------------
 // GLB binary container parsing
@@ -215,7 +215,8 @@ async function parseGLBScene(
 
   // Parse materials
   const materials: Material[] = [];
-  for (const mat of gltfMaterials) {
+  for (let matIdx = 0; matIdx < gltfMaterials.length; matIdx++) {
+    const mat = gltfMaterials[matIdx];
     const pbr = (mat.pbrMetallicRoughness ?? {}) as Record<string, unknown>;
     const bc = (pbr.baseColorFactor as number[]) ?? [1, 1, 1, 1];
     const texMap = new Map<string, GPUTextureView>();
@@ -250,6 +251,37 @@ async function parseGLBScene(
 
     const emf = (mat.emissiveFactor as number[]) ?? [0, 0, 0];
 
+    // Parse material extensions
+    const exts = (mat.extensions ?? {}) as Record<string, Record<string, unknown>>;
+
+    // KHR_materials_clearcoat
+    const clearcoatExt = exts.KHR_materials_clearcoat;
+    const hasClearcoat = clearcoatExt !== undefined;
+    const clearcoatFactor = hasClearcoat ? (clearcoatExt.clearcoatFactor as number) ?? 0.0 : 0.0;
+    const clearcoatRoughnessFactor = hasClearcoat ? (clearcoatExt.clearcoatRoughnessFactor as number) ?? 0.0 : 0.0;
+
+    // KHR_materials_sheen
+    const sheenExt = exts.KHR_materials_sheen;
+    const hasSheen = sheenExt !== undefined;
+    const sheenColor = hasSheen ? (sheenExt.sheenColorFactor as number[]) ?? [0, 0, 0] : [0, 0, 0];
+    const sheenRoughnessFactor = hasSheen ? (sheenExt.sheenRoughnessFactor as number) ?? 0.0 : 0.0;
+
+    // KHR_materials_transmission
+    const transmissionExt = exts.KHR_materials_transmission;
+    const hasTransmission = transmissionExt !== undefined;
+    const transmissionFactor = hasTransmission ? (transmissionExt.transmissionFactor as number) ?? 0.0 : 0.0;
+
+    // KHR_materials_ior
+    const iorExt = exts.KHR_materials_ior;
+    const ior = iorExt ? (iorExt.ior as number) ?? 1.5 : 1.5;
+
+    // KHR_materials_emissive_strength
+    const emStrExt = exts.KHR_materials_emissive_strength;
+    const emissiveStrength = emStrExt ? (emStrExt.emissiveStrength as number) ?? 1.0 : 1.0;
+
+    // KHR_materials_unlit
+    const isUnlit = exts.KHR_materials_unlit !== undefined;
+
     materials.push({
       baseColor: [bc[0], bc[1], bc[2], bc[3]],
       metallic: (pbr.metallicFactor as number) ?? 1.0,
@@ -257,19 +289,56 @@ async function parseGLBScene(
       emissive: [emf[0], emf[1], emf[2]],
       textures: texMap,
       sampler: defaultSampler,
+      alphaMode: (mat.alphaMode as Material['alphaMode']) ?? 'OPAQUE',
+      alphaCutoff: (mat.alphaCutoff as number) ?? 0.5,
+      doubleSided: (mat.doubleSided as boolean) ?? false,
+      ior,
+      emissiveStrength,
+      isUnlit,
+      hasClearcoat,
+      clearcoatFactor,
+      clearcoatRoughnessFactor,
+      hasSheen,
+      sheenColorFactor: [sheenColor[0], sheenColor[1], sheenColor[2]],
+      sheenRoughnessFactor,
+      hasTransmission,
+      transmissionFactor,
+      materialIndex: matIdx,
     });
   }
 
   // Parse meshes
+  // Track per-primitive material indices and position data for bounds/draw ranges
   const meshes: Mesh[] = [];
+  const primitiveMaterialIndices: number[] = [];  // parallel to meshes[]
+  const boundsMin: [number, number, number] = [Infinity, Infinity, Infinity];
+  const boundsMax: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+
   for (const gm of gltfMeshes) {
     for (const prim of gm.primitives) {
       const attrs = prim.attributes as Record<string, number>;
+
+      // Track which material this primitive uses
+      const primMatIdx = (prim.material as number) ?? -1;
+      primitiveMaterialIndices.push(primMatIdx);
 
       // Interleave: position(3) + normal(3) + uv(2) + tangent(4) = 12 floats = 48 bytes
       const posAccess = accessors[attrs.POSITION];
       const posData = new Float32Array(getAccessorData(posAccess, bufferViews, bin));
       const vertCount = posAccess.count;
+
+      // Update scene bounds from position data
+      for (let i = 0; i < vertCount; i++) {
+        const x = posData[i * 3 + 0];
+        const y = posData[i * 3 + 1];
+        const z = posData[i * 3 + 2];
+        if (x < boundsMin[0]) boundsMin[0] = x;
+        if (y < boundsMin[1]) boundsMin[1] = y;
+        if (z < boundsMin[2]) boundsMin[2] = z;
+        if (x > boundsMax[0]) boundsMax[0] = x;
+        if (y > boundsMax[1]) boundsMax[1] = y;
+        if (z > boundsMax[2]) boundsMax[2] = z;
+      }
 
       let norData: Float32Array | null = null;
       if (attrs.NORMAL !== undefined) {
@@ -350,6 +419,12 @@ async function parseGLBScene(
     }
   }
 
+  // Clamp bounds if no geometry was loaded
+  if (boundsMin[0] === Infinity) {
+    boundsMin[0] = boundsMin[1] = boundsMin[2] = 0;
+    boundsMax[0] = boundsMax[1] = boundsMax[2] = 0;
+  }
+
   // Parse lights (KHR_lights_punctual)
   const lights: Light[] = [];
   const extensions = gltf.extensions as Record<string, unknown> | undefined;
@@ -370,6 +445,16 @@ async function parseGLBScene(
     }
   }
 
+  // Build a mapping from glTF mesh index to the range of entries in meshes[]
+  // (each glTF mesh may have multiple primitives, each becoming one Mesh entry)
+  const meshPrimitiveRanges: Array<{ start: number; count: number }> = [];
+  let flatIdx = 0;
+  for (const gm of gltfMeshes) {
+    const count = gm.primitives.length;
+    meshPrimitiveRanges.push({ start: flatIdx, count });
+    flatIdx += count;
+  }
+
   // Build scene graph
   const nodes: SceneNode[] = [];
   for (const gn of gltfNodes) {
@@ -379,7 +464,9 @@ async function parseGLBScene(
     };
     if (gn.mesh !== undefined) {
       const meshIdx = gn.mesh as number;
-      node.mesh = meshes[meshIdx];
+      // Point to first primitive mesh (backward compat)
+      const range = meshPrimitiveRanges[meshIdx];
+      node.mesh = meshes[range.start];
       // Material from first primitive
       const gm = gltfMeshes[meshIdx];
       const matIdx = gm.primitives[0]?.material as number | undefined;
@@ -406,10 +493,60 @@ async function parseGLBScene(
   const rootNodeIndices = scenes?.[sceneIdx]?.nodes ?? [];
   const rootNodes = rootNodeIndices.map((i: number) => nodes[i]).filter(Boolean);
 
+  // Compute world transforms and build draw ranges by traversing the scene graph.
+  // Each node with a mesh generates one DrawRange per primitive of that glTF mesh.
+  const drawRanges: DrawRange[] = [];
+
+  function traverseForDrawRanges(
+    nodeIdx: number,
+    parentWorldTransform: Float32Array,
+  ): void {
+    const gn = gltfNodes[nodeIdx];
+    const localTransform = nodeTransform(gn);
+    const worldTransform = mat4.create() as Float32Array;
+    mat4.multiply(worldTransform, parentWorldTransform, localTransform);
+
+    if (gn.mesh !== undefined) {
+      const gltfMeshIdx = gn.mesh as number;
+      const range = meshPrimitiveRanges[gltfMeshIdx];
+      const gm = gltfMeshes[gltfMeshIdx];
+
+      for (let p = 0; p < gm.primitives.length; p++) {
+        const meshEntry = meshes[range.start + p];
+        const primMatIdx = primitiveMaterialIndices[range.start + p];
+
+        drawRanges.push({
+          indexOffset: 0,
+          indexCount: meshEntry.indexCount,
+          vertexOffset: 0,
+          vertexCount: meshEntry.vertexCount,
+          materialIndex: primMatIdx >= 0 ? primMatIdx : 0,
+          worldTransform: new Float32Array(worldTransform),
+        });
+      }
+    }
+
+    // Recurse into children
+    const children = gn.children as number[] | undefined;
+    if (children) {
+      for (const ci of children) {
+        traverseForDrawRanges(ci, worldTransform);
+      }
+    }
+  }
+
+  const identityMat = mat4.create() as Float32Array;
+  for (const ri of rootNodeIndices) {
+    traverseForDrawRanges(ri, identityMat);
+  }
+
   return {
     nodes: rootNodes,
     meshes,
     materials,
     lights,
+    boundsMin,
+    boundsMax,
+    drawRanges,
   };
 }

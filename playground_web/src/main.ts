@@ -225,8 +225,7 @@ async function main() {
     console.log(`Loaded ${scene.meshes.length} meshes, ${scene.materials.length} materials`);
     const state = await buildGltfRenderState(device, format, scene, ibl);
     engine.setRenderState(state);
-    engine.camera.distance = 3.5;
-    engine.camera.elevation = 0.2;
+    engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
     console.log('DamagedHelmet loaded successfully');
   } catch (e) {
     console.warn('Failed to load DamagedHelmet, falling back to PBR sphere:', e);
@@ -246,8 +245,7 @@ async function main() {
         const scene = await loadGLB(device, DAMAGED_HELMET_URL);
         const state = await buildGltfRenderState(device, format, scene, ibl);
         engine.setRenderState(state);
-        engine.camera.distance = 3.5;
-        engine.camera.elevation = 0.2;
+        engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
       } catch (e) {
         console.error('Failed to load DamagedHelmet:', e);
       }
@@ -265,13 +263,26 @@ async function main() {
     }
   };
 
+  ui.onScreenshot = () => {
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'lux_screenshot.png';
+      a.click();
+      URL.revokeObjectURL(url);
+    }, 'image/png');
+  };
+
   ui.onFileDrop = async (buffer, name) => {
     console.log(`Loading dropped file: ${name}`);
     try {
       const glScene = await loadGLBFromBuffer(device, buffer);
-      console.log(`Loaded ${glScene.meshes.length} meshes, ${glScene.materials.length} materials`);
+      console.log(`Loaded ${glScene.meshes.length} meshes, ${glScene.materials.length} materials, bounds: [${glScene.boundsMin}] -> [${glScene.boundsMax}]`);
       const state = await buildGltfRenderState(device, format, glScene, ibl);
       engine.setRenderState(state);
+      engine.camera.frameScene(glScene.boundsMin, glScene.boundsMax);
       currentScene = 'custom';
     } catch (e) {
       console.error('Failed to load glTF:', e);

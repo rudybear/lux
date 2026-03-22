@@ -17,6 +17,37 @@ export interface Material {
   emissive: [number, number, number];
   textures: Map<string, GPUTextureView>;
   sampler: GPUSampler;
+
+  // Alpha
+  alphaMode: 'OPAQUE' | 'BLEND' | 'MASK';
+  alphaCutoff: number;
+  doubleSided: boolean;
+
+  // IOR
+  ior: number;
+
+  // Emissive strength (KHR_materials_emissive_strength)
+  emissiveStrength: number;
+
+  // Unlit (KHR_materials_unlit)
+  isUnlit: boolean;
+
+  // Clearcoat (KHR_materials_clearcoat)
+  hasClearcoat: boolean;
+  clearcoatFactor: number;
+  clearcoatRoughnessFactor: number;
+
+  // Sheen (KHR_materials_sheen)
+  hasSheen: boolean;
+  sheenColorFactor: [number, number, number];
+  sheenRoughnessFactor: number;
+
+  // Transmission (KHR_materials_transmission)
+  hasTransmission: boolean;
+  transmissionFactor: number;
+
+  // Original glTF material index
+  materialIndex: number;
 }
 
 export interface Light {
@@ -37,9 +68,21 @@ export interface SceneNode {
   children: SceneNode[];
 }
 
+export interface DrawRange {
+  indexOffset: number;
+  indexCount: number;
+  vertexOffset: number;
+  vertexCount: number;
+  materialIndex: number;
+  worldTransform: Float32Array;  // mat4
+}
+
 export interface Scene {
   nodes: SceneNode[];
   meshes: Mesh[];
   materials: Material[];
   lights: Light[];
+  boundsMin: [number, number, number];
+  boundsMax: [number, number, number];
+  drawRanges: DrawRange[];
 }

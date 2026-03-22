@@ -34,10 +34,10 @@
 | P24 | KHR_gaussian_splatting Conformance | ✅ Complete |
 | P25 | PLY-to-glTF Converter | ✅ Complete |
 | P26 | Hybrid Rendering (RT+Splat, Mesh+Splat) | ✅ Complete (C++; Rust partial) |
-| P27 | WebGPU Backend | ✅ In Progress (P27.1-P27.7 implemented) |
-| P28 | RT Gaussian Splats (Elliptic Intersections) | Research |
+| P27 | WebGPU Backend | ✅ Complete (P27.1-P27.7; deploy P27.8 deferred) |
+| P28 | RT Gaussian Splats (3DGRT) | ✅ Complete (compiler + C++ Vulkan engine, 34 tests) |
 
-**Test suite: 1462+ tests passing. Compiler: 160+ stdlib functions, 15 modules.**
+**Test suite: 1496 tests (1479 passing, 5 skipped SPZ, 12 skipped no-assets). Compiler: 160+ stdlib functions, 15 modules.**
 
 ---
 
@@ -975,8 +975,8 @@ Probes and LPV integrate with the existing IBL layer — when probe data is avai
 | **P24** | Shader hot-reload (`--watch` file watcher, live recompile, sentinel protocol for engine hot-swap) | ✅ Complete |
 | **P25** | Performance optimization (`-O` spirv-opt integration, algebraic identity folding) | ✅ Complete (25.1) |
 | **P26** | Hybrid rendering (RT+splat, mesh shader+splat compositing in all engines) | ✅ Complete (C++) |
-| **P27** | WebGPU backend (browser deployment via WGSL, wgpu-native desktop) | Planned |
-| **P28** | RT Gaussian splats (analytic ray-ellipsoid intersection, custom intersection shaders) | Research |
+| **P27** | WebGPU backend (browser deployment via WGSL, wgpu-native desktop) | ✅ Complete (P27.1-P27.7) |
+| **P28** | RT Gaussian splats (3DGRT: analytic ray-Gaussian intersection, AABB BLAS, multi-round closest-hit) | ✅ Complete |
 
 ---
 

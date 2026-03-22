@@ -26,6 +26,7 @@ export class UI {
 
   onSceneChange: SceneChangeCallback | null = null;
   onFileDrop: FileDropCallback | null = null;
+  onScreenshot: (() => void) | null = null;
 
   constructor() {
     this._fpsEl = document.getElementById('fps')!;
@@ -42,6 +43,10 @@ export class UI {
       this._state.selectedScene = select.value;
       this.onSceneChange?.(select.value);
     });
+
+    // Screenshot button
+    const screenshotBtn = document.getElementById('screenshot-btn');
+    screenshotBtn?.addEventListener('click', () => this.onScreenshot?.());
 
     // Drag and drop
     this._setupDragDrop();

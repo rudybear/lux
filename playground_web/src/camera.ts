@@ -24,6 +24,28 @@ export class OrbitCamera {
   private _lastX = 0;
   private _lastY = 0;
 
+  /** Configure camera to frame scene bounds (matches C++ computeAutoCamera). */
+  frameScene(
+    boundsMin: [number, number, number],
+    boundsMax: [number, number, number],
+  ): void {
+    const cx = (boundsMin[0] + boundsMax[0]) * 0.5;
+    const cy = (boundsMin[1] + boundsMax[1]) * 0.5;
+    const cz = (boundsMin[2] + boundsMax[2]) * 0.5;
+    this.target = vec3.fromValues(cx, cy, cz);
+
+    const dx = boundsMax[0] - boundsMin[0];
+    const dy = boundsMax[1] - boundsMin[1];
+    const dz = boundsMax[2] - boundsMin[2];
+    const radius = Math.sqrt(dx * dx + dy * dy + dz * dz) * 0.5;
+
+    this.distance = radius * 2.5;
+    this.far = radius * 10;
+    this.near = Math.max(0.01, radius * 0.01);
+    this.elevation = 0.2;
+    this.azimuth = 0;
+  }
+
   /** Attach mouse/touch listeners to a canvas element. */
   attach(canvas: HTMLCanvasElement): void {
     canvas.addEventListener('mousedown', (e) => this._onMouseDown(e));

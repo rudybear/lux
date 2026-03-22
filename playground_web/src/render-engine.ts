@@ -69,6 +69,7 @@ export class RenderEngine {
   roughness = 0.5;
   exposure = 1.0;
   lightDirY = 0.7;
+  lightCount = 1;
 
   constructor(gpu: GPUContext) {
     this.gpu = gpu;
@@ -244,6 +245,9 @@ export class RenderEngine {
     values.set('resolution', [this._width, this._height]);
     values.set('screen_size', [this._width, this._height]);
     values.set('time', [this._time]);
+
+    // Light count (for multi-light shaders)
+    values.set('light_count', [this.lightCount]);
 
     // Identity model matrix
     values.set('model', Array.from(mat4.create() as Float32Array));
