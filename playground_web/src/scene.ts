@@ -75,6 +75,8 @@ export interface DrawRange {
   vertexCount: number;
   materialIndex: number;
   worldTransform: Float32Array;  // mat4
+  /** Index into Scene.meshes[] — used by gltf-pbr to find vertex/index buffers. */
+  meshIndex: number;
 }
 
 export interface Scene {

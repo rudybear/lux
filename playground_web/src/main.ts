@@ -142,7 +142,7 @@ async function buildGltfRenderState(
   ibl: ProceduralIBL,
 ): Promise<RenderState> {
   const pipeline = await createGltfPbrPipeline(device, format);
-  const { draws, uniformBuffers, mvpBindGroup } = buildGltfSceneDrawCalls(device, pipeline, scene, ibl);
+  const { draws, uniformBuffers, mvpBindGroup, storageBuffers } = buildGltfSceneDrawCalls(device, pipeline, scene, ibl);
 
   return {
     pipeline,
@@ -150,6 +150,7 @@ async function buildGltfRenderState(
     draws,
     pushBuffer: null,
     uniformBuffers,
+    storageBuffers,
   };
 }
 
@@ -222,10 +223,11 @@ async function main() {
   try {
     console.log('Loading DamagedHelmet...');
     const scene = await loadGLB(device, DAMAGED_HELMET_URL);
-    console.log(`Loaded ${scene.meshes.length} meshes, ${scene.materials.length} materials`);
+    console.log(`Loaded ${scene.meshes.length} meshes, ${scene.materials.length} materials, ${scene.lights.length} lights, ${scene.drawRanges.length} draw ranges`);
     const state = await buildGltfRenderState(device, format, scene, ibl);
     engine.setRenderState(state);
     engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
+    engine.lightCount = Math.max(1, scene.lights.length);
     console.log('DamagedHelmet loaded successfully');
   } catch (e) {
     console.warn('Failed to load DamagedHelmet, falling back to PBR sphere:', e);
@@ -246,6 +248,7 @@ async function main() {
         const state = await buildGltfRenderState(device, format, scene, ibl);
         engine.setRenderState(state);
         engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
+        engine.lightCount = Math.max(1, scene.lights.length);
       } catch (e) {
         console.error('Failed to load DamagedHelmet:', e);
       }
@@ -279,10 +282,11 @@ async function main() {
     console.log(`Loading dropped file: ${name}`);
     try {
       const glScene = await loadGLBFromBuffer(device, buffer);
-      console.log(`Loaded ${glScene.meshes.length} meshes, ${glScene.materials.length} materials, bounds: [${glScene.boundsMin}] -> [${glScene.boundsMax}]`);
+      console.log(`Loaded ${glScene.meshes.length} meshes, ${glScene.materials.length} materials, ${glScene.lights.length} lights`);
       const state = await buildGltfRenderState(device, format, glScene, ibl);
       engine.setRenderState(state);
       engine.camera.frameScene(glScene.boundsMin, glScene.boundsMax);
+      engine.lightCount = Math.max(1, glScene.lights.length);
       currentScene = 'custom';
     } catch (e) {
       console.error('Failed to load glTF:', e);

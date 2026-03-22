@@ -522,6 +522,7 @@ async function parseGLBScene(
           vertexCount: meshEntry.vertexCount,
           materialIndex: primMatIdx >= 0 ? primMatIdx : 0,
           worldTransform: new Float32Array(worldTransform),
+          meshIndex: range.start + p,
         });
       }
     }

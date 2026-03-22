@@ -22,6 +22,14 @@ export interface DrawCall {
   vertexCount: number;
   /** Per-draw material bind group (set 1) for glTF rendering. */
   materialBindGroup?: GPUBindGroup;
+  /** Per-draw MVP bind group (set 0) — if set, used instead of shared bindGroups[0]. */
+  mvpBindGroup?: GPUBindGroup;
+  /** Per-draw MVP uniform buffer for model matrix update. */
+  mvpBuffer?: GPUBuffer;
+  /** World transform (model matrix) for this draw call. */
+  worldTransform?: Float32Array;
+  /** Alpha mode for draw ordering (OPAQUE rendered first). */
+  alphaMode?: 'OPAQUE' | 'BLEND' | 'MASK';
 }
 
 /** A uniform buffer with its field layout from reflection. */
@@ -38,6 +46,8 @@ export interface RenderState {
   pushBuffer: GPUBuffer | null;
   /** All uniform buffers to update per-frame, populated from reflection. */
   uniformBuffers: UniformBufferBinding[];
+  /** Storage buffers that need per-frame updates (e.g. lights SSBO). */
+  storageBuffers?: { buffer: GPUBuffer; data: Float32Array }[];
 }
 
 /** Field layout entry from reflection JSON. */
@@ -127,6 +137,22 @@ export class RenderEngine {
     // Update uniforms from reflection
     this._updateUniforms(state);
 
+    // Update per-draw MVP buffers with current view/proj + each draw's model matrix
+    const view = mat4.create();
+    const proj = mat4.create();
+    this.camera.getViewMatrix(view);
+    this.camera.getProjectionMatrix(proj, this._width / this._height);
+
+    for (const draw of state.draws) {
+      if (draw.mvpBuffer && draw.worldTransform) {
+        const data = new Float32Array(48); // 3x mat4 = 192 bytes
+        data.set(draw.worldTransform, 0);         // model at offset 0
+        data.set(view as Float32Array, 16);        // view at offset 64 bytes = float index 16
+        data.set(proj as Float32Array, 32);        // proj at offset 128 bytes = float index 32
+        device.queue.writeBuffer(draw.mvpBuffer, 0, data);
+      }
+    }
+
     const pass = encoder.beginRenderPass({
       colorAttachments: [{
         view: textureView,
@@ -148,6 +174,9 @@ export class RenderEngine {
 
     // Multi-draw: iterate over all draw calls
     for (const draw of state.draws) {
+      if (draw.mvpBindGroup) {
+        pass.setBindGroup(0, draw.mvpBindGroup);
+      }
       if (draw.materialBindGroup) {
         pass.setBindGroup(1, draw.materialBindGroup);
       }
@@ -193,6 +222,13 @@ export class RenderEngine {
       const data = new ArrayBuffer(ub.size);
       this._writeFieldsFromReflection(new Float32Array(data), ub.fields, namedValues);
       this.gpu.device.queue.writeBuffer(ub.buffer, 0, data);
+    }
+
+    // Write storage buffers (e.g., lights SSBO)
+    if (state.storageBuffers) {
+      for (const sb of state.storageBuffers) {
+        this.gpu.device.queue.writeBuffer(sb.buffer, 0, sb.data.buffer, sb.data.byteOffset, sb.data.byteLength);
+      }
     }
   }
 
