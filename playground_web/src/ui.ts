@@ -56,6 +56,45 @@ export class UI {
     return this._state;
   }
 
+  /** Update the scene info panel with loaded scene metadata. */
+  updateSceneInfo(info: {
+    meshes: number;
+    materials: number;
+    lights: number;
+    drawRanges: number;
+    bounds: { min: [number, number, number]; max: [number, number, number] };
+    materialNames?: string[];
+    lightDescriptions?: string[];
+  }): void {
+    const infoEl = document.getElementById('scene-info');
+    if (infoEl) {
+      const bMin = info.bounds.min.map(v => v.toFixed(2)).join(', ');
+      const bMax = info.bounds.max.map(v => v.toFixed(2)).join(', ');
+      infoEl.innerHTML = [
+        `Meshes: ${info.meshes}`,
+        `Materials: ${info.materials}`,
+        `Lights: ${info.lights}`,
+        `Draw calls: ${info.drawRanges}`,
+        `Bounds: [${bMin}]`,
+        `&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[${bMax}]`,
+      ].join('<br>');
+    }
+
+    const matEl = document.getElementById('material-list');
+    if (matEl && info.materialNames) {
+      matEl.innerHTML = info.materialNames.map((name, i) =>
+        `<div style="padding:2px 0;color:#aab">${i}: ${name}</div>`,
+      ).join('');
+    }
+
+    const lightEl = document.getElementById('light-list');
+    if (lightEl && info.lightDescriptions) {
+      lightEl.innerHTML = info.lightDescriptions.map((desc, i) =>
+        `<div style="padding:2px 0;color:#aab">${i}: ${desc}</div>`,
+      ).join('');
+    }
+  }
+
   /** Call each frame with delta time in seconds. */
   updateFPS(dt: number): void {
     this._frameTimes.push(dt);

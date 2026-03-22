@@ -218,6 +218,22 @@ async function main() {
     ibl = generateProceduralIBL(device);
   }
 
+  function updateSceneUI(scene: Scene): void {
+    ui.updateSceneInfo({
+      meshes: scene.meshes.length,
+      materials: scene.materials.length,
+      lights: scene.lights.length,
+      drawRanges: scene.drawRanges.length,
+      bounds: { min: scene.boundsMin, max: scene.boundsMax },
+      materialNames: scene.materials.map((m, i) =>
+        `Mat${i} (${m.alphaMode}${m.hasClearcoat ? ' +coat' : ''}${m.hasSheen ? ' +sheen' : ''}${m.hasTransmission ? ' +trans' : ''})`,
+      ),
+      lightDescriptions: scene.lights.map(l =>
+        `${l.type} [${l.color.map(c => c.toFixed(1)).join(',')}] i=${l.intensity.toFixed(1)}`,
+      ),
+    });
+  }
+
   // Load DamagedHelmet as default scene
   let currentScene: string = 'damaged_helmet';
   try {
@@ -228,6 +244,7 @@ async function main() {
     engine.setRenderState(state);
     engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
     engine.lightCount = Math.max(1, scene.lights.length);
+    updateSceneUI(scene);
     console.log('DamagedHelmet loaded successfully');
   } catch (e) {
     console.warn('Failed to load DamagedHelmet, falling back to PBR sphere:', e);
@@ -249,6 +266,7 @@ async function main() {
         engine.setRenderState(state);
         engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
         engine.lightCount = Math.max(1, scene.lights.length);
+        updateSceneUI(scene);
       } catch (e) {
         console.error('Failed to load DamagedHelmet:', e);
       }
@@ -287,6 +305,7 @@ async function main() {
       engine.setRenderState(state);
       engine.camera.frameScene(glScene.boundsMin, glScene.boundsMax);
       engine.lightCount = Math.max(1, glScene.lights.length);
+      updateSceneUI(glScene);
       currentScene = 'custom';
     } catch (e) {
       console.error('Failed to load glTF:', e);
