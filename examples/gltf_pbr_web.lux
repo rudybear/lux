@@ -1,0 +1,131 @@
+// glTF PBR for WebGPU — all textures + Material UBO for live editing
+//
+// Same rendering as gltf_pbr.lux but adds a Material uniform block.
+// Material factors multiply texture samples (defaults = 1.0, no change).
+
+import brdf;
+import color;
+import ibl;
+import texture;
+
+vertex {
+    in position: vec3;
+    in normal: vec3;
+    in uv: vec2;
+    in tangent: vec4;
+
+    out world_pos: vec3;
+    out world_normal: vec3;
+    out frag_uv: vec2;
+    out world_tangent: vec3;
+    out world_bitangent: vec3;
+
+    uniform MVP {
+        model: mat4,
+        view: mat4,
+        projection: mat4,
+    }
+
+    fn main() {
+        let world: vec4 = model * vec4(position, 1.0);
+        world_pos = world.xyz;
+        world_normal = normalize((model * vec4(normal, 0.0)).xyz);
+        let t: vec3 = normalize((model * vec4(tangent.xyz, 0.0)).xyz);
+        world_tangent = t;
+        world_bitangent = cross(world_normal, t) * tangent.w;
+        frag_uv = uv;
+        builtin_position = projection * view * world;
+    }
+}
+
+fragment {
+    in world_pos: vec3;
+    in world_normal: vec3;
+    in frag_uv: vec2;
+    in world_tangent: vec3;
+    in world_bitangent: vec3;
+
+    out color: vec4;
+
+    uniform Light {
+        light_dir: vec3,
+        view_pos: vec3,
+        light_color: vec3,
+    }
+
+    uniform Material {
+        base_color_factor: vec4,
+        emissive_factor: vec3,
+        metallic_factor: scalar,
+        roughness_factor: scalar,
+        emissive_strength: scalar,
+    }
+
+    sampler2d base_color_tex;
+    sampler2d normal_tex;
+    sampler2d metallic_roughness_tex;
+    sampler2d occlusion_tex;
+    sampler2d emissive_tex;
+
+    samplerCube env_specular;
+    samplerCube env_irradiance;
+    sampler2d brdf_lut;
+
+    fn main() {
+        // Sample textures and apply Material factors
+        let base_color_sample: vec4 = sample(base_color_tex, frag_uv) * base_color_factor;
+        let base_color_linear: vec3 = srgb_to_linear(base_color_sample.xyz);
+
+        let mr_sample: vec4 = sample(metallic_roughness_tex, frag_uv);
+        let roughness: scalar = mr_sample.y * roughness_factor;
+        let metallic: scalar = mr_sample.z * metallic_factor;
+
+        let ao_sample: vec4 = sample(occlusion_tex, frag_uv);
+        let ao: scalar = ao_sample.x;
+
+        let emissive_sample: vec4 = sample(emissive_tex, frag_uv);
+        let emissive: vec3 = srgb_to_linear(emissive_sample.xyz) * emissive_factor * emissive_strength;
+
+        // Normal mapping via TBN
+        let normal_sample: vec4 = sample(normal_tex, frag_uv);
+        let n: vec3 = tbn_perturb_normal(normal_sample.xyz, normalize(world_normal), normalize(world_tangent), normalize(world_bitangent));
+
+        // View and light directions
+        let v: vec3 = normalize(view_pos - world_pos);
+        let l: vec3 = normalize(light_dir);
+        let n_dot_v: scalar = max(dot(n, v), 0.001);
+
+        // Direct lighting
+        let direct: vec3 = gltf_pbr(n, v, l, base_color_linear, roughness, metallic);
+        let direct_lit: vec3 = direct * light_color;
+
+        // IBL
+        let f0: vec3 = mix(vec3(0.04), base_color_linear, metallic);
+        let r: vec3 = reflect(v * -1.0, n);
+        let prefiltered: vec3 = sample_lod(env_specular, r, roughness * 8.0).xyz;
+        let irradiance: vec3 = sample(env_irradiance, n).xyz;
+        let brdf_sample: vec2 = sample(brdf_lut, vec2(n_dot_v, roughness)).xy;
+
+        let fr: vec3 = max(vec3(1.0 - roughness), f0) - f0;
+        let k_s: vec3 = f0 + fr * pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 5.0);
+
+        let e_ss: scalar = brdf_sample.x + brdf_sample.y;
+        let f_single: vec3 = k_s * brdf_sample.x + vec3(brdf_sample.y);
+        let f_avg: vec3 = f0 + (vec3(1.0) - f0) * (1.0 / 21.0);
+        let f_ms: vec3 = f_single * f_avg / (vec3(1.0) - f_avg * (1.0 - e_ss));
+        let f_total: vec3 = f_single + f_ms * (1.0 - e_ss);
+        let ibl_spec: vec3 = f_total * prefiltered;
+
+        let kd: vec3 = (vec3(1.0) - f_total) * (1.0 - metallic);
+        let ibl_diff: vec3 = kd * base_color_linear * irradiance;
+
+        let ambient: vec3 = (ibl_diff + ibl_spec) * ao;
+
+        let hdr: vec3 = direct_lit + ambient + emissive;
+
+        let tonemapped: vec3 = tonemap_aces(hdr);
+        let final_color: vec3 = linear_to_srgb(tonemapped);
+
+        color = vec4(final_color, base_color_sample.w);
+    }
+}

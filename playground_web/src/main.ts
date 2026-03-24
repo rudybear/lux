@@ -17,7 +17,7 @@ import {
   FALLBACK_VERT_REFLECTION, FALLBACK_FRAG_REFLECTION,
 } from './fallback-shaders';
 import { createGltfPbrPipeline, buildGltfSceneDrawCalls } from './gltf-pbr';
-import { fillMaterialUBO } from './material-ubo';
+import { fillWebMaterialUBO } from './gltf-pbr';
 import { loadIBL } from './ibl-loader';
 import { generateProceduralIBL, type ProceduralIBL } from './procedural-ibl';
 
@@ -145,7 +145,7 @@ async function buildGltfRenderState(
   ibl: ProceduralIBL,
 ): Promise<{ state: RenderState; materialUboBuffers: Map<number, GPUBuffer> }> {
   const pipeline = await createGltfPbrPipeline(device, format);
-  const { draws, uniformBuffers, mvpBindGroup, storageBuffers, materialUboBuffers } = buildGltfSceneDrawCalls(device, pipeline, scene, ibl);
+  const { draws, uniformBuffers, mvpBindGroup, materialUboBuffers } = buildGltfSceneDrawCalls(device, pipeline, scene, ibl);
 
   return {
     state: {
@@ -154,7 +154,6 @@ async function buildGltfRenderState(
       draws,
       pushBuffer: null,
       uniformBuffers,
-      storageBuffers,
     },
     materialUboBuffers,
   };
@@ -332,7 +331,7 @@ async function main() {
     // Re-pack and upload to GPU via Material UBO
     const buf = currentMaterialBuffers?.get(materialIndex);
     if (buf) {
-      const data = fillMaterialUBO(mat);
+      const data = fillWebMaterialUBO(mat);
       device.queue.writeBuffer(buf, 0, data);
     }
   };

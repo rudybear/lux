@@ -1,20 +1,22 @@
 /**
  * glTF PBR rendering pipeline using Lux compiler-produced WGSL shaders.
  *
- * Loads gltf_pbr_layered+emission+normal_map shaders (compiled from examples/gltf_pbr_layered.lux)
- * with fallback to gltf_pbr shaders, and creates the pipeline via ReflectedPipeline
- * from the reflection JSON.
+ * Uses gltf_pbr_web shader (compiled from examples/gltf_pbr_web.lux) which has:
+ *   - ALL texture bindings (base_color, normal, metallic_roughness, occlusion, emissive, IBL)
+ *   - Material UBO for live editing (base_color_factor, metallic/roughness factors, emissive)
+ *   - Light UBO with light_dir, view_pos, light_color
  *
- * Layout (from compiler reflection — layered shader):
- *   Set 0, binding 0: MVP uniform (model, view, projection — 192 bytes)
- *   Set 1, binding 0: SceneLight UBO (view_pos vec3 + light_count int — 16 bytes)
- *   Set 1, binding 1: Material UBO (144 bytes)
- *   Set 1, binding 2-7: material textures (base_color, metallic_roughness, occlusion)
- *   Set 1, binding 8-13: IBL textures (env_specular cubemap, env_irradiance cubemap, brdf_lut 2D)
- *   Set 1, binding 14: lights storage buffer (SSBO)
- *
- * Supports per-draw model matrices, per-material bind groups with Material UBO for
- * live editing, and alpha-mode draw ordering.
+ * Layout (set 1):
+ *   b0:  Light UBO (48 bytes)
+ *   b1:  Material UBO (48 bytes)
+ *   b2-3:  base_color_tex (sampler + texture)
+ *   b4-5:  normal_tex
+ *   b6-7:  metallic_roughness_tex
+ *   b8-9:  occlusion_tex
+ *   b10-11: emissive_tex
+ *   b12-13: env_specular (cubemap)
+ *   b14-15: env_irradiance (cubemap)
+ *   b16-17: brdf_lut
  */
 
 import { loadShader } from './shader-loader';
@@ -22,35 +24,62 @@ import { ReflectedPipeline } from './reflected-pipeline';
 import type { Scene, Material } from './scene';
 import type { DrawCall, UniformBufferBinding } from './render-engine';
 import type { ProceduralIBL } from './procedural-ibl';
-import { fillMaterialUBO, MATERIAL_UBO_SIZE } from './material-ubo';
-import {
-  populateLightsFromScene, packLightsBuffer, packSceneLightUBO,
-  LIGHT_BUFFER_STRIDE, MAX_LIGHTS,
-} from './lights';
 
 // --------------------------------------------------------------------------
-// Pipeline creation (async — loads compiler-produced shaders)
+// Material UBO for gltf_pbr_web (48 bytes — simpler than the 144-byte layered)
+// --------------------------------------------------------------------------
+
+/** Size of the Material UBO for gltf_pbr_web shader. */
+const WEB_MATERIAL_UBO_SIZE = 48;
+
+/** Pack material into the 48-byte UBO matching gltf_pbr_web.lux Material block. */
+function fillWebMaterialUBO(mat: Material): ArrayBuffer {
+  // Layout (std140):
+  //  0: vec4 base_color_factor (16 bytes)
+  // 16: vec3 emissive_factor (12 bytes)
+  // 28: float metallic_factor (4 bytes)
+  // 32: float roughness_factor (4 bytes)
+  // 36: float emissive_strength (4 bytes)
+  // 40: 8 bytes padding to 48
+  const buf = new ArrayBuffer(WEB_MATERIAL_UBO_SIZE);
+  const f = new Float32Array(buf);
+  f[0] = mat.baseColor[0];
+  f[1] = mat.baseColor[1];
+  f[2] = mat.baseColor[2];
+  f[3] = mat.baseColor[3];
+  f[4] = mat.emissive[0];
+  f[5] = mat.emissive[1];
+  f[6] = mat.emissive[2];
+  f[7] = mat.metallic;
+  f[8] = mat.roughness;
+  f[9] = mat.emissiveStrength;
+  // f[10], f[11] = padding
+  return buf;
+}
+
+// Re-export for main.ts
+export { fillWebMaterialUBO, WEB_MATERIAL_UBO_SIZE };
+
+// --------------------------------------------------------------------------
+// Pipeline creation
 // --------------------------------------------------------------------------
 
 export async function createGltfPbrPipeline(
   device: GPUDevice,
   format: GPUTextureFormat,
 ): Promise<ReflectedPipeline> {
-  // Try layered shader first, fall back to basic
   try {
     const [vertShader, fragShader] = await Promise.all([
-      loadShader(device, 'shaders/gltf_pbr_full.vert'),
-      loadShader(device, 'shaders/gltf_pbr_full.frag'),
+      loadShader(device, 'shaders/gltf_pbr_web.vert'),
+      loadShader(device, 'shaders/gltf_pbr_web.frag'),
     ]);
-    // Stride override: glTF loader interleaves at 48 bytes (pos3+nor3+uv2+tan4)
-    // even though this shader only reads 32 bytes (pos3+nor3+uv2)
     return ReflectedPipeline.create(
       device, vertShader.module, fragShader.module,
       vertShader.reflection, fragShader.reflection,
-      format, 'depth24plus', 'none', 48,
+      format, 'depth24plus', 'none',
     );
-  } catch {
-    // Fallback to basic gltf_pbr (stride 48 matches its vertex layout)
+  } catch (e) {
+    console.warn('gltf_pbr_web not available, falling back to gltf_pbr:', e);
     const [vertShader, fragShader] = await Promise.all([
       loadShader(device, 'shaders/gltf_pbr.vert'),
       loadShader(device, 'shaders/gltf_pbr.frag'),
@@ -58,7 +87,7 @@ export async function createGltfPbrPipeline(
     return ReflectedPipeline.create(
       device, vertShader.module, fragShader.module,
       vertShader.reflection, fragShader.reflection,
-      format, 'depth24plus', 'none', 48,
+      format, 'depth24plus', 'none',
     );
   }
 }
@@ -90,7 +119,6 @@ export function create1x1Texture(
 // Build draw calls from glTF scene
 // --------------------------------------------------------------------------
 
-/** Alpha mode sort order: OPAQUE first, MASK second, BLEND last. */
 const ALPHA_ORDER: Record<string, number> = { OPAQUE: 0, MASK: 1, BLEND: 2 };
 
 export function buildGltfSceneDrawCalls(
@@ -102,7 +130,6 @@ export function buildGltfSceneDrawCalls(
   draws: DrawCall[];
   uniformBuffers: UniformBufferBinding[];
   mvpBindGroup: GPUBindGroup;
-  storageBuffers?: { buffer: GPUBuffer; data: Float32Array }[];
   materialUboBuffers: Map<number, GPUBuffer>;
 } {
   // Default textures
@@ -110,66 +137,51 @@ export function buildGltfSceneDrawCalls(
   const normalTex = create1x1Texture(device, 128, 128, 255, 255);
   const blackTex = create1x1Texture(device, 0, 0, 0, 255);
   const defaultSampler = device.createSampler({
-    magFilter: 'linear',
-    minFilter: 'linear',
-    mipmapFilter: 'linear',
-    addressModeU: 'repeat',
-    addressModeV: 'repeat',
+    magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
+    addressModeU: 'repeat', addressModeV: 'repeat',
   });
-
   const whiteView = whiteTex.createView();
   const normalView = normalTex.createView();
   const blackView = blackTex.createView();
 
-  // -- Lights --
-  const lights = populateLightsFromScene(scene);
-  const lightsData = packLightsBuffer(lights);
-
-  // Lights SSBO (set 1, binding 14)
-  const lightsBuffer = device.createBuffer({
-    size: Math.max(lightsData.byteLength, 64),
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    label: 'lights_ssbo',
-  });
-  device.queue.writeBuffer(lightsBuffer, 0, lightsData.buffer, lightsData.byteOffset, lightsData.byteLength);
-
-  // SceneLight UBO (set 1, binding 0 — 16 bytes: view_pos + light_count)
-  const sceneLightBuffer = device.createBuffer({
-    size: 16,
+  // Light UBO (48 bytes: light_dir vec3, view_pos vec3, light_color vec3)
+  const lightBuffer = device.createBuffer({
+    size: 48,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    label: 'scene_light_ubo',
+    label: 'light_ubo',
   });
 
   const uniformBuffers: UniformBufferBinding[] = [
     {
-      buffer: sceneLightBuffer,
+      buffer: lightBuffer,
       fields: [
-        { name: 'view_pos', type: 'vec3', offset: 0, size: 12 },
-        { name: 'light_count', type: 'int', offset: 12, size: 4 },
+        { name: 'light_dir', type: 'vec3', offset: 0, size: 12 },
+        { name: 'view_pos', type: 'vec3', offset: 16, size: 12 },
+        { name: 'light_color', type: 'vec3', offset: 32, size: 12 },
       ],
-      size: 16,
+      size: 48,
     },
   ];
 
-  // Per-material UBO buffers (for live editing)
+  // Per-material UBO buffers
   const materialUboBuffers = new Map<number, GPUBuffer>();
 
-  function getOrCreateMaterialUboBuffer(materialIndex: number): GPUBuffer {
+  function getOrCreateMaterialUbo(materialIndex: number): GPUBuffer {
     if (materialUboBuffers.has(materialIndex)) return materialUboBuffers.get(materialIndex)!;
     const mat = materialIndex >= 0 && materialIndex < scene.materials.length
       ? scene.materials[materialIndex] : null;
-    const uboData = mat ? fillMaterialUBO(mat) : new ArrayBuffer(MATERIAL_UBO_SIZE);
+    const data = mat ? fillWebMaterialUBO(mat) : new ArrayBuffer(WEB_MATERIAL_UBO_SIZE);
     const buf = device.createBuffer({
-      size: MATERIAL_UBO_SIZE,
+      size: WEB_MATERIAL_UBO_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       label: `material_ubo_${materialIndex}`,
     });
-    device.queue.writeBuffer(buf, 0, uboData);
+    device.queue.writeBuffer(buf, 0, data);
     materialUboBuffers.set(materialIndex, buf);
     return buf;
   }
 
-  // Per-material bind group cache (keyed by materialIndex)
+  // Per-material bind group cache
   const materialBindGroups = new Map<number, GPUBindGroup>();
   const matLayout = pipeline.bindGroupLayouts[1];
 
@@ -177,13 +189,49 @@ export function buildGltfSceneDrawCalls(
     if (materialBindGroups.has(materialIndex)) return materialBindGroups.get(materialIndex)!;
     const mat = materialIndex >= 0 && materialIndex < scene.materials.length
       ? scene.materials[materialIndex] : null;
-    const materialUboBuffer = getOrCreateMaterialUboBuffer(materialIndex);
-    const bg = createMaterialBindGroup(
-      device, matLayout, mat,
-      sceneLightBuffer, materialUboBuffer,
-      defaultSampler, ibl, lightsBuffer,
-      whiteView, normalView, blackView,
-    );
+    const materialUbo = getOrCreateMaterialUbo(materialIndex);
+
+    const sampler = mat?.sampler ?? defaultSampler;
+    const baseColorView = mat?.textures.get('baseColor') ?? whiteView;
+    const normalMapView = mat?.textures.get('normal') ?? normalView;
+    const mrView = mat?.textures.get('metallicRoughness') ?? whiteView;
+    const occlusionView = mat?.textures.get('occlusion') ?? whiteView;
+    const emissiveView = mat?.textures.get('emissive') ?? blackView;
+
+    const bg = device.createBindGroup({
+      layout: matLayout,
+      entries: [
+        // Light UBO (b0)
+        { binding: 0, resource: { buffer: lightBuffer } },
+        // Material UBO (b1)
+        { binding: 1, resource: { buffer: materialUbo } },
+        // base_color_tex (b2-3)
+        { binding: 2, resource: sampler },
+        { binding: 3, resource: baseColorView },
+        // normal_tex (b4-5)
+        { binding: 4, resource: sampler },
+        { binding: 5, resource: normalMapView },
+        // metallic_roughness_tex (b6-7)
+        { binding: 6, resource: sampler },
+        { binding: 7, resource: mrView },
+        // occlusion_tex (b8-9)
+        { binding: 8, resource: sampler },
+        { binding: 9, resource: occlusionView },
+        // emissive_tex (b10-11)
+        { binding: 10, resource: sampler },
+        { binding: 11, resource: emissiveView },
+        // env_specular (b12-13)
+        { binding: 12, resource: ibl.sampler },
+        { binding: 13, resource: ibl.specularView },
+        // env_irradiance (b14-15)
+        { binding: 14, resource: ibl.sampler },
+        { binding: 15, resource: ibl.irradianceView },
+        // brdf_lut (b16-17)
+        { binding: 16, resource: ibl.sampler },
+        { binding: 17, resource: ibl.brdfLutView },
+      ],
+      label: `material_bg_${materialIndex}`,
+    });
     materialBindGroups.set(materialIndex, bg);
     return bg;
   }
@@ -192,27 +240,21 @@ export function buildGltfSceneDrawCalls(
   const draws: DrawCall[] = [];
 
   if (scene.drawRanges.length > 0) {
-    // ---- New path: use drawRanges with per-draw model matrices ----
     for (let i = 0; i < scene.drawRanges.length; i++) {
       const dr = scene.drawRanges[i];
       const mesh = scene.meshes[dr.meshIndex];
       if (!mesh) continue;
 
-      // Per-draw MVP buffer (192 bytes: model + view + proj)
       const mvpBuffer = device.createBuffer({
-        size: 192,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         label: `mvp_draw_${i}`,
       });
-
-      // Per-draw MVP bind group (set 0)
-      const mvpBindGroup = device.createBindGroup({
+      const mvpBg = device.createBindGroup({
         layout: pipeline.bindGroupLayouts[0],
         entries: [{ binding: 0, resource: { buffer: mvpBuffer } }],
         label: `mvp_bg_${i}`,
       });
 
-      const materialBindGroup = getOrCreateMaterialBindGroup(dr.materialIndex);
       const mat = dr.materialIndex >= 0 && dr.materialIndex < scene.materials.length
         ? scene.materials[dr.materialIndex] : null;
 
@@ -221,39 +263,37 @@ export function buildGltfSceneDrawCalls(
         indexBuffer: mesh.indexBuffer,
         indexCount: mesh.indexCount,
         vertexCount: mesh.vertexCount,
-        materialBindGroup,
-        mvpBindGroup,
+        materialBindGroup: getOrCreateMaterialBindGroup(dr.materialIndex),
+        mvpBindGroup: mvpBg,
         mvpBuffer,
         worldTransform: dr.worldTransform,
         alphaMode: mat?.alphaMode ?? 'OPAQUE',
       });
     }
   } else {
-    // ---- Fallback path: walk node tree (backward compat for scenes without drawRanges) ----
+    // Fallback: walk node tree
     function collectDraws(nodes: Scene['nodes']): void {
       for (const node of nodes) {
         if (node.mesh) {
           const mat = node.material;
-          const matIndex = mat?.materialIndex ?? -1;
+          const matIdx = mat?.materialIndex ?? -1;
           const mvpBuffer = device.createBuffer({
-            size: 192,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
           });
-          const mvpBindGroup = device.createBindGroup({
+          const mvpBg = device.createBindGroup({
             layout: pipeline.bindGroupLayouts[0],
             entries: [{ binding: 0, resource: { buffer: mvpBuffer } }],
           });
-          const materialBindGroup = getOrCreateMaterialBindGroup(matIndex);
           draws.push({
             vertexBuffer: node.mesh.vertexBuffer,
             indexBuffer: node.mesh.indexBuffer,
             indexCount: node.mesh.indexCount,
             vertexCount: node.mesh.vertexCount,
-            materialBindGroup,
-            mvpBindGroup,
+            materialBindGroup: getOrCreateMaterialBindGroup(matIdx),
+            mvpBindGroup: mvpBg,
             mvpBuffer,
             worldTransform: node.transform,
-            alphaMode: (mat?.alphaMode) ?? 'OPAQUE',
+            alphaMode: mat?.alphaMode ?? 'OPAQUE',
           });
         }
         collectDraws(node.children);
@@ -262,25 +302,20 @@ export function buildGltfSceneDrawCalls(
     collectDraws(scene.nodes);
   }
 
-  // Sort draws: OPAQUE first, MASK second, BLEND last
+  // Sort: OPAQUE first, MASK second, BLEND last
   draws.sort((a, b) =>
     (ALPHA_ORDER[a.alphaMode ?? 'OPAQUE'] ?? 0) - (ALPHA_ORDER[b.alphaMode ?? 'OPAQUE'] ?? 0),
   );
 
-  // Create a shared MVP bind group (needed for backward compat — won't be used
-  // when per-draw mvpBindGroup exists, but callers expect it in the return value)
+  // Shared MVP bind group (backward compat)
   const sharedMvpBuffer = device.createBuffer({
-    size: 192,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    label: 'mvp_shared',
+    size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'mvp_shared',
   });
   const mvpBindGroup = device.createBindGroup({
     layout: pipeline.bindGroupLayouts[0],
     entries: [{ binding: 0, resource: { buffer: sharedMvpBuffer } }],
     label: 'mvp_bg_shared',
   });
-
-  // Add shared MVP to uniformBuffers for backward compat (engine writes model/view/proj)
   uniformBuffers.unshift({
     buffer: sharedMvpBuffer,
     fields: [
@@ -292,62 +327,4 @@ export function buildGltfSceneDrawCalls(
   });
 
   return { draws, uniformBuffers, mvpBindGroup, materialUboBuffers };
-}
-
-/**
- * Create a material bind group (set 1) matching the layered shader reflection layout:
- *   binding 0: SceneLight UBO (16 bytes: view_pos vec3 + light_count int)
- *   binding 1: Material UBO (144 bytes)
- *   binding 2-3: base_color_tex (sampler + texture)
- *   binding 4-5: metallic_roughness_tex (sampler + texture)
- *   binding 6-7: occlusion_tex (sampler + texture)
- *   binding 8-9: env_specular (sampler + cubemap)
- *   binding 10-11: env_irradiance (sampler + cubemap)
- *   binding 12-13: brdf_lut (sampler + texture)
- *   binding 14: lights storage buffer (SSBO)
- */
-function createMaterialBindGroup(
-  device: GPUDevice,
-  layout: GPUBindGroupLayout,
-  mat: Material | null,
-  sceneLightBuffer: GPUBuffer,
-  materialUboBuffer: GPUBuffer,
-  defaultSampler: GPUSampler,
-  ibl: ProceduralIBL,
-  lightsBuffer: GPUBuffer,
-  defaultWhiteView: GPUTextureView,
-  _defaultNormalView: GPUTextureView,
-  _defaultBlackView: GPUTextureView,
-): GPUBindGroup {
-  const sampler = mat?.sampler ?? defaultSampler;
-  const baseColorView = mat?.textures.get('baseColor') ?? defaultWhiteView;
-  const mrView = mat?.textures.get('metallicRoughness') ?? defaultWhiteView;
-  const occlusionView = mat?.textures.get('occlusion') ?? defaultWhiteView;
-
-  return device.createBindGroup({
-    layout,
-    entries: [
-      // SceneLight UBO
-      { binding: 0, resource: { buffer: sceneLightBuffer } },
-      // Material UBO
-      { binding: 1, resource: { buffer: materialUboBuffer } },
-      // Material textures (each has sampler + texture)
-      { binding: 2, resource: sampler },
-      { binding: 3, resource: baseColorView },
-      { binding: 4, resource: sampler },
-      { binding: 5, resource: mrView },
-      { binding: 6, resource: sampler },
-      { binding: 7, resource: occlusionView },
-      // IBL cubemaps
-      { binding: 8, resource: ibl.sampler },
-      { binding: 9, resource: ibl.specularView },
-      { binding: 10, resource: ibl.sampler },
-      { binding: 11, resource: ibl.irradianceView },
-      { binding: 12, resource: ibl.sampler },
-      { binding: 13, resource: ibl.brdfLutView },
-      // Lights SSBO
-      { binding: 14, resource: { buffer: lightsBuffer } },
-    ],
-    label: 'material_bg',
-  });
 }
