@@ -527,8 +527,20 @@ export class SplatRenderer {
     if (this._sort && sr) {
       const sort = this._sort;
 
-      // Each bit-pass: histogram -> prefix_sum (3 dispatches) -> scatter
-      // Ping-pong: pass 0 A->B, pass 1 B->A, pass 2 A->B, pass 3 B->A -> result in A
+      // IMPORTANT: WebGPU queue.writeBuffer resolves BEFORE the command buffer
+      // executes. All writeBuffer calls to the same buffer are last-write-wins.
+      // Each dispatch needs its OWN uniform buffer with pre-written data.
+      const makePushBuf = (data: Uint32Array): GPUBuffer => {
+        const buf = device.createBuffer({
+          size: 16, // 2x uint32 + padding
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true,
+        });
+        new Uint32Array(buf.getMappedRange()).set(data);
+        buf.unmap();
+        return buf;
+      };
+
       for (let bitPass = 0; bitPass < 4; bitPass++) {
         const bitOffset = bitPass * 8;
         const keysIn = bitPass % 2 === 0 ? sr.keysA : sr.keysB;
@@ -538,8 +550,7 @@ export class SplatRenderer {
 
         // ---- Histogram ----
         {
-          device.queue.writeBuffer(this._sortPushBuffer!, 0, new Uint32Array([n, bitOffset]));
-
+          const pushBuf = makePushBuf(new Uint32Array([n, bitOffset, 0, 0]));
           const histBindGroup = device.createBindGroup({
             layout: sort.histogramLayout,
             entries: [
@@ -549,7 +560,7 @@ export class SplatRenderer {
           });
           const pushBG = device.createBindGroup({
             layout: sort.histogram.getBindGroupLayout(1),
-            entries: [{ binding: 0, resource: { buffer: this._sortPushBuffer! } }],
+            entries: [{ binding: 0, resource: { buffer: pushBuf } }],
           });
 
           const pass = encoder.beginComputePass({ label: `sort_histogram_bit${bitOffset}` });
@@ -560,7 +571,7 @@ export class SplatRenderer {
           pass.end();
         }
 
-        // ---- Prefix sum (3 sub-dispatches, each in own compute pass for barriers) ----
+        // ---- Prefix sum (3 sub-dispatches) ----
         const prefixBindGroup = device.createBindGroup({
           layout: sort.prefixLayout,
           entries: [
@@ -571,10 +582,10 @@ export class SplatRenderer {
 
         // Pass 0: local scan
         {
-          device.queue.writeBuffer(this._sortPushBuffer!, 0, new Uint32Array([this._totalHistogramEntries, 0]));
+          const pushBuf = makePushBuf(new Uint32Array([this._totalHistogramEntries, 0, 0, 0]));
           const pushBG = device.createBindGroup({
             layout: sort.prefix.getBindGroupLayout(1),
-            entries: [{ binding: 0, resource: { buffer: this._sortPushBuffer! } }],
+            entries: [{ binding: 0, resource: { buffer: pushBuf } }],
           });
           const pass = encoder.beginComputePass({ label: `sort_prefix_local_bit${bitOffset}` });
           pass.setPipeline(sort.prefix);
@@ -586,10 +597,10 @@ export class SplatRenderer {
 
         // Pass 1: spine scan
         {
-          device.queue.writeBuffer(this._sortPushBuffer!, 0, new Uint32Array([this._prefixPartitions, 1]));
+          const pushBuf = makePushBuf(new Uint32Array([this._prefixPartitions, 1, 0, 0]));
           const pushBG = device.createBindGroup({
             layout: sort.prefix.getBindGroupLayout(1),
-            entries: [{ binding: 0, resource: { buffer: this._sortPushBuffer! } }],
+            entries: [{ binding: 0, resource: { buffer: pushBuf } }],
           });
           const pass = encoder.beginComputePass({ label: `sort_prefix_spine_bit${bitOffset}` });
           pass.setPipeline(sort.prefix);
@@ -601,10 +612,10 @@ export class SplatRenderer {
 
         // Pass 2: propagate
         {
-          device.queue.writeBuffer(this._sortPushBuffer!, 0, new Uint32Array([this._totalHistogramEntries, 2]));
+          const pushBuf = makePushBuf(new Uint32Array([this._totalHistogramEntries, 2, 0, 0]));
           const pushBG = device.createBindGroup({
             layout: sort.prefix.getBindGroupLayout(1),
-            entries: [{ binding: 0, resource: { buffer: this._sortPushBuffer! } }],
+            entries: [{ binding: 0, resource: { buffer: pushBuf } }],
           });
           const pass = encoder.beginComputePass({ label: `sort_prefix_propagate_bit${bitOffset}` });
           pass.setPipeline(sort.prefix);
@@ -616,8 +627,7 @@ export class SplatRenderer {
 
         // ---- Scatter ----
         {
-          device.queue.writeBuffer(this._sortPushBuffer!, 0, new Uint32Array([n, bitOffset]));
-
+          const pushBuf = makePushBuf(new Uint32Array([n, bitOffset, 0, 0]));
           const scatterBindGroup = device.createBindGroup({
             layout: sort.scatterLayout,
             entries: [
@@ -630,7 +640,7 @@ export class SplatRenderer {
           });
           const pushBG = device.createBindGroup({
             layout: sort.scatter.getBindGroupLayout(1),
-            entries: [{ binding: 0, resource: { buffer: this._sortPushBuffer! } }],
+            entries: [{ binding: 0, resource: { buffer: pushBuf } }],
           });
 
           const pass = encoder.beginComputePass({ label: `sort_scatter_bit${bitOffset}` });
