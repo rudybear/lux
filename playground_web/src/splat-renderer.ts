@@ -335,8 +335,9 @@ export class SplatRenderer {
         prefix, prefixLayout,
         scatter, scatterLayout,
       };
-    } catch {
-      console.warn('Sort shaders not available, rendering without GPU sort (unsorted splats)');
+      console.log('GPU radix sort pipelines created successfully');
+    } catch (e) {
+      console.warn('Sort shaders not available, rendering without GPU sort (unsorted splats):', e);
     }
   }
 
