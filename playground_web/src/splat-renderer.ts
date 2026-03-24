@@ -169,8 +169,14 @@ export class SplatRenderer {
     await this._createRenderPipeline(shaderBasePath, colorFormat);
 
     // Write initial indirect draw buffer: 6 vertices (quad), N instances (all splats), 0, 0
-    // Since we don't have a visible count from preprocess, draw all splats
     device.queue.writeBuffer(this._sortRes.indirectDraw, 0, new Uint32Array([6, n, 0, 0]));
+
+    // Initialize sorted_indices (valsA) to identity [0,1,2,...,n-1]
+    // Without GPU sort, the render shader reads sorted_indices[instance_id] to find which splat to draw.
+    // If uninitialized (zeros), every instance draws splat 0 → black screen.
+    const identityIndices = new Uint32Array(n);
+    for (let i = 0; i < n; i++) identityIndices[i] = i;
+    device.queue.writeBuffer(this._sortRes.valsA, 0, identityIndices);
   }
 
   private async _createPreprocessPipeline(basePath: string, splats: SplatBuffers): Promise<void> {
