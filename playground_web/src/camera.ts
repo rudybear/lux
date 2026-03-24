@@ -43,7 +43,7 @@ export class OrbitCamera {
     this.far = radius * 10;
     this.near = Math.max(0.01, radius * 0.01);
     this.elevation = 0.2;
-    this.azimuth = 0;
+    this.azimuth = Math.PI * 0.25;
   }
 
   /** Attach mouse/touch listeners to a canvas element. */

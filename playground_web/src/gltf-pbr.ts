@@ -1,16 +1,20 @@
 /**
  * glTF PBR rendering pipeline using Lux compiler-produced WGSL shaders.
  *
- * Loads gltf_pbr.vert.wgsl + gltf_pbr.frag.wgsl (compiled from examples/gltf_pbr.lux)
- * and creates the pipeline via ReflectedPipeline from the reflection JSON.
+ * Loads gltf_pbr_layered+emission+normal_map shaders (compiled from examples/gltf_pbr_layered.lux)
+ * with fallback to gltf_pbr shaders, and creates the pipeline via ReflectedPipeline
+ * from the reflection JSON.
  *
- * Layout (from compiler reflection):
+ * Layout (from compiler reflection — layered shader):
  *   Set 0, binding 0: MVP uniform (model, view, projection — 192 bytes)
- *   Set 1, binding 0: Light uniform (light_dir, view_pos — 32 bytes)
- *   Set 1, binding 1-10: material textures (base_color, normal, metallic_roughness, occlusion, emissive)
- *   Set 1, binding 11-16: IBL textures (env_specular cubemap, env_irradiance cubemap, brdf_lut 2D)
+ *   Set 1, binding 0: SceneLight UBO (view_pos vec3 + light_count int — 16 bytes)
+ *   Set 1, binding 1: Material UBO (144 bytes)
+ *   Set 1, binding 2-7: material textures (base_color, metallic_roughness, occlusion)
+ *   Set 1, binding 8-13: IBL textures (env_specular cubemap, env_irradiance cubemap, brdf_lut 2D)
+ *   Set 1, binding 14: lights storage buffer (SSBO)
  *
- * Supports per-draw model matrices, per-material bind groups, and alpha-mode draw ordering.
+ * Supports per-draw model matrices, per-material bind groups with Material UBO for
+ * live editing, and alpha-mode draw ordering.
  */
 
 import { loadShader } from './shader-loader';
@@ -32,17 +36,29 @@ export async function createGltfPbrPipeline(
   device: GPUDevice,
   format: GPUTextureFormat,
 ): Promise<ReflectedPipeline> {
-  const [vertShader, fragShader] = await Promise.all([
-    loadShader(device, 'shaders/gltf_pbr.vert'),
-    loadShader(device, 'shaders/gltf_pbr.frag'),
-  ]);
-  return ReflectedPipeline.create(
-    device, vertShader.module, fragShader.module,
-    vertShader.reflection, fragShader.reflection,
-    format,
-    'depth24plus',
-    'none', // double-sided
-  );
+  // Try layered shader first, fall back to basic
+  try {
+    const [vertShader, fragShader] = await Promise.all([
+      loadShader(device, 'shaders/gltf_pbr_layered+emission+normal_map.vert'),
+      loadShader(device, 'shaders/gltf_pbr_layered+emission+normal_map.frag'),
+    ]);
+    return ReflectedPipeline.create(
+      device, vertShader.module, fragShader.module,
+      vertShader.reflection, fragShader.reflection,
+      format, 'depth24plus', 'none',
+    );
+  } catch {
+    // Fallback to basic gltf_pbr
+    const [vertShader, fragShader] = await Promise.all([
+      loadShader(device, 'shaders/gltf_pbr.vert'),
+      loadShader(device, 'shaders/gltf_pbr.frag'),
+    ]);
+    return ReflectedPipeline.create(
+      device, vertShader.module, fragShader.module,
+      vertShader.reflection, fragShader.reflection,
+      format, 'depth24plus', 'none',
+    );
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -80,7 +96,13 @@ export function buildGltfSceneDrawCalls(
   pipeline: ReflectedPipeline,
   scene: Scene,
   ibl: ProceduralIBL,
-): { draws: DrawCall[]; uniformBuffers: UniformBufferBinding[]; mvpBindGroup: GPUBindGroup; storageBuffers?: { buffer: GPUBuffer; data: Float32Array }[] } {
+): {
+  draws: DrawCall[];
+  uniformBuffers: UniformBufferBinding[];
+  mvpBindGroup: GPUBindGroup;
+  storageBuffers?: { buffer: GPUBuffer; data: Float32Array }[];
+  materialUboBuffers: Map<number, GPUBuffer>;
+} {
   // Default textures
   const whiteTex = create1x1Texture(device, 255, 255, 255, 255);
   const normalTex = create1x1Texture(device, 128, 128, 255, 255);
@@ -97,23 +119,53 @@ export function buildGltfSceneDrawCalls(
   const normalView = normalTex.createView();
   const blackView = blackTex.createView();
 
-  // Light uniform buffer (set 1, binding 0 — 32 bytes: light_dir + view_pos)
-  const lightBuffer = device.createBuffer({
-    size: 32,
+  // -- Lights --
+  const lights = populateLightsFromScene(scene);
+  const lightsData = packLightsBuffer(lights);
+
+  // Lights SSBO (set 1, binding 14)
+  const lightsBuffer = device.createBuffer({
+    size: Math.max(lightsData.byteLength, 64),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    label: 'lights_ssbo',
+  });
+  device.queue.writeBuffer(lightsBuffer, 0, lightsData.buffer, lightsData.byteOffset, lightsData.byteLength);
+
+  // SceneLight UBO (set 1, binding 0 — 16 bytes: view_pos + light_count)
+  const sceneLightBuffer = device.createBuffer({
+    size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    label: 'light_uniforms',
+    label: 'scene_light_ubo',
   });
 
   const uniformBuffers: UniformBufferBinding[] = [
     {
-      buffer: lightBuffer,
+      buffer: sceneLightBuffer,
       fields: [
-        { name: 'light_dir', type: 'vec3', offset: 0, size: 12 },
-        { name: 'view_pos', type: 'vec3', offset: 16, size: 12 },
+        { name: 'view_pos', type: 'vec3', offset: 0, size: 12 },
+        { name: 'light_count', type: 'int', offset: 12, size: 4 },
       ],
-      size: 32,
+      size: 16,
     },
   ];
+
+  // Per-material UBO buffers (for live editing)
+  const materialUboBuffers = new Map<number, GPUBuffer>();
+
+  function getOrCreateMaterialUboBuffer(materialIndex: number): GPUBuffer {
+    if (materialUboBuffers.has(materialIndex)) return materialUboBuffers.get(materialIndex)!;
+    const mat = materialIndex >= 0 && materialIndex < scene.materials.length
+      ? scene.materials[materialIndex] : null;
+    const uboData = mat ? fillMaterialUBO(mat) : new ArrayBuffer(MATERIAL_UBO_SIZE);
+    const buf = device.createBuffer({
+      size: MATERIAL_UBO_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: `material_ubo_${materialIndex}`,
+    });
+    device.queue.writeBuffer(buf, 0, uboData);
+    materialUboBuffers.set(materialIndex, buf);
+    return buf;
+  }
 
   // Per-material bind group cache (keyed by materialIndex)
   const materialBindGroups = new Map<number, GPUBindGroup>();
@@ -123,8 +175,11 @@ export function buildGltfSceneDrawCalls(
     if (materialBindGroups.has(materialIndex)) return materialBindGroups.get(materialIndex)!;
     const mat = materialIndex >= 0 && materialIndex < scene.materials.length
       ? scene.materials[materialIndex] : null;
+    const materialUboBuffer = getOrCreateMaterialUboBuffer(materialIndex);
     const bg = createMaterialBindGroup(
-      device, matLayout, mat, lightBuffer, defaultSampler, ibl,
+      device, matLayout, mat,
+      sceneLightBuffer, materialUboBuffer,
+      defaultSampler, ibl, lightsBuffer,
       whiteView, normalView, blackView,
     );
     materialBindGroups.set(materialIndex, bg);
@@ -177,6 +232,7 @@ export function buildGltfSceneDrawCalls(
       for (const node of nodes) {
         if (node.mesh) {
           const mat = node.material;
+          const matIndex = mat?.materialIndex ?? -1;
           const mvpBuffer = device.createBuffer({
             size: 192,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -185,11 +241,7 @@ export function buildGltfSceneDrawCalls(
             layout: pipeline.bindGroupLayouts[0],
             entries: [{ binding: 0, resource: { buffer: mvpBuffer } }],
           });
-          const materialBindGroup = createMaterialBindGroup(
-            device, matLayout, mat ?? null,
-            lightBuffer, defaultSampler, ibl,
-            whiteView, normalView, blackView,
-          );
+          const materialBindGroup = getOrCreateMaterialBindGroup(matIndex);
           draws.push({
             vertexBuffer: node.mesh.vertexBuffer,
             indexBuffer: node.mesh.indexBuffer,
@@ -237,62 +289,62 @@ export function buildGltfSceneDrawCalls(
     size: 192,
   });
 
-  return { draws, uniformBuffers, mvpBindGroup };
+  return { draws, uniformBuffers, mvpBindGroup, materialUboBuffers };
 }
 
 /**
- * Create a material bind group (set 1) matching the compiler reflection layout:
- *   binding 0: Light uniform buffer
- *   binding 1-2: base_color_tex (sampler + texture)
- *   binding 3-4: normal_tex (sampler + texture)
- *   binding 5-6: metallic_roughness_tex (sampler + texture)
- *   binding 7-8: occlusion_tex (sampler + texture)
- *   binding 9-10: emissive_tex (sampler + texture)
- *   binding 11-12: env_specular (sampler + cubemap)
- *   binding 13-14: env_irradiance (sampler + cubemap)
- *   binding 15-16: brdf_lut (sampler + texture)
+ * Create a material bind group (set 1) matching the layered shader reflection layout:
+ *   binding 0: SceneLight UBO (16 bytes: view_pos vec3 + light_count int)
+ *   binding 1: Material UBO (144 bytes)
+ *   binding 2-3: base_color_tex (sampler + texture)
+ *   binding 4-5: metallic_roughness_tex (sampler + texture)
+ *   binding 6-7: occlusion_tex (sampler + texture)
+ *   binding 8-9: env_specular (sampler + cubemap)
+ *   binding 10-11: env_irradiance (sampler + cubemap)
+ *   binding 12-13: brdf_lut (sampler + texture)
+ *   binding 14: lights storage buffer (SSBO)
  */
 function createMaterialBindGroup(
   device: GPUDevice,
   layout: GPUBindGroupLayout,
   mat: Material | null,
-  lightBuffer: GPUBuffer,
+  sceneLightBuffer: GPUBuffer,
+  materialUboBuffer: GPUBuffer,
   defaultSampler: GPUSampler,
   ibl: ProceduralIBL,
+  lightsBuffer: GPUBuffer,
   defaultWhiteView: GPUTextureView,
-  defaultNormalView: GPUTextureView,
-  defaultBlackView: GPUTextureView,
+  _defaultNormalView: GPUTextureView,
+  _defaultBlackView: GPUTextureView,
 ): GPUBindGroup {
   const sampler = mat?.sampler ?? defaultSampler;
   const baseColorView = mat?.textures.get('baseColor') ?? defaultWhiteView;
-  const normalMapView = mat?.textures.get('normal') ?? defaultNormalView;
   const mrView = mat?.textures.get('metallicRoughness') ?? defaultWhiteView;
   const occlusionView = mat?.textures.get('occlusion') ?? defaultWhiteView;
-  const emissiveView = mat?.textures.get('emissive') ?? defaultBlackView;
 
   return device.createBindGroup({
     layout,
     entries: [
-      // Light uniform
-      { binding: 0, resource: { buffer: lightBuffer } },
+      // SceneLight UBO
+      { binding: 0, resource: { buffer: sceneLightBuffer } },
+      // Material UBO
+      { binding: 1, resource: { buffer: materialUboBuffer } },
       // Material textures (each has sampler + texture)
-      { binding: 1, resource: sampler },
-      { binding: 2, resource: baseColorView },
-      { binding: 3, resource: sampler },
-      { binding: 4, resource: normalMapView },
-      { binding: 5, resource: sampler },
-      { binding: 6, resource: mrView },
-      { binding: 7, resource: sampler },
-      { binding: 8, resource: occlusionView },
-      { binding: 9, resource: sampler },
-      { binding: 10, resource: emissiveView },
+      { binding: 2, resource: sampler },
+      { binding: 3, resource: baseColorView },
+      { binding: 4, resource: sampler },
+      { binding: 5, resource: mrView },
+      { binding: 6, resource: sampler },
+      { binding: 7, resource: occlusionView },
       // IBL cubemaps
-      { binding: 11, resource: ibl.sampler },
-      { binding: 12, resource: ibl.specularView },
-      { binding: 13, resource: ibl.sampler },
-      { binding: 14, resource: ibl.irradianceView },
-      { binding: 15, resource: ibl.sampler },
-      { binding: 16, resource: ibl.brdfLutView },
+      { binding: 8, resource: ibl.sampler },
+      { binding: 9, resource: ibl.specularView },
+      { binding: 10, resource: ibl.sampler },
+      { binding: 11, resource: ibl.irradianceView },
+      { binding: 12, resource: ibl.sampler },
+      { binding: 13, resource: ibl.brdfLutView },
+      // Lights SSBO
+      { binding: 14, resource: { buffer: lightsBuffer } },
     ],
     label: 'material_bg',
   });

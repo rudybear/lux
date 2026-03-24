@@ -17,6 +17,7 @@ import {
   FALLBACK_VERT_REFLECTION, FALLBACK_FRAG_REFLECTION,
 } from './fallback-shaders';
 import { createGltfPbrPipeline, buildGltfSceneDrawCalls } from './gltf-pbr';
+import { fillMaterialUBO } from './material-ubo';
 import { loadIBL } from './ibl-loader';
 import { generateProceduralIBL, type ProceduralIBL } from './procedural-ibl';
 
@@ -142,17 +143,20 @@ async function buildGltfRenderState(
   format: GPUTextureFormat,
   scene: Scene,
   ibl: ProceduralIBL,
-): Promise<RenderState> {
+): Promise<{ state: RenderState; materialUboBuffers: Map<number, GPUBuffer> }> {
   const pipeline = await createGltfPbrPipeline(device, format);
-  const { draws, uniformBuffers, mvpBindGroup, storageBuffers } = buildGltfSceneDrawCalls(device, pipeline, scene, ibl);
+  const { draws, uniformBuffers, mvpBindGroup, storageBuffers, materialUboBuffers } = buildGltfSceneDrawCalls(device, pipeline, scene, ibl);
 
   return {
-    pipeline,
-    bindGroups: [mvpBindGroup],
-    draws,
-    pushBuffer: null,
-    uniformBuffers,
-    storageBuffers,
+    state: {
+      pipeline,
+      bindGroups: [mvpBindGroup],
+      draws,
+      pushBuffer: null,
+      uniformBuffers,
+      storageBuffers,
+    },
+    materialUboBuffers,
   };
 }
 
@@ -203,6 +207,7 @@ async function main() {
   const engine = new RenderEngine(gpu);
   const ui = new UI();
   let currentLoadedScene: Scene | null = null;
+  let currentMaterialBuffers: Map<number, GPUBuffer> | null = null;
 
   observeCanvasResize(canvas, (w, h) => {
     gpu.context.configure({ device, format, alphaMode: 'opaque' });
@@ -246,11 +251,12 @@ async function main() {
     console.log('Loading DamagedHelmet...');
     const scene = await loadGLB(device, DAMAGED_HELMET_URL);
     console.log(`Loaded ${scene.meshes.length} meshes, ${scene.materials.length} materials, ${scene.lights.length} lights, ${scene.drawRanges.length} draw ranges`);
-    const state = await buildGltfRenderState(device, format, scene, ibl);
+    const { state, materialUboBuffers } = await buildGltfRenderState(device, format, scene, ibl);
     engine.setRenderState(state);
     engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
     engine.lightCount = Math.max(1, scene.lights.length);
     currentLoadedScene = scene;
+    currentMaterialBuffers = materialUboBuffers;
     updateSceneUI(scene);
     console.log('DamagedHelmet loaded successfully');
   } catch (e) {
@@ -260,6 +266,7 @@ async function main() {
     const state = buildSphereRenderState(device, pipeline);
     engine.setRenderState(state);
     currentLoadedScene = null;
+    currentMaterialBuffers = null;
   }
 
   // UI callbacks
@@ -270,11 +277,12 @@ async function main() {
     if (sceneName === 'damaged_helmet') {
       try {
         const scene = await loadGLB(device, DAMAGED_HELMET_URL);
-        const state = await buildGltfRenderState(device, format, scene, ibl);
+        const { state, materialUboBuffers } = await buildGltfRenderState(device, format, scene, ibl);
         engine.setRenderState(state);
         engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
         engine.lightCount = Math.max(1, scene.lights.length);
         currentLoadedScene = scene;
+        currentMaterialBuffers = materialUboBuffers;
         updateSceneUI(scene);
       } catch (e) {
         console.error('Failed to load DamagedHelmet:', e);
@@ -285,11 +293,12 @@ async function main() {
         const scene = await loadGLB(device, LUIGI_URL);
         console.log(`Loaded ${scene.meshes.length} meshes, ${scene.materials.length} materials`);
         console.log('Gaussian splatting scenes require splat pipeline integration (TODO)');
-        const state = await buildGltfRenderState(device, format, scene, ibl);
+        const { state, materialUboBuffers } = await buildGltfRenderState(device, format, scene, ibl);
         engine.setRenderState(state);
         engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
         engine.lightCount = Math.max(1, scene.lights.length);
         currentLoadedScene = scene;
+        currentMaterialBuffers = materialUboBuffers;
         updateSceneUI(scene);
       } catch (e) {
         console.error('Failed to load Luigi splat scene:', e);
@@ -300,6 +309,7 @@ async function main() {
       engine.setRenderState(state);
       engine.camera.distance = 3.0;
       currentLoadedScene = null;
+      currentMaterialBuffers = null;
       ui.setMaterials([]);
     } else {
       // Try pre-compiled shaders, fall back to sphere
@@ -308,6 +318,7 @@ async function main() {
       const state = buildSphereRenderState(device, pipeline);
       engine.setRenderState(state);
       currentLoadedScene = null;
+      currentMaterialBuffers = null;
       ui.setMaterials([]);
     }
   };
@@ -317,10 +328,13 @@ async function main() {
     const mat = currentLoadedScene?.materials[materialIndex];
     if (!mat) return;
     (mat as any)[field] = value;
-    console.log(`Material ${materialIndex}: ${field} = ${value}`);
-    // NOTE: With the current gltf_pbr shader, material changes are not reflected
-    // in rendering (values come from textures). With gltf_pbr_layered shader
-    // and Material UBO, these changes would update the GPU buffer directly.
+
+    // Re-pack and upload to GPU via Material UBO
+    const buf = currentMaterialBuffers?.get(materialIndex);
+    if (buf) {
+      const data = fillMaterialUBO(mat);
+      device.queue.writeBuffer(buf, 0, data);
+    }
   };
 
   ui.onScreenshot = () => {
@@ -340,11 +354,12 @@ async function main() {
     try {
       const glScene = await loadGLBFromBuffer(device, buffer);
       console.log(`Loaded ${glScene.meshes.length} meshes, ${glScene.materials.length} materials, ${glScene.lights.length} lights`);
-      const state = await buildGltfRenderState(device, format, glScene, ibl);
+      const { state, materialUboBuffers } = await buildGltfRenderState(device, format, glScene, ibl);
       engine.setRenderState(state);
       engine.camera.frameScene(glScene.boundsMin, glScene.boundsMax);
       engine.lightCount = Math.max(1, glScene.lights.length);
       currentLoadedScene = glScene;
+      currentMaterialBuffers = materialUboBuffers;
       updateSceneUI(glScene);
       currentScene = 'custom';
     } catch (e) {

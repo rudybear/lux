@@ -305,13 +305,19 @@ export class RenderEngine {
     fields: FieldLayout[],
     namedValues: Map<string, number[]>,
   ): void {
+    const dv = new DataView(f32.buffer, f32.byteOffset, f32.byteLength);
     for (const field of fields) {
       const vals = namedValues.get(field.name);
       if (!vals) continue;
       const idx = field.offset / 4;
       const count = TYPE_FLOAT_COUNT[field.type] ?? vals.length;
+      const isInt = field.type === 'int' || field.type === 'uint';
       for (let i = 0; i < Math.min(count, vals.length); i++) {
-        f32[idx + i] = vals[i];
+        if (isInt) {
+          dv.setInt32(field.offset + i * 4, Math.round(vals[i]), true);
+        } else {
+          f32[idx + i] = vals[i];
+        }
       }
     }
   }
