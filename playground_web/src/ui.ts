@@ -62,6 +62,8 @@ export class UI {
     materials: number;
     lights: number;
     drawRanges: number;
+    vertices: number;
+    triangles: number;
     bounds: { min: [number, number, number]; max: [number, number, number] };
     materialNames?: string[];
     lightDescriptions?: string[];
@@ -70,11 +72,11 @@ export class UI {
     if (infoEl) {
       const bMin = info.bounds.min.map(v => v.toFixed(2)).join(', ');
       const bMax = info.bounds.max.map(v => v.toFixed(2)).join(', ');
+      const fmtNum = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
       infoEl.innerHTML = [
-        `Meshes: ${info.meshes}`,
-        `Materials: ${info.materials}`,
-        `Lights: ${info.lights}`,
-        `Draw calls: ${info.drawRanges}`,
+        `Vertices: ${fmtNum(info.vertices)} | Triangles: ${fmtNum(info.triangles)}`,
+        `Meshes: ${info.meshes} | Materials: ${info.materials}`,
+        `Lights: ${info.lights} | Draw calls: ${info.drawRanges}`,
         `Bounds: [${bMin}]`,
         `&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[${bMax}]`,
       ].join('<br>');

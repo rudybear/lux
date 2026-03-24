@@ -266,11 +266,12 @@ export class RenderEngine {
     values.set('view_pos', [eye[0], eye[1], eye[2]]);
     values.set('eye_position', [eye[0], eye[1], eye[2]]);
 
-    // Light
+    // Light (exposure scales the light color as intensity multiplier)
     const len = Math.sqrt(0.25 + this.lightDirY * this.lightDirY + 0.09);
     values.set('light_dir', [0.5 / len, this.lightDirY / len, 0.3 / len]);
     values.set('light_direction', [0.5 / len, this.lightDirY / len, 0.3 / len]);
-    values.set('light_color', [1, 1, 1]);
+    const e = this.exposure;
+    values.set('light_color', [e, e, e]);
 
     // Material
     values.set('metallic', [this.metallic]);

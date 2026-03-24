@@ -87,4 +87,8 @@ export interface Scene {
   boundsMin: [number, number, number];
   boundsMax: [number, number, number];
   drawRanges: DrawRange[];
+  /** Total vertex count across all meshes. */
+  totalVertices: number;
+  /** Total triangle count (indexCount / 3 summed). */
+  totalTriangles: number;
 }

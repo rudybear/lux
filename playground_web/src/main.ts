@@ -224,6 +224,8 @@ async function main() {
       materials: scene.materials.length,
       lights: scene.lights.length,
       drawRanges: scene.drawRanges.length,
+      vertices: scene.totalVertices,
+      triangles: scene.totalTriangles,
       bounds: { min: scene.boundsMin, max: scene.boundsMax },
       materialNames: scene.materials.map((m, i) =>
         `Mat${i} (${m.alphaMode}${m.hasClearcoat ? ' +coat' : ''}${m.hasSheen ? ' +sheen' : ''}${m.hasTransmission ? ' +trans' : ''})`,

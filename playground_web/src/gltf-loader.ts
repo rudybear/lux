@@ -541,6 +541,14 @@ async function parseGLBScene(
     traverseForDrawRanges(ri, identityMat);
   }
 
+  // Compute totals
+  let totalVertices = 0;
+  let totalTriangles = 0;
+  for (const m of meshes) {
+    totalVertices += m.vertexCount;
+    totalTriangles += m.indexCount > 0 ? Math.floor(m.indexCount / 3) : Math.floor(m.vertexCount / 3);
+  }
+
   return {
     nodes: rootNodes,
     meshes,
@@ -549,5 +557,7 @@ async function parseGLBScene(
     boundsMin,
     boundsMax,
     drawRanges,
+    totalVertices,
+    totalTriangles,
   };
 }
