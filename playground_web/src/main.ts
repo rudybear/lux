@@ -23,6 +23,8 @@ import { generateProceduralIBL, type ProceduralIBL } from './procedural-ibl';
 const DAMAGED_HELMET_URL =
   'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb';
 
+const LUIGI_URL = 'assets/luigi.glb';
+
 // --------------------------------------------------------------------------
 // Geometry helpers
 // --------------------------------------------------------------------------
@@ -200,6 +202,7 @@ async function main() {
   const { device, format } = gpu;
   const engine = new RenderEngine(gpu);
   const ui = new UI();
+  let currentLoadedScene: Scene | null = null;
 
   observeCanvasResize(canvas, (w, h) => {
     gpu.context.configure({ device, format, alphaMode: 'opaque' });
@@ -234,6 +237,7 @@ async function main() {
         `${l.type} [${l.color.map(c => c.toFixed(1)).join(',')}] i=${l.intensity.toFixed(1)}`,
       ),
     });
+    ui.setMaterials(scene.materials);
   }
 
   // Load DamagedHelmet as default scene
@@ -246,6 +250,7 @@ async function main() {
     engine.setRenderState(state);
     engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
     engine.lightCount = Math.max(1, scene.lights.length);
+    currentLoadedScene = scene;
     updateSceneUI(scene);
     console.log('DamagedHelmet loaded successfully');
   } catch (e) {
@@ -254,6 +259,7 @@ async function main() {
     const pipeline = createFallbackPipeline(device, format);
     const state = buildSphereRenderState(device, pipeline);
     engine.setRenderState(state);
+    currentLoadedScene = null;
   }
 
   // UI callbacks
@@ -268,22 +274,53 @@ async function main() {
         engine.setRenderState(state);
         engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
         engine.lightCount = Math.max(1, scene.lights.length);
+        currentLoadedScene = scene;
         updateSceneUI(scene);
       } catch (e) {
         console.error('Failed to load DamagedHelmet:', e);
+      }
+    } else if (sceneName === 'luigi_splat') {
+      try {
+        console.log('Loading Luigi (Gaussian Splat)...');
+        const scene = await loadGLB(device, LUIGI_URL);
+        console.log(`Loaded ${scene.meshes.length} meshes, ${scene.materials.length} materials`);
+        console.log('Gaussian splatting scenes require splat pipeline integration (TODO)');
+        const state = await buildGltfRenderState(device, format, scene, ibl);
+        engine.setRenderState(state);
+        engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
+        engine.lightCount = Math.max(1, scene.lights.length);
+        currentLoadedScene = scene;
+        updateSceneUI(scene);
+      } catch (e) {
+        console.error('Failed to load Luigi splat scene:', e);
       }
     } else if (sceneName === 'pbr_sphere') {
       const pipeline = createFallbackPipeline(device, format);
       const state = buildSphereRenderState(device, pipeline);
       engine.setRenderState(state);
       engine.camera.distance = 3.0;
+      currentLoadedScene = null;
+      ui.setMaterials([]);
     } else {
       // Try pre-compiled shaders, fall back to sphere
       const compiled = await loadShaderPipeline(device, format, sceneName);
       const pipeline = compiled ?? createFallbackPipeline(device, format);
       const state = buildSphereRenderState(device, pipeline);
       engine.setRenderState(state);
+      currentLoadedScene = null;
+      ui.setMaterials([]);
     }
+  };
+
+  ui.onMaterialChange = (materialIndex, field, value) => {
+    // Update the in-memory material
+    const mat = currentLoadedScene?.materials[materialIndex];
+    if (!mat) return;
+    (mat as any)[field] = value;
+    console.log(`Material ${materialIndex}: ${field} = ${value}`);
+    // NOTE: With the current gltf_pbr shader, material changes are not reflected
+    // in rendering (values come from textures). With gltf_pbr_layered shader
+    // and Material UBO, these changes would update the GPU buffer directly.
   };
 
   ui.onScreenshot = () => {
@@ -307,6 +344,7 @@ async function main() {
       engine.setRenderState(state);
       engine.camera.frameScene(glScene.boundsMin, glScene.boundsMax);
       engine.lightCount = Math.max(1, glScene.lights.length);
+      currentLoadedScene = glScene;
       updateSceneUI(glScene);
       currentScene = 'custom';
     } catch (e) {
@@ -321,8 +359,6 @@ async function main() {
     const dt = (now - lastTime) / 1000;
     lastTime = now;
 
-    engine.metallic = ui.state.metallic;
-    engine.roughness = ui.state.roughness;
     engine.exposure = ui.state.exposure;
     engine.lightDirY = ui.state.lightDirY;
 

@@ -2,9 +2,9 @@
  * UI controls: sidebar sliders, FPS counter, drag-and-drop, scene selector.
  */
 
+import type { Material } from './scene';
+
 export interface UIState {
-  metallic: number;
-  roughness: number;
   exposure: number;
   lightDirY: number;
   selectedScene: string;
@@ -17,23 +17,24 @@ export class UI {
   private _fpsEl: HTMLElement;
   private _frameTimes: number[] = [];
   private _state: UIState = {
-    metallic: 0,
-    roughness: 0.5,
     exposure: 1.0,
     lightDirY: 0.7,
     selectedScene: 'pbr_basic',
   };
 
+  /** Currently loaded materials for the explorer. */
+  private _materials: Material[] = [];
+  private _selectedMaterialIndex = 0;
+
   onSceneChange: SceneChangeCallback | null = null;
   onFileDrop: FileDropCallback | null = null;
   onScreenshot: (() => void) | null = null;
+  onMaterialChange: ((index: number, field: string, value: number | number[]) => void) | null = null;
 
   constructor() {
     this._fpsEl = document.getElementById('fps')!;
 
     // Wire up sliders
-    this._bindSlider('metallic', v => { this._state.metallic = v; });
-    this._bindSlider('roughness', v => { this._state.roughness = v; });
     this._bindSlider('exposure', v => { this._state.exposure = v; });
     this._bindSlider('light-y', v => { this._state.lightDirY = v; });
 
@@ -54,6 +55,36 @@ export class UI {
 
   get state(): Readonly<UIState> {
     return this._state;
+  }
+
+  /** Populate the material explorer with scene materials. */
+  setMaterials(materials: Material[]): void {
+    this._materials = materials;
+    this._selectedMaterialIndex = 0;
+
+    const select = document.getElementById('material-select') as HTMLSelectElement;
+    if (!select) return;
+    select.innerHTML = '';
+
+    materials.forEach((mat, i) => {
+      const opt = document.createElement('option');
+      opt.value = String(i);
+      const flags = [
+        mat.hasClearcoat ? 'coat' : '',
+        mat.hasSheen ? 'sheen' : '',
+        mat.hasTransmission ? 'trans' : '',
+        mat.isUnlit ? 'unlit' : '',
+      ].filter(Boolean).join('+');
+      opt.textContent = `Material ${i} (${mat.alphaMode}${flags ? ' ' + flags : ''})`;
+      select.appendChild(opt);
+    });
+
+    select.addEventListener('change', () => {
+      this._selectedMaterialIndex = parseInt(select.value);
+      this._renderMaterialProps();
+    });
+
+    this._renderMaterialProps();
   }
 
   /** Update the scene info panel with loaded scene metadata. */
@@ -82,13 +113,6 @@ export class UI {
       ].join('<br>');
     }
 
-    const matEl = document.getElementById('material-list');
-    if (matEl && info.materialNames) {
-      matEl.innerHTML = info.materialNames.map((name, i) =>
-        `<div style="padding:2px 0;color:#aab">${i}: ${name}</div>`,
-      ).join('');
-    }
-
     const lightEl = document.getElementById('light-list');
     if (lightEl && info.lightDescriptions) {
       lightEl.innerHTML = info.lightDescriptions.map((desc, i) =>
@@ -104,6 +128,89 @@ export class UI {
     const avg = this._frameTimes.reduce((a, b) => a + b, 0) / this._frameTimes.length;
     const fps = avg > 0 ? 1 / avg : 0;
     this._fpsEl.textContent = `${fps.toFixed(0)} fps`;
+  }
+
+  private _renderMaterialProps(): void {
+    const container = document.getElementById('material-props');
+    if (!container || !this._materials.length) return;
+
+    const mat = this._materials[this._selectedMaterialIndex];
+    if (!mat) return;
+
+    container.innerHTML = '';
+    const idx = this._selectedMaterialIndex;
+
+    // Helper to create a slider row
+    const addSlider = (label: string, field: string, value: number, min: number, max: number, step: number) => {
+      const row = document.createElement('div');
+      row.innerHTML = `
+        <label style="display:block;font-size:11px;margin-top:6px;color:#a0a0c0">${label}</label>
+        <div class="slider-row">
+          <input type="range" min="${min}" max="${max}" step="${step}" value="${value}" style="flex:1" />
+          <span style="font-size:11px;min-width:36px;text-align:right;font-family:monospace">${value.toFixed(2)}</span>
+        </div>`;
+      const input = row.querySelector('input')!;
+      const span = row.querySelector('span')!;
+      input.addEventListener('input', () => {
+        const v = parseFloat(input.value);
+        span.textContent = v.toFixed(2);
+        this.onMaterialChange?.(idx, field, v);
+      });
+      container.appendChild(row);
+    };
+
+    // Helper to create a color display with RGB values
+    const addColor = (label: string, _field: string, rgb: number[]) => {
+      const r = Math.round(rgb[0] * 255);
+      const g = Math.round(rgb[1] * 255);
+      const b = Math.round(rgb[2] * 255);
+      const row = document.createElement('div');
+      row.innerHTML = `
+        <label style="display:block;font-size:11px;margin-top:6px;color:#a0a0c0">${label}</label>
+        <div style="display:flex;align-items:center;gap:6px;margin-top:2px">
+          <div style="width:20px;height:20px;border-radius:3px;border:1px solid #555;background:rgb(${r},${g},${b})"></div>
+          <span style="font-size:10px;font-family:monospace;color:#888">(${rgb[0].toFixed(2)}, ${rgb[1].toFixed(2)}, ${rgb[2].toFixed(2)})</span>
+        </div>`;
+      container.appendChild(row);
+    };
+
+    // Core PBR properties
+    addColor('Base Color', 'baseColor', [mat.baseColor[0], mat.baseColor[1], mat.baseColor[2]]);
+    addSlider('Metallic', 'metallic', mat.metallic, 0, 1, 0.01);
+    addSlider('Roughness', 'roughness', mat.roughness, 0, 1, 0.01);
+    addSlider('IOR', 'ior', mat.ior, 1.0, 3.0, 0.01);
+
+    // Emissive
+    if (mat.emissive[0] > 0 || mat.emissive[1] > 0 || mat.emissive[2] > 0 || mat.emissiveStrength > 0) {
+      addColor('Emissive', 'emissive', mat.emissive);
+      addSlider('Emissive Strength', 'emissiveStrength', mat.emissiveStrength, 0, 10, 0.1);
+    }
+
+    // Clearcoat
+    if (mat.hasClearcoat) {
+      addSlider('Clearcoat', 'clearcoatFactor', mat.clearcoatFactor, 0, 1, 0.01);
+      addSlider('Clearcoat Roughness', 'clearcoatRoughnessFactor', mat.clearcoatRoughnessFactor, 0, 1, 0.01);
+    }
+
+    // Sheen
+    if (mat.hasSheen) {
+      addColor('Sheen Color', 'sheenColorFactor', mat.sheenColorFactor);
+      addSlider('Sheen Roughness', 'sheenRoughnessFactor', mat.sheenRoughnessFactor, 0, 1, 0.01);
+    }
+
+    // Transmission
+    if (mat.hasTransmission) {
+      addSlider('Transmission', 'transmissionFactor', mat.transmissionFactor, 0, 1, 0.01);
+    }
+
+    // Alpha info
+    const alphaInfo = document.createElement('div');
+    alphaInfo.innerHTML = `<div style="font-size:10px;margin-top:8px;padding:4px;background:#0a0a2a;border-radius:3px;color:#666">
+      Alpha: ${mat.alphaMode}${mat.alphaMode === 'MASK' ? ` (cutoff ${mat.alphaCutoff})` : ''} |
+      ${mat.doubleSided ? 'Double-sided' : 'Single-sided'} |
+      Textures: ${mat.textures.size}
+    </div>`;
+    container.appendChild(alphaInfo);
   }
 
   private _bindSlider(id: string, cb: (v: number) => void): void {
