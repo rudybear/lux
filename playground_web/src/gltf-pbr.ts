@@ -39,8 +39,8 @@ export async function createGltfPbrPipeline(
   // Try layered shader first, fall back to basic
   try {
     const [vertShader, fragShader] = await Promise.all([
-      loadShader(device, 'shaders/gltf_pbr_layered+emission+normal_map.vert'),
-      loadShader(device, 'shaders/gltf_pbr_layered+emission+normal_map.frag'),
+      loadShader(device, 'shaders/gltf_pbr_full.vert'),
+      loadShader(device, 'shaders/gltf_pbr_full.frag'),
     ]);
     return ReflectedPipeline.create(
       device, vertShader.module, fragShader.module,
