@@ -466,12 +466,17 @@ export class SplatRenderer {
     // Stage 1: Preprocess compute
     // ================================================================
     if (this._preprocessPipeline && this._preprocessBindGroup && this._preprocessPushBindGroup) {
-      // Compute focal lengths from projection matrix
-      // proj[0][0] = 2*near*focal_x / width (for standard perspective)
-      // focal_x = proj[0][0] * width / 2, focal_y = proj[1][1] * height / 2
-      const projF32 = projMatrix as unknown as Float32Array;
-      const focalX = projF32[0] * viewport[0] * 0.5;
-      const focalY = projF32[5] * viewport[1] * 0.5;
+      // The compute shader expects a Vulkan-convention projection matrix
+      // (Y-flipped: proj[1][1] negated) because the Lux splat expander
+      // generates covariance projection code for Vulkan. Apply the Y-flip
+      // to the projection before passing to the preprocess compute.
+      const projF32 = new Float32Array(projMatrix as unknown as Float32Array);
+      projF32[5] = -projF32[5]; // Vulkan Y-flip: proj[1][1] *= -1
+
+      // Compute focal lengths from the ORIGINAL (un-flipped) projection
+      const origProjF32 = projMatrix as unknown as Float32Array;
+      const focalX = Math.abs(origProjF32[0]) * viewport[0] * 0.5;
+      const focalY = Math.abs(origProjF32[5]) * viewport[1] * 0.5;
 
       // Compute camera position from inverse view matrix
       const invView = mat4.create();
@@ -484,9 +489,9 @@ export class SplatRenderer {
 
       // Update preprocess push constants matching the reflection layout:
       // offset 0:   view_matrix (mat4, 64 bytes)
-      // offset 64:  proj_matrix (mat4, 64 bytes)
+      // offset 64:  proj_matrix (mat4, 64 bytes) — with Vulkan Y-flip
       // offset 128: cam_pos (vec3, 12 bytes)
-      // offset 144: screen_size (vec2, 8 bytes) — note: vec3 pads to 16 bytes
+      // offset 144: screen_size (vec2, 8 bytes)
       // offset 152: total_splats (uint, 4 bytes)
       // offset 156: focal_x (f32, 4 bytes)
       // offset 160: focal_y (f32, 4 bytes)
@@ -496,7 +501,7 @@ export class SplatRenderer {
       const u32 = new Uint32Array(pushData);
       const i32 = new Int32Array(pushData);
       f32.set(viewMatrix as unknown as Float32Array, 0);    // offset 0: view_matrix
-      f32.set(projMatrix as unknown as Float32Array, 16);   // offset 64: proj_matrix
+      f32.set(projF32, 16);                                  // offset 64: proj_matrix (Y-flipped)
       f32[32] = camPos[0];   // offset 128: cam_pos.x
       f32[33] = camPos[1];   // offset 132: cam_pos.y
       f32[34] = camPos[2];   // offset 136: cam_pos.z
