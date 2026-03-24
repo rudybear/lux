@@ -35,6 +35,9 @@ export async function initWebGPU(canvas: HTMLCanvasElement): Promise<GPUContext>
       maxComputeInvocationsPerWorkgroup: Math.min(
         adapter.limits.maxComputeInvocationsPerWorkgroup, 1024,
       ),
+      maxComputeWorkgroupStorageSize: Math.min(
+        adapter.limits.maxComputeWorkgroupStorageSize, 32768,
+      ),
     },
   });
 
