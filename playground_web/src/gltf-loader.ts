@@ -6,7 +6,7 @@
  */
 
 import { mat4, quat } from 'gl-matrix';
-import type { Scene, Mesh, Material, Light, SceneNode, DrawRange } from './scene';
+import type { Scene, Mesh, Material, Light, SceneNode, DrawRange, SplatData } from './scene';
 
 // --------------------------------------------------------------------------
 // GLB binary container parsing
@@ -549,6 +549,170 @@ async function parseGLBScene(
     totalTriangles += m.indexCount > 0 ? Math.floor(m.indexCount / 3) : Math.floor(m.vertexCount / 3);
   }
 
+  // --------------------------------------------------------------------------
+  // Detect KHR_gaussian_splatting primitives and extract splat data
+  // --------------------------------------------------------------------------
+  let splatData: SplatData | undefined;
+
+  for (const gm of gltfMeshes) {
+    for (const prim of gm.primitives) {
+      const primExts = (prim.extensions ?? {}) as Record<string, Record<string, unknown>>;
+      const khrSplat = primExts.KHR_gaussian_splatting;
+      if (!khrSplat) continue;
+
+      // Found a Gaussian splatting primitive
+      const attrs = prim.attributes as Record<string, number>;
+
+      // Positions (standard glTF POSITION attribute)
+      const posAccess = accessors[attrs.POSITION];
+      const positions = new Float32Array(getAccessorData(posAccess, bufferViews, bin));
+      const numSplats = posAccess.count;
+
+      // Update bounds from splat positions
+      for (let i = 0; i < numSplats; i++) {
+        const x = positions[i * 3 + 0];
+        const y = positions[i * 3 + 1];
+        const z = positions[i * 3 + 2];
+        if (x < boundsMin[0]) boundsMin[0] = x;
+        if (y < boundsMin[1]) boundsMin[1] = y;
+        if (z < boundsMin[2]) boundsMin[2] = z;
+        if (x > boundsMax[0]) boundsMax[0] = x;
+        if (y > boundsMax[1]) boundsMax[1] = y;
+        if (z > boundsMax[2]) boundsMax[2] = z;
+      }
+
+      // Helper to find a splat attribute by trying KHR-prefixed and legacy names
+      function getSplatAttr(khrName: string, legacyName: string): Float32Array | null {
+        // Try KHR-prefixed attribute in the extension's attributes dict
+        const khrAttrs = (khrSplat!.attributes ?? {}) as Record<string, number>;
+        if (khrAttrs[khrName] !== undefined) {
+          return new Float32Array(getAccessorData(accessors[khrAttrs[khrName]], bufferViews, bin));
+        }
+        // Try legacy attribute names directly in primitive attributes
+        if (attrs[legacyName] !== undefined) {
+          return new Float32Array(getAccessorData(accessors[attrs[legacyName]], bufferViews, bin));
+        }
+        return null;
+      }
+
+      // Rotations: vec4 quaternion
+      const rawRotations = getSplatAttr('ROTATION', '_ROTATION');
+      const rotations = rawRotations ?? new Float32Array(numSplats * 4);
+      if (!rawRotations) {
+        // Default: identity quaternion (w=1)
+        for (let i = 0; i < numSplats; i++) rotations[i * 4 + 3] = 1.0;
+      }
+
+      // Scales: vec3 — KHR format is linear, convert to log-space for shader
+      const rawScales = getSplatAttr('SCALE', '_SCALE');
+      const scales = new Float32Array(numSplats * 3);
+      if (rawScales) {
+        // Check if this is legacy format (already in log-space) by looking for negative values
+        // KHR format: linear positive values, convert to log
+        // Legacy format: already log-space, may have negative values
+        let hasNegative = false;
+        for (let i = 0; i < rawScales.length; i++) {
+          if (rawScales[i] < 0) { hasNegative = true; break; }
+        }
+        if (hasNegative) {
+          // Legacy format — already in log-space
+          scales.set(rawScales);
+        } else {
+          // KHR format — convert linear to log-space
+          for (let i = 0; i < rawScales.length; i++) {
+            scales[i] = Math.log(Math.max(rawScales[i], 1e-8));
+          }
+        }
+      }
+
+      // Opacity: scalar — KHR format is linear [0,1], convert to logit for shader
+      const rawOpacity = getSplatAttr('OPACITY', '_OPACITY');
+      const opacities = new Float32Array(numSplats);
+      if (rawOpacity) {
+        // Check if legacy format (already logit-space) by looking for values outside [0,1]
+        let outsideRange = false;
+        for (let i = 0; i < rawOpacity.length; i++) {
+          if (rawOpacity[i] < -0.01 || rawOpacity[i] > 1.01) { outsideRange = true; break; }
+        }
+        if (outsideRange) {
+          // Legacy format — already logit-space
+          opacities.set(rawOpacity);
+        } else {
+          // KHR format — convert linear [0,1] to logit
+          for (let i = 0; i < numSplats; i++) {
+            const p = Math.max(1e-6, Math.min(1 - 1e-6, rawOpacity[i]));
+            opacities[i] = Math.log(p / (1 - p));
+          }
+        }
+      }
+
+      // SH coefficients
+      const shCoeffs: Float32Array[] = [];
+
+      // Degree 0: use COLOR_0 attribute (vec3 or vec4 -> take rgb)
+      let shDegree = 0;
+      if (attrs.COLOR_0 !== undefined) {
+        const colorAccess = accessors[attrs.COLOR_0];
+        const rawColor = new Float32Array(getAccessorData(colorAccess, bufferViews, bin));
+        const components = TYPE_COUNTS[colorAccess.type] ?? 3;
+        const dc = new Float32Array(numSplats * 3);
+        for (let i = 0; i < numSplats; i++) {
+          dc[i * 3 + 0] = rawColor[i * components + 0];
+          dc[i * 3 + 1] = rawColor[i * components + 1];
+          dc[i * 3 + 2] = rawColor[i * components + 2];
+        }
+        shCoeffs.push(dc);
+      }
+
+      // Higher SH degrees: look for SH_DEGREE_N_COEF_M attributes in the extension
+      const khrAttrs = (khrSplat.attributes ?? {}) as Record<string, number>;
+      for (let degree = 1; degree <= 3; degree++) {
+        // Number of coefficients per degree: degree 1 = 3, degree 2 = 5, degree 3 = 7
+        const numCoeffs = 2 * degree + 1;
+        let foundAny = false;
+        const degreeData = new Float32Array(numSplats * numCoeffs * 3);
+
+        for (let m = 0; m < numCoeffs; m++) {
+          const attrName = `SH_DEGREE_${degree}_COEF_${m}`;
+          if (khrAttrs[attrName] !== undefined) {
+            foundAny = true;
+            const coeffData = new Float32Array(
+              getAccessorData(accessors[khrAttrs[attrName]], bufferViews, bin),
+            );
+            // Each coefficient is vec3 per splat
+            for (let i = 0; i < numSplats; i++) {
+              const baseIdx = (i * numCoeffs + m) * 3;
+              degreeData[baseIdx + 0] = coeffData[i * 3 + 0];
+              degreeData[baseIdx + 1] = coeffData[i * 3 + 1];
+              degreeData[baseIdx + 2] = coeffData[i * 3 + 2];
+            }
+          }
+        }
+
+        if (foundAny) {
+          shCoeffs.push(degreeData);
+          shDegree = degree;
+        } else {
+          break; // No more SH degrees
+        }
+      }
+
+      splatData = {
+        positions,
+        scales,
+        rotations,
+        opacities,
+        shCoeffs,
+        numSplats,
+        shDegree,
+      };
+
+      console.log(`Extracted ${numSplats} Gaussian splats (SH degree ${shDegree})`);
+      break; // Only extract from first splatting primitive
+    }
+    if (splatData) break;
+  }
+
   return {
     nodes: rootNodes,
     meshes,
@@ -559,5 +723,6 @@ async function parseGLBScene(
     drawRanges,
     totalVertices,
     totalTriangles,
+    splatData,
   };
 }

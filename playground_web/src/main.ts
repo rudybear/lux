@@ -5,13 +5,14 @@
  * with fallback to a PBR sphere if the model can't be loaded.
  */
 
-import { initWebGPU } from './gpu-context';
+import { mat4 } from 'gl-matrix';
+import { initWebGPU, type GPUContext } from './gpu-context';
 import { loadShader, type ReflectionJSON } from './shader-loader';
 import { ReflectedPipeline } from './reflected-pipeline';
 import { RenderEngine, type RenderState, type DrawCall, type UniformBufferBinding } from './render-engine';
 import { UI, observeCanvasResize } from './ui';
 import { loadGLB, loadGLBFromBuffer } from './gltf-loader';
-import type { Scene } from './scene';
+import type { Scene, SplatData } from './scene';
 import {
   FALLBACK_VERT_WGSL, FALLBACK_FRAG_WGSL,
   FALLBACK_VERT_REFLECTION, FALLBACK_FRAG_REFLECTION,
@@ -20,6 +21,7 @@ import { createGltfPbrPipeline, buildGltfSceneDrawCalls } from './gltf-pbr';
 import { fillWebMaterialUBO } from './gltf-pbr';
 import { loadIBL } from './ibl-loader';
 import { generateProceduralIBL, type ProceduralIBL } from './procedural-ibl';
+import { SplatRenderer, type SplatBuffers } from './splat-renderer';
 
 const DAMAGED_HELMET_URL =
   'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb';
@@ -69,6 +71,79 @@ function createSphereBuffers(device: GPUDevice, segments = 32, rings = 16): Draw
   device.queue.writeBuffer(indexBuffer, 0, idxData);
 
   return { vertexBuffer, indexBuffer, indexCount: idxData.length, vertexCount: 0 };
+}
+
+// --------------------------------------------------------------------------
+// Splat buffer creation
+// --------------------------------------------------------------------------
+
+function createSplatBuffers(device: GPUDevice, data: SplatData): SplatBuffers {
+  const makeBuffer = (arr: Float32Array, label: string) => {
+    const buf = device.createBuffer({
+      size: arr.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      label,
+    });
+    device.queue.writeBuffer(buf, 0, arr.buffer, arr.byteOffset, arr.byteLength);
+    return buf;
+  };
+
+  // Pack positions as vec4 (x,y,z,1) for the shader
+  const pos4 = new Float32Array(data.numSplats * 4);
+  for (let i = 0; i < data.numSplats; i++) {
+    pos4[i * 4 + 0] = data.positions[i * 3 + 0];
+    pos4[i * 4 + 1] = data.positions[i * 3 + 1];
+    pos4[i * 4 + 2] = data.positions[i * 3 + 2];
+    pos4[i * 4 + 3] = 1.0;
+  }
+
+  // Pack scales as vec4 (x,y,z,0) — already in log-space from loader
+  const scale4 = new Float32Array(data.numSplats * 4);
+  for (let i = 0; i < data.numSplats; i++) {
+    scale4[i * 4 + 0] = data.scales[i * 3 + 0];
+    scale4[i * 4 + 1] = data.scales[i * 3 + 1];
+    scale4[i * 4 + 2] = data.scales[i * 3 + 2];
+    scale4[i * 4 + 3] = 0.0;
+  }
+
+  // Rotations are already vec4 quaternions, pass through
+  const rot4 = data.rotations;
+
+  // Opacities are scalar (already in logit-space from loader), pass through
+  const opacities = data.opacities;
+
+  // Pack SH coefficients as vec4 (x,y,z,0) for the shader
+  let shData: Float32Array;
+  if (data.shCoeffs.length > 0) {
+    // Use degree 0 (DC color) — each coefficient is vec3 per splat
+    const dc = data.shCoeffs[0];
+    shData = new Float32Array(data.numSplats * 4);
+    for (let i = 0; i < data.numSplats; i++) {
+      shData[i * 4 + 0] = dc[i * 3 + 0];
+      shData[i * 4 + 1] = dc[i * 3 + 1];
+      shData[i * 4 + 2] = dc[i * 3 + 2];
+      shData[i * 4 + 3] = 0.0;
+    }
+  } else {
+    // No SH data — fill with default gray
+    shData = new Float32Array(data.numSplats * 4);
+    for (let i = 0; i < data.numSplats; i++) {
+      shData[i * 4 + 0] = 0.5;
+      shData[i * 4 + 1] = 0.5;
+      shData[i * 4 + 2] = 0.5;
+      shData[i * 4 + 3] = 0.0;
+    }
+  }
+
+  return {
+    positions: makeBuffer(pos4, 'splat_pos'),
+    scales: makeBuffer(scale4, 'splat_scale'),
+    rotations: makeBuffer(rot4, 'splat_rot'),
+    opacities: makeBuffer(opacities, 'splat_opacity'),
+    shCoeffs: makeBuffer(shData, 'splat_sh'),
+    count: data.numSplats,
+    shDegree: data.shDegree,
+  };
 }
 
 // --------------------------------------------------------------------------
@@ -193,7 +268,7 @@ async function main() {
     return;
   }
 
-  let gpu;
+  let gpu: GPUContext;
   try {
     gpu = await initWebGPU(canvas);
   } catch (e) {
@@ -207,6 +282,7 @@ async function main() {
   const ui = new UI();
   let currentLoadedScene: Scene | null = null;
   let currentMaterialBuffers: Map<number, GPUBuffer> | null = null;
+  let currentSplatRenderer: SplatRenderer | null = null;
 
   observeCanvasResize(canvas, (w, h) => {
     gpu.context.configure({ device, format, alphaMode: 'opaque' });
@@ -274,6 +350,8 @@ async function main() {
     currentScene = sceneName;
 
     if (sceneName === 'damaged_helmet') {
+      currentSplatRenderer?.destroy();
+      currentSplatRenderer = null;
       try {
         const scene = await loadGLB(device, DAMAGED_HELMET_URL);
         const { state, materialUboBuffers } = await buildGltfRenderState(device, format, scene, ibl);
@@ -291,18 +369,43 @@ async function main() {
         console.log('Loading Luigi (Gaussian Splat)...');
         const scene = await loadGLB(device, LUIGI_URL);
         console.log(`Loaded ${scene.meshes.length} meshes, ${scene.materials.length} materials`);
-        console.log('Gaussian splatting scenes require splat pipeline integration (TODO)');
-        const { state, materialUboBuffers } = await buildGltfRenderState(device, format, scene, ibl);
-        engine.setRenderState(state);
-        engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
-        engine.lightCount = Math.max(1, scene.lights.length);
-        currentLoadedScene = scene;
-        currentMaterialBuffers = materialUboBuffers;
-        updateSceneUI(scene);
+
+        if (scene.splatData) {
+          console.log(`Splat data: ${scene.splatData.numSplats} splats, SH degree ${scene.splatData.shDegree}`);
+          const splatBufs = createSplatBuffers(device, scene.splatData);
+          const splat = new SplatRenderer(device, scene.splatData.numSplats);
+          await splat.init('shaders/gaussian_splat', splatBufs, format);
+
+          // Destroy previous splat renderer if any
+          currentSplatRenderer?.destroy();
+          currentSplatRenderer = splat;
+
+          // Set a null pipeline render state so the engine just clears
+          engine.setRenderState({ pipeline: null, bindGroups: [], draws: [], pushBuffer: null, uniformBuffers: [] });
+          engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
+          currentLoadedScene = scene;
+          currentMaterialBuffers = null;
+          updateSceneUI(scene);
+          console.log('Splat renderer initialized');
+        } else {
+          // No splat data found, fall back to PBR rendering
+          console.warn('No KHR_gaussian_splatting data found in Luigi GLB, using PBR fallback');
+          currentSplatRenderer?.destroy();
+          currentSplatRenderer = null;
+          const { state, materialUboBuffers } = await buildGltfRenderState(device, format, scene, ibl);
+          engine.setRenderState(state);
+          engine.camera.frameScene(scene.boundsMin, scene.boundsMax);
+          engine.lightCount = Math.max(1, scene.lights.length);
+          currentLoadedScene = scene;
+          currentMaterialBuffers = materialUboBuffers;
+          updateSceneUI(scene);
+        }
       } catch (e) {
         console.error('Failed to load Luigi splat scene:', e);
       }
     } else if (sceneName === 'pbr_sphere') {
+      currentSplatRenderer?.destroy();
+      currentSplatRenderer = null;
       const pipeline = createFallbackPipeline(device, format);
       const state = buildSphereRenderState(device, pipeline);
       engine.setRenderState(state);
@@ -311,6 +414,8 @@ async function main() {
       currentMaterialBuffers = null;
       ui.setMaterials([]);
     } else {
+      currentSplatRenderer?.destroy();
+      currentSplatRenderer = null;
       // Try pre-compiled shaders, fall back to sphere
       const compiled = await loadShaderPipeline(device, format, sceneName);
       const pipeline = compiled ?? createFallbackPipeline(device, format);
@@ -350,6 +455,8 @@ async function main() {
 
   ui.onFileDrop = async (buffer, name) => {
     console.log(`Loading dropped file: ${name}`);
+    currentSplatRenderer?.destroy();
+    currentSplatRenderer = null;
     try {
       const glScene = await loadGLBFromBuffer(device, buffer);
       console.log(`Loaded ${glScene.meshes.length} meshes, ${glScene.materials.length} materials, ${glScene.lights.length} lights`);
@@ -376,7 +483,46 @@ async function main() {
     engine.exposure = ui.state.exposure;
     engine.lightDirY = ui.state.lightDirY;
 
-    engine.renderFrame(dt);
+    if (currentSplatRenderer) {
+      // Splat rendering: clear + compute preprocess + sort + render
+      const textureView = gpu.context.getCurrentTexture().createView();
+      const encoder = gpu.device.createCommandEncoder();
+      const depthView = engine.getDepthView();
+
+      // Clear pass (background)
+      const clearPass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: textureView,
+          clearValue: { r: 0.05, g: 0.05, b: 0.1, a: 1.0 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+        depthStencilAttachment: {
+          view: depthView,
+          depthClearValue: 1.0,
+          depthLoadOp: 'clear',
+          depthStoreOp: 'store',
+        },
+      });
+      clearPass.end();
+
+      // Get camera matrices
+      const view = mat4.create();
+      const proj = mat4.create();
+      engine.camera.getViewMatrix(view);
+      engine.camera.getProjectionMatrix(proj, engine.width / engine.height);
+
+      // Run splat renderer (preprocess + sort + render)
+      currentSplatRenderer.render(
+        encoder, textureView, depthView,
+        view, proj, [engine.width, engine.height],
+      );
+
+      gpu.device.queue.submit([encoder.finish()]);
+    } else {
+      engine.renderFrame(dt);
+    }
+
     ui.updateFPS(dt);
     requestAnimationFrame(frame);
   }

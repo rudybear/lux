@@ -92,6 +92,11 @@ export class RenderEngine {
   get width(): number { return this._width; }
   get height(): number { return this._height; }
 
+  /** Get a depth texture view for external renderers (e.g., splat renderer). */
+  getDepthView(): GPUTextureView {
+    return this._depthTexture.createView();
+  }
+
   setRenderState(state: RenderState): void {
     this._renderState = state;
   }

@@ -79,6 +79,16 @@ export interface DrawRange {
   meshIndex: number;
 }
 
+export interface SplatData {
+  positions: Float32Array;    // vec3 per splat (flat)
+  scales: Float32Array;       // vec3 per splat (flat, log-space)
+  rotations: Float32Array;    // vec4 per splat (flat, quaternion)
+  opacities: Float32Array;    // scalar per splat (logit-space)
+  shCoeffs: Float32Array[];   // per-degree SH coefficient arrays (each vec3 per coeff, flat)
+  numSplats: number;
+  shDegree: number;
+}
+
 export interface Scene {
   nodes: SceneNode[];
   meshes: Mesh[];
@@ -91,4 +101,6 @@ export interface Scene {
   totalVertices: number;
   /** Total triangle count (indexCount / 3 summed). */
   totalTriangles: number;
+  /** Gaussian splat data extracted from KHR_gaussian_splatting primitives. */
+  splatData?: SplatData;
 }
