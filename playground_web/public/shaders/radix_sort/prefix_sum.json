@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "descriptor_sets": {
+    "0": [
+      {"binding": 0, "type": "storage_buffer", "name": "histograms", "stage_flags": ["compute"]},
+      {"binding": 1, "type": "storage_buffer", "name": "partition_sums", "stage_flags": ["compute"]}
+    ]
+  },
+  "push_emulated": {
+    "set": 1, "binding": 0, "size": 8,
+    "fields": [
+      {"name": "num_entries", "type": "uint", "offset": 0, "size": 4},
+      {"name": "pass_id", "type": "uint", "offset": 4, "size": 4}
+    ]
+  },
+  "inputs": [], "outputs": [], "push_constants": [], "vertex_attributes": [], "vertex_stride": 0
+}
