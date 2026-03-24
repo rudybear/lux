@@ -648,11 +648,13 @@ async function parseGLBScene(
 
       // SH coefficients
       const shCoeffs: Float32Array[] = [];
+      const khrAttrs = (khrSplat.attributes ?? {}) as Record<string, number>;
 
-      // Degree 0: use COLOR_0 attribute (vec3 or vec4 -> take rgb)
+      // Degree 0: try COLOR_0, legacy _SH_0, or KHR SH_DEGREE_0_COEF_0
       let shDegree = 0;
-      if (attrs.COLOR_0 !== undefined) {
-        const colorAccess = accessors[attrs.COLOR_0];
+      const dc0AccIdx = attrs.COLOR_0 ?? attrs._SH_0 ?? khrAttrs.SH_DEGREE_0_COEF_0;
+      if (dc0AccIdx !== undefined) {
+        const colorAccess = accessors[dc0AccIdx];
         const rawColor = new Float32Array(getAccessorData(colorAccess, bufferViews, bin));
         const components = TYPE_COUNTS[colorAccess.type] ?? 3;
         const dc = new Float32Array(numSplats * 3);
@@ -664,14 +666,13 @@ async function parseGLBScene(
         shCoeffs.push(dc);
       }
 
-      // Higher SH degrees: look for SH_DEGREE_N_COEF_M attributes in the extension
-      const khrAttrs = (khrSplat.attributes ?? {}) as Record<string, number>;
+      // Higher SH degrees: look for KHR SH_DEGREE_N_COEF_M or legacy _SH_N attributes
       for (let degree = 1; degree <= 3; degree++) {
-        // Number of coefficients per degree: degree 1 = 3, degree 2 = 5, degree 3 = 7
         const numCoeffs = 2 * degree + 1;
         let foundAny = false;
         const degreeData = new Float32Array(numSplats * numCoeffs * 3);
 
+        // Try KHR format first
         for (let m = 0; m < numCoeffs; m++) {
           const attrName = `SH_DEGREE_${degree}_COEF_${m}`;
           if (khrAttrs[attrName] !== undefined) {
@@ -679,12 +680,33 @@ async function parseGLBScene(
             const coeffData = new Float32Array(
               getAccessorData(accessors[khrAttrs[attrName]], bufferViews, bin),
             );
-            // Each coefficient is vec3 per splat
             for (let i = 0; i < numSplats; i++) {
               const baseIdx = (i * numCoeffs + m) * 3;
               degreeData[baseIdx + 0] = coeffData[i * 3 + 0];
               degreeData[baseIdx + 1] = coeffData[i * 3 + 1];
               degreeData[baseIdx + 2] = coeffData[i * 3 + 2];
+            }
+          }
+        }
+
+        // Try legacy _SH_N format (flat vec3 per coefficient per splat)
+        if (!foundAny) {
+          // Legacy: _SH_1 through _SH_15 for degree 1-3 coefficients
+          // Degree 1 uses _SH_1.._SH_3, degree 2 uses _SH_4.._SH_8, degree 3 uses _SH_9.._SH_15
+          const startIdx = degree === 1 ? 1 : degree === 2 ? 4 : 9;
+          for (let m = 0; m < numCoeffs; m++) {
+            const legacyName = `_SH_${startIdx + m}`;
+            if (attrs[legacyName] !== undefined) {
+              foundAny = true;
+              const coeffData = new Float32Array(
+                getAccessorData(accessors[attrs[legacyName]], bufferViews, bin),
+              );
+              for (let i = 0; i < numSplats; i++) {
+                const baseIdx = (i * numCoeffs + m) * 3;
+                degreeData[baseIdx + 0] = coeffData[i * 3 + 0];
+                degreeData[baseIdx + 1] = coeffData[i * 3 + 1];
+                degreeData[baseIdx + 2] = coeffData[i * 3 + 2];
+              }
             }
           }
         }
