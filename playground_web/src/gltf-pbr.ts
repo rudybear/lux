@@ -42,13 +42,15 @@ export async function createGltfPbrPipeline(
       loadShader(device, 'shaders/gltf_pbr_full.vert'),
       loadShader(device, 'shaders/gltf_pbr_full.frag'),
     ]);
+    // Stride override: glTF loader interleaves at 48 bytes (pos3+nor3+uv2+tan4)
+    // even though this shader only reads 32 bytes (pos3+nor3+uv2)
     return ReflectedPipeline.create(
       device, vertShader.module, fragShader.module,
       vertShader.reflection, fragShader.reflection,
-      format, 'depth24plus', 'none',
+      format, 'depth24plus', 'none', 48,
     );
   } catch {
-    // Fallback to basic gltf_pbr
+    // Fallback to basic gltf_pbr (stride 48 matches its vertex layout)
     const [vertShader, fragShader] = await Promise.all([
       loadShader(device, 'shaders/gltf_pbr.vert'),
       loadShader(device, 'shaders/gltf_pbr.frag'),
@@ -56,7 +58,7 @@ export async function createGltfPbrPipeline(
     return ReflectedPipeline.create(
       device, vertShader.module, fragShader.module,
       vertShader.reflection, fragShader.reflection,
-      format, 'depth24plus', 'none',
+      format, 'depth24plus', 'none', 48,
     );
   }
 }
