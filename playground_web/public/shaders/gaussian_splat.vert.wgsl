@@ -65,10 +65,7 @@ fn main_1() {
     let _e64 = global.screen_size;
     let _e67 = global.screen_size;
     let _e69 = vec2<f32>(_e64.x, _e67.y);
-    let _e72_raw = (((_e28.xy * 0.5f) + vec2<f32>(0.5f, 0.5f)) * _e69);
-    // Flip Y for WebGPU: the Y-flip on gl_Position inverts screen Y,
-    // so frag_center must match the flipped coordinate system
-    let _e72 = vec2<f32>(_e72_raw.x, _e69.y - _e72_raw.y);
+    let _e72 = (((_e28.xy * 0.5f) + vec2<f32>(0.5f, 0.5f)) * _e69);
     let _e76 = ((((_e72 + _e62) / _e69) * 2f) - vec2<f32>(1f, 1f));
     unnamed.gl_Position = vec4<f32>(_e76.x, _e76.y, _e28.z, 1f);
     frag_conic = _e31.xyz;
