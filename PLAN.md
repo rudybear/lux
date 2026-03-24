@@ -1,6 +1,6 @@
 # Lux v0.2 — From Shader Language to Rendering Specification Language
 
-## Status Overview (2026-03-12)
+## Status Overview (2026-03-24)
 
 | Phase | Description | Status |
 |-------|-------------|--------|
@@ -34,7 +34,7 @@
 | P24 | KHR_gaussian_splatting Conformance | ✅ Complete |
 | P25 | PLY-to-glTF Converter | ✅ Complete |
 | P26 | Hybrid Rendering (RT+Splat, Mesh+Splat) | ✅ Complete (C++; Rust partial) |
-| P27 | WebGPU Backend | ✅ Complete (P27.1-P27.7; deploy P27.8 deferred) |
+| P27 | WebGPU Backend | ✅ Complete (P27.1-P27.7 + feature parity: material explorer, multi-material, multi-light, shadow infra, Gaussian splatting with GPU radix sort, auto-camera, scene info UI) |
 | P28 | RT Gaussian Splats (3DGRT) | ✅ Complete (compiler + C++ Vulkan engine, 34 tests) |
 
 **Test suite: 1496 tests (1479 passing, 5 skipped SPZ, 12 skipped no-assets). Compiler: 160+ stdlib functions, 15 modules.**

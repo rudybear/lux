@@ -148,6 +148,13 @@ python -m luxc examples/gaussian_splat.lux
 # Compile an RT Gaussian splat pipeline (4 RT stages: raygen + intersection + closest_hit + miss)
 python -m luxc examples/gaussian_splat_rt.lux
 
+# Compile for WebGPU (SPIR-V → WGSL via naga)
+python -m luxc examples/gltf_pbr_web.lux --webgpu --target wgsl
+
+# Run WebGPU playground (browser-based, works on Windows/Mac/Linux)
+cd playground_web && npm install && npm run dev
+# Open http://localhost:5173 in Chrome, Edge, Firefox, or Safari
+
 # Optimize with spirv-opt
 python -m luxc examples/hello_triangle.lux -O
 ```
