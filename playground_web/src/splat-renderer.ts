@@ -663,8 +663,6 @@ export class SplatRenderer {
         // Splats don't write depth (they rely on sort order for mutual ordering).
         depthStencilAttachment: depthView ? {
           view: depthView,
-          depthLoadOp: 'load',
-          depthStoreOp: 'store',
           depthReadOnly: true,
         } : undefined,
         label: 'splat_render',
