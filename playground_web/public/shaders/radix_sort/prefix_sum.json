@@ -1,19 +1,101 @@
 {
   "version": 1,
+  "source": "radix_sort_prefix_sum.lux",
   "stage": "compute",
   "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
   "descriptor_sets": {
     "0": [
-      {"binding": 0, "type": "storage_buffer", "name": "histograms", "stage_flags": ["compute"]},
-      {"binding": 1, "type": "storage_buffer", "name": "partition_sums", "stage_flags": ["compute"]}
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "histograms",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "partition_sums",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      }
     ]
   },
+  "push_constants": [
+    {
+      "name": "params",
+      "fields": [
+        {
+          "name": "num_entries",
+          "type": "uint",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "pass_id",
+          "type": "uint",
+          "offset": 4,
+          "size": 4
+        }
+      ],
+      "size": 16,
+      "stage_flags": [
+        "compute"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      1024,
+      1,
+      1
+    ]
+  },
+  "shared_memory": [
+    {
+      "name": "s_data",
+      "type": "uint",
+      "size_bytes": 8192,
+      "array_size": 2048
+    }
+  ],
+  "shared_memory_total_bytes": 8192,
+  "performance_hints": {
+    "instruction_count": 518,
+    "alu_ops": 51,
+    "texture_samples": 0,
+    "branches": 27,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  },
+  "wgsl_file": "radix_sort_prefix_sum.comp.wgsl",
   "push_emulated": {
-    "set": 1, "binding": 0, "size": 8,
+    "set": 1,
+    "binding": 0,
     "fields": [
-      {"name": "num_entries", "type": "uint", "offset": 0, "size": 4},
-      {"name": "pass_id", "type": "uint", "offset": 4, "size": 4}
-    ]
-  },
-  "inputs": [], "outputs": [], "push_constants": [], "vertex_attributes": [], "vertex_stride": 0
+      {
+        "name": "num_entries",
+        "type": "uint",
+        "offset": 0,
+        "size": 4
+      },
+      {
+        "name": "pass_id",
+        "type": "uint",
+        "offset": 4,
+        "size": 4
+      }
+    ],
+    "size": 16
+  }
 }

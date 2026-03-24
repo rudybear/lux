@@ -1,0 +1,109 @@
+// Radix Sort — Phase 3: Stable Scatter
+// Scatters key-value pairs to sorted positions using prefix-summed histograms.
+// Compile: luxc radix_sort_scatter.lux --define workgroup_size=256
+
+compute {
+    storage_buffer keys_in: uint;
+    storage_buffer keys_out: uint;
+    storage_buffer vals_in: uint;
+    storage_buffer vals_out: uint;
+    storage_buffer histograms: uint;
+
+    push params {
+        num_elements: uint,
+        bit_offset: uint,
+    }
+
+    shared s_keys: uint[3840];
+    shared s_global_offset: uint[256];
+    shared s_row_offset: uint[256];
+    shared s_digits: uint[256];
+
+    fn main() {
+        let local_id: uint = local_invocation_id.x;
+        let group_id: uint = workgroup_id.x;
+        let num_groups: uint = num_workgroups.x;
+
+        let tile_start: uint = group_id * 3840;
+        let tile_end_raw: uint = tile_start + 3840;
+        let tile_end: uint = tile_end_raw;
+        if (tile_end_raw > num_elements) {
+            tile_end = num_elements;
+        }
+        let tile_count: uint = tile_end - tile_start;
+
+        // Step 1: Load keys into shared memory
+        for (let i: uint = 0; i < 15; i = i + 1) {
+            let local_idx: uint = local_id + i * 256;
+            let global_idx: uint = tile_start + local_idx;
+            if (local_idx < tile_count) {
+                s_keys[local_idx] = keys_in[global_idx];
+            }
+        }
+
+        // Step 2: Load global offset and init row offset
+        s_global_offset[local_id] = histograms[local_id * num_groups + group_id];
+        s_row_offset[local_id] = 0;
+
+        barrier();
+
+        // Step 3: Process 15 rows sequentially for stable scatter
+        for (let i: uint = 0; i < 15; i = i + 1) {
+            let local_idx: uint = local_id + i * 256;
+            let global_idx: uint = tile_start + local_idx;
+
+            // Each thread writes its digit to shared memory
+            let digit: uint = 4294967295;
+            let key: uint = 0;
+            if (local_idx < tile_count) {
+                key = s_keys[local_idx];
+                digit = (key >> bit_offset) & 255;
+            }
+            s_digits[local_id] = digit;
+
+            barrier();
+
+            // Deterministic rank: count threads with lower ID sharing same digit
+            if (local_idx < tile_count) {
+                let rank_in_row: uint = 0;
+                for (let j: uint = 0; j < local_id; j = j + 1) {
+                    if (s_digits[j] == digit) {
+                        rank_in_row = rank_in_row + 1;
+                    }
+                }
+
+                // Global output position
+                let local_rank: uint = s_row_offset[digit] + rank_in_row;
+                let out_idx: uint = s_global_offset[digit] + local_rank;
+
+                // Scatter key and value
+                keys_out[out_idx] = key;
+                vals_out[out_idx] = vals_in[global_idx];
+            }
+
+            barrier();
+
+            // Update row offsets: count occurrences of each digit in this row
+            let row_max: uint = i * 256;
+            let row_valid: uint = 0;
+            if (row_max < tile_count) {
+                let remaining: uint = tile_count - row_max;
+                if (remaining > 256) {
+                    row_valid = 256;
+                } else {
+                    row_valid = remaining;
+                }
+            }
+
+            let cnt: uint = 0;
+            for (let j: uint = 0; j < row_valid; j = j + 1) {
+                if (s_digits[j] == local_id) {
+                    cnt = cnt + 1;
+                }
+            }
+            s_row_offset[local_id] = s_row_offset[local_id] + cnt;
+
+            barrier();
+        }
+    }
+}

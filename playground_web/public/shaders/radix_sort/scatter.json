@@ -1,22 +1,146 @@
 {
   "version": 1,
+  "source": "radix_sort_scatter.lux",
   "stage": "compute",
   "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
   "descriptor_sets": {
     "0": [
-      {"binding": 0, "type": "storage_buffer", "name": "keys_in", "stage_flags": ["compute"]},
-      {"binding": 1, "type": "storage_buffer", "name": "keys_out", "stage_flags": ["compute"]},
-      {"binding": 2, "type": "storage_buffer", "name": "vals_in", "stage_flags": ["compute"]},
-      {"binding": 3, "type": "storage_buffer", "name": "vals_out", "stage_flags": ["compute"]},
-      {"binding": 4, "type": "storage_buffer", "name": "histograms", "stage_flags": ["compute"]}
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "keys_in",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "keys_out",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_buffer",
+        "name": "vals_in",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "storage_buffer",
+        "name": "vals_out",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "storage_buffer",
+        "name": "histograms",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      }
     ]
   },
+  "push_constants": [
+    {
+      "name": "params",
+      "fields": [
+        {
+          "name": "num_elements",
+          "type": "uint",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "bit_offset",
+          "type": "uint",
+          "offset": 4,
+          "size": 4
+        }
+      ],
+      "size": 16,
+      "stage_flags": [
+        "compute"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      256,
+      1,
+      1
+    ]
+  },
+  "shared_memory": [
+    {
+      "name": "s_keys",
+      "type": "uint",
+      "size_bytes": 15360,
+      "array_size": 3840
+    },
+    {
+      "name": "s_global_offset",
+      "type": "uint",
+      "size_bytes": 1024,
+      "array_size": 256
+    },
+    {
+      "name": "s_row_offset",
+      "type": "uint",
+      "size_bytes": 1024,
+      "array_size": 256
+    },
+    {
+      "name": "s_digits",
+      "type": "uint",
+      "size_bytes": 1024,
+      "array_size": 256
+    }
+  ],
+  "shared_memory_total_bytes": 18432,
+  "performance_hints": {
+    "instruction_count": 333,
+    "alu_ops": 20,
+    "texture_samples": 0,
+    "branches": 12,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  },
+  "wgsl_file": "radix_sort_scatter.comp.wgsl",
   "push_emulated": {
-    "set": 1, "binding": 0, "size": 8,
+    "set": 1,
+    "binding": 0,
     "fields": [
-      {"name": "num_elements", "type": "uint", "offset": 0, "size": 4},
-      {"name": "bit_offset", "type": "uint", "offset": 4, "size": 4}
-    ]
-  },
-  "inputs": [], "outputs": [], "push_constants": [], "vertex_attributes": [], "vertex_stride": 0
+      {
+        "name": "num_elements",
+        "type": "uint",
+        "offset": 0,
+        "size": 4
+      },
+      {
+        "name": "bit_offset",
+        "type": "uint",
+        "offset": 4,
+        "size": 4
+      }
+    ],
+    "size": 16
+  }
 }

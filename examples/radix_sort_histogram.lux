@@ -1,0 +1,43 @@
+// Radix Sort — Phase 1: Histogram
+// Builds per-workgroup histograms of 8-bit digit frequencies.
+// Compile: luxc radix_sort_histogram.lux --define workgroup_size=256
+
+compute {
+    storage_buffer keys_in: uint;
+    storage_buffer histograms: uint;
+
+    push params {
+        num_elements: uint,
+        bit_offset: uint,
+    }
+
+    shared s_histogram: uint[256];
+
+    fn main() {
+        let local_id: uint = local_invocation_id.x;
+        let group_id: uint = workgroup_id.x;
+        let num_groups: uint = num_workgroups.x;
+
+        // Clear shared histogram
+        s_histogram[local_id] = 0;
+        barrier();
+
+        // Base index for this workgroup's tile (3840 = 256 * 15)
+        let tile_start: uint = group_id * 3840;
+
+        // Each thread processes 15 sequential elements
+        for (let i: uint = 0; i < 15; i = i + 1) {
+            let idx: uint = tile_start + local_id + i * 256;
+            if (idx < num_elements) {
+                let key: uint = keys_in[idx];
+                let digit: uint = (key >> bit_offset) & 255;
+                let old: uint = atomic_add(s_histogram[digit], 1);
+            }
+        }
+
+        barrier();
+
+        // Write this workgroup's histogram to global memory (column-major)
+        histograms[local_id * num_groups + group_id] = s_histogram[local_id];
+    }
+}

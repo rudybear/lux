@@ -1,0 +1,192 @@
+// Radix Sort — Phase 2: Exclusive Prefix Sum (3-pass hierarchical Blelloch)
+// Compile: luxc radix_sort_prefix_sum.lux --define workgroup_size=1024
+
+compute {
+    storage_buffer histograms: uint;
+    storage_buffer partition_sums: uint;
+
+    push params {
+        num_entries: uint,
+        pass_id: uint,
+    }
+
+    shared s_data: uint[2048];
+
+    fn main() {
+        let tid: uint = local_invocation_id.x;
+        let group_id: uint = workgroup_id.x;
+
+        // ================================================================
+        // Pass 0: Local exclusive scan of each 2048-element partition
+        // ================================================================
+        if (pass_id == 0) {
+            let base: uint = group_id * 2048;
+            let idx0: uint = base + tid;
+            let idx1: uint = base + tid + 1024;
+
+            if (idx0 < num_entries) {
+                s_data[tid] = histograms[idx0];
+            } else {
+                s_data[tid] = 0;
+            }
+            if (idx1 < num_entries) {
+                s_data[tid + 1024] = histograms[idx1];
+            } else {
+                s_data[tid + 1024] = 0;
+            }
+            barrier();
+
+            // --- Blelloch exclusive scan on s_data[0..2047] ---
+            // Up-sweep (reduce)
+            let offset0: uint = 1;
+            let d0: uint = 1024;
+            while (d0 > 0) {
+                barrier();
+                if (tid < d0) {
+                    let ai: uint = offset0 * (2 * tid + 1) - 1;
+                    let bi: uint = offset0 * (2 * tid + 2) - 1;
+                    s_data[bi] = s_data[bi] + s_data[ai];
+                }
+                offset0 = offset0 << 1;
+                d0 = d0 >> 1;
+            }
+            barrier();
+
+            // Capture total
+            let total: uint = s_data[2047];
+            barrier();
+
+            // Clear root
+            if (tid == 0) {
+                s_data[2047] = 0;
+            }
+
+            // Down-sweep
+            let d1: uint = 1;
+            while (d1 < 2048) {
+                offset0 = offset0 >> 1;
+                barrier();
+                if (tid < d1) {
+                    let ai: uint = offset0 * (2 * tid + 1) - 1;
+                    let bi: uint = offset0 * (2 * tid + 2) - 1;
+                    let temp: uint = s_data[ai];
+                    s_data[ai] = s_data[bi];
+                    s_data[bi] = s_data[bi] + temp;
+                }
+                d1 = d1 << 1;
+            }
+            barrier();
+            // --- End Blelloch scan ---
+
+            // Thread 0 saves partition total
+            if (tid == 0) {
+                partition_sums[group_id] = total;
+            }
+
+            // Write scanned values back
+            if (idx0 < num_entries) {
+                histograms[idx0] = s_data[tid];
+            }
+            if (idx1 < num_entries) {
+                histograms[idx1] = s_data[tid + 1024];
+            }
+        }
+
+        // ================================================================
+        // Pass 1: Exclusive scan of the spine (partition totals)
+        // ================================================================
+        if (pass_id == 1) {
+            let num_partitions: uint = num_entries;
+
+            // next_pow2 inline (max 2048)
+            let pv: uint = num_partitions;
+            if (pv < 2) { pv = 2; }
+            pv = pv - 1;
+            pv = pv | (pv >> 1);
+            pv = pv | (pv >> 2);
+            pv = pv | (pv >> 4);
+            pv = pv | (pv >> 8);
+            pv = pv | (pv >> 16);
+            let scan_n: uint = pv + 1;
+
+            if (tid < num_partitions) {
+                s_data[tid] = partition_sums[tid];
+            } else {
+                if (tid < scan_n) {
+                    s_data[tid] = 0;
+                }
+            }
+            if (tid + 1024 < scan_n) {
+                if (tid + 1024 < num_partitions) {
+                    s_data[tid + 1024] = partition_sums[tid + 1024];
+                } else {
+                    s_data[tid + 1024] = 0;
+                }
+            }
+            barrier();
+
+            // --- Blelloch scan on s_data[0..scan_n-1] ---
+            let offset1: uint = 1;
+            let e0: uint = scan_n >> 1;
+            while (e0 > 0) {
+                barrier();
+                if (tid < e0) {
+                    let ai: uint = offset1 * (2 * tid + 1) - 1;
+                    let bi: uint = offset1 * (2 * tid + 2) - 1;
+                    s_data[bi] = s_data[bi] + s_data[ai];
+                }
+                offset1 = offset1 << 1;
+                e0 = e0 >> 1;
+            }
+            barrier();
+
+            let spine_total: uint = s_data[scan_n - 1];
+            barrier();
+
+            if (tid == 0) {
+                s_data[scan_n - 1] = 0;
+            }
+
+            let e1: uint = 1;
+            while (e1 < scan_n) {
+                offset1 = offset1 >> 1;
+                barrier();
+                if (tid < e1) {
+                    let ai: uint = offset1 * (2 * tid + 1) - 1;
+                    let bi: uint = offset1 * (2 * tid + 2) - 1;
+                    let temp: uint = s_data[ai];
+                    s_data[ai] = s_data[bi];
+                    s_data[bi] = s_data[bi] + temp;
+                }
+                e1 = e1 << 1;
+            }
+            barrier();
+            // --- End Blelloch scan ---
+
+            // Write scanned spine back
+            if (tid < num_partitions) {
+                partition_sums[tid] = s_data[tid];
+            }
+        }
+
+        // ================================================================
+        // Pass 2: Propagate spine offsets into each partition
+        // ================================================================
+        if (pass_id == 2) {
+            let base: uint = group_id * 2048;
+            let spine_val: uint = partition_sums[group_id];
+
+            if (spine_val != 0) {
+                let idx0: uint = base + tid;
+                let idx1: uint = base + tid + 1024;
+
+                if (idx0 < num_entries) {
+                    histograms[idx0] = histograms[idx0] + spine_val;
+                }
+                if (idx1 < num_entries) {
+                    histograms[idx1] = histograms[idx1] + spine_val;
+                }
+            }
+        }
+    }
+}
