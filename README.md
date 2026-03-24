@@ -93,7 +93,7 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 
 **Ecosystem**
 - 5 rendering engines: Python/wgpu, C++/Vulkan, C++/Metal, Rust/ash, **WebGPU/browser** — all reflection-driven, same compiler pipeline
-- **WebGPU playground** (`playground_web/`): browser-based renderer — `.lux` compiles to SPIR-V, transpiles to WGSL via naga, loads at runtime from reflection JSON. glTF PBR, IBL cubemaps, drag-and-drop `.glb`, interactive orbit camera. No embedded shaders — same pipeline as desktop.
+- **WebGPU playground** (`playground_web/`): browser-based renderer with near-parity to the desktop C++/Vulkan engine. `.lux` compiles to SPIR-V, transpiles to WGSL via naga, loads at runtime from reflection JSON. glTF PBR with IBL, **material explorer** (per-material property editing: base color, metallic, roughness, IOR, clearcoat, sheen, transmission), **multi-material** rendering with per-draw model matrices, **multi-light** system (directional/point/spot via SSBO), **shadow mapping** (2048x2048 depth atlas, PCF, comparison sampler), **Gaussian splatting** (GPU radix sort, SH 0–3), **hybrid splat+mesh** depth-tested compositing, **shader permutations** (manifest-driven per-material feature selection), auto-camera from scene bounds, drag-and-drop `.glb`, screenshot export. 68+ pre-compiled shader variants. No embedded shaders — same pipeline as desktop.
 - **Interactive scene editor** (`--editor`): Dear ImGui overlay with scene tree, material property sliders, pipeline hot-swap, transform inspector, viewport controls
 - AI material authoring: text-to-shader, image-to-material, video-to-animation, 5 providers
 - glTF 2.0 PBR with IBL, multi-material permutations, interactive viewers
@@ -259,7 +259,7 @@ Alternative path (--debug-run):
 luxc/            Compiler (parser, type checker, codegen, optimizer, autotype, debug)
 docs/            Documentation (language ref, gallery, usage, rendering engines)
 examples/        Example .lux shaders
-tests/           Test suite (1424+ tests)
+tests/           Test suite (1496 tests)
 playground/      Python/wgpu rendering engine + screenshot tests
 playground_cpp/  C++/Vulkan + Metal rendering engines
 playground_rust/ Rust/Vulkan rendering engine
@@ -317,7 +317,7 @@ See [full project structure](docs/project-structure.md) for the complete directo
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
-# 1424+ tests
+# 1496 tests
 ```
 
 Requires `spirv-as` and `spirv-val` on PATH for end-to-end tests.
