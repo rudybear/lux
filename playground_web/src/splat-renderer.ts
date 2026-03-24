@@ -282,10 +282,10 @@ export class SplatRenderer {
         loadShader(device, `${sortBase}/scatter`),
       ]);
 
-      // Histogram: binding 0 = keys_in (read), binding 1 = histograms (write), push uniform
+      // Histogram: binding 0 = keys_in, binding 1 = histograms (all read_write in WGSL)
       const histLayout = device.createBindGroupLayout({
         entries: [
-          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
           { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         ],
       });
@@ -312,14 +312,14 @@ export class SplatRenderer {
         layout: prefixPipeLayout, compute: { module: prefixShader.module, entryPoint: 'main' },
       });
 
-      // Scatter: bindings 0-4 = keys_in, keys_out, vals_in, vals_out, histograms; push uniform
+      // Scatter: bindings 0-4 = keys_in, keys_out, vals_in, vals_out, histograms (all read_write in WGSL)
       const scatterLayout = device.createBindGroupLayout({
         entries: [
-          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
           { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
           { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-          { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         ],
       });
       const scatterPushLayout = device.createBindGroupLayout({

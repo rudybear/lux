@@ -22,12 +22,18 @@ export async function initWebGPU(canvas: HTMLCanvasElement): Promise<GPUContext>
     throw new Error('No WebGPU adapter found');
   }
 
-  // Request higher limits for Gaussian splatting (11 storage buffers in preprocess)
+  // Request higher limits for Gaussian splatting
   const device = await adapter.requestDevice({
     requiredFeatures: [],
     requiredLimits: {
       maxStorageBuffersPerShaderStage: Math.min(
         adapter.limits.maxStorageBuffersPerShaderStage, 12,
+      ),
+      maxComputeWorkgroupSizeX: Math.min(
+        adapter.limits.maxComputeWorkgroupSizeX, 1024,
+      ),
+      maxComputeInvocationsPerWorkgroup: Math.min(
+        adapter.limits.maxComputeInvocationsPerWorkgroup, 1024,
       ),
     },
   });
