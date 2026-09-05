@@ -103,6 +103,7 @@ if(Vulkan_FOUND)
         src/splat_renderer.cpp
         src/rt_splat_renderer.cpp
         src/dlss_io.cpp
+        src/reconstruct_runner.cpp
         src/editor_ui.cpp
         ${IMGUI_SOURCES}
     )
@@ -194,6 +195,7 @@ if(APPLE)
         src/metal_scene.cpp
         src/metal_scene_manager.cpp
         src/metal_screenshot.cpp
+        src/metal_reconstruct_runner.cpp
         # Shared files (no Vulkan deps)
         src/gltf_loader.cpp
         src/meshlet.cpp

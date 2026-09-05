@@ -15,6 +15,7 @@ from luxc.parser.ast_nodes import (
     SurfaceDecl, SurfaceMember, SurfaceSampler, LayerCall, LayerArg,
     PropertiesField, PropertiesBlock,
     SplatDecl, SplatMember,
+    ReconstructDecl, ReconstructMember,
     GeometryDecl, GeometryField, GeometryTransform, GeometryOutputs, OutputBinding,
     PipelineDecl, PipelineMember,
     ScheduleDecl, ScheduleMember,
@@ -127,6 +128,8 @@ class LuxTransformer(Transformer):
                 mod.spec_constants.append(item)
             elif isinstance(item, SplatDecl):
                 mod.splats.append(item)
+            elif isinstance(item, ReconstructDecl):
+                mod.reconstructs.append(item)
         return mod
 
     # --- Top-level declarations ---
@@ -265,6 +268,16 @@ class LuxTransformer(Transformer):
 
     def splat_member(self, args):
         return SplatMember(str(args[0]), args[1])
+
+    # --- Reconstruction pass declarations ---
+
+    def reconstruct_decl(self, args):
+        name = args[0]
+        members = [a for a in args[1:] if isinstance(a, ReconstructMember)]
+        return ReconstructDecl(str(name), members, loc=_tok_loc(name))
+
+    def reconstruct_member(self, args):
+        return ReconstructMember(str(args[0]), args[1])
 
     # --- Geometry declarations ---
 

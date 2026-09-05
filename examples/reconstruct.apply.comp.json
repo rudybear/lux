@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "source": "reconstruct.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "packed_params",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "proxy_color",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_buffer",
+        "name": "spatial_out",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "storage_buffer",
+        "name": "alpha_out",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "storage_buffer",
+        "name": "hidden_out",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "push",
+      "fields": [
+        {
+          "name": "target_w",
+          "type": "uint",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "target_h",
+          "type": "uint",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "proxy_w",
+          "type": "uint",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "proxy_h",
+          "type": "uint",
+          "offset": 12,
+          "size": 4
+        },
+        {
+          "name": "net_w",
+          "type": "uint",
+          "offset": 16,
+          "size": 4
+        },
+        {
+          "name": "net_h",
+          "type": "uint",
+          "offset": 20,
+          "size": 4
+        },
+        {
+          "name": "jitter_x",
+          "type": "scalar",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "jitter_y",
+          "type": "scalar",
+          "offset": 28,
+          "size": 4
+        }
+      ],
+      "size": 32,
+      "stage_flags": [
+        "compute"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      256,
+      1,
+      1
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 861,
+    "alu_ops": 314,
+    "texture_samples": 0,
+    "branches": 1,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

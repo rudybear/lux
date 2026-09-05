@@ -69,6 +69,22 @@ glm::mat4 buildIntrinsicsProjection(float fx, float fy, float cx, float cy,
 void writeNpyFloat32(const std::string& path, const std::vector<float>& data,
                       const std::vector<int64_t>& shape);
 
+// Reads a float32 .npy file written by numpy (`<f4`, C order, version 1.0
+// or 2.0 header). Throws std::runtime_error on any other dtype/order, or
+// if the file doesn't exist. docs/lux-reconstruct-spec.md's dump loader.
+struct NpyArray {
+    std::vector<float> data;
+    std::vector<int64_t> shape;
+};
+NpyArray readNpyFloat32(const std::string& path);
+
+// Minimal flat-JSON integer field reader (same "find the key, strtol what
+// follows the colon" approach as loadCameraJson's own scalarAfterKey) --
+// used to read a --reconstruct-dump directory's meta.json (s, k,
+// param_stride, hidden, proxy_w/h, target_w/h, net_w/h, num_frames).
+// Returns -1 if the key isn't found.
+long readJsonIntField(const std::string& jsonPath, const std::string& key);
+
 // Writes a normalized grayscale PNG preview of a float buffer with
 // `channels` interleaved components per pixel (1 = raw value, e.g. depth;
 // 2 = magnitude, e.g. motion vectors). Min/max normalized over the whole

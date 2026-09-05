@@ -66,6 +66,7 @@ private:
 namespace SpvExecModel {
     constexpr uint32_t Vertex = 0;
     constexpr uint32_t Fragment = 4;
+    constexpr uint32_t GLCompute = 5;    // compute shaders (docs/lux-reconstruct-spec.md)
     constexpr uint32_t TaskEXT = 5267;   // SPV_EXT_mesh_shader task/object stage
     constexpr uint32_t MeshEXT = 5268;   // SPV_EXT_mesh_shader mesh stage
 }

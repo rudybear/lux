@@ -19,6 +19,7 @@ start: module_item*
             | features_decl
             | conditional_block
             | splat_decl
+            | reconstruct_decl
 
 // --- Top-level declarations ---
 
@@ -73,6 +74,12 @@ properties_field: IDENT ":" TYPE_NAME ("=" expr)?
 splat_decl: "splat" IDENT "{" splat_item ("," splat_item)* ","? "}"
 ?splat_item: splat_member | surface_properties
 splat_member: IDENT ":" expr
+
+// --- Reconstruction pass declarations (DLSS-style upscale/accumulate,
+// docs/lux-reconstruct-spec.md) ---
+
+reconstruct_decl: "reconstruct" IDENT "{" reconstruct_member ("," reconstruct_member)* ","? "}"
+reconstruct_member: IDENT ":" expr
 
 // --- Geometry declarations ---
 

@@ -7,6 +7,7 @@
 #include "metal_renderer_interface.h"
 #include "metal_screenshot.h"
 #include "dlss_io.h"
+#include "metal_reconstruct_runner.h"
 #include "reflected_pipeline.h"
 #include "scene_light.h"
 #include "camera.h"
@@ -167,6 +168,12 @@ struct CLIOptions {
     // as a host-level flag here since Metal's splat pipeline is hand-written
     // MSL with no compiled .lux splat config to read `sort:` from).
     bool sortByViewDepth = false;  // false = camera_distance (default)
+
+    // Reconstruction pass (docs/lux-reconstruct-spec.md): see main.cpp's
+    // identical Vulkan-side flags / runReconstructDump().
+    std::string reconstructDumpDir;
+    std::string reconstructOutDir;
+    std::string reconstructPipeline = "examples/reconstruct";
 };
 
 static void printUsage(const char* program) {
@@ -272,6 +279,12 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
                           << " (expected camera_distance or view_depth)" << std::endl;
                 std::exit(1);
             }
+        } else if (arg == "--reconstruct-dump" && i + 1 < argc) {
+            opts.reconstructDumpDir = argv[++i];
+        } else if (arg == "--reconstruct-out" && i + 1 < argc) {
+            opts.reconstructOutDir = argv[++i];
+        } else if (arg == "--reconstruct-pipeline" && i + 1 < argc) {
+            opts.reconstructPipeline = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -279,6 +292,10 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             printUsage(argv[0]);
             std::exit(1);
         }
+    }
+
+    if (!opts.reconstructDumpDir.empty()) {
+        return opts;
     }
 
     if (opts.sceneSource.empty()) {
@@ -1186,6 +1203,11 @@ static int runInteractive(CLIOptions opts) {
 
 int main(int argc, char* argv[]) {
     CLIOptions opts = parseArgs(argc, argv);
+
+    if (!opts.reconstructDumpDir.empty()) {
+        return runReconstructDumpMetal(opts.reconstructDumpDir, opts.reconstructOutDir,
+                                        opts.reconstructPipeline);
+    }
 
     if (opts.shaderBase.empty()) {
         try {

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 
 namespace DlssIO {
 
@@ -51,6 +52,13 @@ long scalarAfterKey(const std::string& content, const std::string& key) {
 }
 
 } // namespace
+
+long readJsonIntField(const std::string& jsonPath, const std::string& key) {
+    std::ifstream f(jsonPath);
+    if (!f.is_open()) return -1;
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return scalarAfterKey(content, key);
+}
 
 bool loadCameraJson(const std::string& path, CameraJsonData& out) {
     std::ifstream f(path);
@@ -164,6 +172,72 @@ void writeNpyFloat32(const std::string& path, const std::vector<float>& data,
     f.write(header.data(), static_cast<std::streamsize>(header.size()));
     f.write(reinterpret_cast<const char*>(data.data()),
             static_cast<std::streamsize>(data.size() * sizeof(float)));
+}
+
+NpyArray readNpyFloat32(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        throw std::runtime_error("readNpyFloat32: failed to open " + path);
+    }
+    char magic[6];
+    f.read(magic, 6);
+    if (f.gcount() != 6 || std::memcmp(magic, "\x93NUMPY", 6) != 0) {
+        throw std::runtime_error("readNpyFloat32: bad magic in " + path);
+    }
+    uint8_t version[2];
+    f.read(reinterpret_cast<char*>(version), 2);
+    uint32_t headerLen;
+    if (version[0] == 1) {
+        uint16_t h16;
+        f.read(reinterpret_cast<char*>(&h16), 2);
+        headerLen = h16;
+    } else {
+        f.read(reinterpret_cast<char*>(&headerLen), 4);
+    }
+    std::string header(headerLen, '\0');
+    f.read(header.data(), static_cast<std::streamsize>(headerLen));
+
+    if (header.find("'<f4'") == std::string::npos) {
+        throw std::runtime_error("readNpyFloat32: expected dtype '<f4' in " + path + " header: " + header);
+    }
+    if (header.find("'fortran_order': False") == std::string::npos &&
+        header.find("'fortran_order': True") != std::string::npos) {
+        throw std::runtime_error("readNpyFloat32: fortran-order arrays not supported: " + path);
+    }
+
+    // Parse the 'shape': (a, b, c) tuple -- ints and commas only, so a
+    // simple scan suffices (no general Python-literal parser needed).
+    NpyArray out;
+    size_t shapeKey = header.find("'shape':");
+    if (shapeKey == std::string::npos) {
+        throw std::runtime_error("readNpyFloat32: no 'shape' key in " + path);
+    }
+    size_t open = header.find('(', shapeKey);
+    size_t close = header.find(')', open);
+    if (open == std::string::npos || close == std::string::npos) {
+        throw std::runtime_error("readNpyFloat32: malformed shape tuple in " + path);
+    }
+    std::string shapeBody = header.substr(open + 1, close - open - 1);
+    std::string cur;
+    for (char c : shapeBody) {
+        if (c == ',') {
+            if (!cur.empty()) out.shape.push_back(std::stoll(cur));
+            cur.clear();
+        } else if (!std::isspace(static_cast<unsigned char>(c))) {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) out.shape.push_back(std::stoll(cur));
+
+    int64_t total = 1;
+    for (int64_t d : out.shape) total *= d;
+    out.data.resize(static_cast<size_t>(total));
+    f.read(reinterpret_cast<char*>(out.data.data()),
+           static_cast<std::streamsize>(total * static_cast<int64_t>(sizeof(float))));
+    if (f.gcount() != static_cast<std::streamsize>(total * static_cast<int64_t>(sizeof(float)))) {
+        throw std::runtime_error("readNpyFloat32: short read on " + path);
+    }
+    return out;
 }
 
 void writeNormalizedPreviewPNG(const std::string& path, const std::vector<float>& data,

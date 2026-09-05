@@ -13,6 +13,7 @@
 #include "screenshot.h"
 #include "editor_ui.h"
 #include "dlss_io.h"
+#include "reconstruct_runner.h"
 
 #include <GLFW/glfw3.h>
 #include <iostream>
@@ -152,6 +153,14 @@ struct CLIOptions {
     float timePrev = 0.0f;
     bool hasFramePrev = false;
     int framePrev = 0;
+
+    // Reconstruction pass (docs/lux-reconstruct-spec.md): run the compiled
+    // reconstruct.{warp,apply,blend}.comp.spv stages standalone, driven by
+    // a directory of dumped .npy inputs (network outputs computed offline)
+    // instead of any splat rendering. See runReconstructDump().
+    std::string reconstructDumpDir;   // --reconstruct-dump <dir>
+    std::string reconstructOutDir;    // --reconstruct-out <dir> (default: dump dir)
+    std::string reconstructPipeline = "examples/reconstruct"; // --reconstruct-pipeline <base>
 };
 
 static void printUsage(const char* program) {
@@ -192,6 +201,15 @@ static void printUsage(const char* program) {
               << "                         this previous time into splat_prev_pos, so mv reflects real\n"
               << "                         actor motion too (default: prev positions = current, i.e.\n"
               << "                         camera-only mv). Independent of --camera-json-prev.\n"
+              << "  --reconstruct-dump <DIR>  Run the compiled reconstruct.{warp,apply,blend}\n"
+              << "                         compute passes standalone against a directory of dumped\n"
+              << "                         .npy inputs (docs/lux-reconstruct-spec.md), no splat\n"
+              << "                         rendering at all -- writes out_f{t}.npy/hidden_f{t}.npy.\n"
+              << "                         --scene/--pipeline are ignored in this mode.\n"
+              << "  --reconstruct-out <DIR>   Output directory for --reconstruct-dump (default: the\n"
+              << "                         dump directory itself)\n"
+              << "  --reconstruct-pipeline <BASE>  Compiled reconstruct pipeline base path (default:\n"
+              << "                         examples/reconstruct)\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -272,6 +290,12 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
         } else if (arg == "--frame-prev" && i + 1 < argc) {
             opts.framePrev = std::stoi(argv[++i]);
             opts.hasFramePrev = true;
+        } else if (arg == "--reconstruct-dump" && i + 1 < argc) {
+            opts.reconstructDumpDir = argv[++i];
+        } else if (arg == "--reconstruct-out" && i + 1 < argc) {
+            opts.reconstructOutDir = argv[++i];
+        } else if (arg == "--reconstruct-pipeline" && i + 1 < argc) {
+            opts.reconstructPipeline = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -298,6 +322,11 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             std::cout << "[info] Legacy --mode \"" << legacyMode
                       << "\" mapped to --scene \"" << opts.sceneSource << "\"" << std::endl;
         }
+    }
+
+    // --reconstruct-dump mode needs neither --scene nor --pipeline.
+    if (!opts.reconstructDumpDir.empty()) {
+        return opts;
     }
 
     // Backwards compat: if no --scene, treat positional arg as pipeline base and use "sphere" as scene
@@ -1754,6 +1783,13 @@ static int runInteractive(CLIOptions opts) {
 
 int main(int argc, char* argv[]) {
     CLIOptions opts = parseArgs(argc, argv);
+
+    // Reconstruction pass (docs/lux-reconstruct-spec.md): fully standalone,
+    // no scene/pipeline resolution or splat rendering at all.
+    if (!opts.reconstructDumpDir.empty()) {
+        return runReconstructDump(opts.reconstructDumpDir, opts.reconstructOutDir,
+                                   opts.reconstructPipeline);
+    }
 
     // Resolve pipeline from scene if not explicitly given
     if (opts.shaderBase.empty()) {

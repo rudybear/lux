@@ -1032,3 +1032,50 @@ pipeline MobilePBR {
     schedule: OpenPBRMobile,
 }
 ```
+
+## Reconstruction Pass (DLSS-style Upscale/Accumulate)
+
+A runtime port of `mobiledlss.train.reconstruct` (see `docs/lux-reconstruct-spec.md`
+in the mobiledlss repo, and `SPECIFICATION.md` section 12.9 for the compute-stage
+details). Declares the fixed shape of a temporal-accumulation upscaler and expands
+to three compute stages -- `warp`, `apply` (un-multiplex the network's packed
+per-pixel parameters + apply the resulting kernel, fused), `blend`:
+
+```
+reconstruct DlssReconstruct {
+    s: 2,             // upscale factor (proxy -> target resolution ratio)
+    k: 4,             // taps per axis of the predicted kernel (K*K taps total)
+    param_stride: 1,  // network's own param_stride (see mobiledlss.train.model.ParamPredUNet)
+    hidden: 8,        // recurrent hidden-state channel count
+}
+
+pipeline ReconstructPass {
+    mode: reconstruct,
+    reconstruct: DlssReconstruct,
+}
+```
+
+`s`, `k`, `param_stride`, `hidden` are compile-time (one compiled pipeline is one
+fixed network architecture); the three stages take runtime push-constant fields
+for resolution (`target_w/h`, `proxy_w/h`, `net_w/h`) and per-frame jitter, so the
+same compiled pipeline is reused across every clip/frame. Only the 2-way blend
+(no scene-memory `blend3`) is covered.
+
+This is stage 1 of the port: the packed per-pixel network parameters
+(`kernel_logits`/`blend_logits`/`hidden_raw`, concatenated exactly as
+`ParamPredUNet.forward_packed` produces them) are supplied by the host as a
+`packed_params` input, not computed by a network running inside lux -- see
+`docs/lux-reconstruct-spec.md`'s stage 2 scope note.
+
+Both playgrounds can run these three stages standalone, driven entirely by a
+directory of dumped `.npy` inputs (produced offline, e.g. by mobiledlss's
+`tools/reconstruct_reference_dump.py`) instead of any splat rendering:
+
+```
+lux-playground --reconstruct-dump <DIR> [--reconstruct-out <DIR>] \
+               [--reconstruct-pipeline examples/reconstruct]
+```
+
+writing `out_f{t}.npy` / `hidden_f{t}.npy` per frame into the output directory
+(default: the dump directory itself). See `docs/rendering-engines.md`'s CLI
+table for the dump directory's expected file layout.

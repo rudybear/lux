@@ -25,8 +25,10 @@ from luxc.parser.ast_nodes import (
     StorageBufferDecl, BindlessTextureArrayDecl, IndexAccess, FieldAccess,
     IfStmt, TaskPayloadDecl, PropertiesBlock,
     SplatDecl,
+    ReconstructDecl,
 )
 from luxc.expansion.splat_expander import expand_splat_pipeline, expand_splat_rt_pipeline
+from luxc.expansion.reconstruct_expander import expand_reconstruct_pipeline
 
 
 def _is_openpbr(module):
@@ -115,6 +117,7 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
     procedurals = {p.name: p for p in module.procedurals}
     lightings = {l.name: l for l in module.lightings}
     splats = {s.name: s for s in getattr(module, 'splats', [])}
+    reconstructs = {r.name: r for r in getattr(module, 'reconstructs', [])}
 
     for pipeline in module.pipelines:
         # Filter: skip pipelines that don't match the filter
@@ -123,6 +126,7 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
         geo_name = None
         surf_name = None
         splat_name = None
+        reconstruct_name = None
         schedule_name = None
         env_name = None
         lighting_name = None
@@ -158,6 +162,9 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
             elif member.name == "splat":
                 if isinstance(member.value, VarRef):
                     splat_name = member.value.name
+            elif member.name == "reconstruct":
+                if isinstance(member.value, VarRef):
+                    reconstruct_name = member.value.name
             elif member.name == "use_task_shader":
                 if isinstance(member.value, VarRef) and member.value.name == "true":
                     use_task_shader = True
@@ -209,6 +216,16 @@ def expand_surfaces(module: Module, pipeline_filter: str | None = None, bindless
                     f"splat declaration found (splat: {splat_name})"
                 )
             stages = expand_splat_pipeline(splat, pipeline, module)
+            module.stages.extend(stages)
+        elif mode == "reconstruct":
+            # DLSS-style reconstruction pass expansion (docs/lux-reconstruct-spec.md)
+            reconstruct = reconstructs.get(reconstruct_name) if reconstruct_name else None
+            if reconstruct is None:
+                raise ValueError(
+                    f"Pipeline '{pipeline.name}' has mode: reconstruct but no "
+                    f"reconstruct declaration found (reconstruct: {reconstruct_name})"
+                )
+            stages = expand_reconstruct_pipeline(reconstruct, pipeline, module)
             module.stages.extend(stages)
         elif mode == "deferred":
             surface = surfaces.get(surf_name) if surf_name else None

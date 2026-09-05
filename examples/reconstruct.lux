@@ -1,0 +1,23 @@
+// DLSS-style reconstruction pass (docs/lux-reconstruct-spec.md): runtime
+// port of mobiledlss.train.reconstruct.{warp, pixel_shuffle_params,
+// apply_kernel, blend}. Emits three compute stages -- warp / apply
+// (un-multiplex + kernel-apply, fused) / blend -- from this one
+// declarative block; `s`, `k`, `param_stride`, `hidden` are baked in at
+// compile time (one compiled pipeline == one fixed network architecture).
+//
+// Compile: python -m luxc examples/reconstruct.lux
+//   -> reconstruct.warp.comp.spv
+//   -> reconstruct.apply.comp.spv
+//   -> reconstruct.blend.comp.spv
+
+reconstruct DlssReconstruct {
+    s: 2,
+    k: 4,
+    param_stride: 1,
+    hidden: 8,
+}
+
+pipeline ReconstructPass {
+    mode: reconstruct,
+    reconstruct: DlssReconstruct,
+}

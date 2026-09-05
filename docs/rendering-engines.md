@@ -145,6 +145,22 @@ run_mesh_interactive_rust.bat # Interactive mesh shader viewer (Rust)
 | `--time-prev <SECONDS>` / `--frame-prev <N>` | Dynamic (`motion: keyframes`) splats only: evaluate the morph animation a *second* time, at this earlier time, into `splat_prev_pos` -- so a single headless render's motion vectors reflect real actor motion (`mv = projection(pos(time), cam) - projection(pos(time_prev), cam_prev)`), not just camera motion. Without this flag, `splat_prev_pos` defaults to the current frame's own (post-morph) position, i.e. `mv` is camera-motion-only (see `--camera-json-prev` above) -- this is still what sequential playback wants (`prev` = last rendered frame), it's specifically a single-shot-validation convenience. Combine with `--camera-json-prev` for a real actor-plus-camera delta between two arbitrary frames |
 | `--output-aux <PREFIX>` | Splats compiled with `motion_vectors`/`expected_depth`: write `<PREFIX>_color.png`, `_color.npy` (float32 `[H,W,4]`, un-premultiplied RGBA read directly off the RGBA16F color attachment, no 8-bit quantization), `_depth.npy`, `_mv.npy` (float32, row-major `[H,W,C]`) plus normalized PNG previews |
 | `--sort <MODE>` (Metal only) | `camera_distance` (default, Euclidean) or `view_depth` (gsplat's raw view-space z) -- a host-level mirror of the `splat` block's `sort` option (SPECIFICATION.md 12.8), since Metal's splat pipeline is hand-written MSL with no compiled `.lux` config to read `sort:` from. On Vulkan, `sort` is a compile-time `splat` block member instead (recompile with `sort: view_depth` to switch) |
+| `--reconstruct-dump <DIR>` | Run the compiled `reconstruct.{warp,apply,blend}.comp.spv` stages (SPECIFICATION.md 12.9) standalone against a directory of dumped `.npy` inputs -- no splat rendering, `--scene`/`--pipeline` are ignored. See the dump directory layout below |
+| `--reconstruct-out <DIR>` | Output directory for `--reconstruct-dump` (default: the dump directory itself) |
+| `--reconstruct-pipeline <BASE>` | Compiled reconstruct pipeline base path for `--reconstruct-dump` (default: `examples/reconstruct`) |
+
+**`--reconstruct-dump` directory layout** (all `.npy`, fp32, `[H, W, C]` row-major; `T` = `num_frames`, `t` = `0..T-1`):
+
+| File | Shape | Notes |
+|------|-------|-------|
+| `meta.json` | -- | `{s, k, param_stride, hidden, proxy_w, proxy_h, target_w, target_h, net_w, net_h, num_frames}` |
+| `proxy_color_f{t}.npy` | `[proxy_h, proxy_w, 3]` | this frame's (jittered) proxy colour |
+| `mv_proxy_f{t}.npy` | `[proxy_h, proxy_w, 2]` | backward, jitter-free proxy-resolution motion vectors |
+| `jitter_f{t}.npy` | `[2]` | raw, target-pixel-unit jitter |
+| `packed_params_f{t}.npy` | `[net_h, net_w, sp*sp*k*k + sp*sp + hidden]` (`sp = s*param_stride`) | `ParamPredUNet.forward_packed`'s own layout |
+| `disocc_f{t}.npy` | `[target_h, target_w]` | 1 = disoccluded (forces pure-spatial) |
+
+Writes `out_f{t}.npy` (`[target_h, target_w, 3]`) and `hidden_f{t}.npy` (`[target_h, target_w, hidden]`) per frame into the output directory. `prev_color`/`prev_hidden` are double-buffered host-side between frames (starting at zero, matching `mobiledlss.train.train.rollout`'s initial state); this port runs no network between frames, so `hidden_out` is a pure per-frame function of `packed_params_f{t}.npy` (see SPECIFICATION.md 12.9's scope note).
 
 This table covers flags common to the Vulkan and Metal playgrounds; `--jitter`/`--camera-json`/`--camera-json-prev`/`--time-prev`/`--frame-prev`/`--output-aux` are implemented identically in both (`playground_cpp/src/main.cpp` and `playground_cpp/src/metal_main.cpp`), sharing their camera-math/`.npy`-writing/un-premultiply logic via `playground_cpp/src/dlss_io.h`.
 

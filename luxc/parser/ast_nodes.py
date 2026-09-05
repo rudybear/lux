@@ -52,6 +52,7 @@ class Module:
     features_decls: list[FeaturesDecl] = field(default_factory=list)
     spec_constants: list[SpecConstDecl] = field(default_factory=list)
     splats: list[SplatDecl] = field(default_factory=list)
+    reconstructs: list["ReconstructDecl"] = field(default_factory=list)
 
 
 # --- Top-level declarations ---
@@ -176,6 +177,22 @@ class SplatDecl:
 
 @dataclass
 class SplatMember:
+    name: str
+    value: Expr
+
+
+# --- Reconstruction pass declarations (DLSS-style upscale/accumulate,
+# docs/lux-reconstruct-spec.md) ---
+
+@dataclass
+class ReconstructDecl:
+    name: str
+    members: list["ReconstructMember"]
+    loc: Optional[SourceLocation] = None
+
+
+@dataclass
+class ReconstructMember:
     name: str
     value: Expr
 

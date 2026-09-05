@@ -1,0 +1,21 @@
+// Same as examples/reconstruct.lux, but with param_stride: 2 (the network
+// runs at proxy_res/2, the un-multiplex factor becomes s*param_stride=4)
+// -- used to validate docs/lux-reconstruct-spec.md's param_stride != 1
+// path against a random-weight ParamPredUNet(param_stride=2).
+//
+// Compile: python -m luxc examples/reconstruct_ps2.lux
+//   -> reconstruct_ps2.warp.comp.spv
+//   -> reconstruct_ps2.apply.comp.spv
+//   -> reconstruct_ps2.blend.comp.spv
+
+reconstruct DlssReconstructPS2 {
+    s: 2,
+    k: 4,
+    param_stride: 2,
+    hidden: 8,
+}
+
+pipeline ReconstructPassPS2 {
+    mode: reconstruct,
+    reconstruct: DlssReconstructPS2,
+}
