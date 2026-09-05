@@ -190,6 +190,188 @@ pub struct GltfLight {
     pub direction: Vec3,
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic (4D) Gaussian splats: morph-target keyframe animation.
+// See docs/lux-4d-spec.md and mobiledlss/gltf/dyn_splat_gltf.py (reference
+// writer/reader for the MOBILEDLSS_dynamic_splats convention).
+// ---------------------------------------------------------------------------
+
+/// One sparse morph target: deltas from the base attributes at `indices`.
+#[derive(Default, Clone)]
+pub struct SplatMorphTarget {
+    /// Global indices into the base splat arrays.
+    pub indices: Vec<u32>,
+    pub dpos: Vec<[f32; 3]>,
+    pub drot: Vec<[f32; 4]>,
+    pub dsh0: Vec<[f32; 3]>,
+}
+
+/// One animation keyframe: a time (seconds) and the per-target weight vector
+/// at that time (typically one-hot; keyframes[0] is all-zero -- the base).
+#[derive(Default, Clone)]
+pub struct SplatKeyframe {
+    pub time: f32,
+    pub weights: Vec<f32>,
+}
+
+#[derive(Default, Clone)]
+pub struct SplatDynamics {
+    pub has_motion: bool,
+    /// Length K (one per non-base keyframe).
+    pub targets: Vec<SplatMorphTarget>,
+    /// Length K+1; keyframes[0] is the base (all-zero weights).
+    pub keyframes: Vec<SplatKeyframe>,
+    /// mesh.extras.MOBILEDLSS_dynamic_splats, when present (informative --
+    /// the animation above is authoritative for interpolation semantics).
+    pub extras_frames: Vec<i64>,
+    pub extras_fps: Option<f32>,
+    pub rotation_blend: String,
+}
+
+/// Result of evaluating the animation at a point in time.
+#[derive(Clone, Copy, Debug)]
+pub struct SplatMorphState {
+    /// Valid index into `dynamics.targets` / the segment list.
+    pub high_target_index: usize,
+    /// Valid index into `dynamics.targets`, or `None` for the first segment
+    /// (whose "low" side is the base frame).
+    pub low_target_index: Option<usize>,
+    pub weight_low: f32,
+    pub weight_high: f32,
+}
+
+/// Evaluate the animation at `time_seconds`, clamped to the keyframe range.
+pub fn evaluate_splat_morph_state(dyn_: &SplatDynamics, time_seconds: f32) -> SplatMorphState {
+    if !dyn_.has_motion || dyn_.keyframes.len() < 2 || dyn_.targets.is_empty() {
+        return SplatMorphState { high_target_index: 0, low_target_index: None, weight_low: 0.0, weight_high: 0.0 };
+    }
+    let kf = &dyn_.keyframes;
+    let mut t = time_seconds;
+    if t <= kf[0].time {
+        return SplatMorphState { high_target_index: 0, low_target_index: None, weight_low: 0.0, weight_high: 0.0 };
+    }
+    if t >= kf[kf.len() - 1].time {
+        t = kf[kf.len() - 1].time;
+    }
+    let mut i = 0usize;
+    while i + 1 < kf.len() {
+        if t <= kf[i + 1].time { break; }
+        i += 1;
+    }
+    if i + 1 >= kf.len() { i = kf.len() - 2; }
+    let (t0, t1) = (kf[i].time, kf[i + 1].time);
+    let alpha = if t1 > t0 { (t - t0) / (t1 - t0) } else { 1.0 };
+    SplatMorphState {
+        high_target_index: i,
+        low_target_index: if i >= 1 { Some(i - 1) } else { None },
+        weight_low: 1.0 - alpha,
+        weight_high: alpha,
+    }
+}
+
+/// Map an integer video-frame index to a time in seconds: `frame / fps` when
+/// `extras_fps` is present, otherwise index directly into the animation's
+/// own keyframe times (clamped).
+pub fn splat_frame_to_time(dyn_: &SplatDynamics, frame: i64) -> f32 {
+    if let Some(fps) = dyn_.extras_fps {
+        return frame as f32 / fps;
+    }
+    if dyn_.keyframes.is_empty() { return 0.0; }
+    let idx = frame.clamp(0, dyn_.keyframes.len() as i64 - 1) as usize;
+    dyn_.keyframes[idx].time
+}
+
+/// A precomputed per-segment (union of the segment's low+high target sparse
+/// indices) delta list, ready to feed a GPU morph-apply pass or CPU
+/// evaluation. Segment `i` pairs low=targets[i-1] (or none if i==0) with
+/// high=targets[i]. Call once at load time.
+#[derive(Default, Clone)]
+pub struct SplatMorphSegment {
+    pub index: Vec<u32>,
+    pub dpos_lo: Vec<[f32; 3]>,
+    pub dpos_hi: Vec<[f32; 3]>,
+    pub drot_lo: Vec<[f32; 4]>,
+    pub drot_hi: Vec<[f32; 4]>,
+    pub dsh0_lo: Vec<[f32; 3]>,
+    pub dsh0_hi: Vec<[f32; 3]>,
+}
+
+pub fn build_splat_morph_segments(dyn_: &SplatDynamics) -> Vec<SplatMorphSegment> {
+    use std::collections::HashMap;
+    let num_targets = dyn_.targets.len();
+    let mut segments = Vec::with_capacity(num_targets);
+    for seg in 0..num_targets {
+        let lo = if seg >= 1 { Some(&dyn_.targets[seg - 1]) } else { None };
+        let hi = &dyn_.targets[seg];
+
+        let mut union_idx: Vec<u32> = hi.indices.clone();
+        if let Some(lo) = lo { union_idx.extend_from_slice(&lo.indices); }
+        union_idx.sort_unstable();
+        union_idx.dedup();
+
+        let lo_map: HashMap<u32, usize> = lo.map(|l| l.indices.iter().enumerate().map(|(i, &v)| (v, i)).collect()).unwrap_or_default();
+        let hi_map: HashMap<u32, usize> = hi.indices.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+
+        let n = union_idx.len();
+        let mut s = SplatMorphSegment {
+            index: union_idx.clone(),
+            dpos_lo: vec![[0.0; 3]; n], dpos_hi: vec![[0.0; 3]; n],
+            drot_lo: vec![[0.0; 4]; n], drot_hi: vec![[0.0; 4]; n],
+            dsh0_lo: vec![[0.0; 3]; n], dsh0_hi: vec![[0.0; 3]; n],
+        };
+        for (u, &idx) in union_idx.iter().enumerate() {
+            if let (Some(lo), Some(&li)) = (lo, lo_map.get(&idx)) {
+                s.dpos_lo[u] = lo.dpos[li];
+                s.drot_lo[u] = lo.drot[li];
+                s.dsh0_lo[u] = lo.dsh0[li];
+            }
+            if let Some(&hi_i) = hi_map.get(&idx) {
+                s.dpos_hi[u] = hi.dpos[hi_i];
+                s.drot_hi[u] = hi.drot[hi_i];
+                s.dsh0_hi[u] = hi.dsh0[hi_i];
+            }
+        }
+        segments.push(s);
+    }
+    segments
+}
+
+/// Evaluate the full animation (all splats) at `time_seconds`, generically
+/// (loops over whichever target weights are nonzero -- correct for the
+/// common <=2-active-keyframe case produced by the reference LINEAR/one-hot
+/// sampler, and for arbitrary weight vectors alike). Returns
+/// (positions, rotations (renormalized), sh0) as vec4-padded flat arrays
+/// matching `GaussianSplatData::positions`/`rotations`'s layout.
+pub fn evaluate_splat_dynamics_at(
+    dyn_: &SplatDynamics,
+    base_positions: &[[f32; 4]],
+    base_rotations: &[[f32; 4]],
+    base_sh0: &[[f32; 4]],
+    time_seconds: f32,
+) -> (Vec<[f32; 4]>, Vec<[f32; 4]>, Vec<[f32; 4]>) {
+    let mut pos = base_positions.to_vec();
+    let mut rot = base_rotations.to_vec();
+    let mut sh0 = base_sh0.to_vec();
+    let state = evaluate_splat_morph_state(dyn_, time_seconds);
+    let mut apply = |target_idx: usize, w: f32| {
+        if w == 0.0 { return; }
+        let t = &dyn_.targets[target_idx];
+        for (k, &idx) in t.indices.iter().enumerate() {
+            let i = idx as usize;
+            for c in 0..3 { pos[i][c] += w * t.dpos[k][c]; }
+            for c in 0..4 { rot[i][c] += w * t.drot[k][c]; }
+            for c in 0..3 { sh0[i][c] += w * t.dsh0[k][c]; }
+        }
+    };
+    if let Some(lo) = state.low_target_index { apply(lo, state.weight_low); }
+    apply(state.high_target_index, state.weight_high);
+    for r in rot.iter_mut() {
+        let len = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2] + r[3] * r[3]).sqrt();
+        if len > 1e-8 { for c in 0..4 { r[c] /= len; } }
+    }
+    (pos, rot, sh0)
+}
+
 /// Gaussian splat data extracted from KHR_gaussian_splatting glTF extension.
 pub struct GaussianSplatData {
     pub positions: Vec<[f32; 4]>,
@@ -208,6 +390,10 @@ pub struct GaussianSplatData {
     /// spec's implicit sRGB assumption when the extension object is absent).
     pub color_space: String,
     pub kernel: String,
+    /// Dynamic (morph-target-animated) splats, when the source glTF's splat
+    /// primitive has `targets`. Static assets leave this default
+    /// (`has_motion == false`).
+    pub dynamics: SplatDynamics,
 }
 
 impl Default for GaussianSplatData {
@@ -224,6 +410,7 @@ impl Default for GaussianSplatData {
             khr_format: false,
             color_space: "srgb_rec709_display".to_string(),
             kernel: "ellipse".to_string(),
+            dynamics: SplatDynamics::default(),
         }
     }
 }
@@ -805,6 +992,72 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
         }
     };
 
+    // Read a (possibly sparse) accessor as compact (index, value) pairs,
+    // without materializing a full dense array. Morph target deltas are
+    // typically sparse with **no bufferView** (dense base implicitly all
+    // zero) -- `read_accessor_f32` above returns empty for those (it only
+    // handles the `accessor.view()` case), so dynamic-splat parsing needs
+    // this dedicated sparse-aware reader. The gltf crate exposes
+    // `accessor.sparse()` directly (no custom JSON scanning needed here,
+    // unlike the KHR_gaussian_splatting extension object itself).
+    let read_sparse_accessor_f32 = |acc_idx: usize| -> (Vec<u32>, Vec<f32>) {
+        let Some(accessor) = document.accessors().nth(acc_idx) else {
+            return (Vec::new(), Vec::new());
+        };
+        let comp_count = match accessor.dimensions() {
+            gltf::accessor::Dimensions::Scalar => 1,
+            gltf::accessor::Dimensions::Vec2 => 2,
+            gltf::accessor::Dimensions::Vec3 => 3,
+            gltf::accessor::Dimensions::Vec4 => 4,
+            _ => 1,
+        };
+        if let Some(sparse) = accessor.sparse() {
+            let count = sparse.count();
+            let indices_acc = sparse.indices();
+            let idx_view = indices_acc.view();
+            let idx_buf = &buffers[idx_view.buffer().index()];
+            let idx_offset = idx_view.offset() + indices_acc.offset();
+            let idx_comp_size = indices_acc.index_type().size();
+            let mut indices = Vec::with_capacity(count);
+            for i in 0..count {
+                let off = idx_offset + i * idx_comp_size;
+                let v: u32 = match idx_comp_size {
+                    1 => idx_buf[off] as u32,
+                    2 => u16::from_le_bytes([idx_buf[off], idx_buf[off + 1]]) as u32,
+                    4 => u32::from_le_bytes([
+                        idx_buf[off], idx_buf[off + 1], idx_buf[off + 2], idx_buf[off + 3],
+                    ]),
+                    _ => 0,
+                };
+                indices.push(v);
+            }
+
+            let values_acc = sparse.values();
+            let val_view = values_acc.view();
+            let val_buf = &buffers[val_view.buffer().index()];
+            let val_offset = val_view.offset() + values_acc.offset();
+            let mut values = Vec::with_capacity(count * comp_count);
+            for i in 0..count {
+                for c in 0..comp_count {
+                    let off = val_offset + (i * comp_count + c) * 4;
+                    if off + 4 <= val_buf.len() {
+                        values.push(f32::from_le_bytes([
+                            val_buf[off], val_buf[off + 1], val_buf[off + 2], val_buf[off + 3],
+                        ]));
+                    } else {
+                        values.push(0.0);
+                    }
+                }
+            }
+            (indices, values)
+        } else {
+            // Dense target (valid glTF, just less common): every index is "touched".
+            let dense = read_accessor_f32(acc_idx);
+            let n = (dense.len() / comp_count.max(1)) as u32;
+            ((0..n).collect(), dense)
+        }
+    };
+
     for (mi, mesh) in document.meshes().enumerate() {
         for prim in mesh.primitives() {
             // glTF mode 0 = POINTS
@@ -1086,11 +1339,137 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
             }
 
             // Record per-primitive metadata for node transform application
+            let this_start_splat = scene.splat_data.num_splats as usize;
             splat_prim_infos.push(SplatPrimInfo {
                 mesh_index: mi,
-                start_splat: scene.splat_data.num_splats as usize,
+                start_splat: this_start_splat,
                 splat_count: prim_num_splats as usize,
             });
+
+            // --- Dynamic splats: morph targets (see docs/lux-4d-spec.md) ---
+            // Only the first primitive carrying `targets` populates
+            // scene.splat_data.dynamics; multi-primitive dynamic scenes are
+            // not yet supported end-to-end (documented limitation).
+            let raw_targets: Option<&Vec<JsonValue>> = raw_gltf.as_ref()
+                .and_then(|j| j.get("meshes"))
+                .and_then(|m| m.get(mi))
+                .and_then(|m| m.get("primitives"))
+                .and_then(|p| p.get(prim.index()))
+                .and_then(|p| p.get("targets"))
+                .and_then(|t| t.as_array());
+
+            if let Some(targets_json) = raw_targets {
+                if !targets_json.is_empty() && !scene.splat_data.dynamics.has_motion {
+                    scene.splat_data.dynamics.has_motion = true;
+
+                    for tgt in targets_json {
+                        let get_idx = |suffix: &str| -> Option<u64> {
+                            tgt.get(suffix).and_then(|v| v.as_u64())
+                        };
+                        let pos_idx = tgt.get("POSITION").and_then(|v| v.as_u64());
+                        let rot_idx = tgt.get("KHR_gaussian_splatting:ROTATION").and_then(|v| v.as_u64())
+                            .or_else(|| get_idx("_ROTATION"));
+                        let sh_idx = tgt.get("KHR_gaussian_splatting:SH_DEGREE_0_COEF_0").and_then(|v| v.as_u64());
+
+                        let (pi, pv) = pos_idx.map(|i| read_sparse_accessor_f32(i as usize)).unwrap_or_default();
+                        let (ri, rv) = rot_idx.map(|i| read_sparse_accessor_f32(i as usize)).unwrap_or_default();
+                        let (si, sv) = sh_idx.map(|i| read_sparse_accessor_f32(i as usize)).unwrap_or_default();
+
+                        use std::collections::BTreeSet;
+                        let mut union_idx: BTreeSet<u32> = BTreeSet::new();
+                        union_idx.extend(pi.iter().copied());
+                        union_idx.extend(ri.iter().copied());
+                        union_idx.extend(si.iter().copied());
+
+                        use std::collections::HashMap;
+                        let pmap: HashMap<u32, usize> = pi.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+                        let rmap: HashMap<u32, usize> = ri.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+                        let smap: HashMap<u32, usize> = si.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+
+                        let mut morph_target = SplatMorphTarget::default();
+                        for &local_idx in &union_idx {
+                            // Offset by this primitive's start_splat so indices are
+                            // valid into the scene-level (concatenated) arrays.
+                            morph_target.indices.push(local_idx + this_start_splat as u32);
+                            morph_target.dpos.push(pmap.get(&local_idx).map(|&i| {
+                                [pv[i * 3], pv[i * 3 + 1], pv[i * 3 + 2]]
+                            }).unwrap_or([0.0; 3]));
+                            morph_target.drot.push(rmap.get(&local_idx).map(|&i| {
+                                [rv[i * 4], rv[i * 4 + 1], rv[i * 4 + 2], rv[i * 4 + 3]]
+                            }).unwrap_or([0.0; 4]));
+                            morph_target.dsh0.push(smap.get(&local_idx).map(|&i| {
+                                [sv[i * 3], sv[i * 3 + 1], sv[i * 3 + 2]]
+                            }).unwrap_or([0.0; 3]));
+                        }
+                        scene.splat_data.dynamics.targets.push(morph_target);
+                    }
+
+                    // --- node.weights (initial pose) + animation (LINEAR
+                    // sampler on the node's `weights` path). ---
+                    let num_targets = scene.splat_data.dynamics.targets.len();
+                    let mut got_animation = false;
+                    // Find the node(s) referencing this mesh.
+                    let owner_node_indices: Vec<usize> = document.nodes()
+                        .filter(|n| n.mesh().map(|m| m.index()) == Some(mi))
+                        .map(|n| n.index())
+                        .collect();
+
+                    'anim_search: for anim in document.animations() {
+                        for channel in anim.channels() {
+                            if channel.target().property() != gltf::animation::Property::MorphTargetWeights {
+                                continue;
+                            }
+                            if !owner_node_indices.contains(&channel.target().node().index()) {
+                                continue;
+                            }
+                            let sampler = channel.sampler();
+                            let input_idx = sampler.input().index();
+                            let output_idx = sampler.output().index();
+                            let times = read_accessor_f32(input_idx);
+                            let weights_flat = read_accessor_f32(output_idx);
+                            if num_targets == 0 || times.is_empty()
+                                || weights_flat.len() != times.len() * num_targets {
+                                continue;
+                            }
+                            scene.splat_data.dynamics.keyframes = times.iter().enumerate().map(|(ki, &t)| {
+                                SplatKeyframe {
+                                    time: t,
+                                    weights: weights_flat[ki * num_targets..(ki + 1) * num_targets].to_vec(),
+                                }
+                            }).collect();
+                            got_animation = true;
+                            info!(
+                                "Dynamic splats: {} keyframes, {} morph targets, LINEAR interpolation",
+                                times.len(), num_targets
+                            );
+                            break 'anim_search;
+                        }
+                    }
+                    if !got_animation {
+                        log::warn!("Dynamic splat primitive has morph targets but no weights animation was found; motion will be disabled.");
+                        scene.splat_data.dynamics.has_motion = false;
+                    }
+
+                    // --- mesh.extras.MOBILEDLSS_dynamic_splats (informative) ---
+                    if let Some(conv) = raw_gltf.as_ref()
+                        .and_then(|j| j.get("meshes"))
+                        .and_then(|m| m.get(mi))
+                        .and_then(|m| m.get("extras"))
+                        .and_then(|e| e.get("MOBILEDLSS_dynamic_splats"))
+                    {
+                        if let Some(fps) = conv.get("fps").and_then(|v| v.as_f64()) {
+                            scene.splat_data.dynamics.extras_fps = Some(fps as f32);
+                        }
+                        if let Some(kfs) = conv.get("keyframes").and_then(|v| v.as_array()) {
+                            scene.splat_data.dynamics.extras_frames =
+                                kfs.iter().filter_map(|v| v.as_i64()).collect();
+                        }
+                        if let Some(rb) = conv.get("rotationBlend").and_then(|v| v.as_str()) {
+                            scene.splat_data.dynamics.rotation_blend = rb.to_string();
+                        }
+                    }
+                }
+            }
 
             // Append positions, rotations, scales, opacities to scene-level arrays
             scene.splat_data.positions.extend_from_slice(&prim_positions);
@@ -1523,5 +1902,171 @@ mod khr_gaussian_splatting_layout_tests {
         assert_eq!(scene.splat_data.color_space, "BT.709-sRGB");
         // Log-space scale data (has negative values) must be left untouched.
         assert!(scene.splat_data.scales.iter().any(|s| s[0] < 0.0));
+    }
+}
+
+/// Dynamic (4D) Gaussian splats: morph-target keyframe animation parsing and
+/// evaluation. See docs/lux-4d-spec.md, tests/test_dynamic_splats.py (the
+/// analogous Python coverage), and
+/// mobiledlss/gltf/dyn_splat_gltf.py (reference writer for the test asset).
+#[cfg(test)]
+mod dynamic_splats_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn dynamic_asset() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tests")
+            .join("assets")
+            .join("dynamic_splats_synthetic.glb")
+    }
+
+    fn load_dynamic() -> Option<GltfScene> {
+        let path = dynamic_asset();
+        if !path.exists() {
+            eprintln!(
+                "skipping: {} not present (see docs/lux-4d-spec.md's writer call)",
+                path.display()
+            );
+            return None;
+        }
+        Some(load_gltf(&path).expect("load dynamic_splats_synthetic.glb"))
+    }
+
+    #[test]
+    fn detects_motion_and_parses_targets() {
+        let Some(scene) = load_dynamic() else { return };
+        let dyn_ = &scene.splat_data.dynamics;
+        assert!(dyn_.has_motion);
+        assert_eq!(scene.splat_data.num_splats, 400);
+        // stride=2 over 9 frames -> keyframes [0,2,4,6,8] -> 4 targets
+        assert_eq!(dyn_.targets.len(), 4);
+        assert_eq!(dyn_.keyframes.len(), 5);
+        for t in &dyn_.targets {
+            assert!(!t.indices.is_empty() && t.indices.len() <= 60);
+            assert_eq!(t.indices.len(), t.dpos.len());
+            assert_eq!(t.indices.len(), t.drot.len());
+            assert_eq!(t.indices.len(), t.dsh0.len());
+        }
+    }
+
+    #[test]
+    fn static_assets_have_no_motion() {
+        for name in ["test_splats.glb", "luigi.glb"] {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("tests").join("assets").join(name);
+            let scene = load_gltf(&path).unwrap_or_else(|e| panic!("load {name}: {e}"));
+            assert!(!scene.splat_data.dynamics.has_motion, "{name} should not be detected as dynamic");
+        }
+    }
+
+    #[test]
+    fn keyframes_are_one_hot() {
+        let Some(scene) = load_dynamic() else { return };
+        let kf = &scene.splat_data.dynamics.keyframes;
+        assert!(kf[0].weights.iter().all(|&w| w == 0.0));
+        for (i, k) in kf.iter().enumerate().skip(1) {
+            let nonzero: Vec<usize> = k.weights.iter().enumerate().filter(|(_, &w)| w != 0.0).map(|(j, _)| j).collect();
+            assert_eq!(nonzero, vec![i - 1]);
+            assert_eq!(k.weights[i - 1], 1.0);
+        }
+    }
+
+    #[test]
+    fn extras_parsed() {
+        let Some(scene) = load_dynamic() else { return };
+        let dyn_ = &scene.splat_data.dynamics;
+        assert_eq!(dyn_.extras_fps, Some(30.0));
+        assert_eq!(dyn_.extras_frames, vec![0, 2, 4, 6, 8]);
+        assert_eq!(splat_frame_to_time(dyn_, 4), 4.0 / 30.0);
+    }
+
+    #[test]
+    fn evaluate_at_keyframe_reproduces_dense_frame() {
+        let Some(scene) = load_dynamic() else { return };
+        let dyn_ = &scene.splat_data.dynamics;
+        let base_sh0: Vec<[f32; 4]> = scene.splat_data.sh_coefficients[0].clone();
+
+        for (k, tgt) in dyn_.targets.iter().enumerate() {
+            let t = dyn_.keyframes[k + 1].time;
+            let (pos, rot, sh0) = evaluate_splat_dynamics_at(
+                dyn_, &scene.splat_data.positions, &scene.splat_data.rotations, &base_sh0, t,
+            );
+            for (i, &idx) in tgt.indices.iter().enumerate() {
+                let idx = idx as usize;
+                let expect_pos = [
+                    scene.splat_data.positions[idx][0] + tgt.dpos[i][0],
+                    scene.splat_data.positions[idx][1] + tgt.dpos[i][1],
+                    scene.splat_data.positions[idx][2] + tgt.dpos[i][2],
+                ];
+                assert!((pos[idx][0] - expect_pos[0]).abs() < 1e-6);
+                assert!((pos[idx][1] - expect_pos[1]).abs() < 1e-6);
+                assert!((pos[idx][2] - expect_pos[2]).abs() < 1e-6);
+
+                let raw = [
+                    scene.splat_data.rotations[idx][0] + tgt.drot[i][0],
+                    scene.splat_data.rotations[idx][1] + tgt.drot[i][1],
+                    scene.splat_data.rotations[idx][2] + tgt.drot[i][2],
+                    scene.splat_data.rotations[idx][3] + tgt.drot[i][3],
+                ];
+                let len = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2] + raw[3] * raw[3]).sqrt();
+                for c in 0..4 {
+                    assert!((rot[idx][c] - raw[c] / len).abs() < 1e-6);
+                }
+                let expect_sh0 = [
+                    base_sh0[idx][0] + tgt.dsh0[i][0],
+                    base_sh0[idx][1] + tgt.dsh0[i][1],
+                    base_sh0[idx][2] + tgt.dsh0[i][2],
+                ];
+                assert!((sh0[idx][0] - expect_sh0[0]).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn mid_keyframe_equals_lerp() {
+        let Some(scene) = load_dynamic() else { return };
+        let dyn_ = &scene.splat_data.dynamics;
+        let base_sh0: Vec<[f32; 4]> = scene.splat_data.sh_coefficients[0].clone();
+        let base_pos = &scene.splat_data.positions;
+        let base_rot = &scene.splat_data.rotations;
+
+        let t0 = dyn_.keyframes[1].time;
+        let t1 = dyn_.keyframes[2].time;
+        let tm = 0.5 * (t0 + t1);
+
+        let (p0, r0, s0) = evaluate_splat_dynamics_at(dyn_, base_pos, base_rot, &base_sh0, t0);
+        let (p1, r1, s1) = evaluate_splat_dynamics_at(dyn_, base_pos, base_rot, &base_sh0, t1);
+        let (pm, rm, sm) = evaluate_splat_dynamics_at(dyn_, base_pos, base_rot, &base_sh0, tm);
+
+        for i in 0..scene.splat_data.num_splats as usize {
+            for c in 0..3 {
+                let expect = 0.5 * p0[i][c] + 0.5 * p1[i][c];
+                assert!((pm[i][c] - expect).abs() < 1e-5, "position mismatch at splat {i}");
+                let expect_sh = 0.5 * s0[i][c] + 0.5 * s1[i][c];
+                assert!((sm[i][c] - expect_sh).abs() < 1e-5, "sh0 mismatch at splat {i}");
+            }
+            let mut raw = [0.0f32; 4];
+            for c in 0..4 { raw[c] = 0.5 * r0[i][c] + 0.5 * r1[i][c]; }
+            let len = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2] + raw[3] * raw[3]).sqrt();
+            for c in 0..4 {
+                let expect = if len > 1e-8 { raw[c] / len } else { raw[c] };
+                assert!((rm[i][c] - expect).abs() < 1e-5, "rotation mismatch at splat {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn segments_match_targets() {
+        let Some(scene) = load_dynamic() else { return };
+        let dyn_ = &scene.splat_data.dynamics;
+        let segments = build_splat_morph_segments(dyn_);
+        assert_eq!(segments.len(), dyn_.targets.len());
+        for (i, seg) in segments.iter().enumerate() {
+            // Segment i's union must contain every index in targets[i] (the "high" side).
+            for &idx in &dyn_.targets[i].indices {
+                assert!(seg.index.contains(&idx));
+            }
+        }
     }
 }
