@@ -136,7 +136,15 @@ run_mesh_interactive_rust.bat # Interactive mesh shader viewer (Rust)
 | `--width <N>` | Output width (default: 512, interactive: 1024) |
 | `--height <N>` | Output height (default: 512, interactive: 768) |
 | `--output <PATH>` | Output PNG path for headless mode |
+| `--headless` | Offscreen render only (default) |
 | `--validation` | Force Vulkan validation layers ON in release builds |
+| `--time <SECONDS>` / `--frame <N>` | Dynamic (`motion: keyframes`) splats: pick the animation time for headless renders (frame -> time via `extras.fps` when present, else keyframe times) |
+| `--jitter <JX> <JY>` | Sub-pixel jitter in pixels, applied to the splat projection matrix only (motion vectors always use the unjittered matrices) -- see the "DLSS Input-Contract Outputs" section of `docs/language-reference.md` |
+| `--camera-json <FILE>` | Drive the splat camera from an OpenCV-convention `{viewmat_cv, K, width, height}` JSON file -- see `docs/lux-4d-spec.md` section 4 |
+| `--camera-json-prev <FILE>` | Seed the motion-vector "previous frame" camera explicitly from a second camera JSON, instead of the default prev==curr (mv=0) on frame 1 (testing/tooling) |
+| `--output-aux <PREFIX>` | Splats compiled with `motion_vectors`/`expected_depth`: write `<PREFIX>_color.png`, `_depth.npy`, `_mv.npy` (float32, row-major `[H,W,C]`) plus normalized PNG previews |
+
+This table covers flags common to the Vulkan and Metal playgrounds; `--jitter`/`--camera-json`/`--camera-json-prev`/`--output-aux` are implemented identically in both (`playground_cpp/src/main.cpp` and `playground_cpp/src/metal_main.cpp`), sharing their camera-math/`.npy`-writing/un-premultiply logic via `playground_cpp/src/dlss_io.h`.
 
 ## IBL Preprocessing
 
