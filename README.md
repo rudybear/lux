@@ -98,7 +98,7 @@ See [full gallery](docs/gallery.md) for all demos: Gaussian splatting, mesh shad
 - AI material authoring: text-to-shader, image-to-material, video-to-animation, 5 providers
 - glTF 2.0 PBR with IBL, multi-material permutations, interactive viewers
 - KHR_gaussian_splatting conformance test suite (11 official Khronos assets, 226 tests)
-- PLY-to-glTF converter: coordinate transform, opacity/scale auto-detection, SH degree 0–3, round-trip verification, batch processing
+- PLY-to-glTF converter: writes the ratified `KHR_gaussian_splatting` layout by default (`--legacy-layout` for the pre-ratification draft), coordinate transform, opacity/scale auto-detection, SH degree 0–3, round-trip verification, batch processing
 - Metal backend via SPIRV-Cross, BRDF visualization tools, IBL preprocessing pipeline
 
 ## Prerequisites

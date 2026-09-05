@@ -194,12 +194,14 @@ tests/
     test_deferred_rendering.py  # Deferred rendering tests (expansion, compilation, reflection, edge cases)
     test_openpbr.py             # OpenPBR material model tests (35 tests: parser, stdlib, expansion, compilation, imports)
     test_khr_splat_conformance.py  # KHR_gaussian_splatting conformance tests (226 tests: asset loading, data validation, compilation)
-    test_ply_to_gltf.py         # PLY-to-glTF converter tests (73 tests: parsing, transforms, round-trip, edge cases)
+    test_ply_to_gltf.py         # PLY-to-glTF converter tests (ratified + legacy-layout, round-trip, edge cases)
 tools/
     generate_training_data.py
-    generate_test_splats.py  # generate test Gaussian splat .glb files (KHR_gaussian_splatting)
-    ply_to_gltf.py           # enhanced PLY-to-glTF converter (coord transform, opacity/scale, SH auto-detect, verify, batch)
-    glb_to_ply.py            # convert KHR_gaussian_splatting .glb to standard .ply for external viewers
-    debug_splats.py          # debug visualization for Gaussian splat data
+    generate_test_splats.py  # generate test Gaussian splat .glb files (ratified KHR_gaussian_splatting layout)
+    ply_to_gltf.py           # enhanced PLY-to-glTF converter (coord transform, opacity/scale, SH auto-detect, verify, batch;
+                              # writes the ratified KHR_gaussian_splatting layout by default, --legacy-layout for the
+                              # pre-ratification draft layout)
+    glb_to_ply.py            # convert KHR_gaussian_splatting .glb (ratified or legacy layout) to standard .ply for external viewers
+    debug_splats.py          # debug visualization for Gaussian splat data (ratified layout)
     visualize_brdf.py        # BRDF visualization CLI (compile + render + composite)
 ```
