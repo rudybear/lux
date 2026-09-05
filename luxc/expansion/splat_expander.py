@@ -47,6 +47,13 @@ def _get_splat_config(splat: SplatDecl) -> dict:
         color_space -- output color space ("srgb" or "linear")
         sort        -- sort strategy ("camera_distance" or "depth")
         alpha_cutoff -- minimum alpha for fragment discard
+        motion      -- "none" (default) or "keyframes": when "keyframes", the
+                       compiler emits an additional morph-apply compute stage
+                       (see _build_morph_apply_stage) that blends per-keyframe
+                       sparse position/rotation/SH0 deltas into the working
+                       splat_pos/splat_rot/splat_sh0 buffers before preprocess
+                       runs. See docs/language-reference.md's "Dynamic
+                       (4D) Gaussian Splatting" section.
     """
     config = {
         "sh_degree": 0,
@@ -54,11 +61,12 @@ def _get_splat_config(splat: SplatDecl) -> dict:
         "color_space": "srgb",
         "sort": "camera_distance",
         "alpha_cutoff": 0.004,
+        "motion": "none",
     }
     for m in splat.members:
         if m.name == "sh_degree":
             config["sh_degree"] = int(m.value.value)
-        elif m.name in ("kernel", "color_space", "sort"):
+        elif m.name in ("kernel", "color_space", "sort", "motion"):
             config[m.name] = m.value.name
         elif m.name == "alpha_cutoff":
             config["alpha_cutoff"] = float(m.value.value)
@@ -153,6 +161,131 @@ def _sh_buffer_names(sh_degree: int) -> list[str]:
     n_coeffs = {0: 1, 1: 4, 2: 9, 3: 16}
     count = n_coeffs.get(sh_degree, 1)
     return [f"splat_sh{i}" for i in range(count)]
+
+
+# ---------------------------------------------------------------------------
+# Stage 0 (optional): morph-apply compute shader (motion: keyframes)
+# ---------------------------------------------------------------------------
+#
+# Runs *before* the preprocess stage when `motion: keyframes` is set on the
+# splat declaration. Blends per-keyframe sparse position/rotation/SH0 deltas
+# into the working `splat_pos` / `splat_rot` / `splat_sh0` buffers -- the
+# exact buffer names the preprocess stage already reads, so preprocess itself
+# needs zero changes.
+#
+# GPU buffer layout (populated by the host loader/renderer, not luxc):
+#   splat_base_pos / splat_base_rot / splat_base_sh0  -- immutable base attrs
+#   morph_index            (uint) -- concatenated per-*segment* sparse index list
+#   morph_delta_pos_lo/hi  (vec4) -- position deltas for the segment's low/high keyframe
+#   morph_delta_rot_lo/hi  (vec4) -- rotation deltas
+#   morph_delta_sh0_lo/hi  (vec4) -- SH0 (color) deltas
+#   splat_pos / splat_rot / splat_sh0 (vec4) -- working buffers (also preprocess's input)
+#
+# A "segment" is the interval between two adjacent animation keyframes; its
+# low/high delta lists are the union of the two keyframes' sparse indices,
+# precomputed once at load time so each gaussian index appears at most once
+# per segment (no atomics, no multi-pass reset needed -- see
+# docs/language-reference.md and the loader implementations for how the CPU
+# side builds `morph_index`/`morph_delta_*` and picks `segment_offset` /
+# `segment_count` / `weight_lo` / `weight_hi` each frame from the current
+# animation time). For the general case of more than two simultaneously
+# nonzero target weights (not produced by the reference LINEAR/one-hot
+# sampler), hosts fall back to a CPU-side loop over all targets -- see the
+# spec's "Generic path for >2 non-zero weights" note; this GPU stage always
+# handles exactly the common (>=1, <=2 active keyframes) case.
+def _build_morph_apply_stage(config: dict) -> StageBlock:  # noqa: ARG001 (config kept for symmetry/future use)
+    stage = StageBlock(stage_type="compute")
+
+    # --- Immutable base attributes (read-only) ---
+    stage.storage_buffers.append(StorageBufferDecl("splat_base_pos", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("splat_base_rot", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("splat_base_sh0", "vec4"))
+
+    # --- Per-segment sparse delta lists (read-only) ---
+    stage.storage_buffers.append(StorageBufferDecl("morph_index", "uint"))
+    stage.storage_buffers.append(StorageBufferDecl("morph_delta_pos_lo", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("morph_delta_rot_lo", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("morph_delta_sh0_lo", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("morph_delta_pos_hi", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("morph_delta_rot_hi", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("morph_delta_sh0_hi", "vec4"))
+
+    # --- Working buffers (write) -- same names the preprocess stage reads ---
+    stage.storage_buffers.append(StorageBufferDecl("splat_pos", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("splat_rot", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("splat_sh0", "vec4"))
+
+    pc_fields = [
+        BlockField("segment_offset", "uint"),
+        BlockField("segment_count", "uint"),
+        BlockField("weight_lo", "scalar"),
+        BlockField("weight_hi", "scalar"),
+    ]
+    stage.push_constants.append(PushBlock("push", pc_fields))
+
+    body = _build_morph_apply_body()
+    main_fn = FunctionDef("main", [], None, body)
+    main_fn.attributes = ["workgroup_size(256)"]
+    stage.functions.append(main_fn)
+
+    return stage
+
+
+def _build_morph_apply_body() -> list:
+    body = []
+
+    # let gid = global_invocation_id.x;
+    body.append(_let("gid", "uint", _swizzle(_ref("global_invocation_id"), "x")))
+    # if (gid >= push.segment_count) { return; }
+    body.append(_if(
+        _binop(">=", _ref("gid"), _push_field("segment_count")),
+        [ReturnStmt(None)],
+    ))
+
+    # let entry = push.segment_offset + gid;
+    body.append(_let("entry", "uint", _binop("+", _push_field("segment_offset"), _ref("gid"))))
+    # let idx = morph_index[entry];
+    body.append(_let("idx", "uint", _idx("morph_index", _ref("entry"))))
+
+    # Base attributes at this gaussian.
+    body.append(_let("base_pos", "vec3", _swizzle(_idx("splat_base_pos", _ref("idx")), "xyz")))
+    body.append(_let("base_rot", "vec4", _idx("splat_base_rot", _ref("idx"))))
+    body.append(_let("base_sh0", "vec3", _swizzle(_idx("splat_base_sh0", _ref("idx")), "xyz")))
+
+    wlo = _push_field("weight_lo")
+    whi = _push_field("weight_hi")
+
+    # dpos = weight_lo * delta_pos_lo[entry].xyz + weight_hi * delta_pos_hi[entry].xyz;
+    body.append(_let("dpos", "vec3",
+        _binop("+",
+               _binop("*", wlo, _swizzle(_idx("morph_delta_pos_lo", _ref("entry")), "xyz")),
+               _binop("*", whi, _swizzle(_idx("morph_delta_pos_hi", _ref("entry")), "xyz")))))
+    # drot = weight_lo * delta_rot_lo[entry] + weight_hi * delta_rot_hi[entry];
+    body.append(_let("drot", "vec4",
+        _binop("+",
+               _binop("*", wlo, _idx("morph_delta_rot_lo", _ref("entry"))),
+               _binop("*", whi, _idx("morph_delta_rot_hi", _ref("entry"))))))
+    # dsh0 = weight_lo * delta_sh0_lo[entry].xyz + weight_hi * delta_sh0_hi[entry].xyz;
+    body.append(_let("dsh0", "vec3",
+        _binop("+",
+               _binop("*", wlo, _swizzle(_idx("morph_delta_sh0_lo", _ref("entry")), "xyz")),
+               _binop("*", whi, _swizzle(_idx("morph_delta_sh0_hi", _ref("entry")), "xyz")))))
+
+    body.append(_let("new_pos", "vec3", _binop("+", _ref("base_pos"), _ref("dpos"))))
+    body.append(_let("new_rot_raw", "vec4", _binop("+", _ref("base_rot"), _ref("drot"))))
+    # Renormalize the blended quaternion (lerp + renormalize, matching the
+    # reference writer's "lerp_renormalize" rotationBlend convention).
+    body.append(_let("rot_len", "scalar", _call("length", [_ref("new_rot_raw")])))
+    body.append(_let("new_rot", "vec4", _binop("/", _ref("new_rot_raw"), _ref("rot_len"))))
+    body.append(_let("new_sh0", "vec3", _binop("+", _ref("base_sh0"), _ref("dsh0"))))
+
+    body.append(_assign_idx("splat_pos", _ref("idx"),
+        _ctor("vec4", [_ref("new_pos"), _lit("0.0")])))
+    body.append(_assign_idx("splat_rot", _ref("idx"), _ref("new_rot")))
+    body.append(_assign_idx("splat_sh0", _ref("idx"),
+        _ctor("vec4", [_ref("new_sh0"), _lit("0.0")])))
+
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -1297,7 +1430,20 @@ def expand_splat_pipeline(
     fragment_stage = _build_fragment_stage(config)
     fragment_stage._splat_name = splat.name
 
-    return [compute_stage, vertex_stage, fragment_stage]
+    stages = [compute_stage, vertex_stage, fragment_stage]
+
+    # --- Optional stage 0: morph-apply compute (motion: keyframes) ---
+    if config.get("motion") == "keyframes":
+        morph_stage = _build_morph_apply_stage(config)
+        # Distinct output filename (test_splat.morph.comp.spv) so it doesn't
+        # collide with the preprocess compute stage's test_splat.comp.spv --
+        # same convention deferred_expander.py uses for gbuf/light passes.
+        morph_stage._output_stem_suffix = "morph"
+        morph_stage._splat_name = splat.name
+        morph_stage._splat_motion_config = config
+        stages.insert(0, morph_stage)
+
+    return stages
 
 
 # ---------------------------------------------------------------------------

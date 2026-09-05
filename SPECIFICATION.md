@@ -1785,6 +1785,37 @@ lighting SceneLighting {
 }
 ```
 
+### 12.8 Splat Block
+
+A `splat` block declares Gaussian-splatting configuration; a `pipeline` with `mode: gaussian_splat` expands it into a compute preprocess + instanced vertex + fragment 3-stage pipeline (`splat_expander.py`). See `docs/language-reference.md`'s "Gaussian Splatting" section for the full generated-code walkthrough.
+
+```
+splat Name {
+    sh_degree: 0,             // 0, 1, 2, or 3
+    kernel: ellipse,          // ellipse | circle
+    color_space: srgb,        // srgb | linear
+    sort: camera_distance,    // camera_distance | depth
+    alpha_cutoff: 0.004,
+    motion: keyframes,        // optional; see below
+}
+
+pipeline Name {
+    mode: gaussian_splat,
+    splat: SplatName,
+}
+```
+
+**Grammar**: `splat_decl: "splat" IDENT "{" splat_item ("," splat_item)* ","? "}"`, where `splat_item` is `splat_member: IDENT ":" expr` (fully generic key-value pairs, same mechanism as `surface_item`) or a `properties` block. **AST**: `SplatDecl(name, members: list[SplatMember], properties)`.
+
+**`motion: keyframes`** (optional, default: no motion): dynamic (4D) Gaussian splats animated via glTF morph targets on the splat `POINTS` primitive (base attributes + one sparse morph target per keyframe for `POSITION`, `KHR_gaussian_splatting:ROTATION`, and `KHR_gaussian_splatting:SH_DEGREE_0_COEF_0`, driven by a `LINEAR`-sampled `animation` on the node's `weights`). When set, `expand_splat_pipeline` prepends a **4th stage** ("morph apply", `stage_type: compute`, `_output_stem_suffix = "morph"`) that runs before the preprocess stage:
+
+- Reads immutable base buffers (`splat_base_pos`/`splat_base_rot`/`splat_base_sh0`) and a precomputed, per-animation-segment concatenation of sparse deltas (`morph_index`, `morph_delta_{pos,rot,sh0}_{lo,hi}`).
+- Writes `base + weight_lo * delta_lo + weight_hi * delta_hi` (quaternion renormalized) into `splat_pos`/`splat_rot`/`splat_sh0` — the *same* buffer names the preprocess stage already declares as input, so preprocess needs no changes at all.
+- Push constants: `segment_offset`, `segment_count` (dispatch bound), `weight_lo`, `weight_hi` — set by the host each frame from the current animation time. Cost is proportional to the number of gaussians that move in the active segment, not the total splat count.
+- Reflection: emits a `gaussian_splatting_morph` section (`role: "morph_apply"`) instead of the usual `gaussian_splatting` section; the preprocess stage's own `gaussian_splatting` section additionally reports `motion: "keyframes"` (or `"none"`).
+
+Loading, per-segment delta-buffer construction, and per-frame animation-time evaluation are host (loader/renderer) responsibilities, not the compiler's — see `docs/lux-4d-spec.md`.
+
 ---
 
 ## 13. Automatic Differentiation

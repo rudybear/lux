@@ -506,3 +506,136 @@ class TestSplatEdgeCases:
         pc = fragment.push_constants[0]
         field_names = {f.name for f in pc.fields}
         assert "alpha_cutoff" in field_names
+
+
+# =========================================================================
+# 5. Dynamic splats: motion: keyframes (morph-apply compute stage)
+# =========================================================================
+
+_PIPELINE_WITH_MOTION = """
+splat GS {
+    sh_degree: 0,
+    motion: keyframes,
+}
+
+pipeline SplatRender {
+    mode: gaussian_splat,
+    splat: GS,
+}
+"""
+
+
+class TestSplatMotionConfig:
+    """_get_splat_config should recognize the optional `motion` field."""
+
+    def test_default_motion_is_none(self):
+        splat = SplatDecl("GS", [])
+        config = _get_splat_config(splat)
+        assert config["motion"] == "none"
+
+    def test_motion_keyframes(self):
+        splat = SplatDecl("GS", [SplatMember("motion", VarRef("keyframes"))])
+        config = _get_splat_config(splat)
+        assert config["motion"] == "keyframes"
+
+
+class TestMorphApplyExpansion:
+    """expand_splat_pipeline should prepend a morph-apply compute stage when
+    motion: keyframes is set, and otherwise stay exactly as before."""
+
+    def _expand(self, source):
+        clear_type_aliases()
+        module = parse_lux(source)
+        module._defines = {}
+        expand_surfaces(module)
+        return module.stages
+
+    def test_no_motion_still_three_stages(self):
+        stages = self._expand(_PIPELINE_WITH_SPLAT)
+        assert len(stages) == 3
+        assert [s.stage_type for s in stages] == ["compute", "vertex", "fragment"]
+
+    def test_motion_keyframes_produces_four_stages(self):
+        stages = self._expand(_PIPELINE_WITH_MOTION)
+        assert len(stages) == 4
+        assert [s.stage_type for s in stages] == ["compute", "compute", "vertex", "fragment"]
+
+    def test_morph_stage_is_first_and_tagged(self):
+        stages = self._expand(_PIPELINE_WITH_MOTION)
+        morph = stages[0]
+        assert morph.stage_type == "compute"
+        assert getattr(morph, "_output_stem_suffix", None) == "morph"
+        assert getattr(morph, "_splat_motion_config", None) is not None
+
+    def test_morph_stage_buffers(self):
+        stages = self._expand(_PIPELINE_WITH_MOTION)
+        morph = stages[0]
+        sb_names = {sb.name for sb in morph.storage_buffers}
+        assert {"splat_base_pos", "splat_base_rot", "splat_base_sh0"} <= sb_names
+        assert {"morph_index", "morph_delta_pos_lo", "morph_delta_rot_lo",
+                "morph_delta_sh0_lo", "morph_delta_pos_hi", "morph_delta_rot_hi",
+                "morph_delta_sh0_hi"} <= sb_names
+        # Output buffers are exactly the names the preprocess stage reads as input.
+        assert {"splat_pos", "splat_rot", "splat_sh0"} <= sb_names
+
+    def test_morph_stage_push_constants(self):
+        stages = self._expand(_PIPELINE_WITH_MOTION)
+        morph = stages[0]
+        assert len(morph.push_constants) == 1
+        field_names = {f.name for f in morph.push_constants[0].fields}
+        assert field_names == {"segment_offset", "segment_count", "weight_lo", "weight_hi"}
+
+    def test_preprocess_stage_unaffected_by_motion(self):
+        """The preprocess stage's own buffers/push-constants must be identical
+        whether or not motion: keyframes is set -- it's just fed by different
+        upstream writers."""
+        plain = self._expand(_PIPELINE_WITH_SPLAT)
+        motion = self._expand(_PIPELINE_WITH_MOTION)
+        preprocess_plain = plain[0]
+        preprocess_motion = next(s for s in motion if s._splat_name == "GS" and
+                                  getattr(s, "_splat_config", None) is not None)
+        names_plain = [sb.name for sb in preprocess_plain.storage_buffers]
+        names_motion = [sb.name for sb in preprocess_motion.storage_buffers]
+        assert names_plain == names_motion
+
+
+@requires_spirv_tools
+class TestMorphApplyCompilation:
+    """Full compile of a motion: keyframes splat pipeline."""
+
+    def setup_method(self):
+        clear_type_aliases()
+
+    def teardown_method(self):
+        clear_type_aliases()
+
+    def test_compile_produces_four_spv(self, tmp_path):
+        _compile_splat(tmp_path, _PIPELINE_WITH_MOTION)
+        assert (tmp_path / "test_splat.morph.comp.spv").exists()
+        assert (tmp_path / "test_splat.comp.spv").exists()
+        assert (tmp_path / "test_splat.vert.spv").exists()
+        assert (tmp_path / "test_splat.frag.spv").exists()
+
+    def test_morph_reflection_has_gaussian_splatting_morph(self, tmp_path):
+        _compile_splat(tmp_path, _PIPELINE_WITH_MOTION)
+        json_path = tmp_path / "test_splat.morph.comp.json"
+        assert json_path.exists()
+        meta = json.loads(json_path.read_text())
+        assert "gaussian_splatting_morph" in meta
+        gs = meta["gaussian_splatting_morph"]
+        assert gs["role"] == "morph_apply"
+        assert "splat_pos" in gs["output_buffers"]
+        assert "splat_rot" in gs["output_buffers"]
+        assert "splat_sh0" in gs["output_buffers"]
+
+    def test_preprocess_reflection_reports_motion(self, tmp_path):
+        _compile_splat(tmp_path, _PIPELINE_WITH_MOTION)
+        json_path = tmp_path / "test_splat.comp.json"
+        meta = json.loads(json_path.read_text())
+        assert meta["gaussian_splatting"]["motion"] == "keyframes"
+
+    def test_static_pipeline_reflection_motion_is_none(self, tmp_path):
+        _compile_splat(tmp_path, _PIPELINE_WITH_SPLAT)
+        json_path = tmp_path / "test_splat.comp.json"
+        meta = json.loads(json_path.read_text())
+        assert meta["gaussian_splatting"]["motion"] == "none"

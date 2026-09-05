@@ -462,6 +462,7 @@ def generate_reflection(
             "color_space": splat_config.get("color_space", "srgb"),
             "sort": splat_config.get("sort", "camera_distance"),
             "alpha_cutoff": splat_config.get("alpha_cutoff", 0.004),
+            "motion": splat_config.get("motion", "none"),
         }
         if stage.stage_type == "compute":
             gs_meta["workgroup_size"] = [256, 1, 1]
@@ -472,6 +473,25 @@ def generate_reflection(
                                          if sb.name.startswith("projected_") or
                                          sb.name in ("sort_keys", "visible_count")]
         result["gaussian_splatting"] = gs_meta
+    elif getattr(stage, '_splat_motion_config', None) is not None:
+        # Morph-apply compute stage (motion: keyframes) -- see
+        # splat_expander._build_morph_apply_stage. Runs before preprocess;
+        # its output buffers are preprocess's splat_pos/splat_rot/splat_sh0
+        # input buffers, so engines must dispatch this stage first with a
+        # buffer barrier before the preprocess stage.
+        motion_config = stage._splat_motion_config
+        gs_morph_meta = {
+            "splat_name": getattr(stage, '_splat_name', ''),
+            "role": "morph_apply",
+            "workgroup_size": [256, 1, 1],
+            "base_buffers": [sb.name for sb in stage.storage_buffers
+                             if sb.name.startswith("splat_base_")],
+            "delta_buffers": [sb.name for sb in stage.storage_buffers
+                              if sb.name.startswith("morph_")],
+            "output_buffers": [sb.name for sb in stage.storage_buffers
+                               if sb.name in ("splat_pos", "splat_rot", "splat_sh0")],
+        }
+        result["gaussian_splatting_morph"] = gs_morph_meta
     elif getattr(stage, '_splat_name', None):
         result["gaussian_splatting"] = {
             "splat_name": stage._splat_name,

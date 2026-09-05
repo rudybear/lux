@@ -482,6 +482,51 @@ Reflection JSON includes a `gaussian_splatting` section with SH degree, kernel t
 
 All three rendering engines (C++/Vulkan, Rust/ash, Python/numpy) support Gaussian splat rendering with CPU-side depth sorting and instanced draw.
 
+#### Dynamic (4D) Gaussian Splatting
+
+Add `motion: keyframes` to a `splat` block to animate the cloud via glTF morph
+targets (see `docs/lux-4d-spec.md` for the full file-format spec):
+
+```
+splat DynamicGaussianCloud {
+    sh_degree: 0,
+    motion: keyframes,   // optional: emits a morph-apply compute pre-pass
+}
+
+pipeline DynamicSplatViewer {
+    mode: gaussian_splat,
+    splat: DynamicGaussianCloud,
+}
+```
+
+When `motion: keyframes` is set, the compiler emits a **4th stage** — a
+morph-apply compute shader that runs *before* preprocess and writes animated
+position/rotation/SH-degree-0 (color) values into the same `splat_pos` /
+`splat_rot` / `splat_sh0` buffers preprocess already reads, so preprocess
+itself is completely unchanged. It blends up to two active keyframes'
+sparse per-gaussian deltas (`base + weight_lo * delta_lo + weight_hi *
+delta_hi`, renormalizing the resulting quaternion), so its cost is
+proportional to the number of gaussians that actually move between the two
+keyframes, not the total splat count. The host (loader + renderer) is
+responsible for: parsing the glTF `targets`/`animation`/`weights`/extras,
+uploading the immutable `splat_base_pos/rot/sh0` buffers and the
+concatenated per-segment `morph_index`/`morph_delta_*` sparse delta buffers
+once at load time, and setting the `segment_offset`/`segment_count`/
+`weight_lo`/`weight_hi` push constants each frame from the current
+animation time (`--time`/`--frame` in the playgrounds). Scenes with more
+than two simultaneously non-zero target weights (not produced by the
+reference one-hot `LINEAR` sampler) fall back to a CPU-side loop over all
+targets — correctness over speed, since this case is not expected in
+practice.
+
+Compile with `python -m luxc examples/gaussian_splat_dynamic.lux`, which
+writes `gaussian_splat_dynamic.morph.comp.spv` alongside the usual
+`.comp.spv`/`.vert.spv`/`.frag.spv`. Reflection JSON for the morph stage
+carries a `gaussian_splatting_morph` section (`role: "morph_apply"`,
+`base_buffers`, `delta_buffers`, `output_buffers`); the preprocess stage's
+own `gaussian_splatting` section also reports `motion: "keyframes"` (or
+`"none"` for static splats).
+
 ### Bindless Rendering
 
 The `--bindless` flag enables uber-shaders with runtime descriptor arrays, eliminating per-material descriptor switching:

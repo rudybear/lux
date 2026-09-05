@@ -1,0 +1,27 @@
+// Dynamic (4D / animated) Gaussian Splatting — morph-target keyframe blending
+//
+// Identical to gaussian_splat.lux except for `motion: keyframes`, which makes
+// the compiler emit a 4th compute stage ("morph apply") that runs before the
+// existing preprocess/vertex/fragment stages. It blends per-keyframe sparse
+// position/rotation/SH0-color deltas into the working splat buffers each
+// frame, driven by a glTF `KHR_gaussian_splatting` + morph-target asset (see
+// docs/lux-4d-spec.md and tools that write MOBILEDLSS_dynamic_splats assets).
+//
+// Compile: python -m luxc examples/gaussian_splat_dynamic.lux
+//   -> writes gaussian_splat_dynamic.morph.comp.spv (new stage)
+//   -> writes gaussian_splat_dynamic.comp.spv (preprocess, unchanged)
+//   -> writes gaussian_splat_dynamic.vert.spv / .frag.spv (unchanged)
+
+splat DynamicGaussianCloud {
+    sh_degree: 0,
+    kernel: ellipse,
+    color_space: linear,
+    sort: camera_distance,
+    alpha_cutoff: 0.004,
+    motion: keyframes,
+}
+
+pipeline DynamicSplatViewer {
+    mode: gaussian_splat,
+    splat: DynamicGaussianCloud,
+}
