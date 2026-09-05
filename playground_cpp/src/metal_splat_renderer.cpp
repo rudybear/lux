@@ -485,6 +485,110 @@ void MetalSplatRenderer::createBuffers(MetalContext& ctx, const GaussianSplatDat
     for (uint32_t i = 0; i < numSplats_; ++i) idxPtr[i] = i;
 
     // Note: uniforms are passed via setBytes() in renderToTarget, no persistent buffers needed
+
+    // --- Dynamic splats: cache base attributes + precompute segments ---
+    dynamics_ = data.dynamics;
+    if (dynamics_.has_motion) {
+        // vec4-padded base copies, matching posBuffer_/rotBuffer_/shBuffer_ layout.
+        basePositions_ = hostPositions_;  // already vec4 (x,y,z,1)
+        baseRotations_.assign(data.rotations.begin(), data.rotations.end());
+        baseSH0_.assign(numSplats_ * 4, 0.0f);
+        if (!dynamics_.targets.empty()) {
+            auto* shPtr = static_cast<const float*>(shBuffer_->contents());
+            std::memcpy(baseSH0_.data(), shPtr, numSplats_ * 4 * sizeof(float));
+        }
+
+        morphSegments_ = buildSplatMorphSegments(dynamics_);
+
+        std::vector<uint32_t> allIdx;
+        for (auto& t : dynamics_.targets) allIdx.insert(allIdx.end(), t.indices.begin(), t.indices.end());
+        std::sort(allIdx.begin(), allIdx.end());
+        allIdx.erase(std::unique(allIdx.begin(), allIdx.end()), allIdx.end());
+        everMovingIndices_ = std::move(allIdx);
+
+        std::cout << "[metal] Dynamic splats: " << morphSegments_.size() << " segments, "
+                  << everMovingIndices_.size() << " gaussians ever move" << std::endl;
+    }
+}
+
+float MetalSplatRenderer::animationDuration() const {
+    if (!dynamics_.has_motion || dynamics_.keyframes.empty()) return 0.0f;
+    return dynamics_.keyframes.back().time;
+}
+
+float MetalSplatRenderer::frameToTime(int frame) const {
+    return splatFrameToTime(dynamics_, frame);
+}
+
+void MetalSplatRenderer::stepKeyframe(int direction) {
+    if (!dynamics_.has_motion || dynamics_.keyframes.empty()) return;
+    // Find the keyframe index nearest to (but not past, in the step direction)
+    // the current time, then step by one and clamp.
+    const auto& kf = dynamics_.keyframes;
+    size_t nearest = 0;
+    float best = std::fabs(kf[0].time - currentMorphTime_);
+    for (size_t i = 1; i < kf.size(); i++) {
+        float d = std::fabs(kf[i].time - currentMorphTime_);
+        if (d < best) { best = d; nearest = i; }
+    }
+    long stepped = static_cast<long>(nearest) + direction;
+    stepped = std::max<long>(0, std::min<long>(stepped, static_cast<long>(kf.size()) - 1));
+    setMorphTime(kf[static_cast<size_t>(stepped)].time);
+}
+
+void MetalSplatRenderer::setMorphTime(float seconds) {
+    if (!dynamics_.has_motion) return;
+    currentMorphTime_ = seconds;
+    SplatMorphState state = evaluateSplatMorphState(dynamics_, seconds);
+
+    auto* posPtr = static_cast<float*>(posBuffer_->contents());
+    auto* rotPtr = static_cast<float*>(rotBuffer_->contents());
+    auto* shPtr = static_cast<float*>(shBuffer_->contents());
+
+    // Reset every gaussian that moves *anywhere* in the animation back to
+    // base first (needed for correctness under arbitrary time scrubbing --
+    // not just monotonic playback), then apply the active segment's
+    // weighted deltas. Cost is proportional to the total count of moving
+    // gaussians, not the splat count N.
+    for (uint32_t idx : everMovingIndices_) {
+        std::memcpy(&posPtr[idx * 4], &basePositions_[idx * 4], 3 * sizeof(float));
+        std::memcpy(&rotPtr[idx * 4], &baseRotations_[idx * 4], 4 * sizeof(float));
+        std::memcpy(&shPtr[idx * 4], &baseSH0_[idx * 4], 3 * sizeof(float));
+        hostPositions_[idx * 4 + 0] = basePositions_[idx * 4 + 0];
+        hostPositions_[idx * 4 + 1] = basePositions_[idx * 4 + 1];
+        hostPositions_[idx * 4 + 2] = basePositions_[idx * 4 + 2];
+    }
+
+    if (state.weightLow == 0.0f && state.weightHigh == 0.0f) return;  // at/before the base frame
+
+    const SplatMorphSegment& seg = morphSegments_[state.highTargetIndex];
+    float wlo = state.weightLow, whi = state.weightHigh;
+    for (size_t k = 0; k < seg.index.size(); k++) {
+        uint32_t idx = seg.index[k];
+
+        float newPos[3], newRotRaw[4], newSh0[3];
+        for (int c = 0; c < 3; c++) {
+            newPos[c] = basePositions_[idx * 4 + c]
+                      + wlo * seg.dposLo[k * 3 + c] + whi * seg.dposHi[k * 3 + c];
+            newSh0[c] = baseSH0_[idx * 4 + c]
+                      + wlo * seg.dsh0Lo[k * 3 + c] + whi * seg.dsh0Hi[k * 3 + c];
+        }
+        for (int c = 0; c < 4; c++) {
+            newRotRaw[c] = baseRotations_[idx * 4 + c]
+                         + wlo * seg.drotLo[k * 4 + c] + whi * seg.drotHi[k * 4 + c];
+        }
+        float rotLen = std::sqrt(newRotRaw[0] * newRotRaw[0] + newRotRaw[1] * newRotRaw[1] +
+                                  newRotRaw[2] * newRotRaw[2] + newRotRaw[3] * newRotRaw[3]);
+        if (rotLen < 1e-8f) rotLen = 1.0f;
+
+        std::memcpy(&posPtr[idx * 4], newPos, 3 * sizeof(float));
+        for (int c = 0; c < 4; c++) rotPtr[idx * 4 + c] = newRotRaw[c] / rotLen;
+        std::memcpy(&shPtr[idx * 4], newSh0, 3 * sizeof(float));
+
+        hostPositions_[idx * 4 + 0] = newPos[0];
+        hostPositions_[idx * 4 + 1] = newPos[1];
+        hostPositions_[idx * 4 + 2] = newPos[2];
+    }
 }
 
 // --------------------------------------------------------------------------

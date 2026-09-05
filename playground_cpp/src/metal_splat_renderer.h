@@ -19,6 +19,30 @@ public:
     void init(MetalContext& ctx, const GaussianSplatData& data,
               uint32_t width, uint32_t height);
 
+    // --- Dynamic (4D) splats: morph-target keyframe animation ---
+    // See docs/lux-4d-spec.md. Metal's splat pipeline already hand-writes
+    // its compute/render kernels in MSL rather than transpiling luxc's
+    // compiled SPIR-V (unlike the raster/mesh Metal paths, and unlike the
+    // Vulkan splat renderer, which loads compiled .comp.spv directly) --
+    // this applies the identical morph-apply algorithm luxc emits in
+    // splat_expander._build_morph_apply_stage, but evaluated on the CPU and
+    // written directly into the shared-storage-mode Metal buffers (no GPU
+    // dispatch needed: MTL::ResourceStorageModeShared buffers are already
+    // CPU-writable unified memory). Cost is proportional to the number of
+    // gaussians that ever move in the whole animation, not the splat count.
+    bool hasMotion() const { return dynamics_.has_motion; }
+    float animationDuration() const;
+    // Map a video-frame index to seconds (extras.fps if present, else the
+    // animation's own keyframe times).
+    float frameToTime(int frame) const;
+    // Evaluate the animation at `seconds` and write the result directly into
+    // posBuffer_/rotBuffer_/shBuffer_. Call before render()/renderToDrawable().
+    void setMorphTime(float seconds);
+    float currentMorphTimeSeconds() const { return currentMorphTime_; }
+    // Snap to the next/previous keyframe time (direction = +1 or -1), for
+    // "[" / "]" step-one-keyframe interactive playback.
+    void stepKeyframe(int direction);
+
     void render(MetalContext& ctx) override;
     void renderToDrawable(MetalContext& ctx, CA::MetalDrawable* drawable) override;
     void updateCamera(glm::vec3 eye, glm::vec3 target, glm::vec3 up,
@@ -69,8 +93,18 @@ private:
     float focalX_ = 256.0f;
     float focalY_ = 256.0f;
 
-    // Cached positions for CPU sort
+    // Cached positions for CPU sort (kept in sync with posBuffer_'s current,
+    // possibly-morphed, contents)
     std::vector<float> hostPositions_;
+
+    // --- Dynamic splats ---
+    SplatDynamics dynamics_;
+    std::vector<SplatMorphSegment> morphSegments_;   // one per target/segment, see buildSplatMorphSegments
+    std::vector<uint32_t> everMovingIndices_;        // union of all targets' indices (for reset-to-base)
+    std::vector<float> basePositions_;               // vec4 per splat, immutable
+    std::vector<float> baseRotations_;               // vec4 per splat, immutable
+    std::vector<float> baseSH0_;                     // vec4 per splat, immutable
+    float currentMorphTime_ = 0.0f;
 
     // Helpers
     void createRenderTargets(MetalContext& ctx);

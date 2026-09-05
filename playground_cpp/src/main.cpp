@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <chrono>
 #include <fstream>
+#include <cmath>
 
 namespace fs = std::filesystem;
 
@@ -67,6 +68,15 @@ struct OrbitCamera {
 };
 
 static OrbitCamera g_orbit;
+
+// --- Dynamic (4D) splats: interactive playback state ---
+// Space toggles play/pause; [ and ] step one keyframe when paused.
+struct MorphPlayback {
+    bool paused = true;
+    float time = 0.0f;
+    bool spaceWasDown = false, leftBracketWasDown = false, rightBracketWasDown = false;
+};
+static MorphPlayback g_morph;
 static EditorUI* g_editorUI = nullptr; // non-null when editor mode is active
 
 static void mouseButtonCallback(GLFWwindow* window, int button, int action, int /*mods*/) {
@@ -120,6 +130,12 @@ struct CLIOptions {
     bool sponzaLights = false;
     bool noIBL = false;
     std::string splatPipeline; // --splat-pipeline: splat shader base for hybrid RT/mesh+splat scenes
+    // Dynamic (4D) Gaussian splats: pick an animation time for headless
+    // renders and the initial interactive pose (see docs/lux-4d-spec.md).
+    bool hasTime = false;
+    float time = 0.0f;
+    bool hasFrame = false;
+    int frame = 0;
 };
 
 static void printUsage(const char* program) {
@@ -144,6 +160,8 @@ static void printUsage(const char* program) {
               << "  --sponza-lights        Sponza courtyard lights (sun + orbiting torch + accent)\n"
               << "  --no-ibl               Disable IBL environment loading\n"
               << "  --splat-pipeline <BASE> Splat shader base for hybrid RT/mesh+splat rendering\n"
+              << "  --time <SECONDS>       Dynamic splats: animation time (headless + initial interactive pose)\n"
+              << "  --frame <N>            Dynamic splats: animation frame index (extras.fps, else keyframe times)\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -203,6 +221,12 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.noIBL = true;
         } else if (arg == "--splat-pipeline" && i + 1 < argc) {
             opts.splatPipeline = argv[++i];
+        } else if (arg == "--time" && i + 1 < argc) {
+            opts.time = std::stof(argv[++i]);
+            opts.hasTime = true;
+        } else if (arg == "--frame" && i + 1 < argc) {
+            opts.frame = std::stoi(argv[++i]);
+            opts.hasFrame = true;
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -606,6 +630,19 @@ static int runHeadless(const CLIOptions& opts) {
         if (hasSplatRenderer) {
             auto* splatR = scene.getSplatRenderer();
 
+            if (splatR->hasMotion()) {
+                float t = 0.0f;
+                if (opts.hasFrame) t = splatR->frameToTime(opts.frame);
+                else if (opts.hasTime) t = opts.time;
+                std::cout << "[info] Dynamic splats: evaluating at t=" << t << "s"
+                          << (opts.hasFrame ? " (--frame " + std::to_string(opts.frame) + ")" : "")
+                          << std::endl;
+                splatR->setMorphTime(t);
+            } else if (opts.hasTime || opts.hasFrame) {
+                std::cerr << "[warn] --time/--frame given but scene has no morph-target "
+                             "animation (compile the pipeline with motion: keyframes)" << std::endl;
+            }
+
             // For hybrid scenes, sync splat camera to scene auto-camera.
             // For pure splat scenes, keep the splat renderer's own camera
             // (computed from splat bounding box with Z-forward view).
@@ -970,6 +1007,16 @@ static int runInteractive(CLIOptions opts) {
             std::cout << "[info] Hybrid scene detected: " << hybridType << " + splats" << std::endl;
         }
 
+        if (hasSplatRenderer && scene.getSplatRenderer()->hasMotion()) {
+            auto* splatR = scene.getSplatRenderer();
+            if (opts.hasFrame) g_morph.time = splatR->frameToTime(opts.frame);
+            else if (opts.hasTime) g_morph.time = opts.time;
+            splatR->setMorphTime(g_morph.time);
+            std::cout << "[info] Dynamic splats: t=" << g_morph.time << "s / "
+                      << splatR->animationDuration() << "s. Space=play/pause, "
+                      << "[ / ] = step one keyframe." << std::endl;
+        }
+
         // Create the primary renderer (RT splat, RT, mesh, or raster)
         if (useRTSplat && scene.hasSplatData()) {
             rtSplatRenderer = std::make_unique<RTSplatRenderer>();
@@ -1053,6 +1100,49 @@ static int runInteractive(CLIOptions opts) {
         if (fbWidth == 0 || fbHeight == 0) {
             glfwWaitEvents();
             continue;
+        }
+
+        // --- Dynamic splats: playback keys + advance time ---
+        // Space = pause/resume, [ / ] = step one keyframe (only while paused).
+        if (scene.getSplatRenderer() && scene.getSplatRenderer()->hasMotion() &&
+            (!editorActive || !editorUI.wantCaptureKeyboard())) {
+            auto* splatR = scene.getSplatRenderer();
+            bool spaceDown = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+            if (spaceDown && !g_morph.spaceWasDown) {
+                g_morph.paused = !g_morph.paused;
+                std::cout << "[info] Dynamic splats: " << (g_morph.paused ? "paused" : "playing")
+                          << " at t=" << splatR->currentMorphTimeSeconds() << "s" << std::endl;
+            }
+            g_morph.spaceWasDown = spaceDown;
+
+            bool leftDown = glfwGetKey(window, GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS;
+            if (leftDown && !g_morph.leftBracketWasDown) {
+                g_morph.paused = true;
+                splatR->stepKeyframe(-1);
+                std::cout << "[info] Dynamic splats: stepped to t="
+                          << splatR->currentMorphTimeSeconds() << "s" << std::endl;
+            }
+            g_morph.leftBracketWasDown = leftDown;
+
+            bool rightDown = glfwGetKey(window, GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS;
+            if (rightDown && !g_morph.rightBracketWasDown) {
+                g_morph.paused = true;
+                splatR->stepKeyframe(1);
+                std::cout << "[info] Dynamic splats: stepped to t="
+                          << splatR->currentMorphTimeSeconds() << "s" << std::endl;
+            }
+            g_morph.rightBracketWasDown = rightDown;
+
+            if (!g_morph.paused) {
+                static double lastMorphFrameTime = glfwGetTime();
+                double now = glfwGetTime();
+                float dt = static_cast<float>(now - lastMorphFrameTime);
+                lastMorphFrameTime = now;
+                float duration = splatR->animationDuration();
+                float t = splatR->currentMorphTimeSeconds() + dt;
+                if (duration > 0.0f && t > duration) t = std::fmod(t, duration);  // loop
+                splatR->setMorphTime(t);
+            }
         }
 
         // Wait for previous frame to finish

@@ -577,13 +577,15 @@ void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBa
 
     // --- Descriptor pool ---
     // Need descriptors for: compute + render + sort (2*2 histogram + 1*2 prefix + 2*5 scatter = 16)
+    // + 1 morph-apply set (13 bindings, see _build_morph_apply_stage) for dynamic splats.
+    static constexpr uint32_t kMorphBindingCount = 13;
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = numComputeBindings + 4 + 16 + 4; // compute + render + sort + margin
+    poolSize.descriptorCount = numComputeBindings + 4 + 16 + kMorphBindingCount + 4; // + morph + margin
 
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 2 + 5;  // compute, render + 2 histogram + 1 prefix_sum + 2 scatter
+    poolInfo.maxSets = 2 + 5 + 1;  // compute, render + 2 histogram + 1 prefix_sum + 2 scatter + morph
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
 
@@ -928,6 +930,219 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
 }
 
 // --------------------------------------------------------------------------
+// Dynamic (4D) splats: morph-apply pipeline (luxc-emitted <base>.morph.comp.spv)
+// --------------------------------------------------------------------------
+//
+// Buffer bindings match splat_expander._build_morph_apply_stage's storage_buffers
+// declaration order exactly (auto-assigned bindings 0..12 by luxc):
+//   0 splat_base_pos, 1 splat_base_rot, 2 splat_base_sh0,
+//   3 morph_index,
+//   4 morph_delta_pos_lo, 5 morph_delta_rot_lo, 6 morph_delta_sh0_lo,
+//   7 morph_delta_pos_hi, 8 morph_delta_rot_hi, 9 morph_delta_sh0_hi,
+//   10 splat_pos, 11 splat_rot, 12 splat_sh0  (== preprocess's own input buffers)
+void SplatRenderer::createMorphPipeline(VkDevice device, const std::string& shaderBase) {
+    std::string morphSpvPath = shaderBase + ".morph.comp.spv";
+    if (!fs::exists(morphSpvPath)) {
+        // Not a `motion: keyframes` pipeline -- static splats render exactly
+        // as before, no morph stage.
+        return;
+    }
+
+    static constexpr uint32_t kMorphBindingCount = 13;
+    std::vector<VkDescriptorSetLayoutBinding> bindings(kMorphBindingCount);
+    for (uint32_t i = 0; i < kMorphBindingCount; ++i) {
+        bindings[i] = {};
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = kMorphBindingCount;
+    layoutInfo.pBindings = bindings.data();
+    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &morphSetLayout_);
+
+    // Push constants: segment_offset(u32) + segment_count(u32) + weight_lo(f32) + weight_hi(f32) = 16B
+    VkPushConstantRange pushRange = {};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.offset = 0;
+    pushRange.size = 16;
+
+    VkPipelineLayoutCreateInfo pipeLayoutInfo = {};
+    pipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipeLayoutInfo.setLayoutCount = 1;
+    pipeLayoutInfo.pSetLayouts = &morphSetLayout_;
+    pipeLayoutInfo.pushConstantRangeCount = 1;
+    pipeLayoutInfo.pPushConstantRanges = &pushRange;
+    vkCreatePipelineLayout(device, &pipeLayoutInfo, nullptr, &morphLayout_);
+
+    auto code = SpvLoader::loadSPIRV(morphSpvPath);
+    VkShaderModule module = SpvLoader::createShaderModule(device, code);
+
+    VkComputePipelineCreateInfo pipeInfo = {};
+    pipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeInfo.stage.module = module;
+    pipeInfo.stage.pName = "main";
+    pipeInfo.layout = morphLayout_;
+    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &morphPipeline_);
+    vkDestroyShaderModule(device, module, nullptr);
+
+    std::cout << "[info] Loaded dynamic-splat morph-apply shader: " << morphSpvPath << std::endl;
+}
+
+void SplatRenderer::createMorphBuffers(VulkanContext& ctx, const GaussianSplatData& data) {
+    dynamics_ = data.dynamics;
+    if (!dynamics_.has_motion || morphPipeline_ == VK_NULL_HANDLE) {
+        if (dynamics_.has_motion && morphPipeline_ == VK_NULL_HANDLE) {
+            std::cerr << "[warn] Scene has morph-target animation but the shader base '"
+                      << "' has no .morph.comp.spv -- compile with `motion: keyframes` "
+                      << "(e.g. examples/gaussian_splat_dynamic.lux) to animate it. "
+                      << "Rendering the static base frame." << std::endl;
+        }
+        return;
+    }
+
+    morphSegments_ = buildSplatMorphSegments(dynamics_);
+    segmentOffsets_.resize(morphSegments_.size());
+    segmentCounts_.resize(morphSegments_.size());
+
+    std::vector<uint32_t> catIndex;
+    std::vector<float> catPosLo, catPosHi, catRotLo, catRotHi, catSh0Lo, catSh0Hi;
+    for (size_t seg = 0; seg < morphSegments_.size(); seg++) {
+        const auto& s = morphSegments_[seg];
+        segmentOffsets_[seg] = static_cast<uint32_t>(catIndex.size());
+        segmentCounts_[seg] = static_cast<uint32_t>(s.index.size());
+        catIndex.insert(catIndex.end(), s.index.begin(), s.index.end());
+        catPosLo.insert(catPosLo.end(), s.dposLo.begin(), s.dposLo.end());
+        catPosHi.insert(catPosHi.end(), s.dposHi.begin(), s.dposHi.end());
+        catRotLo.insert(catRotLo.end(), s.drotLo.begin(), s.drotLo.end());
+        catRotHi.insert(catRotHi.end(), s.drotHi.begin(), s.drotHi.end());
+        catSh0Lo.insert(catSh0Lo.end(), s.dsh0Lo.begin(), s.dsh0Lo.end());
+        catSh0Hi.insert(catSh0Hi.end(), s.dsh0Hi.begin(), s.dsh0Hi.end());
+    }
+    morphTotalEntries_ = static_cast<uint32_t>(catIndex.size());
+
+    // Pad vec3 delta arrays to vec4 (matches StorageBufferDecl("...", "vec4") in luxc).
+    auto pad3to4 = [](const std::vector<float>& src) {
+        std::vector<float> out(src.size() / 3 * 4, 0.0f);
+        for (size_t i = 0; i < src.size() / 3; i++) {
+            out[i * 4 + 0] = src[i * 3 + 0];
+            out[i * 4 + 1] = src[i * 3 + 1];
+            out[i * 4 + 2] = src[i * 3 + 2];
+        }
+        return out;
+    };
+    std::vector<float> catPosLo4 = pad3to4(catPosLo), catPosHi4 = pad3to4(catPosHi);
+    std::vector<float> catSh0Lo4 = pad3to4(catSh0Lo), catSh0Hi4 = pad3to4(catSh0Hi);
+
+    VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    auto uploadNew = [&](const void* data_, VkDeviceSize size, VkBuffer& buf, VmaAllocation& alloc) {
+        createVmaBuffer(ctx.allocator, size, ssbo, VMA_MEMORY_USAGE_CPU_TO_GPU, buf, alloc);
+        uploadVmaBuffer(ctx.allocator, alloc, data_, size);
+    };
+
+    // Immutable base copies (posBuffer_/rotBuffer_/shBuffers_[0] are the mutable
+    // "working" buffers preprocess reads -- these are separate, untouched originals).
+    uploadNew(data.positions.data(), data.positions.size() * sizeof(float), baseposBuffer_, baseposAlloc_);
+    uploadNew(data.rotations.data(), numSplats_ * 4 * sizeof(float), baserotBuffer_, baserotAlloc_);
+    {
+        std::vector<float> sh0base(numSplats_ * 4, 0.0f);
+        if (!data.sh_coefficients.empty()) {
+            const auto& c = data.sh_coefficients[0];
+            uint32_t fps = c.empty() ? 0 : static_cast<uint32_t>(c.size() / numSplats_);
+            if (fps == 3) {
+                for (uint32_t i = 0; i < numSplats_; i++)
+                    for (int k = 0; k < 3; k++) sh0base[i * 4 + k] = c[i * 3 + k];
+            } else if (fps == 4) {
+                sh0base = c;
+            }
+        }
+        uploadNew(sh0base.data(), sh0base.size() * sizeof(float), basesh0Buffer_, basesh0Alloc_);
+    }
+
+    uploadNew(catIndex.data(), std::max<size_t>(catIndex.size(), 1) * sizeof(uint32_t), morphIndexBuffer_, morphIndexAlloc_);
+    uploadNew(catPosLo4.data(), std::max<size_t>(catPosLo4.size(), 4) * sizeof(float), morphPosLoBuffer_, morphPosLoAlloc_);
+    uploadNew(catRotLo.data(), std::max<size_t>(catRotLo.size(), 4) * sizeof(float), morphRotLoBuffer_, morphRotLoAlloc_);
+    uploadNew(catSh0Lo4.data(), std::max<size_t>(catSh0Lo4.size(), 4) * sizeof(float), morphSh0LoBuffer_, morphSh0LoAlloc_);
+    uploadNew(catPosHi4.data(), std::max<size_t>(catPosHi4.size(), 4) * sizeof(float), morphPosHiBuffer_, morphPosHiAlloc_);
+    uploadNew(catRotHi.data(), std::max<size_t>(catRotHi.size(), 4) * sizeof(float), morphRotHiBuffer_, morphRotHiAlloc_);
+    uploadNew(catSh0Hi4.data(), std::max<size_t>(catSh0Hi4.size(), 4) * sizeof(float), morphSh0HiBuffer_, morphSh0HiAlloc_);
+
+    // --- Allocate + write the morph descriptor set ---
+    VkDescriptorSetAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = descriptorPool_;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &morphSetLayout_;
+    vkAllocateDescriptorSets(ctx.device, &allocInfo, &morphDescSet_);
+
+    auto writeSSBO = [&](uint32_t binding, VkBuffer buffer, VkDeviceSize size) {
+        VkDescriptorBufferInfo bufInfo = {};
+        bufInfo.buffer = buffer;
+        bufInfo.offset = 0;
+        bufInfo.range = std::max(size, VkDeviceSize(4));
+        VkWriteDescriptorSet write = {};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = morphDescSet_;
+        write.dstBinding = binding;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &bufInfo;
+        vkUpdateDescriptorSets(ctx.device, 1, &write, 0, nullptr);
+    };
+    VkDeviceSize vec4Total = morphTotalEntries_ * 4 * sizeof(float);
+    writeSSBO(0, baseposBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(1, baserotBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(2, basesh0Buffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(3, morphIndexBuffer_, morphTotalEntries_ * sizeof(uint32_t));
+    writeSSBO(4, morphPosLoBuffer_, vec4Total);
+    writeSSBO(5, morphRotLoBuffer_, vec4Total);
+    writeSSBO(6, morphSh0LoBuffer_, vec4Total);
+    writeSSBO(7, morphPosHiBuffer_, vec4Total);
+    writeSSBO(8, morphRotHiBuffer_, vec4Total);
+    writeSSBO(9, morphSh0HiBuffer_, vec4Total);
+    // The morph stage's OUTPUT buffers are exactly preprocess's own INPUT
+    // buffers -- no copy, no separate storage. This is what makes
+    // preprocess itself require zero changes for dynamic splats.
+    writeSSBO(10, posBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(11, rotBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(12, shBuffers_.empty() ? posBuffer_ : shBuffers_[0], numSplats_ * 4 * sizeof(float));
+
+    std::cout << "[info] Dynamic splats: " << morphSegments_.size() << " segments, "
+              << morphTotalEntries_ << " total sparse entries" << std::endl;
+}
+
+float SplatRenderer::animationDuration() const {
+    if (!dynamics_.has_motion || dynamics_.keyframes.empty()) return 0.0f;
+    return dynamics_.keyframes.back().time;
+}
+
+float SplatRenderer::frameToTime(int frame) const {
+    return splatFrameToTime(dynamics_, frame);
+}
+
+void SplatRenderer::setMorphTime(float seconds) {
+    currentMorphTime_ = seconds;
+}
+
+void SplatRenderer::stepKeyframe(int direction) {
+    if (!dynamics_.has_motion || dynamics_.keyframes.empty()) return;
+    const auto& kf = dynamics_.keyframes;
+    size_t nearest = 0;
+    float best = std::fabs(kf[0].time - currentMorphTime_);
+    for (size_t i = 1; i < kf.size(); i++) {
+        float d = std::fabs(kf[i].time - currentMorphTime_);
+        if (d < best) { best = d; nearest = i; }
+    }
+    long stepped = static_cast<long>(nearest) + direction;
+    stepped = std::max<long>(0, std::min<long>(stepped, static_cast<long>(kf.size()) - 1));
+    currentMorphTime_ = kf[static_cast<size_t>(stepped)].time;
+}
+
+// --------------------------------------------------------------------------
 // Init
 // --------------------------------------------------------------------------
 
@@ -955,6 +1170,8 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
     createPipelines(ctx.device, shaderBase);
     createSortPipelines(ctx.device);
     createBuffers(ctx, data);
+    createMorphPipeline(ctx.device, shaderBase);
+    createMorphBuffers(ctx, data);
 
     // Robust camera from IQR-based bounds (handles outlier splats)
     if (data.num_splats > 0) {
@@ -1104,6 +1321,54 @@ void SplatRenderer::render(VulkanContext& ctx) {
     if (numSplats_ == 0) return;
 
     VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+
+    // --- Dynamic splats: morph-apply compute pass (runs before preprocess) ---
+    // See docs/lux-4d-spec.md and SPECIFICATION.md 12.8. Two dispatches so
+    // arbitrary time scrubbing (not just monotonic playback) stays correct:
+    //   1. reset every gaussian that EVER moves back to base (weight 0/0 ==
+    //      base + 0*lo + 0*hi == base, exactly);
+    //   2. apply the currently active segment's weighted deltas.
+    // Both dispatch sizes are proportional to sparse counts, not numSplats_.
+    if (hasMotion()) {
+        struct MorphPush {
+            uint32_t segmentOffset;
+            uint32_t segmentCount;
+            float weightLow;
+            float weightHigh;
+        };
+
+        VkMemoryBarrier morphBarrier = {};
+        morphBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        morphBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        morphBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, morphPipeline_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, morphLayout_,
+                                0, 1, &morphDescSet_, 0, nullptr);
+
+        if (morphTotalEntries_ > 0) {
+            MorphPush resetPush = {0, morphTotalEntries_, 0.0f, 0.0f};
+            vkCmdPushConstants(cmd, morphLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(resetPush), &resetPush);
+            uint32_t resetGroups = (morphTotalEntries_ + 255) / 256;
+            vkCmdDispatch(cmd, resetGroups, 1, 1);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &morphBarrier, 0, nullptr, 0, nullptr);
+        }
+
+        SplatMorphState state = evaluateSplatMorphState(dynamics_, currentMorphTime_);
+        if ((state.weightLow != 0.0f || state.weightHigh != 0.0f) &&
+            state.highTargetIndex >= 0 &&
+            static_cast<size_t>(state.highTargetIndex) < segmentCounts_.size() &&
+            segmentCounts_[state.highTargetIndex] > 0) {
+            uint32_t seg = static_cast<uint32_t>(state.highTargetIndex);
+            MorphPush applyPush = {segmentOffsets_[seg], segmentCounts_[seg], state.weightLow, state.weightHigh};
+            vkCmdPushConstants(cmd, morphLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(applyPush), &applyPush);
+            uint32_t applyGroups = (segmentCounts_[seg] + 255) / 256;
+            vkCmdDispatch(cmd, applyGroups, 1, 1);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &morphBarrier, 0, nullptr, 0, nullptr);
+        }
+    }
 
     // --- Compute dispatch (projection + sort key generation) ---
     struct ComputePush {
@@ -1640,6 +1905,25 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     }
     shBuffers_.clear();
     shAllocs_.clear();
+
+    // Dynamic splats: morph-apply pipeline + buffers
+    if (morphPipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(ctx.device, morphPipeline_, nullptr);
+    if (morphLayout_ != VK_NULL_HANDLE)   vkDestroyPipelineLayout(ctx.device, morphLayout_, nullptr);
+    if (morphSetLayout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(ctx.device, morphSetLayout_, nullptr);
+    morphPipeline_ = VK_NULL_HANDLE;
+    morphLayout_ = VK_NULL_HANDLE;
+    morphSetLayout_ = VK_NULL_HANDLE;
+    morphDescSet_ = VK_NULL_HANDLE;
+    destroyVmaBuffer(ctx.allocator, baseposBuffer_, baseposAlloc_);
+    destroyVmaBuffer(ctx.allocator, baserotBuffer_, baserotAlloc_);
+    destroyVmaBuffer(ctx.allocator, basesh0Buffer_, basesh0Alloc_);
+    destroyVmaBuffer(ctx.allocator, morphIndexBuffer_, morphIndexAlloc_);
+    destroyVmaBuffer(ctx.allocator, morphPosLoBuffer_, morphPosLoAlloc_);
+    destroyVmaBuffer(ctx.allocator, morphRotLoBuffer_, morphRotLoAlloc_);
+    destroyVmaBuffer(ctx.allocator, morphSh0LoBuffer_, morphSh0LoAlloc_);
+    destroyVmaBuffer(ctx.allocator, morphPosHiBuffer_, morphPosHiAlloc_);
+    destroyVmaBuffer(ctx.allocator, morphRotHiBuffer_, morphRotHiAlloc_);
+    destroyVmaBuffer(ctx.allocator, morphSh0HiBuffer_, morphSh0HiAlloc_);
 
     // Zero out all handles
     framebufferLoadDepth_ = VK_NULL_HANDLE;

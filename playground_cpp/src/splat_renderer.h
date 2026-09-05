@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 #include "vk_mem_alloc.h"
+#include "gltf_loader.h"  // SplatDynamics / SplatMorphSegment (dynamic splats)
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <vector>
@@ -9,7 +10,6 @@
 #include <cstdint>
 
 struct VulkanContext;
-struct GaussianSplatData;
 
 class SplatRenderer {
 public:
@@ -18,6 +18,18 @@ public:
 
     void init(VulkanContext& ctx, const GaussianSplatData& data,
               const std::string& shaderBase, uint32_t width, uint32_t height);
+
+    // --- Dynamic (4D) splats: morph-target keyframe animation ---
+    // Dispatches luxc's compiled <shaderBase>.morph.comp.spv (see
+    // splat_expander._build_morph_apply_stage / SPECIFICATION.md 12.8)
+    // before the existing preprocess dispatch each frame -- the playground
+    // only binds buffers to what luxc emitted, per docs/lux-4d-spec.md.
+    bool hasMotion() const { return dynamics_.has_motion && morphPipeline_ != VK_NULL_HANDLE; }
+    float animationDuration() const;
+    float frameToTime(int frame) const;
+    void setMorphTime(float seconds);
+    float currentMorphTimeSeconds() const { return currentMorphTime_; }
+    void stepKeyframe(int direction);
 
     void updateCamera(glm::vec3 eye, glm::vec3 target, glm::vec3 up,
                       float fovY, float aspect, float nearPlane, float farPlane);
@@ -158,4 +170,31 @@ private:
     void createPipelines(VkDevice device, const std::string& shaderBase);
     void createSortPipelines(VkDevice device);
     void createBuffers(VulkanContext& ctx, const GaussianSplatData& data);
+
+    // --- Dynamic splats ---
+    SplatDynamics dynamics_;
+    std::vector<SplatMorphSegment> morphSegments_;
+    std::vector<uint32_t> segmentOffsets_;  // CPU-side, into the concatenated morph_* buffers
+    std::vector<uint32_t> segmentCounts_;
+    uint32_t morphTotalEntries_ = 0;
+    float currentMorphTime_ = 0.0f;
+
+    VkPipeline morphPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout morphLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout morphSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSet morphDescSet_ = VK_NULL_HANDLE;
+
+    VkBuffer baseposBuffer_ = VK_NULL_HANDLE;   VmaAllocation baseposAlloc_ = VK_NULL_HANDLE;
+    VkBuffer baserotBuffer_ = VK_NULL_HANDLE;   VmaAllocation baserotAlloc_ = VK_NULL_HANDLE;
+    VkBuffer basesh0Buffer_ = VK_NULL_HANDLE;   VmaAllocation basesh0Alloc_ = VK_NULL_HANDLE;
+    VkBuffer morphIndexBuffer_ = VK_NULL_HANDLE;  VmaAllocation morphIndexAlloc_ = VK_NULL_HANDLE;
+    VkBuffer morphPosLoBuffer_ = VK_NULL_HANDLE;  VmaAllocation morphPosLoAlloc_ = VK_NULL_HANDLE;
+    VkBuffer morphRotLoBuffer_ = VK_NULL_HANDLE;  VmaAllocation morphRotLoAlloc_ = VK_NULL_HANDLE;
+    VkBuffer morphSh0LoBuffer_ = VK_NULL_HANDLE;  VmaAllocation morphSh0LoAlloc_ = VK_NULL_HANDLE;
+    VkBuffer morphPosHiBuffer_ = VK_NULL_HANDLE;  VmaAllocation morphPosHiAlloc_ = VK_NULL_HANDLE;
+    VkBuffer morphRotHiBuffer_ = VK_NULL_HANDLE;  VmaAllocation morphRotHiAlloc_ = VK_NULL_HANDLE;
+    VkBuffer morphSh0HiBuffer_ = VK_NULL_HANDLE;  VmaAllocation morphSh0HiAlloc_ = VK_NULL_HANDLE;
+
+    void createMorphPipeline(VkDevice device, const std::string& shaderBase);
+    void createMorphBuffers(VulkanContext& ctx, const GaussianSplatData& data);
 };

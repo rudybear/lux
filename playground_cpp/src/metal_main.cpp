@@ -27,6 +27,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <chrono>
+#include <cmath>
 
 namespace fs = std::filesystem;
 
@@ -70,6 +71,16 @@ struct OrbitCamera {
 };
 
 static OrbitCamera g_orbit;
+
+// --- Dynamic (4D) splats: interactive playback state ---
+// Space toggles play/pause; [ and ] step one keyframe when paused.
+struct MorphPlayback {
+    bool paused = true;
+    float time = 0.0f;
+    // Debounce state for edge-triggered polling (glfwGetKey is level-triggered).
+    bool spaceWasDown = false, leftBracketWasDown = false, rightBracketWasDown = false;
+};
+static MorphPlayback g_morph;
 static EditorPanels* g_editorPanels = nullptr;
 
 static void mouseButtonCallback(GLFWwindow* window, int button, int action, int /*mods*/) {
@@ -121,6 +132,14 @@ struct CLIOptions {
     bool demoLights = false;
     bool sponzaLights = false;
     bool editor = false;
+    // Dynamic (4D) Gaussian splats: pick an animation time for headless
+    // renders and the initial interactive pose. --frame maps to time via
+    // mesh.extras.fps when present, else the animation's own keyframe times
+    // (see MetalSplatRenderer::frameToTime / splatFrameToTime).
+    bool hasTime = false;
+    float time = 0.0f;
+    bool hasFrame = false;
+    int frame = 0;
 };
 
 static void printUsage(const char* program) {
@@ -138,6 +157,8 @@ static void printUsage(const char* program) {
               << "  --headless             Offscreen render only (default)\n"
               << "  --demo-lights          Add 3 demo lights (directional + point + spot) with shadows\n"
               << "  --sponza-lights        Sponza courtyard lights (sun + torch + accent)\n"
+              << "  --time <SECONDS>       Dynamic splats: animation time (headless + initial interactive pose)\n"
+              << "  --frame <N>            Dynamic splats: animation frame index (extras.fps, else keyframe times)\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -184,6 +205,12 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.demoLights = true;
         } else if (arg == "--sponza-lights") {
             opts.sponzaLights = true;
+        } else if (arg == "--time" && i + 1 < argc) {
+            opts.time = std::stof(argv[++i]);
+            opts.hasTime = true;
+        } else if (arg == "--frame" && i + 1 < argc) {
+            opts.frame = std::stoi(argv[++i]);
+            opts.hasFrame = true;
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -360,6 +387,18 @@ static int runHeadless(const CLIOptions& opts) {
             std::cout << "[metal] Detected gaussian splat data, using MetalSplatRenderer" << std::endl;
             auto splatR = std::make_unique<MetalSplatRenderer>();
             splatR->init(ctx, scene.getSplatData(), opts.width, opts.height);
+
+            if (splatR->hasMotion()) {
+                float t = 0.0f;
+                if (opts.hasFrame) t = splatR->frameToTime(opts.frame);
+                else if (opts.hasTime) t = opts.time;
+                std::cout << "[metal] Dynamic splats: evaluating at t=" << t << "s"
+                          << (opts.hasFrame ? " (--frame " + std::to_string(opts.frame) + ")" : "")
+                          << std::endl;
+                splatR->setMorphTime(t);
+            } else if (opts.hasTime || opts.hasFrame) {
+                std::cerr << "[warn] --time/--frame given but scene has no morph-target animation" << std::endl;
+            }
 
             splatR->render(ctx);
 
@@ -583,6 +622,14 @@ static int runInteractive(CLIOptions opts) {
             std::cout << "[metal] Detected gaussian splat data, using MetalSplatRenderer" << std::endl;
             auto splatR = std::make_unique<MetalSplatRenderer>();
             splatR->init(ctx, scene.getSplatData(), opts.width, opts.height);
+            if (splatR->hasMotion()) {
+                if (opts.hasFrame) g_morph.time = splatR->frameToTime(opts.frame);
+                else if (opts.hasTime) g_morph.time = opts.time;
+                splatR->setMorphTime(g_morph.time);
+                std::cout << "[metal] Dynamic splats: t=" << g_morph.time << "s / "
+                          << splatR->animationDuration() << "s. Space=play/pause, "
+                          << "[ / ] = step one keyframe." << std::endl;
+            }
             renderer = std::move(splatR);
         } else {
             // Non-splat: populate lights from glTF
@@ -717,6 +764,49 @@ static int runInteractive(CLIOptions opts) {
 
         // Update drawable size
         updateDrawableSize(ctx.metalLayer, window);
+
+        // --- Dynamic splats: playback keys + advance time ---
+        // Space = pause/resume, [ / ] = step one keyframe (only while paused).
+        auto* splatRenderer = dynamic_cast<MetalSplatRenderer*>(renderer.get());
+        if (splatRenderer && splatRenderer->hasMotion() &&
+            (!editorActive || !editorPanels.wantCaptureKeyboard())) {
+            bool spaceDown = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+            if (spaceDown && !g_morph.spaceWasDown) {
+                g_morph.paused = !g_morph.paused;
+                std::cout << "[metal] Dynamic splats: " << (g_morph.paused ? "paused" : "playing")
+                          << " at t=" << splatRenderer->currentMorphTimeSeconds() << "s" << std::endl;
+            }
+            g_morph.spaceWasDown = spaceDown;
+
+            bool leftDown = glfwGetKey(window, GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS;
+            if (leftDown && !g_morph.leftBracketWasDown) {
+                g_morph.paused = true;
+                splatRenderer->stepKeyframe(-1);
+                std::cout << "[metal] Dynamic splats: stepped to t="
+                          << splatRenderer->currentMorphTimeSeconds() << "s" << std::endl;
+            }
+            g_morph.leftBracketWasDown = leftDown;
+
+            bool rightDown = glfwGetKey(window, GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS;
+            if (rightDown && !g_morph.rightBracketWasDown) {
+                g_morph.paused = true;
+                splatRenderer->stepKeyframe(1);
+                std::cout << "[metal] Dynamic splats: stepped to t="
+                          << splatRenderer->currentMorphTimeSeconds() << "s" << std::endl;
+            }
+            g_morph.rightBracketWasDown = rightDown;
+
+            if (!g_morph.paused) {
+                static double lastFrameTime = glfwGetTime();
+                double now = glfwGetTime();
+                float dt = static_cast<float>(now - lastFrameTime);
+                lastFrameTime = now;
+                float duration = splatRenderer->animationDuration();
+                float t = splatRenderer->currentMorphTimeSeconds() + dt;
+                if (duration > 0.0f && t > duration) t = std::fmod(t, duration);  // loop
+                splatRenderer->setMorphTime(t);
+            }
+        }
 
         // Update camera
         float aspect = static_cast<float>(fbWidth) / static_cast<float>(fbHeight);
