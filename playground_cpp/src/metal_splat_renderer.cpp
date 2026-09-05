@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
+#include <chrono>
 #include <cmath>
 
 // --------------------------------------------------------------------------
@@ -842,8 +843,16 @@ void MetalSplatRenderer::cpuSort() {
 void MetalSplatRenderer::render(MetalContext& ctx) {
     if (numSplats_ == 0) return;
 
+    auto t0 = std::chrono::steady_clock::now();
     cpuSort();
+    auto t1 = std::chrono::steady_clock::now();
     renderToTarget(ctx, colorTarget_, depthTarget_, width_, height_);
+    auto t2 = std::chrono::steady_clock::now();
+
+    double sortMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double gpuMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    std::cout << "[metal] render(): cpuSort=" << sortMs
+              << "ms preprocess+draw(GPU, incl. wait)=" << gpuMs << "ms" << std::endl;
 }
 
 // --------------------------------------------------------------------------

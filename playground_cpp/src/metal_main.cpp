@@ -399,14 +399,24 @@ static int runHeadless(const CLIOptions& opts) {
 
     try {
         MetalSceneManager scene;
+        auto tLoadStart = std::chrono::steady_clock::now();
         scene.loadScene(opts.sceneSource);
+        auto tLoadEnd = std::chrono::steady_clock::now();
+        std::cout << "[metal] [timing] scene load: "
+                  << std::chrono::duration<double, std::milli>(tLoadEnd - tLoadStart).count()
+                  << "ms" << std::endl;
 
         // Check for gaussian splat data early — splat scenes use embedded MSL,
         // no external shader pipeline needed
         if (scene.hasSplatData()) {
             std::cout << "[metal] Detected gaussian splat data, using MetalSplatRenderer" << std::endl;
             auto splatR = std::make_unique<MetalSplatRenderer>();
+            auto tInitStart = std::chrono::steady_clock::now();
             splatR->init(ctx, scene.getSplatData(), opts.width, opts.height);
+            auto tInitEnd = std::chrono::steady_clock::now();
+            std::cout << "[metal] [timing] splat init (buffers+pipelines): "
+                      << std::chrono::duration<double, std::milli>(tInitEnd - tInitStart).count()
+                      << "ms" << std::endl;
 
             if (splatR->hasMotion()) {
                 float t = 0.0f;
@@ -415,7 +425,12 @@ static int runHeadless(const CLIOptions& opts) {
                 std::cout << "[metal] Dynamic splats: evaluating at t=" << t << "s"
                           << (opts.hasFrame ? " (--frame " + std::to_string(opts.frame) + ")" : "")
                           << std::endl;
+                auto tMorphStart = std::chrono::steady_clock::now();
                 splatR->setMorphTime(t);
+                auto tMorphEnd = std::chrono::steady_clock::now();
+                std::cout << "[metal] [timing] morph (CPU): "
+                          << std::chrono::duration<double, std::milli>(tMorphEnd - tMorphStart).count()
+                          << "ms" << std::endl;
             } else if (opts.hasTime || opts.hasFrame) {
                 std::cerr << "[warn] --time/--frame given but scene has no morph-target animation" << std::endl;
             }
