@@ -34,6 +34,45 @@ public:
     void updateCamera(glm::vec3 eye, glm::vec3 target, glm::vec3 up,
                       float fovY, float aspect, float nearPlane, float farPlane);
 
+    // --- Camera bridge (docs/lux-4d-spec.md section 4) ---
+    // Sets the camera directly from an already-built view matrix + a
+    // (possibly off-axis, e.g. from OpenCV intrinsics via
+    // DlssIO::buildIntrinsicsProjection) projection matrix, bypassing the
+    // fovY/aspect-based construction in updateCamera(). `eye` is the
+    // world-space camera position (for the SH view-dependent color term).
+    void updateCameraExplicit(glm::vec3 eye, glm::mat4 viewMatrix, glm::mat4 projMatrix,
+                               float focalX, float focalY);
+
+    // Explicitly seeds the motion-vector camera history (docs/lux-4d-spec.md
+    // section 3) instead of letting the first render() call auto-seed it to
+    // "prev == curr" (mv == 0). Lets a single headless process produce a
+    // deterministic non-zero motion vector from one render() call, driven
+    // by two distinct --camera-json files (current + previous) -- used by
+    // the MV-under-camera-motion test.
+    void setPreviousCameraExplicit(glm::mat4 prevViewMatrix, glm::mat4 prevProjMatrixUnjittered) {
+        prevViewMatrix_ = prevViewMatrix;
+        prevProjMatrixUnjittered_ = prevProjMatrixUnjittered;
+        firstMvFrame_ = false;
+    }
+
+    // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
+    // True when the compiled shader base was built with `motion_vectors: true`
+    // / `expected_depth: true` (splat_expander.py); detected once at init()
+    // time by scanning the preprocess stage's reflection JSON.
+    bool hasMotionVectors() const { return hasMotionVectors_; }
+    bool hasExpectedDepth() const { return hasExpectedDepth_; }
+
+    // Sub-pixel jitter in PIXELS, applied to the projection matrix used for
+    // rasterization only -- motion vectors always use the unjittered
+    // current/previous view-projections (see docs/lux-4d-spec.md section 3).
+    // Positive jx shifts rendered content right, positive jy shifts it down.
+    void setJitter(float jitterXPixels, float jitterYPixels);
+
+    VkImage getMotionImage() const { return motionImage_; }
+    VkFormat getMotionFormat() const { return VK_FORMAT_R32G32B32A32_SFLOAT; }  // xy=mv*alpha, z=0, w=alpha
+    VkImage getExpectedDepthImage() const { return expectedDepthImage_; }
+    VkFormat getExpectedDepthFormat() const { return VK_FORMAT_R32G32_SFLOAT; }  // x=depth*alpha, y=alpha
+
     void render(VulkanContext& ctx);
 
     void blitToSwapchain(VulkanContext& ctx, VkCommandBuffer cmd,
@@ -75,6 +114,17 @@ private:
     VmaAllocation depthAlloc_ = VK_NULL_HANDLE;
     VkImageView depthView_ = VK_NULL_HANDLE;
 
+    // --- DLSS input-contract outputs (only allocated when the respective
+    // flag is detected on the compiled shader) ---
+    bool hasMotionVectors_ = false;
+    bool hasExpectedDepth_ = false;
+    VkImage motionImage_ = VK_NULL_HANDLE;
+    VmaAllocation motionAlloc_ = VK_NULL_HANDLE;
+    VkImageView motionView_ = VK_NULL_HANDLE;
+    VkImage expectedDepthImage_ = VK_NULL_HANDLE;
+    VmaAllocation expectedDepthAlloc_ = VK_NULL_HANDLE;
+    VkImageView expectedDepthView_ = VK_NULL_HANDLE;
+
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
 
@@ -113,6 +163,8 @@ private:
     VkBuffer projCenterBuffer_ = VK_NULL_HANDLE;  VmaAllocation projCenterAlloc_ = VK_NULL_HANDLE;
     VkBuffer projConicBuffer_ = VK_NULL_HANDLE;   VmaAllocation projConicAlloc_ = VK_NULL_HANDLE;
     VkBuffer projColorBuffer_ = VK_NULL_HANDLE;   VmaAllocation projColorAlloc_ = VK_NULL_HANDLE;
+    VkBuffer projMvBuffer_ = VK_NULL_HANDLE;      VmaAllocation projMvAlloc_ = VK_NULL_HANDLE;
+    VkBuffer projDepthBuffer_ = VK_NULL_HANDLE;   VmaAllocation projDepthAlloc_ = VK_NULL_HANDLE;
 
     // Sort buffers (buffer A = primary, written by compute shader)
     VkBuffer sortKeysBuffer_ = VK_NULL_HANDLE;      VmaAllocation sortKeysAlloc_ = VK_NULL_HANDLE;
@@ -152,10 +204,28 @@ private:
 
     // Camera state
     glm::mat4 viewMatrix_{1.0f};
-    glm::mat4 projMatrix_{1.0f};
+    glm::mat4 projMatrix_{1.0f};             // may carry --jitter offset (rasterization only)
+    glm::mat4 projMatrixUnjittered_{1.0f};   // always jitter-free (used for motion vectors)
     glm::vec3 camPos_{0.0f, 0.0f, 3.0f};
     float focalX_ = 256.0f;
     float focalY_ = 256.0f;
+    float jitterX_ = 0.0f, jitterY_ = 0.0f;  // pixels
+
+    // Previous-frame camera history for motion vectors (docs/lux-4d-spec.md
+    // section 3). Seeded to equal the current frame's matrices on the first
+    // render() call so mv == 0 on frame 1, then carried forward each frame.
+    glm::mat4 prevViewMatrix_{1.0f};
+    glm::mat4 prevProjMatrixUnjittered_{1.0f};
+    bool firstMvFrame_ = true;
+
+    // Previous-frame animated world position, for motion_vectors. For
+    // static splats (!hasMotion()) this simply aliases posBuffer_ (positions
+    // never change); for `motion: keyframes` splats it's a distinct buffer
+    // the host copies posBuffer_ into once per frame, after the morph-apply
+    // stage has written the current frame's positions.
+    VkBuffer prevPosBuffer_ = VK_NULL_HANDLE;
+    VmaAllocation prevPosAlloc_ = VK_NULL_HANDLE;
+    bool prevPosOwned_ = false;
     uint32_t shDegree_ = 0;        // scene's actual SH degree (for push constant)
     uint32_t shaderShDegree_ = 0;  // shader's compiled SH degree (for descriptor layout)
 
@@ -197,4 +267,7 @@ private:
 
     void createMorphPipeline(VkDevice device, const std::string& shaderBase);
     void createMorphBuffers(VulkanContext& ctx, const GaussianSplatData& data);
+
+    // --- DLSS input-contract outputs ---
+    void createPrevPosBuffer(VulkanContext& ctx, const GaussianSplatData& data);
 };

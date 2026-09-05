@@ -87,7 +87,7 @@ class TestExpectedDepthOnly:
 
         frag = stages["frag"]
         assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_depth"]
-        assert frag["outputs"][1]["type"] == "scalar"
+        assert frag["outputs"][1]["type"] == "vec2"
 
         gs = comp["gaussian_splatting"]
         assert gs["expected_depth"] is True
@@ -110,7 +110,7 @@ class TestMotionVectorsOnly:
 
         frag = stages["frag"]
         assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_motion"]
-        assert frag["outputs"][1]["type"] == "vec2"
+        assert frag["outputs"][1]["type"] == "vec4"
 
         vert = stages["vert"]
         assert "frag_mv" in [o["name"] for o in vert["outputs"]]

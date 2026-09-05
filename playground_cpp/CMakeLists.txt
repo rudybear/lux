@@ -102,6 +102,7 @@ if(Vulkan_FOUND)
         src/meshlet.cpp
         src/splat_renderer.cpp
         src/rt_splat_renderer.cpp
+        src/dlss_io.cpp
         src/editor_ui.cpp
         ${IMGUI_SOURCES}
     )
@@ -199,6 +200,7 @@ if(APPLE)
         src/camera.cpp
         src/reflected_pipeline.cpp
         src/scene_geometry.cpp
+        src/dlss_io.cpp
         # Editor (backend-agnostic panel drawing)
         src/editor_panels.cpp
         # ImGui

@@ -59,15 +59,18 @@ def _get_splat_config(splat: SplatDecl) -> dict:
                        position with the *previous* frame's (unjittered)
                        view-projection and emits a `projected_mv` buffer;
                        the render stages carry it through as an additional
-                       premultiplied-alpha RG output (`out_motion`). See
+                       premultiplied-alpha vec4 output (`out_motion`: xy =
+                       mv*alpha, z = 0, w = alpha itself, so the host can
+                       un-premultiply at full float32 precision instead of
+                       relying on the 8-bit color attachment's alpha). See
                        docs/lux-4d-spec.md section 3 ("DLSS input contract
                        outputs") and docs/language-reference.md.
         expected_depth -- bool (default False): when true, the preprocess
                        stage emits a `projected_depth` buffer (camera-space
                        z) and the render stages carry it through as an
-                       additional premultiplied-alpha R output
-                       (`out_depth`), matching gsplat's "ED" (expected
-                       depth) mode.
+                       additional premultiplied-alpha vec2 output
+                       (`out_depth`: x = depth*alpha, y = alpha), matching
+                       gsplat's "ED" (expected depth) mode.
     """
     config = {
         "sh_degree": 0,
@@ -1390,13 +1393,19 @@ def _build_fragment_stage(config: dict) -> StageBlock:
     out._is_input = False
     stage.outputs.append(out)
     # Additional DLSS input-contract outputs (docs/lux-4d-spec.md section 3),
-    # blended with the SAME premultiplied-alpha equation as out_color.
+    # blended with the SAME premultiplied-alpha equation as out_color. Each
+    # ALSO carries its own copy of the per-fragment alpha in its last
+    # component (out_motion.w, out_depth.y): un-premultiplying by an alpha
+    # sourced from the 8-bit color attachment would lose precision (a splat
+    # rarely reaches exactly alpha=1.0 there), so the host instead divides
+    # by this full-float32-precision alpha accumulated in the SAME
+    # attachment via the SAME blend equation.
     if config.get("motion_vectors"):
-        out_mv = VarDecl("out_motion", "vec2")
+        out_mv = VarDecl("out_motion", "vec4")
         out_mv._is_input = False
         stage.outputs.append(out_mv)
     if config.get("expected_depth"):
-        out_depth = VarDecl("out_depth", "scalar")
+        out_depth = VarDecl("out_depth", "vec2")
         out_depth._is_input = False
         stage.outputs.append(out_depth)
 
@@ -1496,13 +1505,23 @@ def _build_fragment_body(config: dict) -> list:
     # --- Additional DLSS input-contract outputs, premultiplied by the same
     # alpha as out_color so the fixed-function (ONE, ONE_MINUS_SRC_ALPHA)
     # blend used for color also does the correct visibility-weighted average
-    # for motion/depth. ---
+    # for motion/depth. Each also carries alpha itself in its last
+    # component, full-float32-precision, for the host to un-premultiply
+    # with (see the output-declaration comment above). ---
     if config.get("motion_vectors"):
         body.append(_assign("out_motion",
-            _binop("*", _ref("frag_mv"), _ref("alpha"))))
+            _ctor("vec4", [
+                _binop("*", _swizzle(_ref("frag_mv"), "x"), _ref("alpha")),
+                _binop("*", _swizzle(_ref("frag_mv"), "y"), _ref("alpha")),
+                _lit("0.0"),
+                _ref("alpha"),
+            ])))
     if config.get("expected_depth"):
         body.append(_assign("out_depth",
-            _binop("*", _ref("frag_depth"), _ref("alpha"))))
+            _ctor("vec2", [
+                _binop("*", _ref("frag_depth"), _ref("alpha")),
+                _ref("alpha"),
+            ])))
 
     return body
 

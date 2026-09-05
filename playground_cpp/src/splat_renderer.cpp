@@ -47,6 +47,48 @@ static uint32_t readShaderShDegree(const std::string& shaderBase) {
     return static_cast<uint32_t>(std::atoi(content.c_str() + colonPos));
 }
 
+// Reads a `"gaussian_splatting": { ..., "<key>": true|false, ... }` boolean
+// flag from the preprocess stage's reflection JSON (same lightweight
+// substring-scan approach as readShaderShDegree -- luxc's reflection writer
+// always emits `"key": true`/`"key": false` with that exact spacing, so this
+// avoids pulling in a general JSON parser for one boolean lookup).
+static bool readShaderBoolFlag(const std::string& shaderBase, const std::string& key) {
+    std::string jsonPath = shaderBase + ".comp.json";
+    if (!fs::exists(jsonPath)) return false;
+    std::ifstream f(jsonPath);
+    if (!f.is_open()) return false;
+    std::string content((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+    auto gsPos = content.find("\"gaussian_splatting\"");
+    if (gsPos == std::string::npos) return false;
+    std::string needleTrue = "\"" + key + "\": true";
+    auto keyPos = content.find("\"" + key + "\"", gsPos);
+    if (keyPos == std::string::npos) return false;
+    return content.compare(keyPos, needleTrue.size(), needleTrue) == 0;
+}
+
+// Applies a sub-pixel jitter (in pixels) to a projection matrix by directly
+// shifting the post-divide NDC x/y coordinates: for any projection matrix P,
+// adding `d * row3(P)` to `row_k(P)` adds exactly `d` to `clip[k]/clip.w`
+// after the perspective divide, regardless of the matrix's internal sign
+// convention (Vulkan Y-flip already baked in via proj[1][1] *= -1 or not).
+// Positive jx shifts rendered content right; positive jy shifts it down
+// (matches the OpenCV convention `K[1,2] += jy`, see docs/lux-4d-spec.md
+// section 3 -- lux's NDC-to-pixel mapping in the vertex stage,
+// pixel = (ndc*0.5+0.5)*screen_size, is already a direct increasing map from
+// ndc.y to pixel row, so a positive ndc.y delta moves content down).
+static glm::mat4 applySplatJitter(glm::mat4 proj, float jitterXPixels, float jitterYPixels,
+                                   uint32_t width, uint32_t height) {
+    if (jitterXPixels == 0.0f && jitterYPixels == 0.0f) return proj;
+    float dx = 2.0f * jitterXPixels / static_cast<float>(width);
+    float dy = 2.0f * jitterYPixels / static_cast<float>(height);
+    for (int c = 0; c < 4; ++c) {
+        proj[c][0] += dx * proj[c][3];
+        proj[c][1] += dy * proj[c][3];
+    }
+    return proj;
+}
+
 // --------------------------------------------------------------------------
 // VMA buffer helper
 // --------------------------------------------------------------------------
@@ -142,6 +184,28 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
     depthViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
 
     vkCreateImageView(ctx.device, &depthViewInfo, nullptr, &depthView_);
+
+    // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
+    if (hasMotionVectors_) {
+        VkImageCreateInfo mvInfo = imageInfo;
+        mvInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        vmaCreateImage(ctx.allocator, &mvInfo, &allocInfo, &motionImage_, &motionAlloc_, nullptr);
+
+        VkImageViewCreateInfo mvViewInfo = viewInfo;
+        mvViewInfo.image = motionImage_;
+        mvViewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        vkCreateImageView(ctx.device, &mvViewInfo, nullptr, &motionView_);
+    }
+    if (hasExpectedDepth_) {
+        VkImageCreateInfo edInfo = imageInfo;
+        edInfo.format = VK_FORMAT_R32G32_SFLOAT;
+        vmaCreateImage(ctx.allocator, &edInfo, &allocInfo, &expectedDepthImage_, &expectedDepthAlloc_, nullptr);
+
+        VkImageViewCreateInfo edViewInfo = viewInfo;
+        edViewInfo.image = expectedDepthImage_;
+        edViewInfo.format = VK_FORMAT_R32G32_SFLOAT;
+        vkCreateImageView(ctx.device, &edViewInfo, nullptr, &expectedDepthView_);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -149,35 +213,57 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
 // --------------------------------------------------------------------------
 
 void SplatRenderer::createRenderPass(VkDevice device) {
-    VkAttachmentDescription attachments[2] = {};
+    // Color attachments: out_color always present; out_motion/out_depth
+    // (docs/lux-4d-spec.md section 3) appended in that order when enabled,
+    // each with the SAME premultiplied-alpha blend as color (set up in
+    // createPipelines) so overlapping splats blend correctly. The
+    // depth-test attachment is always last.
+    std::vector<VkAttachmentDescription> attachments;
+    std::vector<VkAttachmentReference> colorRefs;
 
-    // Color
-    attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
-    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    attachments[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkAttachmentDescription colorAttach = {};
+    colorAttach.format = VK_FORMAT_R8G8B8A8_UNORM;
+    colorAttach.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttach.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttach.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttach.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorAttach.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    attachments.push_back(colorAttach);
+    colorRefs.push_back({static_cast<uint32_t>(attachments.size() - 1), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
 
-    // Depth
-    attachments[1].format = VK_FORMAT_D32_SFLOAT;
-    attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
-    attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    if (hasMotionVectors_) {
+        VkAttachmentDescription mv = colorAttach;
+        mv.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attachments.push_back(mv);
+        colorRefs.push_back({static_cast<uint32_t>(attachments.size() - 1), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
+    }
+    if (hasExpectedDepth_) {
+        VkAttachmentDescription ed = colorAttach;
+        ed.format = VK_FORMAT_R32G32_SFLOAT;
+        attachments.push_back(ed);
+        colorRefs.push_back({static_cast<uint32_t>(attachments.size() - 1), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
+    }
 
-    VkAttachmentReference colorRef = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkAttachmentReference depthRef = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    // Depth (test)
+    VkAttachmentDescription depthAttach = {};
+    depthAttach.format = VK_FORMAT_D32_SFLOAT;
+    depthAttach.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttach.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAttach.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttach.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthAttach.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    attachments.push_back(depthAttach);
+    VkAttachmentReference depthRef = {static_cast<uint32_t>(attachments.size() - 1),
+                                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
 
     VkSubpassDescription subpass = {};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &colorRef;
+    subpass.colorAttachmentCount = static_cast<uint32_t>(colorRefs.size());
+    subpass.pColorAttachments = colorRefs.data();
     subpass.pDepthStencilAttachment = &depthRef;
 
     VkSubpassDependency deps[2] = {};
@@ -200,8 +286,8 @@ void SplatRenderer::createRenderPass(VkDevice device) {
 
     VkRenderPassCreateInfo rpInfo = {};
     rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    rpInfo.attachmentCount = 2;
-    rpInfo.pAttachments = attachments;
+    rpInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+    rpInfo.pAttachments = attachments.data();
     rpInfo.subpassCount = 1;
     rpInfo.pSubpasses = &subpass;
     rpInfo.dependencyCount = 2;
@@ -352,13 +438,17 @@ void SplatRenderer::createRenderPassLoadDepth(VkDevice device) {
 // --------------------------------------------------------------------------
 
 void SplatRenderer::createFramebuffer(VkDevice device) {
-    VkImageView fbViews[2] = {colorView_, depthView_};
+    std::vector<VkImageView> fbViews;
+    fbViews.push_back(colorView_);
+    if (hasMotionVectors_) fbViews.push_back(motionView_);
+    if (hasExpectedDepth_) fbViews.push_back(expectedDepthView_);
+    fbViews.push_back(depthView_);
 
     VkFramebufferCreateInfo fbInfo = {};
     fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fbInfo.renderPass = renderPass_;
-    fbInfo.attachmentCount = 2;
-    fbInfo.pAttachments = fbViews;
+    fbInfo.attachmentCount = static_cast<uint32_t>(fbViews.size());
+    fbInfo.pAttachments = fbViews.data();
     fbInfo.width = width_;
     fbInfo.height = height_;
     fbInfo.layers = 1;
@@ -405,8 +495,11 @@ void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBa
 
     // Compute: 4 input + N SH coefficients + 6 output SSBOs
     // Output order: proj_center, proj_conic, proj_color, sort_keys, sorted_indices, visible_count
+    // + (motion_vectors) splat_prev_pos, projected_mv + (expected_depth) projected_depth,
+    // appended in that order (matches splat_expander._build_preprocess_stage exactly).
     uint32_t numShCoeffs = numShCoeffsForDegree(shaderShDegree_);
-    uint32_t numComputeBindings = 4 + numShCoeffs + 6;
+    uint32_t numComputeBindings = 4 + numShCoeffs + 6
+        + (hasMotionVectors_ ? 2 : 0) + (hasExpectedDepth_ ? 1 : 0);
     std::vector<VkDescriptorSetLayoutBinding> computeBindings(numComputeBindings);
     for (uint32_t i = 0; i < numComputeBindings; ++i) {
         computeBindings[i] = {};
@@ -423,8 +516,10 @@ void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBa
     vkCreateDescriptorSetLayout(device, &computeLayoutInfo, nullptr, &computeSetLayout_);
 
     // Render: 4 SSBOs (projected_centers, conics, colors, sorted_indices)
-    std::vector<VkDescriptorSetLayoutBinding> renderBindings(4);
-    for (uint32_t i = 0; i < 4; ++i) {
+    // + (motion_vectors) projected_mv + (expected_depth) projected_depth.
+    uint32_t numRenderBindings = 4 + (hasMotionVectors_ ? 1 : 0) + (hasExpectedDepth_ ? 1 : 0);
+    std::vector<VkDescriptorSetLayoutBinding> renderBindings(numRenderBindings);
+    for (uint32_t i = 0; i < numRenderBindings; ++i) {
         renderBindings[i] = {};
         renderBindings[i].binding = i;
         renderBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -441,10 +536,11 @@ void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBa
     // --- Pipeline layouts ---
 
     // Compute push constants: view(64) + proj(64) + camPos(12) + pad(4) + focal(8) + screen(8) + numSplats(4) + pad(12) = 176 bytes
+    // + (motion_vectors) proj_matrix_unjittered(64) + prev_view_proj_unjittered(64) = 304 bytes
     VkPushConstantRange computePush = {};
     computePush.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     computePush.offset = 0;
-    computePush.size = 176;
+    computePush.size = hasMotionVectors_ ? 304 : 176;
 
     VkPipelineLayoutCreateInfo computePipeLayoutInfo = {};
     computePipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -550,10 +646,17 @@ void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBa
     blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
+    // out_motion/out_depth (docs/lux-4d-spec.md section 3) use the SAME
+    // premultiplied-alpha blend equation as out_color, duplicated per
+    // attachment, so overlapping splats blend to the correct
+    // visibility-weighted average for free.
+    uint32_t numColorAttachments = 1 + (hasMotionVectors_ ? 1 : 0) + (hasExpectedDepth_ ? 1 : 0);
+    std::vector<VkPipelineColorBlendAttachmentState> blendAttachments(numColorAttachments, blendAttachment);
+
     VkPipelineColorBlendStateCreateInfo colorBlending = {};
     colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    colorBlending.attachmentCount = 1;
-    colorBlending.pAttachments = &blendAttachment;
+    colorBlending.attachmentCount = numColorAttachments;
+    colorBlending.pAttachments = blendAttachments.data();
 
     VkGraphicsPipelineCreateInfo pipelineInfo = {};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -581,7 +684,7 @@ void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBa
     static constexpr uint32_t kMorphBindingCount = 13;
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = numComputeBindings + 4 + 16 + kMorphBindingCount + 4; // + morph + margin
+    poolSize.descriptorCount = numComputeBindings + numRenderBindings + 16 + kMorphBindingCount + 4; // + morph + margin
 
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -789,6 +892,17 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     createVmaBuffer(ctx.allocator, numSplats_ * 4 * sizeof(float), ssbo,
                     VMA_MEMORY_USAGE_GPU_ONLY, projColorBuffer_, projColorAlloc_);
 
+    // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
+    if (hasMotionVectors_) {
+        createVmaBuffer(ctx.allocator, numSplats_ * 2 * sizeof(float), ssbo,
+                        VMA_MEMORY_USAGE_GPU_ONLY, projMvBuffer_, projMvAlloc_);
+        createPrevPosBuffer(ctx, data);
+    }
+    if (hasExpectedDepth_) {
+        createVmaBuffer(ctx.allocator, numSplats_ * sizeof(float), ssbo,
+                        VMA_MEMORY_USAGE_GPU_ONLY, projDepthBuffer_, projDepthAlloc_);
+    }
+
     // Sort keys (buffer A, GPU only)
     createVmaBuffer(ctx.allocator, numSplats_ * sizeof(uint32_t), ssbo,
                     VMA_MEMORY_USAGE_GPU_ONLY, sortKeysBuffer_, sortKeysAlloc_);
@@ -891,11 +1005,32 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     writeSSBO(computeDescSet_, outputBase + 4, sortedIndicesBuffer_, numSplats_ * sizeof(uint32_t));
     writeSSBO(computeDescSet_, outputBase + 5, visibleCountBuffer_, sizeof(uint32_t));
 
+    // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
+    // Appended after visible_count, matching splat_expander._build_preprocess_stage's
+    // storage_buffers order exactly: [motion_vectors: splat_prev_pos, projected_mv]
+    // then [expected_depth: projected_depth].
+    uint32_t computeNextBinding = outputBase + 6;
+    if (hasMotionVectors_) {
+        writeSSBO(computeDescSet_, computeNextBinding++, prevPosBuffer_, numSplats_ * 4 * sizeof(float));
+        writeSSBO(computeDescSet_, computeNextBinding++, projMvBuffer_, numSplats_ * 2 * sizeof(float));
+    }
+    if (hasExpectedDepth_) {
+        writeSSBO(computeDescSet_, computeNextBinding++, projDepthBuffer_, numSplats_ * sizeof(float));
+    }
+
     // Render set: projected_centers(0), conics(1), colors(2), sorted_indices(3)
+    // + (motion_vectors) projected_mv + (expected_depth) projected_depth.
     writeSSBO(renderDescSet_, 0, projCenterBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(renderDescSet_, 1, projConicBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(renderDescSet_, 2, projColorBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(renderDescSet_, 3, sortedIndicesBuffer_, numSplats_ * sizeof(uint32_t));
+    uint32_t renderNextBinding = 4;
+    if (hasMotionVectors_) {
+        writeSSBO(renderDescSet_, renderNextBinding++, projMvBuffer_, numSplats_ * 2 * sizeof(float));
+    }
+    if (hasExpectedDepth_) {
+        writeSSBO(renderDescSet_, renderNextBinding++, projDepthBuffer_, numSplats_ * sizeof(float));
+    }
 
     // --- Sort descriptor sets ---
     VkDeviceSize sortBufSize = numSplats_ * sizeof(uint32_t);
@@ -1115,6 +1250,45 @@ void SplatRenderer::createMorphBuffers(VulkanContext& ctx, const GaussianSplatDa
               << morphTotalEntries_ << " total sparse entries" << std::endl;
 }
 
+// --------------------------------------------------------------------------
+// DLSS input-contract outputs: previous-frame position buffer
+// --------------------------------------------------------------------------
+//
+// For static splats (no `motion: keyframes`), positions never change frame
+// to frame, so splat_prev_pos can simply alias posBuffer_ -- motion vectors
+// then reduce to the pure camera-motion term, with zero extra memory/copies.
+// For dynamic splats, a distinct buffer is required: it's seeded to the
+// scene's base positions here, and render() copies posBuffer_ into it once
+// per frame (after the morph-apply stage has written the current frame's
+// positions), so it always holds the PREVIOUS frame's animated position by
+// the time the NEXT frame's preprocess dispatch reads it.
+void SplatRenderer::createPrevPosBuffer(VulkanContext& ctx, const GaussianSplatData& data) {
+    if (!data.dynamics.has_motion) {
+        prevPosBuffer_ = posBuffer_;
+        prevPosOwned_ = false;
+        return;
+    }
+    VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    createVmaBuffer(ctx.allocator, data.positions.size() * sizeof(float), ssbo,
+                    VMA_MEMORY_USAGE_GPU_ONLY, prevPosBuffer_, prevPosAlloc_);
+    prevPosOwned_ = true;
+    // Seed with the base pose; render()'s firstMvFrame_ handling additionally
+    // copies the first frame's own (post-morph) position into this buffer
+    // before preprocess runs, so mv == 0 exactly on frame 1 regardless of
+    // the initial animation time.
+    VkDeviceSize sz = data.positions.size() * sizeof(float);
+    VkBuffer staging = VK_NULL_HANDLE;
+    VmaAllocation stagingAlloc = VK_NULL_HANDLE;
+    createVmaBuffer(ctx.allocator, sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    VMA_MEMORY_USAGE_CPU_TO_GPU, staging, stagingAlloc);
+    uploadVmaBuffer(ctx.allocator, stagingAlloc, data.positions.data(), sz);
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    VkBufferCopy copy = {0, 0, sz};
+    vkCmdCopyBuffer(cmd, staging, prevPosBuffer_, 1, &copy);
+    ctx.endSingleTimeCommands(cmd);
+    vmaDestroyBuffer(ctx.allocator, staging, stagingAlloc);
+}
+
 float SplatRenderer::animationDuration() const {
     if (!dynamics_.has_motion || dynamics_.keyframes.empty()) return 0.0f;
     return dynamics_.keyframes.back().time;
@@ -1159,6 +1333,15 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
     std::cout << "[info] Shader SH degree: " << shaderShDegree_
               << ", scene SH degree: " << shDegree_
               << " (" << numShCoeffsForDegree(shaderShDegree_) << " SH bindings)" << std::endl;
+
+    // DLSS input-contract outputs (docs/lux-4d-spec.md section 3): detected
+    // once from the preprocess stage's reflection JSON.
+    hasMotionVectors_ = readShaderBoolFlag(shaderBase, "motion_vectors");
+    hasExpectedDepth_ = readShaderBoolFlag(shaderBase, "expected_depth");
+    if (hasMotionVectors_ || hasExpectedDepth_) {
+        std::cout << "[info] DLSS outputs enabled: motion_vectors=" << hasMotionVectors_
+                  << " expected_depth=" << hasExpectedDepth_ << std::endl;
+    }
 
     createOffscreenTarget(ctx);
     createRenderPass(ctx.device);
@@ -1235,6 +1418,7 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
             viewMatrix_ = glm::lookAt(camPos_, center, upVec);
             projMatrix_ = glm::perspective(fov, aspect, 0.01f, fullRadius * 10.0f);
             projMatrix_[1][1] *= -1.0f;
+            projMatrixUnjittered_ = projMatrix_;
             focalY_ = 0.5f * static_cast<float>(height) / tanf(fov * 0.5f);
             focalX_ = focalY_;
             std::cout << "[info] Splat bounds: min=(" << minB.x << "," << minB.y << "," << minB.z
@@ -1282,6 +1466,7 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
             viewMatrix_ = glm::lookAt(camPos_, center, upVec);
             projMatrix_ = glm::perspective(fov, aspect, 0.01f, fullRadius * 5.0f);
             projMatrix_[1][1] *= -1.0f;
+            projMatrixUnjittered_ = projMatrix_;
             focalY_ = 0.5f * static_cast<float>(height) / tanf(fov * 0.5f);
             focalX_ = focalY_;
 
@@ -1305,12 +1490,32 @@ void SplatRenderer::updateCamera(glm::vec3 eye, glm::vec3 target, glm::vec3 up,
                                   float fovY, float aspect, float nearPlane, float farPlane) {
     camPos_ = eye;
     viewMatrix_ = glm::lookAt(eye, target, up);
-    projMatrix_ = glm::perspective(fovY, aspect, nearPlane, farPlane);
-    projMatrix_[1][1] *= -1.0f; // Vulkan Y-flip
+    glm::mat4 proj = glm::perspective(fovY, aspect, nearPlane, farPlane);
+    proj[1][1] *= -1.0f; // Vulkan Y-flip
+    projMatrixUnjittered_ = proj;
+    projMatrix_ = applySplatJitter(proj, jitterX_, jitterY_, width_, height_);
 
     // Focal lengths: fy = h/(2*tan(fov_y/2)), fx = fy for square pixels
     focalY_ = 0.5f * static_cast<float>(height_) / tanf(fovY * 0.5f);
     focalX_ = focalY_;
+}
+
+void SplatRenderer::updateCameraExplicit(glm::vec3 eye, glm::mat4 viewMatrix, glm::mat4 projMatrix,
+                                          float focalX, float focalY) {
+    camPos_ = eye;
+    viewMatrix_ = viewMatrix;
+    projMatrixUnjittered_ = projMatrix;
+    projMatrix_ = applySplatJitter(projMatrix, jitterX_, jitterY_, width_, height_);
+    focalX_ = focalX;
+    focalY_ = focalY;
+}
+
+void SplatRenderer::setJitter(float jitterXPixels, float jitterYPixels) {
+    jitterX_ = jitterXPixels;
+    jitterY_ = jitterYPixels;
+    // Re-derive the jittered matrix from the last-known unjittered one so
+    // setJitter() can be called either before or after updateCamera().
+    projMatrix_ = applySplatJitter(projMatrixUnjittered_, jitterX_, jitterY_, width_, height_);
 }
 
 // --------------------------------------------------------------------------
@@ -1321,6 +1526,17 @@ void SplatRenderer::render(VulkanContext& ctx) {
     if (numSplats_ == 0) return;
 
     VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+
+    // --- Motion vectors: seed history on the very first frame so mv == 0 ---
+    // (docs/lux-4d-spec.md section 3). Seeding here (not at construction)
+    // means it doesn't matter how many updateCamera()/setMorphTime() calls
+    // happened before the first render() -- "current" always equals "prev"
+    // for that first call, regardless of the starting camera or animation
+    // time.
+    if (hasMotionVectors_ && firstMvFrame_) {
+        prevViewMatrix_ = viewMatrix_;
+        prevProjMatrixUnjittered_ = projMatrixUnjittered_;
+    }
 
     // --- Dynamic splats: morph-apply compute pass (runs before preprocess) ---
     // See docs/lux-4d-spec.md and SPECIFICATION.md 12.8. Two dispatches so
@@ -1370,6 +1586,22 @@ void SplatRenderer::render(VulkanContext& ctx) {
         }
     }
 
+    // --- Motion vectors: seed splat_prev_pos on the very first frame ---
+    // (dynamic splats only -- static splats' prevPosBuffer_ already aliases
+    // posBuffer_, so curr == prev trivially). Copies THIS frame's own
+    // (post-morph) position into prevPosBuffer_ before preprocess reads it,
+    // so the position term of mv is also exactly 0 on frame 1.
+    if (hasMotionVectors_ && firstMvFrame_ && prevPosOwned_) {
+        VkBufferCopy copy = {0, 0, static_cast<VkDeviceSize>(numSplats_) * 4 * sizeof(float)};
+        vkCmdCopyBuffer(cmd, posBuffer_, prevPosBuffer_, 1, &copy);
+        VkMemoryBarrier copyBarrier = {};
+        copyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        copyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        copyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &copyBarrier, 0, nullptr, 0, nullptr);
+    }
+
     // --- Compute dispatch (projection + sort key generation) ---
     struct ComputePush {
         float view[16];       // offset 0
@@ -1382,6 +1614,9 @@ void SplatRenderer::render(VulkanContext& ctx) {
         float focalY;         // offset 160
         int32_t shDegree;     // offset 164
         float _pad1[2];       // offset 168 (pad to 176)
+        // --- DLSS input-contract outputs: only pushed when hasMotionVectors_ ---
+        float projUnjittered[16];         // offset 176
+        float prevViewProjUnjittered[16]; // offset 240 (total 304)
     } push = {};
 
     std::memcpy(push.view, &viewMatrix_[0][0], 64);
@@ -1395,12 +1630,17 @@ void SplatRenderer::render(VulkanContext& ctx) {
     push.focalX = focalX_;
     push.focalY = focalY_;
     push.shDegree = static_cast<int32_t>(shDegree_);
+    if (hasMotionVectors_) {
+        glm::mat4 prevViewProj = prevProjMatrixUnjittered_ * prevViewMatrix_;
+        std::memcpy(push.projUnjittered, &projMatrixUnjittered_[0][0], 64);
+        std::memcpy(push.prevViewProjUnjittered, &prevViewProj[0][0], 64);
+    }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computeLayout_,
                             0, 1, &computeDescSet_, 0, nullptr);
     vkCmdPushConstants(cmd, computeLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(push), &push);
+                       0, hasMotionVectors_ ? sizeof(push) : 176, &push);
 
     uint32_t groupCount = (numSplats_ + 255) / 256;
     vkCmdDispatch(cmd, groupCount, 1, 1);
@@ -1414,6 +1654,22 @@ void SplatRenderer::render(VulkanContext& ctx) {
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+    // --- Motion vectors: carry history forward for the NEXT frame ---
+    // Preprocess has now consumed this frame's prevPosBuffer_/prev camera
+    // matrices; safe to overwrite. Each render() call is fully
+    // GPU-synchronous (endSingleTimeCommands waits for completion below),
+    // so no cross-frame synchronization beyond this command buffer's own
+    // barriers is needed.
+    if (hasMotionVectors_) {
+        if (prevPosOwned_) {
+            VkBufferCopy copy = {0, 0, static_cast<VkDeviceSize>(numSplats_) * 4 * sizeof(float)};
+            vkCmdCopyBuffer(cmd, posBuffer_, prevPosBuffer_, 1, &copy);
+        }
+        prevViewMatrix_ = viewMatrix_;
+        prevProjMatrixUnjittered_ = projMatrixUnjittered_;
+        firstMvFrame_ = false;
+    }
 
     // --- GPU Radix Sort (4 passes, 8 bits per pass = 32-bit keys) ---
     {
@@ -1512,28 +1768,53 @@ void SplatRenderer::render(VulkanContext& ctx) {
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 
     // --- Render pass ---
-    // Use LOAD render pass when a background has been blitted in (hybrid compositing)
-    VkClearValue clearValues[2] = {};
-    clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
-    clearValues[1].depthStencil = {1.0f, 0};
-
+    // Use LOAD render pass when a background has been blitted in (hybrid
+    // compositing) -- never true together with the DLSS outputs, see
+    // preloadBackground()/preloadDepth().
     VkRenderPassBeginInfo rpBegin = {};
     rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    std::vector<VkClearValue> clearValues;
     if (hasBackgroundDepth_) {
         // Full hybrid: both color and depth loaded from raster pass
         rpBegin.renderPass = renderPassLoadDepth_;
         rpBegin.framebuffer = framebufferLoadDepth_;
+        clearValues = {VkClearValue{}, VkClearValue{}};
+        clearValues[1].depthStencil = {1.0f, 0};
     } else if (hasBackground_) {
         // Color-only compositing: color loaded, depth cleared
         rpBegin.renderPass = renderPassLoad_;
         rpBegin.framebuffer = framebufferLoad_;
+        clearValues = {VkClearValue{}, VkClearValue{}};
+        clearValues[1].depthStencil = {1.0f, 0};
     } else {
         rpBegin.renderPass = renderPass_;
         rpBegin.framebuffer = framebuffer_;
+        // Order matches createFramebuffer(): color, [motion], [expected_depth], depth_test.
+        // Motion/expected-depth clear to 0 -- "0 where nothing was drawn" per
+        // docs/lux-4d-spec.md section 3. Color's alpha is cleared to 0 (not
+        // the usual opaque-black 1.0) whenever the DLSS outputs are enabled:
+        // the host needs color.a to be a genuine "how much splat coverage
+        // landed in this pixel" signal (0..1, accumulated via the same
+        // premultiplied-alpha blend as the aux attachments) to correctly
+        // un-premultiply motion/depth -- an opaque background alpha would
+        // saturate it to 1 everywhere regardless of actual splat coverage.
+        // Non-DLSS pipelines are unaffected (alpha stays 1, unchanged).
+        clearValues.push_back(VkClearValue{});
+        clearValues.back().color = {{0.0f, 0.0f, 0.0f, (hasMotionVectors_ || hasExpectedDepth_) ? 0.0f : 1.0f}};
+        if (hasMotionVectors_) {
+            clearValues.push_back(VkClearValue{});
+            clearValues.back().color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+        }
+        if (hasExpectedDepth_) {
+            clearValues.push_back(VkClearValue{});
+            clearValues.back().color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+        }
+        clearValues.push_back(VkClearValue{});
+        clearValues.back().depthStencil = {1.0f, 0};
     }
     rpBegin.renderArea.extent = {width_, height_};
-    rpBegin.clearValueCount = 2;
-    rpBegin.pClearValues = clearValues;
+    rpBegin.clearValueCount = static_cast<uint32_t>(clearValues.size());
+    rpBegin.pClearValues = clearValues.data();
 
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -1681,6 +1962,17 @@ void SplatRenderer::blitToSwapchainComposite(VulkanContext& ctx, VkCommandBuffer
 
 void SplatRenderer::preloadBackground(VulkanContext& ctx, VkImage srcImage, VkFormat /*srcFormat*/,
                                        uint32_t srcWidth, uint32_t srcHeight) {
+    if (hasMotionVectors_ || hasExpectedDepth_) {
+        // Hybrid mesh+splat compositing (LOAD render pass, 2 attachments)
+        // isn't supported together with the extra DLSS output attachments
+        // in this iteration -- render() always uses the primary N-attachment
+        // render pass when either flag is set. See docs/lux-4d-spec.md
+        // section 3 and splat_renderer.h's createRenderPass comment.
+        std::cout << "[warn] preloadBackground() ignored: motion_vectors/"
+                     "expected_depth splats don't support background compositing yet."
+                  << std::endl;
+        return;
+    }
     VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
 
     // Transition splat color image: UNDEFINED -> TRANSFER_DST
@@ -1744,6 +2036,12 @@ void SplatRenderer::preloadBackground(VulkanContext& ctx, VkImage srcImage, VkFo
 
 void SplatRenderer::preloadDepth(VulkanContext& ctx, VkImage srcDepthImage,
                                   uint32_t srcWidth, uint32_t srcHeight) {
+    if (hasMotionVectors_ || hasExpectedDepth_) {
+        std::cout << "[warn] preloadDepth() ignored: motion_vectors/"
+                     "expected_depth splats don't support background compositing yet."
+                  << std::endl;
+        return;
+    }
     VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
 
     // Transition raster depth: DEPTH_STENCIL_ATTACHMENT_OPTIMAL -> TRANSFER_SRC
@@ -1857,10 +2155,14 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     // Image views
     if (colorView_ != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, colorView_, nullptr);
     if (depthView_ != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, depthView_, nullptr);
+    if (motionView_ != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, motionView_, nullptr);
+    if (expectedDepthView_ != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, expectedDepthView_, nullptr);
 
     // Images (VMA)
     if (colorImage_ != VK_NULL_HANDLE) vmaDestroyImage(ctx.allocator, colorImage_, colorAlloc_);
     if (depthImage_ != VK_NULL_HANDLE) vmaDestroyImage(ctx.allocator, depthImage_, depthAlloc_);
+    if (motionImage_ != VK_NULL_HANDLE) vmaDestroyImage(ctx.allocator, motionImage_, motionAlloc_);
+    if (expectedDepthImage_ != VK_NULL_HANDLE) vmaDestroyImage(ctx.allocator, expectedDepthImage_, expectedDepthAlloc_);
 
     // Pipelines
     if (computePipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(ctx.device, computePipeline_, nullptr);
@@ -1892,6 +2194,13 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     destroyVmaBuffer(ctx.allocator, projCenterBuffer_, projCenterAlloc_);
     destroyVmaBuffer(ctx.allocator, projConicBuffer_, projConicAlloc_);
     destroyVmaBuffer(ctx.allocator, projColorBuffer_, projColorAlloc_);
+    destroyVmaBuffer(ctx.allocator, projMvBuffer_, projMvAlloc_);
+    destroyVmaBuffer(ctx.allocator, projDepthBuffer_, projDepthAlloc_);
+    if (prevPosOwned_) {
+        destroyVmaBuffer(ctx.allocator, prevPosBuffer_, prevPosAlloc_);
+    }
+    prevPosBuffer_ = VK_NULL_HANDLE;
+    prevPosOwned_ = false;
     destroyVmaBuffer(ctx.allocator, sortKeysBuffer_, sortKeysAlloc_);
     destroyVmaBuffer(ctx.allocator, sortedIndicesBuffer_, sortedIndicesAlloc_);
     destroyVmaBuffer(ctx.allocator, visibleCountBuffer_, visibleCountAlloc_);
@@ -1938,6 +2247,13 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     depthView_ = VK_NULL_HANDLE;
     colorImage_ = VK_NULL_HANDLE;
     depthImage_ = VK_NULL_HANDLE;
+    motionView_ = VK_NULL_HANDLE;
+    expectedDepthView_ = VK_NULL_HANDLE;
+    motionImage_ = VK_NULL_HANDLE;
+    expectedDepthImage_ = VK_NULL_HANDLE;
+    hasMotionVectors_ = false;
+    hasExpectedDepth_ = false;
+    firstMvFrame_ = true;
     computePipeline_ = VK_NULL_HANDLE;
     renderPipeline_ = VK_NULL_HANDLE;
     computeLayout_ = VK_NULL_HANDLE;

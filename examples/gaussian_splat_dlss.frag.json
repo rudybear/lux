@@ -45,12 +45,12 @@
     },
     {
       "name": "out_motion",
-      "type": "vec2",
+      "type": "vec4",
       "location": 1
     },
     {
       "name": "out_depth",
-      "type": "scalar",
+      "type": "vec2",
       "location": 2
     }
   ],
@@ -90,8 +90,8 @@
     "splat_name": "DlssGaussianCloud"
   },
   "performance_hints": {
-    "instruction_count": 120,
-    "alu_ops": 16,
+    "instruction_count": 126,
+    "alu_ops": 17,
     "texture_samples": 0,
     "branches": 2,
     "function_calls": 0,

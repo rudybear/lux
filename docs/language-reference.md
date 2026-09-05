@@ -538,8 +538,8 @@ alongside `out_color` (see `docs/lux-4d-spec.md` section 3):
 splat DlssGaussianCloud {
     sh_degree: 0,
     motion: keyframes,      // optional, independent of the two flags below
-    motion_vectors: true,   // adds an RG "out_motion" fragment output
-    expected_depth: true,   // adds a scalar "out_depth" fragment output
+    motion_vectors: true,   // adds a vec4 "out_motion" fragment output
+    expected_depth: true,   // adds a vec2 "out_depth" fragment output
 }
 
 pipeline DlssSplatViewer {
@@ -575,24 +575,29 @@ splat cloud under camera motion alone can still emit motion vectors.
   previous frame's pixel location of the same surface point. `uv` uses a
   top-left origin with +y down, matching the existing `pixel_center`
   convention in the vertex stage. Carried through as `frag_mv` (vertex →
-  fragment) and written to the `out_motion` fragment output as
-  `frag_mv * alpha` — i.e. **premultiplied by the same per-fragment alpha
-  as `out_color`**, so the engine can reuse the identical
-  `(ONE, ONE_MINUS_SRC_ALPHA)` blend state for the motion attachment and
-  get the correct visibility-weighted average of overlapping splats for
-  free. On the very first rendered frame (no previous camera/position
-  data yet), the host is expected to set `prev_view_proj_unjittered` equal
-  to the current frame's unjittered view-projection and alias/copy
-  `splat_prev_pos` to the current positions, which makes `mv` evaluate to
-  (0, 0) exactly.
+  fragment) and written to the `out_motion` fragment output (**vec4**:
+  `xy = frag_mv * alpha`, `z = 0`, `w = alpha`) — i.e. **premultiplied by
+  the same per-fragment alpha as `out_color`**, so the engine can reuse the
+  identical `(ONE, ONE_MINUS_SRC_ALPHA)` blend state for the motion
+  attachment and get the correct visibility-weighted average of
+  overlapping splats for free. Alpha is also duplicated into `.w` (rather
+  than making the host divide by `out_color`'s alpha) so un-premultiplying
+  `mv` happens at full float32 precision instead of being limited by an
+  8-bit color attachment's alpha resolution. On the very first rendered
+  frame (no previous camera/position data yet), the host is expected to
+  set `prev_view_proj_unjittered` equal to the current frame's unjittered
+  view-projection and alias/copy `splat_prev_pos` to the current
+  positions, which makes `mv` evaluate to (0, 0) exactly.
 
 **`expected_depth: true`** adds an output buffer `projected_depth`
 (scalar): the camera-space depth `t = -view_pos.z` already computed by the
 preprocess stage's Jacobian projection (gsplat's `"ED"` — expected depth
-— mode). Carried through as `frag_depth` and written to `out_depth` as
-`frag_depth * alpha`, again using the same premultiplied-alpha blend as
-color, so overlapping splats contribute an alpha-weighted average depth
-and pixels with no splats at all end up at exactly `0.0`.
+— mode). Carried through as `frag_depth` and written to `out_depth`
+(**vec2**: `x = frag_depth * alpha`, `y = alpha`), again using the same
+premultiplied-alpha blend as color (with the same full-precision-alpha
+rationale as `out_motion` above), so overlapping splats contribute an
+alpha-weighted average depth and pixels with no splats at all end up at
+exactly `0.0`.
 
 Both new fragment outputs are appended *after* `out_color` in declaration
 order (so `out_color` is always location 0, `out_motion`/`out_depth` take
