@@ -273,13 +273,16 @@ def load_splat_glb(path: Path) -> dict:
             attrs = prim.get('attributes', {})
 
             # Detect splat attributes: check for KHR extension or _ROTATION/_SCALE
-            # prim_is_khr is True ONLY when attribute names use the
-            # "KHR_gaussian_splatting:" prefix (conformance format with linear
-            # opacity).  Having the extension object alone does NOT imply
-            # linear opacity -- internal format stores logit values.
+            # prim_is_khr is True when attribute names use the ratified
+            # "KHR_gaussian_splatting:" prefix (linear opacity/scale semantics).
+            # has_internal_attrs is True for lux's hand-authored fixture
+            # convention (_ROTATION/_SCALE/_OPACITY): those are already
+            # shader-native (logit opacity, log-space scale), even when a
+            # (historically unused, redundant) extension object is also present.
             has_rotation = False
             has_scale = False
             prim_is_khr = False
+            has_internal_attrs = False
             gs_ext = prim.get('extensions', {}).get('KHR_gaussian_splatting')
 
             # Always scan top-level attributes for both naming conventions
@@ -290,19 +293,32 @@ def load_splat_glb(path: Path) -> dict:
                     has_scale = True
                 if aname.startswith('KHR_gaussian_splatting:'):
                     prim_is_khr = True
+                if aname in ('_ROTATION', '_SCALE', '_OPACITY'):
+                    has_internal_attrs = True
 
-            # Also check the extension object's attributes sub-dict
+            # Also check the extension object's attributes sub-dict (legacy
+            # pre-ratification draft layout: ROTATION/SCALE nested under the
+            # extension rather than living in primitive.attributes).
+            legacy_nested_attrs = False
             if gs_ext is not None:
                 gs_attrs_dict = gs_ext.get('attributes', {})
-                if 'ROTATION' in gs_attrs_dict:
+                if 'ROTATION' in gs_attrs_dict and not has_rotation:
                     has_rotation = True
-                if 'SCALE' in gs_attrs_dict:
+                    legacy_nested_attrs = True
+                if 'SCALE' in gs_attrs_dict and not has_scale:
                     has_scale = True
+                    legacy_nested_attrs = True
 
             if not has_rotation and not has_scale:
                 continue
 
             if prim_is_khr:
+                khr_format = True
+            elif legacy_nested_attrs and not has_internal_attrs:
+                # Pure legacy-layout primitive (no ratified prefix, no internal
+                # underscore attrs): ROTATION/SCALE/OPACITY came from the
+                # nested extension object, which (like the ratified layout)
+                # stores linear opacity and needs the same conversion below.
                 khr_format = True
 
             # Read position data
@@ -533,16 +549,29 @@ def load_splat_glb(path: Path) -> dict:
         sh_coeffs_list.append(merged)
 
     # -----------------------------------------------------------------------
-    # KHR linear opacity → logit conversion
+    # KHR linear opacity → logit conversion, linear → log scale conversion
     # -----------------------------------------------------------------------
     # KHR_gaussian_splatting stores opacity in linear [0,1] space.
     # The rasterizer applies sigmoid() to opacity, so we convert to logit.
-    # KHR scales are already in log-space per spec (no conversion needed).
     # Non-KHR formats already store log/logit values.
+    #
+    # SCALE is trickier: the *ratified* KHR_gaussian_splatting spec requires SCALE
+    # to be linear ("Scale values are linear and MUST NOT be negative"), but the
+    # currently-published Khronos conformance test assets predate an April-2026
+    # editorial pass and still store log-space values (matching the pre-ratification
+    # draft and raw 3DGS training convention) -- including negative values, which
+    # are invalid under the ratified rule. Since both encodings are seen in the
+    # wild for the exact same attribute location, auto-detect: any negative value
+    # means the data is already log-space (leave as-is, since the rasterizer
+    # applies exp()); all-non-negative, boundedly-small values are treated as
+    # ratified linear scale and converted to log-space here.
     if khr_format:
         # Convert linear opacity [0,1] to logit: log(p / (1-p))
         p = np.clip(merged_opacities, 1e-6, 1.0 - 1e-6)
         merged_opacities = np.log(p / (1.0 - p)).astype(np.float32)
+
+        if merged_scales.size > 0 and np.all(merged_scales >= 0.0) and np.all(merged_scales < 20.0):
+            merged_scales = np.log(np.maximum(merged_scales, 1e-12)).astype(np.float32)
 
     # -----------------------------------------------------------------------
     # Node transform application
