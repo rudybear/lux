@@ -53,12 +53,64 @@ def read_accessor(gltf, bin_data, accessor_idx):
     return data.reshape(count, components) if components > 1 else data
 
 
+def _find_splat_primitive(gltf):
+    """Find the first POINTS-mode primitive carrying Gaussian splat attributes.
+
+    Supports the ratified layout (KHR_gaussian_splatting:ROTATION etc. living
+    directly in primitive.attributes), the legacy pre-ratification draft
+    layout (ROTATION/SCALE/OPACITY nested under
+    extensions.KHR_gaussian_splatting.attributes), and lux's internal
+    hand-authored fixture convention (_ROTATION/_SCALE/... in
+    primitive.attributes).
+    """
+    for mesh in gltf.get('meshes', []):
+        for prim in mesh.get('primitives', []):
+            if prim.get('mode', 4) != 0:
+                continue
+            attrs = prim.get('attributes', {})
+            ext = prim.get('extensions', {}).get('KHR_gaussian_splatting', {})
+            has_rotation = (
+                'KHR_gaussian_splatting:ROTATION' in attrs
+                or '_ROTATION' in attrs
+                or 'ROTATION' in ext.get('attributes', {})
+            )
+            if has_rotation:
+                return prim
+    raise ValueError("No KHR_gaussian_splatting primitive found in glTF")
+
+
+def _resolve_attr(attrs, ext, suffix):
+    """Resolve a splat attribute accessor index across ratified/legacy/internal layouts."""
+    if f"KHR_gaussian_splatting:{suffix}" in attrs:
+        return attrs[f"KHR_gaussian_splatting:{suffix}"]
+    if f"_{suffix}" in attrs:
+        return attrs[f"_{suffix}"]
+    return ext['attributes'][suffix]
+
+
+def _is_linear_scale(values):
+    """Heuristic: ratified KHR_gaussian_splatting:SCALE is linear (non-negative);
+    the legacy/pre-editorial-review draft (matching the currently-published
+    Khronos conformance test assets) and lux's internal _SCALE convention both
+    store log-space values, which can be negative. Treat all-non-negative,
+    boundedly-small values as linear; anything with negatives (or very large
+    magnitude) as log-space.
+    """
+    return bool(np.all(values >= 0.0) and np.all(values < 20.0))
+
+
+def _is_linear_opacity(values):
+    """Heuristic: linear opacity is always in [0, 1]; logit-space values
+    routinely fall outside that range."""
+    return bool(np.all(values >= 0.0) and np.all(values <= 1.0))
+
+
 def convert_glb_to_ply(glb_path, ply_path, verbose=True):
     gltf, bin_data = load_glb(glb_path)
 
-    # Find the gaussian splatting primitive
-    mesh = gltf['meshes'][0]
-    prim = mesh['primitives'][0]
+    # Find the gaussian splatting primitive (not necessarily mesh 0 / primitive 0 —
+    # hybrid mesh+splat assets interleave regular mesh primitives with the splat one).
+    prim = _find_splat_primitive(gltf)
     ext = prim.get('extensions', {}).get('KHR_gaussian_splatting', {})
 
     attrs = prim['attributes']
@@ -66,14 +118,35 @@ def convert_glb_to_ply(glb_path, ply_path, verbose=True):
 
     # Read data
     positions = read_accessor(gltf, bin_data, attrs['POSITION'])  # (N, 3)
-    rotations = read_accessor(gltf, bin_data, attrs.get('_ROTATION', ext['attributes']['ROTATION']))  # (N, 4) XYZW
-    scales = read_accessor(gltf, bin_data, attrs.get('_SCALE', ext['attributes']['SCALE']))  # (N, 3) log-scale
-    opacities = read_accessor(gltf, bin_data, attrs.get('_OPACITY', ext['attributes']['OPACITY']))  # (N,) logit
+    rotations = read_accessor(gltf, bin_data, _resolve_attr(attrs, ext, 'ROTATION'))  # (N, 4) XYZW
+    scales = read_accessor(gltf, bin_data, _resolve_attr(attrs, ext, 'SCALE'))
+    opacities = read_accessor(gltf, bin_data, _resolve_attr(attrs, ext, 'OPACITY'))
 
-    # SH coefficients
-    sh_bands = ext.get('sh', [])
-    sh_degree = sh_bands[0]['degree'] if sh_bands else 0
-    sh0_idx = sh_bands[0]['coefficients'] if sh_bands else attrs.get('_SH_0')
+    # PLY output always uses log-space scale / logit-space opacity (matching
+    # the raw 3DGS training convention). Ratified-layout GLBs store linear
+    # scale and linear opacity, so convert back; legacy/internal layouts are
+    # already in log/logit space.
+    if _is_linear_scale(scales):
+        scales = np.log(np.maximum(scales, 1e-12))
+    if _is_linear_opacity(opacities):
+        opacities = np.log(np.clip(opacities, 1e-7, 1 - 1e-7) / (1 - np.clip(opacities, 1e-7, 1 - 1e-7)))
+
+    # SH coefficients: ratified layout keeps SH_DEGREE_0_COEF_0 directly in
+    # primitive.attributes; legacy layout nests a "sh" array in the extension.
+    sh0_idx = attrs.get('KHR_gaussian_splatting:SH_DEGREE_0_COEF_0', attrs.get('_SH_0'))
+    sh_degree = 0
+    if sh0_idx is None:
+        sh_bands = ext.get('sh', [])
+        sh_degree = sh_bands[0]['degree'] if sh_bands else 0
+        coeffs = sh_bands[0]['coefficients'] if sh_bands else None
+        sh0_idx = coeffs[0] if isinstance(coeffs, list) else coeffs
+    else:
+        prefix = 'KHR_gaussian_splatting:SH_DEGREE_'
+        sh_degree = max(
+            (int(name[len(prefix):].split('_COEF_')[0]) for name in attrs
+             if name.startswith(prefix)),
+            default=0,
+        )
     sh0 = read_accessor(gltf, bin_data, sh0_idx)  # (N, 3)
 
     if verbose:
