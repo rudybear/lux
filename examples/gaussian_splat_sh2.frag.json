@@ -52,7 +52,7 @@
           "size": 4
         },
         {
-          "name": "alpha_cutoff",
+          "name": "alpha_min",
           "type": "scalar",
           "offset": 12,
           "size": 4
@@ -70,7 +70,7 @@
     "splat_name": "GaussianCloud"
   },
   "performance_hints": {
-    "instruction_count": 99,
+    "instruction_count": 101,
     "alu_ops": 14,
     "texture_samples": 0,
     "branches": 2,

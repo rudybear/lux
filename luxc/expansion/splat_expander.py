@@ -45,8 +45,29 @@ def _get_splat_config(splat: SplatDecl) -> dict:
         sh_degree   -- spherical harmonics degree (0, 1, 2, or 3)
         kernel      -- splat kernel type ("ellipse" or "circle")
         color_space -- output color space ("srgb" or "linear")
-        sort        -- sort strategy ("camera_distance" or "depth")
-        alpha_cutoff -- minimum alpha for fragment discard
+        sort        -- sort strategy: "camera_distance" (default; true
+                       Euclidean distance from the camera, matching the
+                       ratified KHR_gaussian_splatting spec's
+                       `sortingMethod: cameraDistance`) or "view_depth"
+                       (raw view-space z, matching gsplat's own convention
+                       -- added so the two can be measured against each
+                       other; see docs/lux-4d-spec.md follow-up).
+        alpha_cutoff -- (legacy name, still accepted) minimum alpha for
+                       fragment discard; see `alpha_min` below, which is
+                       the same runtime threshold under the reference-
+                       matching name.
+        dilation    -- scalar (default 0.3): added to the diagonal of the
+                       projected 2D covariance before inversion (3DGS/
+                       gsplat's "eps2d" antialiasing convention), with NO
+                       opacity compensation for the resulting blur -- this
+                       matches the reference 3DGS rasterizer / gsplat
+                       exactly (earlier lux versions additionally applied a
+                       `sqrt(det_orig/det)` opacity compensation gsplat's
+                       default AA mode does not use).
+        alpha_min   -- scalar (default 1/255 ~= 0.00392): fragments with
+                       `alpha = opacity * exp(-0.5*d^2) < alpha_min` are
+                       discarded (3σ quad extent, alpha clamped to <= 0.99
+                       before compositing), matching 3DGS/gsplat exactly.
         motion      -- "none" (default) or "keyframes": when "keyframes", the
                        compiler emits an additional morph-apply compute stage
                        (see _build_morph_apply_stage) that blends per-keyframe
@@ -77,7 +98,9 @@ def _get_splat_config(splat: SplatDecl) -> dict:
         "kernel": "ellipse",
         "color_space": "srgb",
         "sort": "camera_distance",
-        "alpha_cutoff": 0.004,
+        "alpha_cutoff": 1.0 / 255.0,
+        "dilation": 0.3,
+        "alpha_min": 1.0 / 255.0,
         "motion": "none",
         "motion_vectors": False,
         "expected_depth": False,
@@ -88,7 +111,15 @@ def _get_splat_config(splat: SplatDecl) -> dict:
         elif m.name in ("kernel", "color_space", "sort", "motion"):
             config[m.name] = m.value.name
         elif m.name == "alpha_cutoff":
+            # Legacy name; kept as an alias of alpha_min for backward
+            # compatibility with existing .lux sources.
             config["alpha_cutoff"] = float(m.value.value)
+            config["alpha_min"] = float(m.value.value)
+        elif m.name == "alpha_min":
+            config["alpha_min"] = float(m.value.value)
+            config["alpha_cutoff"] = float(m.value.value)
+        elif m.name == "dilation":
+            config["dilation"] = float(m.value.value)
         elif m.name in ("motion_vectors", "expected_depth"):
             if isinstance(m.value, BoolLit):
                 config[m.name] = bool(m.value.value)
@@ -639,17 +670,16 @@ def _build_preprocess_body(config: dict) -> list:
                              _ref("cov3d_12"))),
                _binop("*", _binop("*", _ref("j12"), _ref("j12")), _ref("cov3d_22")))))
 
-    # Determinant of the ORIGINAL 2D covariance (before low-pass filter)
-    body.append(_let("det_orig", "scalar",
-        _binop("-",
-               _binop("*", _ref("cov2d_00"), _ref("cov2d_11")),
-               _binop("*", _ref("cov2d_01"), _ref("cov2d_01")))))
-
-    # Add low-pass filter to prevent aliasing on very small splats
+    # Dilation (3DGS/gsplat "eps2d" antialiasing convention, SPECIFICATION.md
+    # 12.8): add `dilation` px^2 to the diagonal of the projected 2D
+    # covariance before inversion, with NO opacity compensation for the
+    # resulting blur (matching the reference 3DGS rasterizer / gsplat
+    # exactly -- earlier lux versions additionally scaled opacity down by
+    # sqrt(det_orig/det), which gsplat's default AA mode does not do).
     body.append(_let("cov2d_00f", "scalar",
-        _binop("+", _ref("cov2d_00"), _lit("0.3"))))
+        _binop("+", _ref("cov2d_00"), _lit(config["dilation"]))))
     body.append(_let("cov2d_11f", "scalar",
-        _binop("+", _ref("cov2d_11"), _lit("0.3"))))
+        _binop("+", _ref("cov2d_11"), _lit(config["dilation"]))))
 
     # --- Compute inverse covariance (conic) for the fragment shader ---
     # det = cov2d_00f * cov2d_11f - cov2d_01^2
@@ -663,15 +693,6 @@ def _build_preprocess_body(config: dict) -> list:
         _binop("<=", _ref("det"), _lit("0.0")),
         _cull_writes(config) + [ReturnStmt(None)],
     ))
-
-    # Opacity compensation: reduce opacity proportionally to how much the
-    # low-pass filter enlarged the splat (matches reference 3DGS implementation).
-    # compensation = sqrt(max(det_orig / det, 0.0))
-    body.append(_let("compensation", "scalar",
-        _call("sqrt", [_call("max", [
-            _binop("/", _ref("det_orig"), _ref("det")),
-            _lit("0.0"),
-        ])])))
 
     body.append(_let("inv_det", "scalar", _binop("/", _lit("1.0"), _ref("det"))))
 
@@ -753,14 +774,15 @@ def _build_preprocess_body(config: dict) -> list:
         _binop("/", _lit("1.0"),
                _binop("+", _lit("1.0"),
                       _call("exp", [_neg(_ref("raw_opacity"))])))))
-    # Apply anti-aliasing compensation: reduce opacity for splats enlarged by filter
-    body.append(_let("opacity", "scalar",
-        _binop("*", _ref("raw_sigmoid"), _ref("compensation"))))
+    # No opacity compensation (see the dilation comment above) -- opacity is
+    # just the activated raw value.
+    body.append(_let("opacity", "scalar", _ref("raw_sigmoid")))
 
     # --- Cull low-opacity splats early (before SH eval) ---
-    # Splats with opacity < 1/255 after compensation are invisible.
+    # Splats with opacity < alpha_min (default 1/255, matching 3DGS/gsplat)
+    # are invisible.
     body.append(_if(
-        _binop("<", _ref("opacity"), _lit("0.00392157")),
+        _binop("<", _ref("opacity"), _lit(config["alpha_min"])),
         _cull_writes(config) + [ReturnStmt(None)],
     ))
 
@@ -828,8 +850,22 @@ def _build_preprocess_body(config: dict) -> list:
     body.append(_assign_idx("projected_color", _ref("gid"),
         _ctor("vec4", [_ref("clamped_r"), _ref("clamped_g"), _ref("clamped_b"), _ref("opacity")])))
 
+    # --- Sort metric ---
+    # "camera_distance" (default, matches the ratified KHR_gaussian_splatting
+    # spec's sortingMethod): true Euclidean distance from the camera,
+    # negated so farther splats get the more-negative value -- matching
+    # `vz`'s own sign convention (objects in front have negative view-space
+    # z, more negative the farther away) so the existing ascending-key
+    # radix sort still produces a back-to-front draw order for correct
+    # premultiplied-alpha "over" compositing.
+    # "view_depth" (gsplat's own convention): raw view-space z.
+    if config.get("sort") == "view_depth":
+        body.append(_let("sort_metric", "scalar", _ref("vz")))
+    else:
+        body.append(_let("sort_metric", "scalar", _neg(_call("length", [_ref("view_pos")]))))
+
     # --- Sort key: convert float depth to sortable uint for GPU radix sort ---
-    body.append(_let("key_bits", "uint", _call("float_bits_to_uint", [_ref("vz")])))
+    body.append(_let("key_bits", "uint", _call("float_bits_to_uint", [_ref("sort_metric")])))
     body.append(_let("sign_mask", "uint",
         _binop("*",
             _binop(">>", _ref("key_bits"), _uint_lit("31")),
@@ -1078,7 +1114,7 @@ def _build_vertex_stage(config: dict) -> StageBlock:
     pc_fields = [
         BlockField("screen_size", "vec2"),
         BlockField("visible_count", "uint"),
-        BlockField("alpha_cutoff", "scalar"),
+        BlockField("alpha_min", "scalar"),
     ]
     stage.push_constants.append(PushBlock("push", pc_fields))
 
@@ -1413,7 +1449,7 @@ def _build_fragment_stage(config: dict) -> StageBlock:
     pc_fields = [
         BlockField("screen_size", "vec2"),
         BlockField("visible_count", "uint"),
-        BlockField("alpha_cutoff", "scalar"),
+        BlockField("alpha_min", "scalar"),
     ]
     stage.push_constants.append(PushBlock("push", pc_fields))
 
@@ -1453,23 +1489,29 @@ def _build_fragment_body(config: dict) -> list:
                         _binop("*", _ref("dx"), _ref("dy")))),
                 _binop("*", _ref("c"), _binop("*", _ref("dy"), _ref("dy")))))))
 
-    # Discard fragments outside the Gaussian tail (power < -4.0 is negligible)
+    # power > 0 is numerically invalid for a valid (positive-definite) conic;
+    # the actual visibility cutoff is the alpha_min check below, evaluated
+    # out to the quad's own 3-sigma extent (see `raw_radius` above) --
+    # matching the reference 3DGS/gsplat rasterizer (no separate arbitrary
+    # power threshold).
     body.append(_if(
-        _binop("<", _ref("power"), _lit("-4.0")),
+        _binop(">", _ref("power"), _lit("0.0")),
         [DiscardStmt()],
     ))
 
-    # alpha = exp(power) * opacity
+    # alpha = opacity * exp(-0.5*d^2), clamped to <= 0.99 (reference 3DGS/gsplat)
     body.append(_let("gauss_weight", "scalar", _call("exp", [_ref("power")])))
     body.append(_let("opacity", "scalar",
         _swizzle(_ref("frag_color"), "w")))
-    body.append(_let("alpha", "scalar",
+    body.append(_let("raw_alpha", "scalar",
         _binop("*", _ref("gauss_weight"), _ref("opacity"))))
+    body.append(_let("alpha", "scalar",
+        _call("min", [_ref("raw_alpha"), _lit("0.99")])))
 
-    # Alpha cutoff (discard nearly-transparent fragments)
-    alpha_cutoff = config["alpha_cutoff"]
+    # alpha_min cutoff (discard nearly-transparent fragments; default 1/255,
+    # matching 3DGS/gsplat)
     body.append(_if(
-        _binop("<", _ref("alpha"), _push_field("alpha_cutoff")),
+        _binop("<", _ref("alpha"), _push_field("alpha_min")),
         [DiscardStmt()],
     ))
 

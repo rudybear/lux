@@ -1835,7 +1835,12 @@ void SplatRenderer::render(VulkanContext& ctx) {
     renderPush.screenW = static_cast<float>(width_);
     renderPush.screenH = static_cast<float>(height_);
     renderPush.visibleCount = numSplats_;  // all splats visible (CPU sort)
-    renderPush.alphaCutoff = 0.004f;
+    // alpha_min default (3DGS/gsplat convention, SPECIFICATION.md 12.8): 1/255.
+    // NOTE: like the pre-existing alpha_cutoff this replaces, this value is
+    // NOT read back from the compiled splat's `alpha_min`/`alpha_cutoff`
+    // config (that field only feeds reflection metadata) -- it's a fixed
+    // host-side default, unchanged from that prior architecture.
+    renderPush.alphaCutoff = 1.0f / 255.0f;
     vkCmdPushConstants(cmd, renderLayout_,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(renderPush), &renderPush);

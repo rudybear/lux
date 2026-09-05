@@ -456,11 +456,12 @@ First-class 3D Gaussian splatting via the `splat` declaration. One block generat
 
 ```
 splat GaussianCloud {
-    sh_degree: 0,        // SH bands: 0 (DC only), 1, 2, or 3
-    kernel: ellipse,     // Gaussian kernel shape
-    color_space: srgb,   // Output color space
-    sort: camera_distance,  // Sorting method
-    alpha_cutoff: 0.004, // Minimum alpha threshold (OpKill below this)
+    sh_degree: 0,          // SH bands: 0 (DC only), 1, 2, or 3
+    kernel: ellipse,       // Gaussian kernel shape
+    color_space: srgb,     // Output color space
+    sort: camera_distance, // camera_distance (default) | view_depth
+    dilation: 0.3,         // 3DGS/gsplat "eps2d" antialiasing convention
+    alpha_min: 0.00392,    // ~= 1/255, minimum alpha threshold (OpKill below this)
 }
 
 pipeline SplatViewer {
@@ -470,9 +471,13 @@ pipeline SplatViewer {
 ```
 
 The compiler generates:
-- **Compute shader** (workgroup 256): transforms splat positions to screen space, computes 3D→2D covariance matrices via Jacobian projection, evaluates spherical harmonics for view-dependent color, and writes sort keys for depth ordering
-- **Vertex shader**: reads sorted splat data and emits instanced screen-space quads (6 vertices per splat) sized by the 2D Gaussian radius
-- **Fragment shader**: evaluates the 2D Gaussian kernel, applies alpha cutoff with `discard` (OpKill), and outputs premultiplied alpha for back-to-front compositing
+- **Compute shader** (workgroup 256): transforms splat positions to screen space, computes 3D→2D covariance matrices via Jacobian projection, evaluates spherical harmonics for view-dependent color, and writes sort keys for depth ordering. Covariance dilation (`dilation`, default `0.3`) is added to the diagonal before inversion with **no opacity compensation** (matching the reference 3DGS rasterizer / gsplat exactly — earlier lux versions scaled opacity by `sqrt(det_orig/det)` to compensate for the dilation blur, which gsplat's default AA mode does not do).
+- **Vertex shader**: reads sorted splat data and emits instanced screen-space quads (6 vertices per splat) sized to the Gaussian's 3σ extent (`radius = ceil(3*sqrt(lambda_max))`)
+- **Fragment shader**: evaluates the 2D Gaussian kernel (`alpha = min(0.99, opacity*exp(-0.5*d²))`, discarding only on the trivial `power > 0` validity check in between — i.e. evaluated out to the full 3σ quad, not an arbitrary tighter cutoff), discards fragments below `alpha_min` (the reference-matching name for what was previously `alpha_cutoff` — still accepted as a legacy alias), and outputs premultiplied alpha for back-to-front compositing
+
+`sort: camera_distance` (default, matches the ratified `KHR_gaussian_splatting` spec's `sortingMethod: cameraDistance`) sorts by true Euclidean distance from the camera; `sort: view_depth` (gsplat's own convention) sorts by raw view-space `z` instead. (Metal's hand-written splat pipeline has no compiled `.lux` config to read this option from — it mirrors the same choice as a host-level `--sort camera_distance|view_depth` CLI flag instead, see `docs/rendering-engines.md`.)
+
+**Note**: the antialiasing/alpha changes above are a real behavior change from lux's previous defaults (no compensation, wider fragment-tail evaluation, `1/255` instead of `0.004` for the threshold) — recompiled splat pipelines render measurably differently (there is no committed golden-image regression fixture in this repo to regenerate).
 
 Push constants provide camera matrices, screen dimensions, focal lengths, splat count, and SH degree. SSBOs carry per-splat input data (positions, rotations, scales, opacities, SH coefficients) and intermediate projected data.
 

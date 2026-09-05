@@ -153,6 +153,11 @@ struct CLIOptions {
     // right after setMorphTime(), for bit-exactness comparison against the
     // Python reference evaluator (playground/dynamic_splat_gltf.py).
     std::string dumpSplatBuffersPrefix;
+
+    // Sort convention (SPECIFICATION.md 12.8's `sort` splat option, mirrored
+    // as a host-level flag here since Metal's splat pipeline is hand-written
+    // MSL with no compiled .lux splat config to read `sort:` from).
+    bool sortByViewDepth = false;  // false = camera_distance (default)
 };
 
 static void printUsage(const char* program) {
@@ -176,6 +181,7 @@ static void printUsage(const char* program) {
               << "  --output-aux <PREFIX>  Write <PREFIX>_color.png, _depth.npy, _mv.npy + PNG previews\n"
               << "  --camera-json <FILE>   Drive the splat camera from {viewmat_cv, K, width, height}\n"
               << "  --camera-json-prev <FILE> Seed the mv \"previous frame\" camera explicitly (testing)\n"
+              << "  --sort <MODE>          camera_distance (default, Euclidean) or view_depth (gsplat's z)\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -239,6 +245,15 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.cameraJsonPrevPath = argv[++i];
         } else if (arg == "--dump-splat-buffers" && i + 1 < argc) {
             opts.dumpSplatBuffersPrefix = argv[++i];
+        } else if (arg == "--sort" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "view_depth") opts.sortByViewDepth = true;
+            else if (mode == "camera_distance") opts.sortByViewDepth = false;
+            else {
+                std::cerr << "Unknown --sort mode: " << mode
+                          << " (expected camera_distance or view_depth)" << std::endl;
+                std::exit(1);
+            }
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -419,6 +434,7 @@ static int runHeadless(const CLIOptions& opts) {
         if (scene.hasSplatData()) {
             std::cout << "[metal] Detected gaussian splat data, using MetalSplatRenderer" << std::endl;
             auto splatR = std::make_unique<MetalSplatRenderer>();
+            splatR->setSortByViewDepth(opts.sortByViewDepth);
             auto tInitStart = std::chrono::steady_clock::now();
             splatR->init(ctx, scene.getSplatData(), opts.width, opts.height);
             auto tInitEnd = std::chrono::steady_clock::now();

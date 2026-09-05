@@ -143,6 +143,7 @@ run_mesh_interactive_rust.bat # Interactive mesh shader viewer (Rust)
 | `--camera-json <FILE>` | Drive the splat camera from an OpenCV-convention `{viewmat_cv, K, width, height}` JSON file -- see `docs/lux-4d-spec.md` section 4 |
 | `--camera-json-prev <FILE>` | Seed the motion-vector "previous frame" camera explicitly from a second camera JSON, instead of the default prev==curr (mv=0) on frame 1 (testing/tooling) |
 | `--output-aux <PREFIX>` | Splats compiled with `motion_vectors`/`expected_depth`: write `<PREFIX>_color.png`, `_depth.npy`, `_mv.npy` (float32, row-major `[H,W,C]`) plus normalized PNG previews |
+| `--sort <MODE>` (Metal only) | `camera_distance` (default, Euclidean) or `view_depth` (gsplat's raw view-space z) -- a host-level mirror of the `splat` block's `sort` option (SPECIFICATION.md 12.8), since Metal's splat pipeline is hand-written MSL with no compiled `.lux` config to read `sort:` from. On Vulkan, `sort` is a compile-time `splat` block member instead (recompile with `sort: view_depth` to switch) |
 
 This table covers flags common to the Vulkan and Metal playgrounds; `--jitter`/`--camera-json`/`--camera-json-prev`/`--output-aux` are implemented identically in both (`playground_cpp/src/main.cpp` and `playground_cpp/src/metal_main.cpp`), sharing their camera-math/`.npy`-writing/un-premultiply logic via `playground_cpp/src/dlss_io.h`.
 

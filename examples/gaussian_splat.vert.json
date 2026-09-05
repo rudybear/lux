@@ -85,7 +85,7 @@
           "size": 4
         },
         {
-          "name": "alpha_cutoff",
+          "name": "alpha_min",
           "type": "scalar",
           "offset": 12,
           "size": 4

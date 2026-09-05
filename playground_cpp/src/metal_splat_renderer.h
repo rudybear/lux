@@ -74,6 +74,15 @@ public:
     MTL::Texture* getMotionTexture() const { return motionTarget_; }
     MTL::Texture* getExpectedDepthTexture() const { return expectedDepthTarget_; }
 
+    // --- Sort convention (SPECIFICATION.md 12.8's `sort` splat option) ---
+    // Metal's splat pipeline is hand-written (no compiled .lux splat config
+    // to read a `sort:` member from -- see the class-level comment), so
+    // this mirrors the option's *semantics* as a host-level toggle instead:
+    // "camera_distance" (default, true Euclidean distance from the camera,
+    // matching the ratified KHR_gaussian_splatting spec) or "view_depth"
+    // (raw view-space z, matching gsplat's own convention).
+    void setSortByViewDepth(bool viewDepth) { sortByViewDepth_ = viewDepth; }
+
     MTL::Texture* getOutputTexture() const override { return colorTarget_; }
     uint32_t getWidth() const override { return width_; }
     uint32_t getHeight() const override { return height_; }
@@ -151,6 +160,8 @@ private:
     glm::mat4 prevViewMatrix_{1.0f};
     glm::mat4 prevProjMatrixUnjittered_{1.0f};
     bool firstMvFrame_ = true;
+
+    bool sortByViewDepth_ = false;  // false = camera_distance (default)
 
     // Cached positions for CPU sort (kept in sync with posBuffer_'s current,
     // possibly-morphed, contents)

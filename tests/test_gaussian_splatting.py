@@ -209,7 +209,11 @@ class TestSplatConfig:
         assert config["kernel"] == "ellipse"
         assert config["color_space"] == "srgb"
         assert config["sort"] == "camera_distance"
-        assert config["alpha_cutoff"] == pytest.approx(0.004)
+        # alpha_cutoff/alpha_min default to 1/255 (3DGS/gsplat convention,
+        # SPECIFICATION.md 12.8), not the old 0.004.
+        assert config["alpha_cutoff"] == pytest.approx(1.0 / 255.0)
+        assert config["alpha_min"] == pytest.approx(1.0 / 255.0)
+        assert config["dilation"] == pytest.approx(0.3)
 
     def test_get_splat_config_sh_degree_3(self):
         """Custom sh_degree should override the default."""
@@ -224,10 +228,78 @@ class TestSplatConfig:
         assert config["color_space"] == "linear"
 
     def test_get_splat_config_custom_alpha(self):
-        """Custom alpha_cutoff should be extracted as a float."""
+        """Custom alpha_cutoff (legacy name) should be extracted as a float
+        and mirrored into alpha_min (they're aliases of each other)."""
         splat = SplatDecl("Custom", [SplatMember("alpha_cutoff", NumberLit("0.01"))])
         config = _get_splat_config(splat)
         assert config["alpha_cutoff"] == pytest.approx(0.01)
+        assert config["alpha_min"] == pytest.approx(0.01)
+
+    def test_get_splat_config_custom_alpha_min(self):
+        """alpha_min (the reference-matching name) should also set the
+        legacy alpha_cutoff alias."""
+        splat = SplatDecl("Custom", [SplatMember("alpha_min", NumberLit("0.02"))])
+        config = _get_splat_config(splat)
+        assert config["alpha_min"] == pytest.approx(0.02)
+        assert config["alpha_cutoff"] == pytest.approx(0.02)
+
+    def test_get_splat_config_custom_dilation(self):
+        splat = SplatDecl("Custom", [SplatMember("dilation", NumberLit("0.5"))])
+        config = _get_splat_config(splat)
+        assert config["dilation"] == pytest.approx(0.5)
+
+    def test_get_splat_config_sort_view_depth(self):
+        splat = SplatDecl("Custom", [SplatMember("sort", VarRef("view_depth"))])
+        config = _get_splat_config(splat)
+        assert config["sort"] == "view_depth"
+
+
+class TestSplatAntialiasing:
+    """3DGS/gsplat antialiasing conventions (SPECIFICATION.md 12.8): no
+    opacity compensation, dilation baked as a compile-time literal, alpha
+    clamped to <= 0.99, only a trivial power>0 discard (no arbitrary -4.0
+    cutoff), and a real (not silently-ignored) `sort` option."""
+
+    def test_no_compensation_term_emitted(self):
+        from luxc.expansion.splat_expander import _build_preprocess_stage
+        stage = _build_preprocess_stage(_get_splat_config(SplatDecl("S", [])))
+        main_fn = next(fn for fn in stage.functions if fn.name == "main")
+        var_names = {stmt.name for stmt in main_fn.body if hasattr(stmt, "name")}
+        assert "compensation" not in var_names
+        assert "det_orig" not in var_names
+
+    def test_dilation_baked_as_literal(self):
+        from luxc.expansion.splat_expander import _build_preprocess_stage
+        config = _get_splat_config(SplatDecl("S", [SplatMember("dilation", NumberLit("0.7"))]))
+        stage = _build_preprocess_stage(config)
+        main_fn = next(fn for fn in stage.functions if fn.name == "main")
+        dilation_lets = [stmt for stmt in main_fn.body
+                         if hasattr(stmt, "name") and stmt.name in ("cov2d_00f", "cov2d_11f")]
+        assert len(dilation_lets) == 2
+        for stmt in dilation_lets:
+            # value is `cov2d_XX + <dilation literal>`; the literal's value
+            # should be exactly the configured dilation.
+            assert stmt.value.right.value == "0.7"
+
+    def test_fragment_no_arbitrary_power_cutoff(self):
+        from luxc.expansion.splat_expander import _build_fragment_body
+        config = _get_splat_config(SplatDecl("S", []))
+        body = _build_fragment_body(config)
+        # There should be exactly one power-related discard (`power > 0.0`),
+        # not the old `power < -4.0`.
+        literals = [stmt.condition.right.value for stmt in body
+                    if hasattr(stmt, "condition") and hasattr(stmt.condition, "right")
+                    and getattr(stmt.condition, "op", None) == ">"
+                    and getattr(stmt.condition.left, "name", None) == "power"]
+        assert literals == ["0.0"]
+
+    def test_fragment_alpha_clamped_to_099(self):
+        from luxc.expansion.splat_expander import _build_fragment_body
+        config = _get_splat_config(SplatDecl("S", []))
+        body = _build_fragment_body(config)
+        alpha_let = next(stmt for stmt in body if getattr(stmt, "name", None) == "alpha")
+        assert alpha_let.value.func.name == "min"
+        assert any(getattr(a, "value", None) == "0.99" for a in alpha_let.value.args)
 
 
 # =========================================================================
@@ -497,7 +569,9 @@ class TestSplatEdgeCases:
         assert any("workgroup_size" in attr for attr in main_fn.attributes)
 
     def test_fragment_alpha_cutoff(self):
-        """The fragment stage push constants should include alpha_cutoff."""
+        """The fragment stage push constants should include alpha_min (the
+        reference-matching name; renamed from alpha_cutoff, SPECIFICATION.md
+        12.8's 3DGS/gsplat antialiasing convention update)."""
         module = parse_lux(_PIPELINE_WITH_SPLAT)
         module._defines = {}
         expand_surfaces(module)
@@ -505,7 +579,7 @@ class TestSplatEdgeCases:
         assert len(fragment.push_constants) == 1
         pc = fragment.push_constants[0]
         field_names = {f.name for f in pc.fields}
-        assert "alpha_cutoff" in field_names
+        assert "alpha_min" in field_names
 
 
 # =========================================================================

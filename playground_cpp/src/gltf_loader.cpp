@@ -248,6 +248,52 @@ static bool jsonExtractObject(const std::string& json, const std::string& key, s
     return true;
 }
 
+// Find the raw JSON text of `data->meshes[meshIndex]`'s `"extras"` object by
+// manually scanning cgltf's retained raw JSON buffer (data->json/json_size).
+// Needed because this vendored cgltf.h calls cgltf_parse_json_extras() for
+// PRIMITIVE-level extras but never for the owning cgltf_mesh object itself,
+// so `mesh.extras.data` is always null even when a writer (e.g. the ratified
+// MOBILEDLSS_dynamic_splats convention) puts extras on the mesh.
+static bool jsonMeshExtras(const cgltf_data* data, size_t meshIndex, std::string& out) {
+    if (!data->json || data->json_size == 0) return false;
+    std::string json(data->json, data->json_size);
+
+    size_t pos = json.find("\"meshes\"");
+    if (pos == std::string::npos) return false;
+    pos = json.find('[', pos);
+    if (pos == std::string::npos) return false;
+
+    // Walk balanced brace/bracket depth from just past the array's '[':
+    // depth==0 means "directly inside the meshes array" -- a '{' seen there
+    // starts the meshIndex-th element, and the matching '}' (depth back to 0)
+    // ends it.
+    int depth = 0;
+    size_t objStart = std::string::npos;
+    size_t curIndex = 0;
+    for (size_t i = pos + 1; i < json.size(); i++) {
+        char c = json[i];
+        if (c == '{' || c == '[') {
+            if (depth == 0 && c == '{') objStart = i;
+            depth++;
+        } else if (c == '}' || c == ']') {
+            depth--;
+            if (depth == 0) {
+                if (c == '}' && objStart != std::string::npos) {
+                    if (curIndex == meshIndex) {
+                        std::string meshObj = json.substr(objStart, i - objStart + 1);
+                        return jsonExtractObject(meshObj, "extras", out);
+                    }
+                    curIndex++;
+                    objStart = std::string::npos;
+                } else if (c == ']') {
+                    return false;  // end of the meshes array, index not found
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // Find the raw JSON text of a named unprocessed extension on a primitive, if any.
 static const char* findExtensionData(const cgltf_primitive& prim, const char* name) {
     for (size_t i = 0; i < prim.extensions_count; i++) {
@@ -1062,10 +1108,17 @@ GltfScene loadGltf(const std::string& path) {
                 }
 
                 // --- mesh.extras.MOBILEDLSS_dynamic_splats (informative) ---
-                if (mesh.extras.data) {
-                    std::string extrasJson(static_cast<const char*>(mesh.extras.data));
+                // NOTE: this vendored cgltf.h only calls cgltf_parse_json_extras()
+                // for PRIMITIVE-level extras (out_prim->extras), never for the
+                // owning cgltf_mesh itself -- mesh.extras.data is therefore
+                // always null, even though the ratified writer puts
+                // MOBILEDLSS_dynamic_splats on the *mesh* object. Fall back to a
+                // manual scan of the raw JSON buffer cgltf retains
+                // (data->json/json_size) instead of relying on cgltf for this.
+                std::string meshExtrasJson;
+                if (jsonMeshExtras(data, mi, meshExtrasJson)) {
                     std::string convJson;
-                    if (jsonExtractObject(extrasJson, "MOBILEDLSS_dynamic_splats", convJson)) {
+                    if (jsonExtractObject(meshExtrasJson, "MOBILEDLSS_dynamic_splats", convJson)) {
                         float fps = 30.0f;
                         if (jsonExtractFloat(convJson, "fps", fps)) {
                             scene.splat_data.dynamics.extrasFps = fps;

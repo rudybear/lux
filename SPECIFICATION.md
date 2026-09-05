@@ -1794,8 +1794,9 @@ splat Name {
     sh_degree: 0,             // 0, 1, 2, or 3
     kernel: ellipse,          // ellipse | circle
     color_space: srgb,        // srgb | linear
-    sort: camera_distance,    // camera_distance | depth
-    alpha_cutoff: 0.004,
+    sort: camera_distance,    // camera_distance (default, true Euclidean distance) | view_depth (raw view-space z)
+    dilation: 0.3,            // added to the projected 2D covariance diagonal (3DGS/gsplat "eps2d")
+    alpha_min: 0.00392,       // ~= 1/255; fragments below this alpha are discarded
     motion: keyframes,        // optional; see below
 }
 
@@ -1806,6 +1807,10 @@ pipeline Name {
 ```
 
 **Grammar**: `splat_decl: "splat" IDENT "{" splat_item ("," splat_item)* ","? "}"`, where `splat_item` is `splat_member: IDENT ":" expr` (fully generic key-value pairs, same mechanism as `surface_item`) or a `properties` block. **AST**: `SplatDecl(name, members: list[SplatMember], properties)`.
+
+**3DGS/gsplat antialiasing conventions** (`dilation`, `alpha_min`; defaults `0.3` and `1/255 ≈ 0.00392`, matching the reference 3DGS rasterizer / gsplat exactly): `dilation` is added to both diagonal entries of the projected 2D covariance before inversion (the "low-pass filter"/"eps2d" that prevents aliasing on sub-pixel splats), with **no opacity compensation** for the resulting blur — earlier lux versions additionally scaled opacity by `sqrt(det_orig/det)`, which gsplat's default AA mode does not do; that compensation term has been removed. Per fragment, `alpha = min(0.99, opacity * exp(-0.5*d²))` (evaluated out to the quad's own 3σ extent — `raw_radius = ceil(3.0*sqrt(lambda_max))`, unchanged — with only a trivial `power > 0` validity discard in between, not an arbitrary tighter cutoff), and fragments with `alpha < alpha_min` are discarded. `alpha_min` is the compile-time-reflected name for what was previously called `alpha_cutoff`; the legacy name is still accepted as an alias (setting either sets both), and the actual runtime discard threshold is a host-controlled push constant (`push.alpha_min`), not a compile-time literal — same pre-existing architecture as `alpha_cutoff` before it, allowing runtime tuning without recompiling. **This changes lux's previous default rendering behavior** (no compensation + wider fragment-tail evaluation + a slightly different default threshold): recompiled splat pipelines render measurably differently from before (spot-checked: `luigi.glb`, 256×256 — 9,857/65,536 pixels changed, max per-channel diff 60/255); there is no committed golden-PNG regression fixture in this repo to regenerate, so this is reported here instead.
+
+**`sort`**: `camera_distance` (default, matching the ratified `KHR_gaussian_splatting` spec's `sortingMethod: cameraDistance`) computes the true Euclidean distance from the camera (`-length(view_pos)`, negated to preserve the ascending-sort-key = back-to-front draw order the fixed-function alpha blend requires); `view_depth` (gsplat's own convention) uses raw view-space `z` instead — added so the two can be measured against each other. Previously `sort` was accepted but never actually affected codegen (always used view-space `z`, i.e. behaved like today's `view_depth` regardless of the declared value) — this is now a real, functioning option.
 
 **`motion: keyframes`** (optional, default: no motion): dynamic (4D) Gaussian splats animated via glTF morph targets on the splat `POINTS` primitive (base attributes + one sparse morph target per keyframe for `POSITION`, `KHR_gaussian_splatting:ROTATION`, and `KHR_gaussian_splatting:SH_DEGREE_0_COEF_0`, driven by a `LINEAR`-sampled `animation` on the node's `weights`). When set, `expand_splat_pipeline` prepends a **4th stage** ("morph apply", `stage_type: compute`, `_output_stem_suffix = "morph"`) that runs before the preprocess stage:
 

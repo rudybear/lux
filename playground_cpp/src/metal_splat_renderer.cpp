@@ -1008,7 +1008,16 @@ void MetalSplatRenderer::cpuSort() {
         float x = hostPositions_[i * 4 + 0];
         float y = hostPositions_[i * 4 + 1];
         float z = hostPositions_[i * 4 + 2];
-        depths[i] = vm[2] * x + vm[6] * y + vm[10] * z + vm[14];
+        if (sortByViewDepth_) {
+            // "view_depth": raw view-space z (gsplat's own convention).
+            depths[i] = vm[2] * x + vm[6] * y + vm[10] * z + vm[14];
+        } else {
+            // "camera_distance" (default): true Euclidean distance from the
+            // camera, negated so it sorts with the same "more negative ==
+            // farther" convention as view-space z above.
+            float dx = x - camPos_.x, dy = y - camPos_.y, dz = z - camPos_.z;
+            depths[i] = -std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
     }
 
     std::vector<uint32_t> indices(numSplats_);
@@ -1125,7 +1134,8 @@ void MetalSplatRenderer::renderToTarget(MetalContext& ctx, MTL::Texture* colorTe
     renderUniforms.screenW = static_cast<float>(drawW);
     renderUniforms.screenH = static_cast<float>(drawH);
     renderUniforms.visibleCount = numSplats_;
-    renderUniforms.alphaCutoff = 0.004f;
+    // alpha_min default (3DGS/gsplat convention, SPECIFICATION.md 12.8): 1/255.
+    renderUniforms.alphaCutoff = 1.0f / 255.0f;
 
     // --- Command buffer with compute + render ---
     auto* cmdBuf = ctx.beginCommandBuffer();
