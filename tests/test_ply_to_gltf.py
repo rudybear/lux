@@ -433,8 +433,8 @@ class TestScaleTransform:
         values = np.array([[0.5, 0.3, 15.0]])
         assert auto_detect_scale_space(values) is False
 
-    def test_scale_kept_in_log_space(self, tmp_path):
-        """KHR spec: scales stay in log-space (no exp transform)."""
+    def test_scale_converted_to_linear_by_default(self, tmp_path):
+        """Ratified KHR spec: SCALE is linear (log -> linear exp transform applied)."""
         log_scale = -3.0
         splats = [_default_splat(scale_0=log_scale, scale_1=log_scale, scale_2=log_scale)]
         ply_path = _make_ply_binary(tmp_path, splats)
@@ -444,7 +444,22 @@ class TestScaleTransform:
         gltf, bin_data = load_glb(glb_path)
         attrs = gltf['meshes'][0]['primitives'][0]['attributes']
         scales = read_accessor(gltf, bin_data, attrs['KHR_gaussian_splatting:SCALE'])
-        # Scales kept in log-space per KHR spec — all same value after coord swap
+        expected_linear = math.exp(log_scale)
+        for j in range(3):
+            assert float(scales[0, j]) == pytest.approx(expected_linear, abs=1e-5)
+            assert scales[0, j] >= 0.0  # ratified spec: SCALE MUST NOT be negative
+
+    def test_scale_kept_in_log_space_with_legacy_layout(self, tmp_path):
+        """--legacy-layout: scales stay in log-space (pre-ratification draft behavior)."""
+        log_scale = -3.0
+        splats = [_default_splat(scale_0=log_scale, scale_1=log_scale, scale_2=log_scale)]
+        ply_path = _make_ply_binary(tmp_path, splats)
+        glb_path = os.path.join(str(tmp_path), "test.glb")
+        ply_to_gltf(ply_path, glb_path, raw_opacity=True, quiet=True, legacy_layout=True)
+
+        gltf, bin_data = load_glb(glb_path)
+        ext = gltf['meshes'][0]['primitives'][0]['extensions']['KHR_gaussian_splatting']
+        scales = read_accessor(gltf, bin_data, ext['attributes']['SCALE'])
         for j in range(3):
             assert float(scales[0, j]) == pytest.approx(log_scale, abs=1e-5)
 
@@ -678,7 +693,7 @@ class TestEdgeCases:
         splats = [_default_splat()]
         ply_path = _make_ply_binary(tmp_path, splats, sh_degree=0)
         glb_path = os.path.join(str(tmp_path), "test.glb")
-        ply_to_gltf(ply_path, glb_path, quiet=True)
+        ply_to_gltf(ply_path, glb_path, quiet=True, add_color0=False)
 
         gltf, _ = load_glb(glb_path)
         # 5 accessors: pos, rot, scale, opacity, sh_dc
@@ -690,11 +705,23 @@ class TestEdgeCases:
         ply_path = _make_ply_binary(tmp_path, splats, sh_degree=1,
                                     extra_rest_coeffs=[[0.01 * i for i in range(9)]])
         glb_path = os.path.join(str(tmp_path), "test.glb")
-        ply_to_gltf(ply_path, glb_path, quiet=True)
+        ply_to_gltf(ply_path, glb_path, quiet=True, add_color0=False)
 
         gltf, _ = load_glb(glb_path)
         # 5 base (pos, rot, scale, opa, sh_dc) + 3 VEC3 per-coefficient for degree 1
         assert len(gltf['accessors']) == 8
+
+    def test_ratified_layout_adds_color0_fallback(self, tmp_path):
+        """Ratified layout should add one extra COLOR_0 accessor by default."""
+        splats = [_default_splat()]
+        ply_path = _make_ply_binary(tmp_path, splats, sh_degree=0)
+        glb_path = os.path.join(str(tmp_path), "test.glb")
+        ply_to_gltf(ply_path, glb_path, quiet=True)
+
+        gltf, _ = load_glb(glb_path)
+        prim = gltf['meshes'][0]['primitives'][0]
+        assert 'COLOR_0' in prim['attributes']
+        assert len(gltf['accessors']) == 6
 
     def test_center_positions(self, tmp_path):
         """--center should center the point cloud at origin."""
@@ -745,12 +772,25 @@ class TestEdgeCases:
         # Should keep indices 1 (0.9) and 3 (0.8)
         np.testing.assert_array_equal(result['opacity'], [0.9, 0.8])
 
-    def test_extensions_used_not_required(self, tmp_path):
-        """glTF output must use extensionsUsed (NOT extensionsRequired)."""
+    def test_ratified_layout_sets_extensions_required(self, tmp_path):
+        """Ratified layout: glTF output must list extensionsRequired too."""
         splats = [_default_splat()]
         ply_path = _make_ply_binary(tmp_path, splats)
         glb_path = os.path.join(str(tmp_path), "test.glb")
         ply_to_gltf(ply_path, glb_path, quiet=True)
+
+        gltf, _ = load_glb(glb_path)
+        assert 'extensionsUsed' in gltf
+        assert 'KHR_gaussian_splatting' in gltf['extensionsUsed']
+        assert 'extensionsRequired' in gltf
+        assert 'KHR_gaussian_splatting' in gltf['extensionsRequired']
+
+    def test_legacy_layout_extensions_used_not_required(self, tmp_path):
+        """--legacy-layout: matches the old pre-ratification behavior (no extensionsRequired)."""
+        splats = [_default_splat()]
+        ply_path = _make_ply_binary(tmp_path, splats)
+        glb_path = os.path.join(str(tmp_path), "test.glb")
+        ply_to_gltf(ply_path, glb_path, quiet=True, legacy_layout=True)
 
         gltf, _ = load_glb(glb_path)
         assert 'extensionsUsed' in gltf
@@ -987,3 +1027,68 @@ class TestExistingAssets:
             pos_accessor = gltf['accessors'][0]
             assert 'min' in pos_accessor, f"{name} missing POSITION min"
             assert 'max' in pos_accessor, f"{name} missing POSITION max"
+
+
+# =========================================================================
+# 16. glb_to_ply.py round-trip (ratified and legacy layouts)
+# =========================================================================
+
+class TestGlbToPlyLayouts:
+    """glb_to_ply.py must read back both the ratified and legacy layouts."""
+
+    def test_glb_to_ply_ratified_layout(self, tmp_path):
+        """Ratified layout (linear SCALE/OPACITY) round-trips through glb_to_ply.py."""
+        from tools.glb_to_ply import convert_glb_to_ply
+
+        splats = [_default_splat(scale_0=-3.0, scale_1=-3.0, scale_2=-3.0, opacity=0.8)]
+        ply_path = _make_ply_binary(tmp_path, splats)
+        glb_path = os.path.join(str(tmp_path), "ratified.glb")
+        ply_to_gltf(ply_path, glb_path, quiet=True)
+
+        out_ply = os.path.join(str(tmp_path), "roundtrip.ply")
+        convert_glb_to_ply(glb_path, out_ply, verbose=False)
+        assert os.path.exists(out_ply)
+
+        # PLY output is always log/logit space; check the scale round-trips to ~-3.0.
+        with open(out_ply, 'rb') as f:
+            data = f.read()
+        header_end = data.index(b'end_header\n') + len(b'end_header\n')
+        values = struct.unpack('<17f', data[header_end:header_end + 17 * 4])
+        # Layout: x,y,z,nx,ny,nz,f_dc_0,f_dc_1,f_dc_2,opacity,scale_0,scale_1,scale_2,rot...
+        scale_0 = values[10]
+        assert scale_0 == pytest.approx(-3.0, abs=1e-4)
+
+    def test_glb_to_ply_legacy_layout(self, tmp_path):
+        """Legacy pre-ratification draft layout round-trips through glb_to_ply.py."""
+        from tools.glb_to_ply import convert_glb_to_ply
+
+        splats = [_default_splat(scale_0=-3.0, scale_1=-3.0, scale_2=-3.0, opacity=0.8)]
+        ply_path = _make_ply_binary(tmp_path, splats)
+        glb_path = os.path.join(str(tmp_path), "legacy.glb")
+        ply_to_gltf(ply_path, glb_path, quiet=True, legacy_layout=True)
+
+        out_ply = os.path.join(str(tmp_path), "roundtrip_legacy.ply")
+        convert_glb_to_ply(glb_path, out_ply, verbose=False)
+        assert os.path.exists(out_ply)
+
+        with open(out_ply, 'rb') as f:
+            data = f.read()
+        header_end = data.index(b'end_header\n') + len(b'end_header\n')
+        values = struct.unpack('<17f', data[header_end:header_end + 17 * 4])
+        scale_0 = values[10]
+        assert scale_0 == pytest.approx(-3.0, abs=1e-4)
+
+    def test_glb_to_ply_khr_conformance_asset(self):
+        """glb_to_ply.py must handle the official (pre-editorial-review) conformance
+        layout too: log-space SCALE, colorSpace="BT.709-sRGB"."""
+        from tools.glb_to_ply import convert_glb_to_ply
+
+        asset = os.path.join(os.path.dirname(__file__), 'assets',
+                              'khr_splat_conformance', 'Scales.glb')
+        if not os.path.exists(asset):
+            pytest.skip("khr_splat_conformance assets not downloaded")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_ply = os.path.join(tmp, 'scales.ply')
+            convert_glb_to_ply(asset, out_ply, verbose=False)
+            assert os.path.exists(out_ply)

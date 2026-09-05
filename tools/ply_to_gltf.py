@@ -483,8 +483,20 @@ def read_accessor(gltf, bin_data, accessor_idx):
 def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
                 convert_coords=True, convert_sh=True,
                 raw_opacity=False, raw_scale=False,
-                do_center=False, decimate_count=None, quiet=False):
+                do_center=False, decimate_count=None, quiet=False,
+                legacy_layout=False, color_space="srgb_rec709_display",
+                add_color0=None):
     """Convert PLY to glTF (.glb) with KHR_gaussian_splatting.
+
+    By default this writes the *ratified* Khronos KHR_gaussian_splatting
+    layout (attribute semantics living directly in ``primitive.attributes``,
+    e.g. ``KHR_gaussian_splatting:SCALE``, with the extension object
+    carrying the required ``kernel``/``colorSpace`` properties, and SCALE
+    stored as linear values per the ratified spec). Pass
+    ``legacy_layout=True`` to instead emit the pre-ratification draft layout
+    that older lux tooling/tests used (ROTATION/SCALE/OPACITY accessor
+    indices nested under ``extensions.KHR_gaussian_splatting.attributes``,
+    SCALE kept in log-space, no ``kernel``/``colorSpace``).
 
     Args:
         ply_path: Input PLY file path.
@@ -493,14 +505,25 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
         convert_coords: If True, convert Z-up to Y-up (default True).
         convert_sh: If True, convert SH coefficients from 3DGS to KHR convention (default True).
         raw_opacity: If True, skip opacity sigmoid transform.
-        raw_scale: If True, skip scale exp transform.
+        raw_scale: If True, skip the log->linear scale conversion (ratified layout only;
+            use when the PLY already stores linear scale values).
         do_center: If True, center point cloud at origin.
         decimate_count: If set, reduce to this many splats.
         quiet: If True, suppress output.
+        legacy_layout: If True, emit the pre-ratification draft layout instead of the
+            ratified one (default False).
+        color_space: KHR_gaussian_splatting colorSpace value for the ratified layout
+            ("srgb_rec709_display" or "lin_rec709_display"). Ignored for legacy_layout.
+        add_color0: If True, add an optional COLOR_0 fallback attribute (VEC4 linear
+            RGBA, derived from the SH DC term + opacity) for the ratified layout, so
+            non-splat-aware viewers can fall back to a colored point cloud. Defaults to
+            True for the ratified layout and is ignored (never added) for legacy_layout.
 
     Returns:
         dict with conversion metadata.
     """
+    if add_color0 is None:
+        add_color0 = not legacy_layout
     data = read_ply(ply_path)
     n = data['_vertex_count']
     props = data['_properties']
@@ -559,11 +582,27 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
     if convert_coords:
         scales = convert_scales_z_up_to_y_up(scales)
 
-    # KHR_gaussian_splatting spec stores scales in log-space (same as 3DGS PLY).
-    # No transform needed — pass through as-is.  The compute shader applies exp().
-    if not quiet:
-        print("Scales kept in log-space (KHR spec)")
-    scale_buf = scales.astype(np.float32).tobytes()
+    # 3DGS PLY files store scale in log-space (raw training output).
+    #
+    # The *ratified* KHR_gaussian_splatting spec requires SCALE to be linear
+    # ("Scale values are linear and MUST NOT be negative") — this differs from
+    # the pre-ratification draft (and the currently-published Khronos
+    # conformance test assets, which predate an April-2026 editorial pass and
+    # still store log-space values). Ratified output therefore applies exp()
+    # here; legacy_layout keeps the old log-space passthrough.
+    if legacy_layout:
+        if not quiet:
+            print("Scales kept in log-space (legacy pre-ratification draft layout)")
+        scale_buf = scales.astype(np.float32).tobytes()
+    elif raw_scale:
+        if not quiet:
+            print("Scales written as-is (--raw-scale: already linear)")
+        scale_buf = scales.astype(np.float32).tobytes()
+    else:
+        linear_scales = np.exp(scales)
+        if not quiet:
+            print("Converted scales log -> linear (ratified KHR_gaussian_splatting spec)")
+        scale_buf = linear_scales.astype(np.float32).tobytes()
 
     # Build opacity array
     opacities = data['opacity'].copy()
@@ -650,6 +689,28 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
     for _, _, buf in sh_coeff_bufs:
         buffer_parts.append(buf)
 
+    # Optional COLOR_0 fallback attribute (ratified layout only): lets a
+    # renderer with no KHR_gaussian_splatting support still show a colored
+    # point cloud. Per spec: diffuse = clip(SH_DC * 0.282095 + 0.5, 0, 1),
+    # decoded from sRGB to linear if colorSpace is srgb_rec709_display
+    # (COLOR_0 is always linear per the base glTF spec); alpha = opacity.
+    color0_buf = None
+    if add_color0 and not legacy_layout:
+        SH_C0 = 0.2820947917738781
+        diffuse = np.clip(sh_dc * SH_C0 + 0.5, 0.0, 1.0)
+        if color_space == "lin_rec709_display":
+            diffuse_linear = diffuse
+        else:
+            # sRGB EOTF (decode display-referred sRGB -> linear)
+            diffuse_linear = np.where(
+                diffuse <= 0.04045,
+                diffuse / 12.92,
+                ((diffuse + 0.055) / 1.055) ** 2.4,
+            )
+        color0 = np.column_stack([diffuse_linear, opacities.reshape(-1, 1)])
+        color0_buf = color0.astype(np.float32).tobytes()
+        buffer_parts.append(color0_buf)
+
     offsets = []
     running = 0
     for part in buffer_parts:
@@ -686,19 +747,40 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
             "type": "VEC3",
         })
 
-    # Build KHR-conformant primitive attributes
-    attributes = {
-        "POSITION": 0,
-        "KHR_gaussian_splatting:ROTATION": 1,
-        "KHR_gaussian_splatting:SCALE": 2,
-        "KHR_gaussian_splatting:OPACITY": 3,
-        "KHR_gaussian_splatting:SH_DEGREE_0_COEF_0": 4,
-    }
-    for idx, (l, c, _) in enumerate(sh_coeff_bufs):
-        attributes[f"KHR_gaussian_splatting:SH_DEGREE_{l}_COEF_{c}"] = 5 + idx
+    color0_accessor_idx = None
+    if color0_buf is not None:
+        color0_accessor_idx = 5 + len(sh_coeff_bufs)
+        accessors.append({
+            "bufferView": color0_accessor_idx,
+            "componentType": 5126,
+            "count": n,
+            "type": "VEC4",
+        })
 
-    # Build extension "sh" array with per-coefficient accessor indices per degree.
-    # coefficients is an array of accessor indices (one VEC3 accessor per coefficient).
+    # Build KHR-conformant primitive attributes.
+    if legacy_layout:
+        # Pre-ratification draft layout: only POSITION lives in
+        # primitive.attributes; ROTATION/SCALE/OPACITY/SH accessor indices
+        # are nested (unprefixed) under extensions.KHR_gaussian_splatting.
+        attributes = {"POSITION": 0}
+    else:
+        # Ratified layout: every splat attribute semantic lives directly in
+        # primitive.attributes, namespaced with the extension name.
+        attributes = {
+            "POSITION": 0,
+            "KHR_gaussian_splatting:ROTATION": 1,
+            "KHR_gaussian_splatting:SCALE": 2,
+            "KHR_gaussian_splatting:OPACITY": 3,
+            "KHR_gaussian_splatting:SH_DEGREE_0_COEF_0": 4,
+        }
+        for idx, (l, c, _) in enumerate(sh_coeff_bufs):
+            attributes[f"KHR_gaussian_splatting:SH_DEGREE_{l}_COEF_{c}"] = 5 + idx
+        if color0_accessor_idx is not None:
+            attributes["COLOR_0"] = color0_accessor_idx
+
+    # Build extension "sh" array with per-coefficient accessor indices per degree
+    # (legacy layout only — the ratified layout has no such field; SH accessors
+    # are found directly via the KHR_gaussian_splatting:SH_DEGREE_*_COEF_* keys).
     sh_entries = [{"degree": 0, "coefficients": [4]}]
     for l in range(1, sh_degree + 1):
         degree_acc_indices = [
@@ -706,9 +788,28 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
         ]
         sh_entries.append({"degree": l, "coefficients": degree_acc_indices})
 
+    if legacy_layout:
+        splat_extension = {
+            "attributes": {
+                "ROTATION": 1,
+                "SCALE": 2,
+                "OPACITY": 3,
+            },
+            "sh": sh_entries,
+        }
+    else:
+        splat_extension = {
+            "kernel": "ellipse",
+            "colorSpace": color_space,
+            "sortingMethod": "cameraDistance",
+            "projection": "perspective",
+        }
+
+    extensions_used = ["KHR_gaussian_splatting"]
+
     gltf_json = {
         "asset": {"version": "2.0", "generator": "lux-ply-to-gltf"},
-        "extensionsUsed": ["KHR_gaussian_splatting"],
+        "extensionsUsed": extensions_used,
         "buffers": [{"byteLength": total_size}],
         "bufferViews": buffer_views,
         "accessors": accessors,
@@ -717,14 +818,7 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
                 "mode": 0,
                 "attributes": attributes,
                 "extensions": {
-                    "KHR_gaussian_splatting": {
-                        "attributes": {
-                            "ROTATION": 1,
-                            "SCALE": 2,
-                            "OPACITY": 3,
-                        },
-                        "sh": sh_entries,
-                    }
+                    "KHR_gaussian_splatting": splat_extension,
                 }
             }]
         }],
@@ -732,6 +826,13 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
         "scenes": [{"nodes": [0]}],
         "scene": 0,
     }
+
+    if not legacy_layout:
+        # Ratified layout: KHR_gaussian_splatting fundamentally changes how the
+        # primitive must be interpreted (mode POINTS + namespaced attributes),
+        # so a renderer without support for it cannot safely render it as a
+        # normal point cloud without the COLOR_0 fallback; list it as required.
+        gltf_json["extensionsRequired"] = list(extensions_used)
 
     glb_bytes = encode_glb(gltf_json, buffer_parts)
     with open(gltf_path, 'wb') as f:
@@ -755,9 +856,24 @@ def ply_to_gltf(ply_path, gltf_path, sh_degree=None,
 # Round-trip verification
 # ---------------------------------------------------------------------------
 
+def _resolve_splat_accessor(attrs, ext, suffix):
+    """Resolve a splat attribute's accessor index across all layouts.
+
+    Checks, in order: the ratified ``KHR_gaussian_splatting:<suffix>``
+    primitive attribute, the internal ``_<suffix>`` convention (used by
+    hand-authored lux test fixtures), then the legacy pre-ratification
+    ``extensions.KHR_gaussian_splatting.attributes.<suffix>`` nesting.
+    """
+    if f"KHR_gaussian_splatting:{suffix}" in attrs:
+        return attrs[f"KHR_gaussian_splatting:{suffix}"]
+    if f"_{suffix}" in attrs:
+        return attrs[f"_{suffix}"]
+    return ext["attributes"][suffix]
+
+
 def verify_round_trip(ply_path, glb_path, convert_coords=True,
                       raw_opacity=False, raw_scale=False, threshold=1e-5,
-                      quiet=False):
+                      quiet=False, legacy_layout=False):
     """Verify PLY -> glTF conversion by reading back and comparing.
 
     Reads the original PLY and the generated GLB, applies inverse transforms
@@ -780,11 +896,11 @@ def verify_round_trip(ply_path, glb_path, convert_coords=True,
 
     glb_positions = read_accessor(gltf, bin_data, attrs['POSITION'])
     glb_rotations = read_accessor(gltf, bin_data,
-                                  attrs.get('_ROTATION', ext['attributes']['ROTATION']))
+                                  _resolve_splat_accessor(attrs, ext, 'ROTATION'))
     glb_scales = read_accessor(gltf, bin_data,
-                               attrs.get('_SCALE', ext['attributes']['SCALE']))
+                               _resolve_splat_accessor(attrs, ext, 'SCALE'))
     glb_opacities = read_accessor(gltf, bin_data,
-                                  attrs.get('_OPACITY', ext['attributes']['OPACITY']))
+                                  _resolve_splat_accessor(attrs, ext, 'OPACITY'))
 
     n_glb = gltf['accessors'][attrs['POSITION']]['count']
     assert n_orig == n_glb, f"Vertex count mismatch: PLY={n_orig}, GLB={n_glb}"
@@ -819,12 +935,16 @@ def verify_round_trip(ply_path, glb_path, convert_coords=True,
         orig_rot_conv = np.column_stack([qx, qy, qz, w])
     errors['rotation'] = float(np.max(np.abs(glb_rotations - orig_rot_conv)))
 
-    # Compare scales (kept in log-space per KHR spec, no transform)
+    # Compare scales. Legacy layout keeps scale in log-space (no transform);
+    # the ratified layout stores linear scale, so PLY log-space values must
+    # be exponentiated before comparison (unless --raw-scale skipped that).
     orig_scales = np.column_stack([
         orig['scale_0'], orig['scale_1'], orig['scale_2']
     ]).astype(np.float32)
     if convert_coords:
         orig_scales = convert_scales_z_up_to_y_up(orig_scales)
+    if not legacy_layout and not raw_scale:
+        orig_scales = np.exp(orig_scales).astype(np.float32)
     errors['scale'] = float(np.max(np.abs(glb_scales - orig_scales)))
 
     # Compare opacities
@@ -834,12 +954,17 @@ def verify_round_trip(ply_path, glb_path, convert_coords=True,
             orig_opa = sigmoid(orig_opa).astype(np.float32)
     errors['opacity'] = float(np.max(np.abs(glb_opacities - orig_opa)))
 
-    # Compare SH DC
-    sh_bands = ext.get('sh', [])
-    if sh_bands:
-        coeffs = sh_bands[0]['coefficients']
-        # Handle both old (single index) and new (array of indices) formats
-        sh0_idx = coeffs[0] if isinstance(coeffs, list) else coeffs
+    # Compare SH DC. Ratified layout: KHR_gaussian_splatting:SH_DEGREE_0_COEF_0
+    # lives directly in primitive.attributes. Legacy layout: resolved via the
+    # extensions.KHR_gaussian_splatting.sh[] array.
+    sh0_idx = attrs.get('KHR_gaussian_splatting:SH_DEGREE_0_COEF_0')
+    if sh0_idx is None:
+        sh_bands = ext.get('sh', [])
+        if sh_bands:
+            coeffs = sh_bands[0]['coefficients']
+            # Handle both old (single index) and new (array of indices) formats
+            sh0_idx = coeffs[0] if isinstance(coeffs, list) else coeffs
+    if sh0_idx is not None:
         glb_sh0 = read_accessor(gltf, bin_data, sh0_idx)
         orig_sh0 = np.column_stack([
             orig['f_dc_0'], orig['f_dc_1'], orig['f_dc_2']
@@ -954,9 +1079,28 @@ Examples:
     parser.add_argument('--raw-opacity', action='store_true', default=False,
                         help='Skip sigmoid opacity transform (PLY already in linear [0,1])')
     parser.add_argument('--raw-scale', action='store_true', default=False,
-                        help='Skip exp scale transform (PLY already in linear space)')
+                        help='Skip log->linear scale conversion (PLY already in linear space; '
+                             'ratified layout only)')
     parser.add_argument('--sh-degree', type=int, default=None, metavar='N',
                         help='Override SH degree (default: auto-detect)')
+
+    # Layout selection
+    parser.add_argument('--legacy-layout', action='store_true', default=False,
+                        help='Emit the pre-ratification draft KHR_gaussian_splatting layout '
+                             '(ROTATION/SCALE/OPACITY nested under extensions.attributes, '
+                             'SCALE kept in log-space) instead of the ratified layout (default)')
+    parser.add_argument('--color-space', type=str, default='srgb_rec709_display',
+                        choices=['srgb_rec709_display', 'lin_rec709_display'],
+                        help='KHR_gaussian_splatting colorSpace for the ratified layout '
+                             '(default: srgb_rec709_display)')
+    color0_group = parser.add_mutually_exclusive_group()
+    color0_group.add_argument('--color0-fallback', action='store_true', default=None,
+                              dest='add_color0',
+                              help='Add an optional COLOR_0 fallback attribute (default for '
+                                   'the ratified layout)')
+    color0_group.add_argument('--no-color0-fallback', action='store_false', default=None,
+                              dest='add_color0',
+                              help='Do not add a COLOR_0 fallback attribute')
 
     # Processing
     parser.add_argument('--center', action='store_true', default=False,
@@ -1005,6 +1149,9 @@ def main(argv=None):
             raw_scale=args.raw_scale,
             do_center=args.center,
             decimate_count=args.decimate,
+            legacy_layout=args.legacy_layout,
+            color_space=args.color_space,
+            add_color0=args.add_color0,
         )
         return
 
@@ -1024,6 +1171,9 @@ def main(argv=None):
         raw_scale=args.raw_scale,
         do_center=args.center,
         decimate_count=args.decimate,
+        legacy_layout=args.legacy_layout,
+        color_space=args.color_space,
+        add_color0=args.add_color0,
     )
 
     if args.verify:
@@ -1033,6 +1183,7 @@ def main(argv=None):
             raw_opacity=args.raw_opacity,
             raw_scale=args.raw_scale,
             threshold=args.verify_threshold,
+            legacy_layout=args.legacy_layout,
         )
 
 
