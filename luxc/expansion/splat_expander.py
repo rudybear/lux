@@ -25,7 +25,7 @@ from luxc.parser.ast_nodes import (
     Module, StageBlock, VarDecl, UniformBlock, PushBlock, BlockField,
     SamplerDecl,
     FunctionDef, Param, LetStmt, AssignStmt, ReturnStmt, ExprStmt,
-    NumberLit, VarRef, BinaryOp, CallExpr, ConstructorExpr,
+    NumberLit, BoolLit, VarRef, BinaryOp, CallExpr, ConstructorExpr,
     SwizzleAccess, UnaryOp,
     AssignTarget, IndexAccess, FieldAccess,
     StorageBufferDecl, IfStmt, DiscardStmt, ForStmt, BreakStmt,
@@ -54,6 +54,20 @@ def _get_splat_config(splat: SplatDecl) -> dict:
                        splat_pos/splat_rot/splat_sh0 buffers before preprocess
                        runs. See docs/language-reference.md's "Dynamic
                        (4D) Gaussian Splatting" section.
+        motion_vectors -- bool (default False): when true, the preprocess
+                       stage also projects each splat's *previous* frame
+                       position with the *previous* frame's (unjittered)
+                       view-projection and emits a `projected_mv` buffer;
+                       the render stages carry it through as an additional
+                       premultiplied-alpha RG output (`out_motion`). See
+                       docs/lux-4d-spec.md section 3 ("DLSS input contract
+                       outputs") and docs/language-reference.md.
+        expected_depth -- bool (default False): when true, the preprocess
+                       stage emits a `projected_depth` buffer (camera-space
+                       z) and the render stages carry it through as an
+                       additional premultiplied-alpha R output
+                       (`out_depth`), matching gsplat's "ED" (expected
+                       depth) mode.
     """
     config = {
         "sh_degree": 0,
@@ -62,6 +76,8 @@ def _get_splat_config(splat: SplatDecl) -> dict:
         "sort": "camera_distance",
         "alpha_cutoff": 0.004,
         "motion": "none",
+        "motion_vectors": False,
+        "expected_depth": False,
     }
     for m in splat.members:
         if m.name == "sh_degree":
@@ -70,6 +86,13 @@ def _get_splat_config(splat: SplatDecl) -> dict:
             config[m.name] = m.value.name
         elif m.name == "alpha_cutoff":
             config["alpha_cutoff"] = float(m.value.value)
+        elif m.name in ("motion_vectors", "expected_depth"):
+            if isinstance(m.value, BoolLit):
+                config[m.name] = bool(m.value.value)
+            else:
+                # Accept true/false spelled as a bare identifier too, for
+                # symmetry with the other enum-like members.
+                config[m.name] = getattr(m.value, "name", "") == "true"
     return config
 
 
@@ -328,6 +351,18 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
     stage.storage_buffers.append(StorageBufferDecl("sorted_indices", "uint"))
     stage.storage_buffers.append(StorageBufferDecl("visible_count", "uint"))
 
+    # --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
+    if config.get("motion_vectors"):
+        # Previous frame's animated world-space position (host double-buffers
+        # this: it's a copy of splat_pos from the start of the previous
+        # render() call -- for static splats it may simply alias splat_pos
+        # since positions never change).
+        stage.storage_buffers.append(StorageBufferDecl("splat_prev_pos", "vec4"))
+        # Backward motion vector in pixels: uv_curr - uv_prev.
+        stage.storage_buffers.append(StorageBufferDecl("projected_mv", "vec2"))
+    if config.get("expected_depth"):
+        stage.storage_buffers.append(StorageBufferDecl("projected_depth", "scalar"))
+
     # --- Push constants ---
     pc_fields = [
         BlockField("view_matrix", "mat4"),
@@ -339,6 +374,13 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
         BlockField("focal_y", "scalar"),
         BlockField("sh_degree", "int"),
     ]
+    if config.get("motion_vectors"):
+        # `proj_matrix` above may carry a sub-pixel jitter offset (--jitter);
+        # motion vectors must be computed WITHOUT jitter, so the host also
+        # supplies the unjittered current projection and the previous
+        # frame's combined (unjittered) view-projection matrix.
+        pc_fields.append(BlockField("proj_matrix_unjittered", "mat4"))
+        pc_fields.append(BlockField("prev_view_proj_unjittered", "mat4"))
     stage.push_constants.append(PushBlock("push", pc_fields))
 
     # --- Main function body ---
@@ -350,20 +392,26 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
     return stage
 
 
-def _cull_writes() -> list:
+def _cull_writes(config: dict | None = None) -> list:
     """Write invisible markers for culled splats (zero radius + zero opacity).
 
     Without this, culled splats leave uninitialized GPU memory in the projected
     output buffers, causing flickering / garbage in the render pass.
     """
     zero4 = _ctor("vec4", [_lit("0.0"), _lit("0.0"), _lit("0.0"), _lit("0.0")])
-    return [
+    writes = [
         _assign_idx("projected_center", _ref("gid"), zero4),
         _assign_idx("projected_conic", _ref("gid"), zero4),
         _assign_idx("projected_color", _ref("gid"), zero4),
         _assign_idx("sort_keys", _ref("gid"), _uint_lit("4294967295")),
         _assign_idx("sorted_indices", _ref("gid"), _ref("gid")),
     ]
+    if config and config.get("motion_vectors"):
+        zero2 = _ctor("vec2", [_lit("0.0"), _lit("0.0")])
+        writes.append(_assign_idx("projected_mv", _ref("gid"), zero2))
+    if config and config.get("expected_depth"):
+        writes.append(_assign_idx("projected_depth", _ref("gid"), _lit("0.0")))
+    return writes
 
 
 def _build_preprocess_body(config: dict) -> list:
@@ -399,7 +447,7 @@ def _build_preprocess_body(config: dict) -> list:
     # Write invisible markers so culled splats don't leave uninitialized GPU memory.
     body.append(_if(
         _binop(">", _swizzle(_ref("view_pos"), "z"), _lit("-0.1")),
-        _cull_writes() + [ReturnStmt(None)],
+        _cull_writes(config) + [ReturnStmt(None)],
     ))
 
     # --- Read rotation quaternion and build 3x3 rotation matrix ---
@@ -610,7 +658,7 @@ def _build_preprocess_body(config: dict) -> list:
     # if (det <= 0.0) { return; }  -- degenerate ellipse
     body.append(_if(
         _binop("<=", _ref("det"), _lit("0.0")),
-        _cull_writes() + [ReturnStmt(None)],
+        _cull_writes(config) + [ReturnStmt(None)],
     ))
 
     # Opacity compensation: reduce opacity proportionally to how much the
@@ -690,7 +738,7 @@ def _build_preprocess_body(config: dict) -> list:
                _binop("||",
                       _binop(">", _ref("ndc_y"), _ref("ndc_margin")),
                       _binop("<", _ref("ndc_y"), _neg(_ref("ndc_margin"))))),
-        _cull_writes() + [ReturnStmt(None)],
+        _cull_writes(config) + [ReturnStmt(None)],
     ))
 
     # --- Read opacity (sigmoid activation) ---
@@ -710,7 +758,7 @@ def _build_preprocess_body(config: dict) -> list:
     # Splats with opacity < 1/255 after compensation are invisible.
     body.append(_if(
         _binop("<", _ref("opacity"), _lit("0.00392157")),
-        _cull_writes() + [ReturnStmt(None)],
+        _cull_writes(config) + [ReturnStmt(None)],
     ))
 
     # --- Evaluate spherical harmonics for view-dependent color ---
@@ -723,6 +771,49 @@ def _build_preprocess_body(config: dict) -> list:
         _call("clamp", [_swizzle(_ref("sh_color"), "y"), _lit("0.0"), _lit("1.0")])))
     body.append(_let("clamped_b", "scalar",
         _call("clamp", [_swizzle(_ref("sh_color"), "z"), _lit("0.0"), _lit("1.0")])))
+
+    # --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
+    if config.get("motion_vectors"):
+        # Current-frame NDC using the UNJITTERED projection (jitter must not
+        # leak into the motion vector); reuses the already-computed
+        # view-space position.
+        body.append(_let("clip_u", "vec4",
+            _binop("*", _push_field("proj_matrix_unjittered"),
+                   _ctor("vec4", [_ref("view_pos"), _lit("1.0")]))))
+        body.append(_let("ndc_u_x", "scalar",
+            _binop("/", _swizzle(_ref("clip_u"), "x"), _swizzle(_ref("clip_u"), "w"))))
+        body.append(_let("ndc_u_y", "scalar",
+            _binop("/", _swizzle(_ref("clip_u"), "y"), _swizzle(_ref("clip_u"), "w"))))
+
+        # Previous frame's animated world position, projected with the
+        # previous frame's (unjittered) view-projection.
+        body.append(_let("prev_world_pos", "vec3",
+            _swizzle(_idx("splat_prev_pos", _ref("gid")), "xyz")))
+        body.append(_let("prev_clip", "vec4",
+            _binop("*", _push_field("prev_view_proj_unjittered"),
+                   _ctor("vec4", [_ref("prev_world_pos"), _lit("1.0")]))))
+        body.append(_let("prev_ndc_x", "scalar",
+            _binop("/", _swizzle(_ref("prev_clip"), "x"), _swizzle(_ref("prev_clip"), "w"))))
+        body.append(_let("prev_ndc_y", "scalar",
+            _binop("/", _swizzle(_ref("prev_clip"), "y"), _swizzle(_ref("prev_clip"), "w"))))
+
+        # uv = (ndc*0.5 + 0.5) * screen_size  =>  d(uv)/d(ndc) = 0.5*screen_size,
+        # so the pixel-space motion vector is exactly the NDC delta scaled by
+        # that constant factor (no need to materialize uv_curr/uv_prev).
+        body.append(_let("mv_x", "scalar",
+            _binop("*",
+                   _binop("-", _ref("ndc_u_x"), _ref("prev_ndc_x")),
+                   _binop("*", _lit("0.5"), _swizzle(_push_field("screen_size"), "x")))))
+        body.append(_let("mv_y", "scalar",
+            _binop("*",
+                   _binop("-", _ref("ndc_u_y"), _ref("prev_ndc_y")),
+                   _binop("*", _lit("0.5"), _swizzle(_push_field("screen_size"), "y")))))
+        body.append(_assign_idx("projected_mv", _ref("gid"),
+            _ctor("vec2", [_ref("mv_x"), _ref("mv_y")])))
+
+    if config.get("expected_depth"):
+        # Camera-space z (already computed as `t = -view_pos.z` above).
+        body.append(_assign_idx("projected_depth", _ref("gid"), _ref("t")))
 
     # --- Write output buffers ---
     body.append(_assign_idx("projected_center", _ref("gid"),
@@ -945,7 +1036,7 @@ def _build_sh_evaluation(sh_degree: int) -> list:
 # Stage 2: render vertex shader
 # ---------------------------------------------------------------------------
 
-def _build_vertex_stage() -> StageBlock:
+def _build_vertex_stage(config: dict) -> StageBlock:
     """Generate the render vertex stage.
 
     This is an instanced draw with 6 vertices per instance (two triangles
@@ -957,12 +1048,16 @@ def _build_vertex_stage() -> StageBlock:
         projected_conic  -- (inv_cov_a, inv_cov_b, inv_cov_c, opacity)
         projected_color  -- (r, g, b, opacity)
         sorted_indices   -- indirection table from radix sort
+        projected_mv     -- (optional, motion_vectors) pixel-space MV
+        projected_depth  -- (optional, expected_depth) camera-space z
 
     Outputs (to fragment stage):
         frag_conic   -- vec3: inverse 2D covariance upper triangle
         frag_color   -- vec4: splat color + opacity
         frag_center  -- vec2: screen-pixel center of the splat
         frag_offset  -- vec2: pixel offset from center for this vertex
+        frag_mv      -- (optional) vec2: pixel-space motion vector
+        frag_depth   -- (optional) scalar: camera-space z
     """
     stage = StageBlock(stage_type="vertex")
 
@@ -971,6 +1066,10 @@ def _build_vertex_stage() -> StageBlock:
     stage.storage_buffers.append(StorageBufferDecl("projected_conic", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("projected_color", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("sorted_indices", "uint"))
+    if config.get("motion_vectors"):
+        stage.storage_buffers.append(StorageBufferDecl("projected_mv", "vec2"))
+    if config.get("expected_depth"):
+        stage.storage_buffers.append(StorageBufferDecl("projected_depth", "scalar"))
 
     # --- Push constants (shared block with fragment to avoid Vulkan offset conflicts) ---
     pc_fields = [
@@ -981,19 +1080,24 @@ def _build_vertex_stage() -> StageBlock:
     stage.push_constants.append(PushBlock("push", pc_fields))
 
     # --- Vertex outputs → fragment inputs ---
-    for name, ty in [("frag_conic", "vec3"), ("frag_color", "vec4"),
-                     ("frag_center", "vec2"), ("frag_offset", "vec2")]:
+    out_vars = [("frag_conic", "vec3"), ("frag_color", "vec4"),
+                ("frag_center", "vec2"), ("frag_offset", "vec2")]
+    if config.get("motion_vectors"):
+        out_vars.append(("frag_mv", "vec2"))
+    if config.get("expected_depth"):
+        out_vars.append(("frag_depth", "scalar"))
+    for name, ty in out_vars:
         v = VarDecl(name, ty)
         v._is_input = False
         stage.outputs.append(v)
 
     # --- Main function body ---
-    body = _build_vertex_body()
+    body = _build_vertex_body(config)
     stage.functions.append(FunctionDef("main", [], None, body))
     return stage
 
 
-def _build_vertex_body() -> list:
+def _build_vertex_body(config: dict) -> list:
     """Generate the vertex shader main() body."""
     body = []
 
@@ -1011,6 +1115,12 @@ def _build_vertex_body() -> list:
         _idx("projected_conic", _ref("splat_idx"))))
     body.append(_let("color_data", "vec4",
         _idx("projected_color", _ref("splat_idx"))))
+    if config.get("motion_vectors"):
+        body.append(_let("mv_data", "vec2",
+            _idx("projected_mv", _ref("splat_idx"))))
+    if config.get("expected_depth"):
+        body.append(_let("depth_data", "scalar",
+            _idx("projected_depth", _ref("splat_idx"))))
 
     # Unpack center / radius
     body.append(_let("ndc_center", "vec2",
@@ -1241,6 +1351,10 @@ def _build_vertex_body() -> list:
     body.append(_assign("frag_color", _ref("color_data")))
     body.append(_assign("frag_center", _ref("pixel_center")))
     body.append(_assign("frag_offset", _ref("offset")))
+    if config.get("motion_vectors"):
+        body.append(_assign("frag_mv", _ref("mv_data")))
+    if config.get("expected_depth"):
+        body.append(_assign("frag_depth", _ref("depth_data")))
 
     return body
 
@@ -1260,8 +1374,13 @@ def _build_fragment_stage(config: dict) -> StageBlock:
     stage = StageBlock(stage_type="fragment")
 
     # --- Fragment inputs (from vertex stage) ---
-    for name, ty in [("frag_conic", "vec3"), ("frag_color", "vec4"),
-                     ("frag_center", "vec2"), ("frag_offset", "vec2")]:
+    in_vars = [("frag_conic", "vec3"), ("frag_color", "vec4"),
+               ("frag_center", "vec2"), ("frag_offset", "vec2")]
+    if config.get("motion_vectors"):
+        in_vars.append(("frag_mv", "vec2"))
+    if config.get("expected_depth"):
+        in_vars.append(("frag_depth", "scalar"))
+    for name, ty in in_vars:
         v = VarDecl(name, ty)
         v._is_input = True
         stage.inputs.append(v)
@@ -1270,6 +1389,16 @@ def _build_fragment_stage(config: dict) -> StageBlock:
     out = VarDecl("out_color", "vec4")
     out._is_input = False
     stage.outputs.append(out)
+    # Additional DLSS input-contract outputs (docs/lux-4d-spec.md section 3),
+    # blended with the SAME premultiplied-alpha equation as out_color.
+    if config.get("motion_vectors"):
+        out_mv = VarDecl("out_motion", "vec2")
+        out_mv._is_input = False
+        stage.outputs.append(out_mv)
+    if config.get("expected_depth"):
+        out_depth = VarDecl("out_depth", "scalar")
+        out_depth._is_input = False
+        stage.outputs.append(out_depth)
 
     # --- Push constants (shared block with vertex to avoid Vulkan offset conflicts) ---
     pc_fields = [
@@ -1364,6 +1493,17 @@ def _build_fragment_body(config: dict) -> list:
             _ref("alpha"),
         ])))
 
+    # --- Additional DLSS input-contract outputs, premultiplied by the same
+    # alpha as out_color so the fixed-function (ONE, ONE_MINUS_SRC_ALPHA)
+    # blend used for color also does the correct visibility-weighted average
+    # for motion/depth. ---
+    if config.get("motion_vectors"):
+        body.append(_assign("out_motion",
+            _binop("*", _ref("frag_mv"), _ref("alpha"))))
+    if config.get("expected_depth"):
+        body.append(_assign("out_depth",
+            _binop("*", _ref("frag_depth"), _ref("alpha"))))
+
     return body
 
 
@@ -1423,7 +1563,7 @@ def expand_splat_pipeline(
     compute_stage._splat_name = splat.name
 
     # --- Stage 2: render vertex ---
-    vertex_stage = _build_vertex_stage()
+    vertex_stage = _build_vertex_stage(config)
     vertex_stage._splat_name = splat.name
 
     # --- Stage 3: render fragment ---

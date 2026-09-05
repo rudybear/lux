@@ -463,6 +463,8 @@ def generate_reflection(
             "sort": splat_config.get("sort", "camera_distance"),
             "alpha_cutoff": splat_config.get("alpha_cutoff", 0.004),
             "motion": splat_config.get("motion", "none"),
+            "motion_vectors": splat_config.get("motion_vectors", False),
+            "expected_depth": splat_config.get("expected_depth", False),
         }
         if stage.stage_type == "compute":
             gs_meta["workgroup_size"] = [256, 1, 1]

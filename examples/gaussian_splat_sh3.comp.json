@@ -320,6 +320,9 @@
     "color_space": "linear",
     "sort": "camera_distance",
     "alpha_cutoff": 0.004,
+    "motion": "none",
+    "motion_vectors": false,
+    "expected_depth": false,
     "workgroup_size": [
       256,
       1,
@@ -356,10 +359,10 @@
     ]
   },
   "performance_hints": {
-    "instruction_count": 736,
-    "alu_ops": 221,
+    "instruction_count": 820,
+    "alu_ops": 238,
     "texture_samples": 0,
-    "branches": 3,
+    "branches": 5,
     "function_calls": 0,
     "vgpr_estimate": "high"
   }

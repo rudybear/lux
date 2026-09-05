@@ -1,0 +1,32 @@
+// DLSS input-contract outputs: motion vectors + expected depth
+// (docs/lux-4d-spec.md section 3, SPECIFICATION.md 12.8).
+//
+// Identical to gaussian_splat_dynamic.lux except for `motion_vectors: true`
+// and `expected_depth: true`, which make the preprocess/vertex/fragment
+// stages carry two extra premultiplied-alpha outputs:
+//   out_motion (RG): backward per-splat motion vector in pixels
+//                     (prev_uv = uv - mv, origin top-left, +y down)
+//   out_depth  (R):  alpha-weighted camera-space z (gsplat's "ED" mode)
+//
+// Compile: python -m luxc examples/gaussian_splat_dlss.lux
+//   -> gaussian_splat_dlss.morph.comp.spv (motion: keyframes morph-apply)
+//   -> gaussian_splat_dlss.comp.spv       (preprocess: projects prev frame
+//                                           too, writes projected_mv/_depth)
+//   -> gaussian_splat_dlss.vert.spv / .frag.spv (carry frag_mv/frag_depth,
+//                                                 write out_motion/out_depth)
+
+splat DlssGaussianCloud {
+    sh_degree: 0,
+    kernel: ellipse,
+    color_space: linear,
+    sort: camera_distance,
+    alpha_cutoff: 0.004,
+    motion: keyframes,
+    motion_vectors: true,
+    expected_depth: true,
+}
+
+pipeline DlssSplatViewer {
+    mode: gaussian_splat,
+    splat: DlssGaussianCloud,
+}

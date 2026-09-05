@@ -186,6 +186,8 @@
     "sort": "camera_distance",
     "alpha_cutoff": 0.004,
     "motion": "keyframes",
+    "motion_vectors": false,
+    "expected_depth": false,
     "workgroup_size": [
       256,
       1,

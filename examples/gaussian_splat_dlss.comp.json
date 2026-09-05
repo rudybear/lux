@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "source": "gaussian_splat_linear.lux",
+  "source": "gaussian_splat_dlss.lux",
   "stage": "compute",
   "execution_model": "GLCompute",
   "features": {},
@@ -107,6 +107,33 @@
         "stage_flags": [
           "compute"
         ]
+      },
+      {
+        "binding": 11,
+        "type": "storage_buffer",
+        "name": "splat_prev_pos",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 12,
+        "type": "storage_buffer",
+        "name": "projected_mv",
+        "element_type": "vec2",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 13,
+        "type": "storage_buffer",
+        "name": "projected_depth",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
       }
     ]
   },
@@ -161,9 +188,21 @@
           "type": "int",
           "offset": 164,
           "size": 4
+        },
+        {
+          "name": "proj_matrix_unjittered",
+          "type": "mat4",
+          "offset": 176,
+          "size": 64
+        },
+        {
+          "name": "prev_view_proj_unjittered",
+          "type": "mat4",
+          "offset": 240,
+          "size": 64
         }
       ],
-      "size": 176,
+      "size": 304,
       "stage_flags": [
         "compute"
       ]
@@ -179,15 +218,15 @@
     ]
   },
   "gaussian_splatting": {
-    "splat_name": "GaussianCloud",
+    "splat_name": "DlssGaussianCloud",
     "sh_degree": 0,
     "kernel": "ellipse",
     "color_space": "linear",
     "sort": "camera_distance",
     "alpha_cutoff": 0.004,
-    "motion": "none",
-    "motion_vectors": false,
-    "expected_depth": false,
+    "motion": "keyframes",
+    "motion_vectors": true,
+    "expected_depth": true,
     "workgroup_size": [
       256,
       1,
@@ -198,19 +237,22 @@
       "splat_rot",
       "splat_scale",
       "splat_opacity",
-      "splat_sh0"
+      "splat_sh0",
+      "splat_prev_pos"
     ],
     "output_buffers": [
       "projected_center",
       "projected_conic",
       "projected_color",
       "sort_keys",
-      "visible_count"
+      "visible_count",
+      "projected_mv",
+      "projected_depth"
     ]
   },
   "performance_hints": {
-    "instruction_count": 564,
-    "alu_ops": 167,
+    "instruction_count": 652,
+    "alu_ops": 177,
     "texture_samples": 0,
     "branches": 5,
     "function_calls": 0,

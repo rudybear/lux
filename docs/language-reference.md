@@ -527,6 +527,90 @@ carries a `gaussian_splatting_morph` section (`role: "morph_apply"`,
 own `gaussian_splatting` section also reports `motion: "keyframes"` (or
 `"none"` for static splats).
 
+#### DLSS Input-Contract Outputs (motion vectors + expected depth)
+
+Add `motion_vectors: true` and/or `expected_depth: true` to a `splat` block
+to make the pipeline additionally emit the two auxiliary render targets a
+temporal upscaler (DLSS/FSR/XeSS-style) or a training/eval harness expects,
+alongside `out_color` (see `docs/lux-4d-spec.md` section 3):
+
+```
+splat DlssGaussianCloud {
+    sh_degree: 0,
+    motion: keyframes,      // optional, independent of the two flags below
+    motion_vectors: true,   // adds an RG "out_motion" fragment output
+    expected_depth: true,   // adds a scalar "out_depth" fragment output
+}
+
+pipeline DlssSplatViewer {
+    mode: gaussian_splat,
+    splat: DlssGaussianCloud,
+}
+```
+
+Both flags default to `false`; with both off, the generated shaders are
+byte-for-byte identical to the plain 3-stage pipeline (no regression for
+existing splat assets). `motion_vectors` and `expected_depth` are
+independent of each other and of `motion: keyframes` — a purely static
+splat cloud under camera motion alone can still emit motion vectors.
+
+**`motion_vectors: true`** adds:
+- an input buffer `splat_prev_pos` (vec4): the previous frame's animated
+  world-space position per splat. The host double-buffers this — for
+  static splats it may simply alias `splat_pos` (positions never change,
+  so `mv` reduces to the camera-motion term only); for `motion: keyframes`
+  splats the host copies `splat_pos` into it once per frame, *after* the
+  morph-apply stage has written the current frame's positions and *before*
+  the next frame's dispatch.
+- two extra preprocess push-constant fields: `proj_matrix_unjittered` (the
+  current frame's projection matrix *without* any `--jitter` offset baked
+  in — `proj_matrix` itself may be jittered) and
+  `prev_view_proj_unjittered` (the previous frame's combined, unjittered
+  view-projection matrix). Jitter must never leak into the motion vector,
+  so both the current and previous projections used for `projected_mv` are
+  always the unjittered ones, even when the color/depth render itself uses
+  a jittered `proj_matrix`.
+- an output buffer `projected_mv` (vec2, pixels): backward motion vector,
+  `mv = uv_curr - uv_prev`, such that `uv_prev = uv - mv` recovers the
+  previous frame's pixel location of the same surface point. `uv` uses a
+  top-left origin with +y down, matching the existing `pixel_center`
+  convention in the vertex stage. Carried through as `frag_mv` (vertex →
+  fragment) and written to the `out_motion` fragment output as
+  `frag_mv * alpha` — i.e. **premultiplied by the same per-fragment alpha
+  as `out_color`**, so the engine can reuse the identical
+  `(ONE, ONE_MINUS_SRC_ALPHA)` blend state for the motion attachment and
+  get the correct visibility-weighted average of overlapping splats for
+  free. On the very first rendered frame (no previous camera/position
+  data yet), the host is expected to set `prev_view_proj_unjittered` equal
+  to the current frame's unjittered view-projection and alias/copy
+  `splat_prev_pos` to the current positions, which makes `mv` evaluate to
+  (0, 0) exactly.
+
+**`expected_depth: true`** adds an output buffer `projected_depth`
+(scalar): the camera-space depth `t = -view_pos.z` already computed by the
+preprocess stage's Jacobian projection (gsplat's `"ED"` — expected depth
+— mode). Carried through as `frag_depth` and written to `out_depth` as
+`frag_depth * alpha`, again using the same premultiplied-alpha blend as
+color, so overlapping splats contribute an alpha-weighted average depth
+and pixels with no splats at all end up at exactly `0.0`.
+
+Both new fragment outputs are appended *after* `out_color` in declaration
+order (so `out_color` is always location 0, `out_motion`/`out_depth` take
+the next free locations in the order the flags are checked:
+motion first, then depth), and both new vertex-stage varyings
+(`frag_mv`/`frag_depth`) are appended after the existing four. Reflection
+JSON's `gaussian_splatting` section (on the preprocess stage) reports
+`"motion_vectors"` and `"expected_depth"` booleans, and the buffer/push
+changes are visible in the usual `descriptor_sets`/`push_constants`
+sections — see `examples/gaussian_splat_dlss.lux` for a compiling example
+with both flags and `motion: keyframes` all enabled together.
+
+Sub-pixel jitter (`--jitter jx jy` in the playgrounds), the previous-frame
+double buffering, and the `--output-aux`/`--camera-json` headless dump and
+camera-bridge flags are all host (playground) responsibilities, not
+compiler ones — see `docs/lux-4d-spec.md` sections 3-4 for the full
+runtime design.
+
 ### Bindless Rendering
 
 The `--bindless` flag enables uber-shaders with runtime descriptor arrays, eliminating per-material descriptor switching:

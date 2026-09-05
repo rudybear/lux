@@ -1816,6 +1816,12 @@ pipeline Name {
 
 Loading, per-segment delta-buffer construction, and per-frame animation-time evaluation are host (loader/renderer) responsibilities, not the compiler's — see `docs/lux-4d-spec.md`.
 
+**`motion_vectors: true` / `expected_depth: true`** (optional, both default `false`, independent of each other and of `motion`): DLSS-style input-contract outputs (see `docs/lux-4d-spec.md` section 3). With both off, generated shaders are byte-identical to the plain 3-stage pipeline.
+
+- `motion_vectors: true` adds an input buffer `splat_prev_pos` (previous frame's animated world position, host double-buffered), two preprocess push fields (`proj_matrix_unjittered`, `prev_view_proj_unjittered` — jitter must never leak into the MV), an output buffer `projected_mv` (vec2, pixels; backward convention `uv_prev = uv - mv`), and a fragment output `out_motion` written as `frag_mv * alpha` (same premultiplied-alpha blend as `out_color`).
+- `expected_depth: true` adds an output buffer `projected_depth` (scalar camera-space `z`, i.e. `t` from the existing Jacobian projection) and a fragment output `out_depth` written as `frag_depth * alpha`.
+- New fragment outputs are appended after `out_color` (motion before depth); reflection's `gaussian_splatting` section reports both booleans. Jitter (`--jitter`), previous-frame buffering, and headless aux dumps (`--output-aux`) / camera bridge (`--camera-json`) are playground (host) responsibilities — see `docs/lux-4d-spec.md` sections 3-4.
+
 ---
 
 ## 13. Automatic Differentiation
