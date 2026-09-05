@@ -8,6 +8,7 @@
 
 use glam::{Mat4, Quat, Vec3};
 use log::info;
+use serde_json::Value as JsonValue;
 use std::path::Path;
 
 // ===========================================================================
@@ -202,6 +203,11 @@ pub struct GaussianSplatData {
     /// True when loaded from KHR_gaussian_splatting extension (opacities are linear [0,1],
     /// need logit conversion for shader compatibility).
     pub khr_format: bool,
+    /// KHR_gaussian_splatting extension-object `colorSpace`, when present
+    /// ("srgb_rec709_display" or "lin_rec709_display"; defaults to the
+    /// spec's implicit sRGB assumption when the extension object is absent).
+    pub color_space: String,
+    pub kernel: String,
 }
 
 impl Default for GaussianSplatData {
@@ -216,6 +222,8 @@ impl Default for GaussianSplatData {
             num_splats: 0,
             has_splats: false,
             khr_format: false,
+            color_space: "srgb_rec709_display".to_string(),
+            kernel: "ellipse".to_string(),
         }
     }
 }
@@ -452,10 +460,38 @@ fn import_without_validation(path: &Path) -> Result<(gltf::Document, Vec<gltf::b
     Ok((document, buffers, images))
 }
 
+/// Read the raw glTF JSON document as a `serde_json::Value`, bypassing the
+/// `gltf` crate's typed attribute model entirely.
+///
+/// This is needed because the `gltf` crate's `Semantic` enum only recognizes
+/// a fixed set of attribute names (POSITION, NORMAL, COLOR_0, ...); custom
+/// namespaced attribute semantics like `KHR_gaussian_splatting:ROTATION`
+/// (the ratified KHR_gaussian_splatting layout) are silently dropped by
+/// `Primitive::attributes()`, even with strict validation disabled. Reading
+/// the raw JSON lets us see every attribute key exactly as authored.
+fn read_raw_gltf_json(path: &Path) -> Option<JsonValue> {
+    let data = std::fs::read(path).ok()?;
+    // GLB: 12-byte header (magic, version, length) then a JSON chunk
+    // (length:u32, type:u32 == 0x4E4F534A, then the JSON bytes).
+    if data.len() >= 20 && &data[0..4] == b"glTF" {
+        let chunk_len = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+        let json_start: usize = 20;
+        let json_end = json_start.checked_add(chunk_len)?;
+        if json_end > data.len() {
+            return None;
+        }
+        serde_json::from_slice(&data[json_start..json_end]).ok()
+    } else {
+        // Plain .gltf JSON file
+        serde_json::from_slice(&data).ok()
+    }
+}
+
 /// Load a .glb or .gltf file.
 pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
     let (document, buffers, images) =
         import_without_validation(path)?;
+    let raw_gltf = read_raw_gltf_json(path);
 
     info!("Loaded glTF: {} images, {} materials", images.len(), document.materials().len());
 
@@ -775,10 +811,64 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
             if prim.mode() != gltf::mesh::Mode::Points {
                 continue;
             }
-            let ext = match prim.extension_value("KHR_gaussian_splatting") {
-                Some(v) => v.clone(),
-                None => continue,
+
+            // Detect gaussian splatting attributes, supporting three layouts:
+            //   1. Ratified: KHR_gaussian_splatting:ROTATION etc. living directly in
+            //      primitive.attributes (read via raw JSON below, since the gltf
+            //      crate's Semantic enum can't represent custom namespaced attribute
+            //      names and silently drops them from Primitive::attributes()).
+            //   2. Legacy pre-ratification draft: ROTATION/SCALE/OPACITY nested,
+            //      unprefixed, under extensions.KHR_gaussian_splatting.attributes.
+            //   3. Internal lux fixture convention: _ROTATION/_SCALE/_OPACITY in
+            //      primitive.attributes — already shader-native (logit opacity,
+            //      log-space scale), even when a redundant extension object with
+            //      the same (legacy-style) nested attributes is also present.
+            let raw_attrs: Option<&JsonValue> = raw_gltf.as_ref()
+                .and_then(|j| j.get("meshes"))
+                .and_then(|m| m.get(mi))
+                .and_then(|m| m.get("primitives"))
+                .and_then(|p| p.get(prim.index()))
+                .and_then(|p| p.get("attributes"));
+
+            let find_raw_attr = |suffix: &str| -> Option<u64> {
+                raw_attrs
+                    .and_then(|a| a.as_object())
+                    .and_then(|obj| obj.get(&format!("KHR_gaussian_splatting:{}", suffix)))
+                    .and_then(|v| v.as_u64())
             };
+            let find_internal_attr = |suffix: &str| -> Option<u64> {
+                raw_attrs
+                    .and_then(|a| a.as_object())
+                    .and_then(|obj| obj.get(&format!("_{}", suffix)))
+                    .and_then(|v| v.as_u64())
+            };
+
+            let ext_opt = prim.extension_value("KHR_gaussian_splatting").cloned();
+            let legacy_ext_attrs = ext_opt.as_ref().and_then(|e| e.get("attributes")).cloned();
+            let find_legacy_attr = |suffix: &str| -> Option<u64> {
+                legacy_ext_attrs.as_ref()
+                    .and_then(|a| a.get(suffix))
+                    .and_then(|v| v.as_u64())
+            };
+
+            let has_ratified_rotation = find_raw_attr("ROTATION").is_some();
+            let has_ratified_scale = find_raw_attr("SCALE").is_some();
+            let has_internal_rotation = find_internal_attr("ROTATION").is_some();
+            let has_internal_scale = find_internal_attr("SCALE").is_some();
+            let has_internal_attrs =
+                has_internal_rotation || has_internal_scale || find_internal_attr("OPACITY").is_some();
+            let has_legacy_rotation = find_legacy_attr("ROTATION").is_some();
+            let has_legacy_scale = find_legacy_attr("SCALE").is_some();
+
+            let has_rotation = has_ratified_rotation || has_internal_rotation || has_legacy_rotation;
+            let has_scale = has_ratified_scale || has_internal_scale || has_legacy_scale;
+            if !has_rotation && !has_scale {
+                continue;
+            }
+
+            let is_ratified = has_ratified_rotation || has_ratified_scale;
+            let is_legacy_nested_only = !is_ratified && !has_internal_attrs
+                && (has_legacy_rotation || has_legacy_scale);
 
             let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
 
@@ -800,21 +890,36 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                 );
             } else {
                 info!(
-                    "Detected KHR_gaussian_splatting primitive in mesh: {}",
-                    mesh.name().unwrap_or("unnamed")
+                    "Detected KHR_gaussian_splatting primitive in mesh: {}{}",
+                    mesh.name().unwrap_or("unnamed"),
+                    if is_legacy_nested_only { " (legacy pre-ratification draft layout)" } else { "" }
                 );
             }
 
-            // Mark as KHR format (opacities are linear [0,1], need logit conversion)
-            scene.splat_data.khr_format = true;
+            // KHR format (opacities linear [0,1], need logit conversion for shader
+            // compatibility) applies to the ratified and legacy-nested layouts, but
+            // NOT lux's internal shader-native fixture convention — even when a
+            // (historically unused, redundant) extension object is also present.
+            if is_ratified || is_legacy_nested_only {
+                scene.splat_data.khr_format = true;
+            }
+            if let Some(ext) = &ext_opt {
+                if let Some(cs) = ext.get("colorSpace").and_then(|v| v.as_str()) {
+                    scene.splat_data.color_space = cs.to_string();
+                }
+                if let Some(k) = ext.get("kernel").and_then(|v| v.as_str()) {
+                    scene.splat_data.kernel = k.to_string();
+                }
+            }
 
-            // Parse the extension's "attributes" sub-object for accessor indices
-            let ext_attrs = ext.get("attributes");
+            let resolve_idx = |suffix: &str| -> Option<u64> {
+                find_raw_attr(suffix)
+                    .or_else(|| find_internal_attr(suffix))
+                    .or_else(|| find_legacy_attr(suffix))
+            };
 
             // Parse rotation accessor (vec4 quaternions)
-            let prim_rotations: Vec<[f32; 4]> = ext_attrs
-                .and_then(|a| a.get("ROTATION"))
-                .and_then(|v| v.as_u64())
+            let prim_rotations: Vec<[f32; 4]> = resolve_idx("ROTATION")
                 .map(|idx| {
                     let raw = read_accessor_f32(idx as usize);
                     raw.chunks(4)
@@ -829,9 +934,7 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                 .unwrap_or_else(|| vec![[0.0, 0.0, 0.0, 1.0]; prim_num_splats as usize]);
 
             // Parse scale accessor (vec3 -> pad to vec4)
-            let prim_scales: Vec<[f32; 4]> = ext_attrs
-                .and_then(|a| a.get("SCALE"))
-                .and_then(|v| v.as_u64())
+            let prim_scales: Vec<[f32; 4]> = resolve_idx("SCALE")
                 .map(|idx| {
                     let raw = read_accessor_f32(idx as usize);
                     raw.chunks(3)
@@ -846,9 +949,7 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                 .unwrap_or_else(|| vec![[1.0, 1.0, 1.0, 0.0]; prim_num_splats as usize]);
 
             // Parse opacity accessor (scalar)
-            let prim_opacities: Vec<f32> = ext_attrs
-                .and_then(|a| a.get("OPACITY"))
-                .and_then(|v| v.as_u64())
+            let prim_opacities: Vec<f32> = resolve_idx("OPACITY")
                 .map(|idx| read_accessor_f32(idx as usize))
                 .unwrap_or_else(|| vec![1.0; prim_num_splats as usize]);
 
@@ -867,7 +968,43 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
             let mut prim_sh_degree = 0u32;
             let mut prim_sh_coefficients: Vec<Vec<[f32; 4]>> = Vec::new();
             let coeff_base: [usize; 4] = [0, 1, 4, 9];
-            if let Some(sh_arr) = ext.get("sh").and_then(|v| v.as_array()) {
+
+            // Ratified layout: KHR_gaussian_splatting:SH_DEGREE_<D>_COEF_<C> lives
+            // directly in primitive.attributes, one VEC3 accessor per coefficient.
+            if let Some(obj) = raw_attrs.and_then(|a| a.as_object()) {
+                let prefix = "KHR_gaussian_splatting:SH_DEGREE_";
+                for (name, val) in obj {
+                    let Some(rest) = name.strip_prefix(prefix) else { continue };
+                    let Some((deg_str, coef_str)) = rest.split_once("_COEF_") else { continue };
+                    let (Ok(degree), Ok(coef_idx), Some(acc_idx)) =
+                        (deg_str.parse::<usize>(), coef_str.parse::<usize>(), val.as_u64())
+                    else { continue };
+                    if degree > 3 {
+                        continue;
+                    }
+                    let idx = coeff_base[degree] + coef_idx;
+                    if idx >= prim_sh_coefficients.len() {
+                        prim_sh_coefficients.resize(idx + 1, Vec::new());
+                    }
+                    let raw = read_accessor_f32(acc_idx as usize);
+                    prim_sh_coefficients[idx] = raw.chunks(3)
+                        .map(|c| [
+                            c.first().copied().unwrap_or(0.0),
+                            c.get(1).copied().unwrap_or(0.0),
+                            c.get(2).copied().unwrap_or(0.0),
+                            0.0,
+                        ])
+                        .collect();
+                    if degree as u32 > prim_sh_degree {
+                        prim_sh_degree = degree as u32;
+                    }
+                }
+            }
+
+            // Legacy pre-ratification draft layout: "sh": [{"coefficients": <idx_or_array>,
+            // "degree": <N>}, ...] nested under the extension object. Only consulted when
+            // the ratified attributes above found nothing.
+            if prim_sh_coefficients.is_empty() { if let Some(sh_arr) = ext_opt.as_ref().and_then(|e| e.get("sh")).and_then(|v| v.as_array()) {
                 for sh_entry in sh_arr {
                     let degree = sh_entry.get("degree")
                         .and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -941,7 +1078,7 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                         }
                     }
                 }
-            }
+            } }
 
             // Update global max SH degree
             if prim_sh_degree > global_max_sh_degree {
@@ -1010,8 +1147,18 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
 
         // Convert KHR linear opacity to logit space for shader compatibility.
         // The compute shader applies sigmoid() to opacity, so we store logit-space values.
-        // KHR scales are already in log-space per spec (no conversion needed).
         // Only for KHR format; internal format (_SCALE, _OPACITY) already stores raw values.
+        //
+        // SCALE is trickier: the *ratified* KHR_gaussian_splatting spec requires SCALE to
+        // be linear ("Scale values are linear and MUST NOT be negative"), but the
+        // currently-published Khronos conformance test assets predate an April-2026
+        // editorial pass and still store log-space values (matching the pre-ratification
+        // draft and raw 3DGS training convention) — including negative values, invalid
+        // under the ratified rule. Since both encodings are seen in the wild for the exact
+        // same attribute location, auto-detect: any negative value means the data is
+        // already log-space (leave as-is, since the shader applies exp()); all-non-negative,
+        // boundedly-small values are treated as ratified linear scale and converted to
+        // log-space here to match the shader's exp()-based reconstruction.
         if scene.splat_data.khr_format {
             // Convert linear opacity [0,1] to logit: ln(p / (1 - p))
             for opacity in &mut scene.splat_data.opacities {
@@ -1022,6 +1169,23 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
                 "Converted KHR linear opacity to logit for {} splats",
                 scene.splat_data.opacities.len()
             );
+
+            let scale_looks_linear = !scene.splat_data.scales.is_empty()
+                && scene.splat_data.scales.iter()
+                    .all(|s| s[0] >= 0.0 && s[0] < 20.0 && s[1] >= 0.0 && s[1] < 20.0 && s[2] >= 0.0 && s[2] < 20.0);
+            if scale_looks_linear {
+                for s in &mut scene.splat_data.scales {
+                    s[0] = s[0].max(1e-12).ln();
+                    s[1] = s[1].max(1e-12).ln();
+                    s[2] = s[2].max(1e-12).ln();
+                }
+                info!(
+                    "Converted ratified linear KHR SCALE to log-space for {} splats",
+                    scene.splat_data.num_splats
+                );
+            } else {
+                info!("KHR SCALE already log-space (legacy/conformance layout)");
+            }
         }
 
         info!(
@@ -1285,4 +1449,79 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene, String> {
     }
 
     Ok(scene)
+}
+
+#[cfg(test)]
+mod khr_gaussian_splatting_layout_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn asset(name: &str) -> PathBuf {
+        // Tests run with CWD = playground_rust/, assets live in ../tests/assets/
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tests")
+            .join("assets")
+            .join(name)
+    }
+
+    /// Ratified layout (regenerated tools/generate_test_splats.py output): SCALE and
+    /// OPACITY are written linear per the ratified spec, and must be auto-detected and
+    /// converted back to the shader-native log/logit space used internally.
+    #[test]
+    fn loads_ratified_layout_test_splats() {
+        let scene = load_gltf(&asset("test_splats.glb")).expect("load test_splats.glb");
+        assert!(scene.splat_data.has_splats);
+        assert_eq!(scene.splat_data.num_splats, 1000);
+        assert!(scene.splat_data.khr_format);
+        assert_eq!(scene.splat_data.color_space, "srgb_rec709_display");
+        assert_eq!(scene.splat_data.kernel, "ellipse");
+        // linear_scale = 0.02 -> log-space ~= ln(0.02) ~= -3.912
+        for s in &scene.splat_data.scales {
+            assert!((s[0] - (0.02f32).ln()).abs() < 1e-4);
+        }
+    }
+
+    /// Legacy pre-ratification draft layout (POSITION-only in primitive.attributes,
+    /// ROTATION/SCALE/OPACITY nested under extensions.KHR_gaussian_splatting.attributes) —
+    /// the fallback path this migration must keep working.
+    #[test]
+    fn loads_legacy_nested_layout() {
+        let scene = load_gltf(&asset("legacy_layout_splats.glb"))
+            .expect("load legacy_layout_splats.glb");
+        assert!(scene.splat_data.has_splats);
+        assert_eq!(scene.splat_data.num_splats, 5);
+        assert!(scene.splat_data.khr_format);
+    }
+
+    /// Lux's internal hand-authored fixture convention (_ROTATION/_SCALE/_OPACITY) must
+    /// NOT be treated as KHR format, even though these fixtures also carry a (redundant,
+    /// historically unused) extension object — regression coverage for the double-convert
+    /// bug this migration must avoid introducing.
+    #[test]
+    fn internal_fixture_convention_is_not_khr_format() {
+        let scene = load_gltf(&asset("luigi.glb")).expect("load luigi.glb");
+        assert!(scene.splat_data.has_splats);
+        assert_eq!(scene.splat_data.num_splats, 14526);
+        assert!(!scene.splat_data.khr_format);
+    }
+
+    /// Official Khronos conformance asset: predates the April-2026 editorial pass, so
+    /// SCALE is still log-space (can be negative) and colorSpace is the older
+    /// "BT.709-sRGB" string rather than "srgb_rec709_display" — must still load.
+    #[test]
+    fn loads_khr_conformance_asset() {
+        let path = asset("khr_splat_conformance/Scales.glb");
+        if !path.exists() {
+            eprintln!("skipping: {} not present (run tools/download_khr_splat_tests.py)", path.display());
+            return;
+        }
+        let scene = load_gltf(&path).expect("load Scales.glb");
+        assert!(scene.splat_data.has_splats);
+        assert_eq!(scene.splat_data.num_splats, 90);
+        assert!(scene.splat_data.khr_format);
+        assert_eq!(scene.splat_data.color_space, "BT.709-sRGB");
+        // Log-space scale data (has negative values) must be left untouched.
+        assert!(scene.splat_data.scales.iter().any(|s| s[0] < 0.0));
+    }
 }
