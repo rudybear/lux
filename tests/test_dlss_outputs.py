@@ -295,6 +295,69 @@ class TestExpectedDepth:
         measured = depth_map[mask]
         assert np.max(np.abs(measured - depth)) < 1e-3, (measured.min(), measured.max(), depth)
 
+    def test_overlapping_splats_depth_matches_over_compositing(self, binary, tmp_path):
+        """Regression test for a real bug: out_depth was declared vec2 (x =
+        depth*alpha, y = alpha), but Vulkan's fixed-function alpha blend
+        factors (ONE_MINUS_SRC_ALPHA) read "source alpha" from the 4th
+        component of the fragment shader's output for that attachment. A
+        vec2 output has no 4th component; on MoltenVK/Apple GPUs this was
+        empirically observed to blend as if src alpha were 0 (dst_new = src
+        + dst_old, an undecayed running sum) instead of the correct
+        back-to-front "over" composite (dst_new = src + dst_old*(1-alpha)).
+        For two co-axial overlapping splats at different depths this gives
+        a visibly different, order-INdependent answer (a simple opacity-
+        weighted average) instead of the correct occlusion-weighted one.
+        `out_motion` (already vec4, alpha genuinely at .w) never had this
+        bug -- see out_depth's vec4 fix in
+        luxc/expansion/splat_expander.py.
+        """
+        if not _supports_dlss_flags(binary):
+            pytest.skip(f"{binary} doesn't support --output-aux yet")
+
+        width, height = 64, 64
+        # Two splats directly along the optical axis (same x, y) so they
+        # fully overlap at the center pixel; default sort is camera_distance
+        # (back-to-front), so the far one (z=6) is drawn before the near one
+        # (z=4).
+        alpha_each = 0.5
+        z_far, z_near = 6.0, 4.0
+        glb_path = tmp_path / "two_splats.glb"
+        _write_splats_glb(glb_path, [(0.0, 0.0, z_far), (0.0, 0.0, z_near)],
+                           scale=0.6, opacity=alpha_each)
+
+        cam_path = tmp_path / "cam.json"
+        _identity_camera_json(cam_path, (0.0, 0.0, 0.0), width, height)
+
+        aux_prefix = tmp_path / "aux"
+        _run(binary, ["--scene", str(glb_path), "--pipeline", PIPELINE_BASE,
+                      "--headless", "--width", str(width), "--height", str(height),
+                      "--camera-json", str(cam_path),
+                      "--output", str(tmp_path / "out.png"),
+                      "--output-aux", str(aux_prefix)])
+
+        depth_map = np.load(str(aux_prefix) + "_depth.npy")
+        measured = float(depth_map[height // 2, width // 2])
+
+        # Correct back-to-front "over" composite (far drawn first, near on
+        # top): the near splat's contribution isn't attenuated by the far
+        # one, but the far splat's IS attenuated by (1 - alpha_near).
+        premul = alpha_each * z_far
+        cum_alpha = alpha_each
+        premul = alpha_each * z_near + premul * (1 - alpha_each)
+        cum_alpha = alpha_each + cum_alpha * (1 - alpha_each)
+        correct = premul / cum_alpha
+
+        # The buggy (undecayed-sum) behavior degenerates to a simple,
+        # order-independent opacity-weighted average -- provably different
+        # from `correct` whenever the two alphas are equal and nonzero.
+        buggy = (alpha_each * z_far + alpha_each * z_near) / (alpha_each + alpha_each)
+        assert abs(correct - buggy) > 0.1, "test's own two values must differ to be meaningful"
+
+        assert abs(measured - correct) < 0.05, (
+            f"measured depth {measured} should match the correct back-to-front "
+            f"'over' composite {correct}, not the buggy undecayed-sum value {buggy}"
+        )
+
 
 # ===========================================================================
 # Section 3: motion vectors

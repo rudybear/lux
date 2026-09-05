@@ -89,9 +89,12 @@ def _get_splat_config(splat: SplatDecl) -> dict:
         expected_depth -- bool (default False): when true, the preprocess
                        stage emits a `projected_depth` buffer (camera-space
                        z) and the render stages carry it through as an
-                       additional premultiplied-alpha vec2 output
-                       (`out_depth`: x = depth*alpha, y = alpha), matching
-                       gsplat's "ED" (expected depth) mode.
+                       additional premultiplied-alpha vec4 output
+                       (`out_depth`: x = depth*alpha, y/z unused, w =
+                       alpha), matching gsplat's "ED" (expected depth)
+                       mode. vec4 (not vec2) so Vulkan's fixed-function
+                       alpha blend has a genuine 4th-component alpha to
+                       read -- see the fragment-stage output comment.
     """
     config = {
         "sh_degree": 0,
@@ -1441,7 +1444,19 @@ def _build_fragment_stage(config: dict) -> StageBlock:
         out_mv._is_input = False
         stage.outputs.append(out_mv)
     if config.get("expected_depth"):
-        out_depth = VarDecl("out_depth", "vec2")
+        # vec4, not vec2: Vulkan's fixed-function alpha blend factors
+        # (ONE_MINUS_SRC_ALPHA) read "source alpha" from the 4th component
+        # of the fragment shader's output for that attachment -- a vec2
+        # output has no 4th component, and MoltenVK/Apple GPUs were
+        # empirically observed to then blend as if src alpha were 0 (i.e.
+        # dst_new = src + dst_old, an un-decayed running SUM instead of the
+        # correct back-to-front "over" composite), silently producing a
+        # simple order-independent alpha-weighted average biased toward
+        # farther/occluded splats instead of the correct visibility-
+        # weighted one. out_motion (already vec4, alpha genuinely at .w)
+        # never had this bug -- see docs/lux-4d-spec.md section 3's depth
+        # regression follow-up. y/z are unused padding.
+        out_depth = VarDecl("out_depth", "vec4")
         out_depth._is_input = False
         stage.outputs.append(out_depth)
 
@@ -1559,9 +1574,14 @@ def _build_fragment_body(config: dict) -> list:
                 _ref("alpha"),
             ])))
     if config.get("expected_depth"):
+        # x = depth*alpha, y/z unused, w = alpha (the genuine 4th-component
+        # alpha the hardware blend needs -- see the output-declaration
+        # comment above). The host un-premultiplies by .w now, not .y.
         body.append(_assign("out_depth",
-            _ctor("vec2", [
+            _ctor("vec4", [
                 _binop("*", _ref("frag_depth"), _ref("alpha")),
+                _lit("0.0"),
+                _lit("0.0"),
                 _ref("alpha"),
             ])))
 

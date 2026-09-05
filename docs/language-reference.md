@@ -544,7 +544,7 @@ splat DlssGaussianCloud {
     sh_degree: 0,
     motion: keyframes,      // optional, independent of the two flags below
     motion_vectors: true,   // adds a vec4 "out_motion" fragment output
-    expected_depth: true,   // adds a vec2 "out_depth" fragment output
+    expected_depth: true,   // adds a vec4 "out_depth" fragment output
 }
 
 pipeline DlssSplatViewer {
@@ -611,11 +611,21 @@ splat cloud under camera motion alone can still emit motion vectors.
 (scalar): the camera-space depth `t = -view_pos.z` already computed by the
 preprocess stage's Jacobian projection (gsplat's `"ED"` — expected depth
 — mode). Carried through as `frag_depth` and written to `out_depth`
-(**vec2**: `x = frag_depth * alpha`, `y = alpha`), again using the same
-premultiplied-alpha blend as color (with the same full-precision-alpha
-rationale as `out_motion` above), so overlapping splats contribute an
-alpha-weighted average depth and pixels with no splats at all end up at
-exactly `0.0`.
+(**vec4**: `x = frag_depth * alpha`, `y`/`z` unused, `w = alpha`), again
+using the same premultiplied-alpha blend as color (with the same
+full-precision-alpha rationale as `out_motion` above), so overlapping
+splats contribute an alpha-weighted average depth and pixels with no
+splats at all end up at exactly `0.0`. `out_depth` is `vec4`, not `vec2`,
+even though only one data channel is used: Vulkan's fixed-function alpha
+blend factors (`ONE_MINUS_SRC_ALPHA`) read "source alpha" from the 4th
+component of the fragment shader's output for that attachment specifically
+— a `vec2` output has no 4th component, and this was empirically found to
+make MoltenVK/Apple GPUs blend as if source alpha were always 0 (i.e.
+`dst_new = src + dst_old`, an undecayed running sum across overlapping
+splats) instead of the correct back-to-front `dst_new = src + dst_old *
+(1 - alpha)` composite. `out_motion` never had this bug (already `vec4`,
+alpha genuinely at `.w`). See `tests/test_dlss_outputs.py`'s
+`TestExpectedDepth::test_overlapping_splats_depth_matches_over_compositing`.
 
 Both new fragment outputs are appended *after* `out_color` in declaration
 order (so `out_color` is always location 0, `out_motion`/`out_depth` take

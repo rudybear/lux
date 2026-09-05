@@ -836,15 +836,17 @@ static int runHeadless(const CLIOptions& opts) {
                     // color attachment's alpha would lose precision (a
                     // splat rarely reaches exactly alpha=1.0 there).
                     if (splatR->hasExpectedDepth()) {
-                        auto raw = Screenshot::readImageRaw(ctx, splatR->getExpectedDepthImage(), w, h, 8,
+                        // getExpectedDepthFormat() is vec4 (x=depth*alpha,
+                        // y/z unused, w=alpha), not vec2 -- see its comment.
+                        auto raw = Screenshot::readImageRaw(ctx, splatR->getExpectedDepthImage(), w, h, 16,
                                                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                        std::vector<float> rg(static_cast<size_t>(w) * h * 2);
-                        std::memcpy(rg.data(), raw.data(), raw.size());
+                        std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
+                        std::memcpy(rgba.data(), raw.data(), raw.size());
                         std::vector<float> depthPremul(static_cast<size_t>(w) * h);
                         std::vector<float> depthAlpha(static_cast<size_t>(w) * h);
                         for (size_t i = 0; i < depthPremul.size(); ++i) {
-                            depthPremul[i] = rg[i * 2 + 0];
-                            depthAlpha[i] = rg[i * 2 + 1];
+                            depthPremul[i] = rgba[i * 4 + 0];
+                            depthAlpha[i] = rgba[i * 4 + 3];
                         }
                         auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
                         DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_depth.npy", depth,

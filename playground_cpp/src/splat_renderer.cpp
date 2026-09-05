@@ -198,12 +198,12 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
     }
     if (hasExpectedDepth_) {
         VkImageCreateInfo edInfo = imageInfo;
-        edInfo.format = VK_FORMAT_R32G32_SFLOAT;
+        edInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
         vmaCreateImage(ctx.allocator, &edInfo, &allocInfo, &expectedDepthImage_, &expectedDepthAlloc_, nullptr);
 
         VkImageViewCreateInfo edViewInfo = viewInfo;
         edViewInfo.image = expectedDepthImage_;
-        edViewInfo.format = VK_FORMAT_R32G32_SFLOAT;
+        edViewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
         vkCreateImageView(ctx.device, &edViewInfo, nullptr, &expectedDepthView_);
     }
 }
@@ -241,7 +241,7 @@ void SplatRenderer::createRenderPass(VkDevice device) {
     }
     if (hasExpectedDepth_) {
         VkAttachmentDescription ed = colorAttach;
-        ed.format = VK_FORMAT_R32G32_SFLOAT;
+        ed.format = VK_FORMAT_R32G32B32A32_SFLOAT;
         attachments.push_back(ed);
         colorRefs.push_back({static_cast<uint32_t>(attachments.size() - 1), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
     }

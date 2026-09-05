@@ -87,7 +87,11 @@ class TestExpectedDepthOnly:
 
         frag = stages["frag"]
         assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_depth"]
-        assert frag["outputs"][1]["type"] == "vec2"
+        # vec4, not vec2: Vulkan's fixed-function alpha blend reads "source
+        # alpha" from the 4th component of the fragment output for this
+        # attachment, which a vec2 output doesn't have -- see
+        # splat_expander.py's out_depth comment.
+        assert frag["outputs"][1]["type"] == "vec4"
 
         gs = comp["gaussian_splatting"]
         assert gs["expected_depth"] is True

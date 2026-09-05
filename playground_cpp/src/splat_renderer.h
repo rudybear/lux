@@ -85,7 +85,15 @@ public:
     VkImage getMotionImage() const { return motionImage_; }
     VkFormat getMotionFormat() const { return VK_FORMAT_R32G32B32A32_SFLOAT; }  // xy=mv*alpha, z=0, w=alpha
     VkImage getExpectedDepthImage() const { return expectedDepthImage_; }
-    VkFormat getExpectedDepthFormat() const { return VK_FORMAT_R32G32_SFLOAT; }  // x=depth*alpha, y=alpha
+    // vec4 (x=depth*alpha, y/z unused, w=alpha), not vec2 -- Vulkan's
+    // fixed-function alpha blend reads "source alpha" from the 4th
+    // component of the fragment output for THIS attachment; a vec2 output
+    // has none, and this was empirically found to blend as if src alpha
+    // were 0 (undecayed running sum instead of the correct back-to-front
+    // "over" composite) on MoltenVK/Apple GPUs. See
+    // luxc/expansion/splat_expander.py's out_depth comment and
+    // docs/lux-4d-spec.md section 3's depth-regression follow-up.
+    VkFormat getExpectedDepthFormat() const { return VK_FORMAT_R32G32B32A32_SFLOAT; }
 
     void render(VulkanContext& ctx);
 
