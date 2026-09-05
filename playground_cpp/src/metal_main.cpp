@@ -148,6 +148,15 @@ struct CLIOptions {
     std::string cameraJsonPath;
     std::string cameraJsonPrevPath;
 
+    // Motion vectors: evaluate the morph at a *different* previous time
+    // for a real positional MV delta from one headless render (instead of
+    // the default prev-positions == current-positions "camera-only" mv).
+    // See docs/lux-4d-spec.md section 3's --time-prev/--frame-prev follow-up.
+    bool hasTimePrev = false;
+    float timePrev = 0.0f;
+    bool hasFramePrev = false;
+    int framePrev = 0;
+
     // Verification hook (tests/test_metal_morph_gpu.py): dumps the
     // GPU-morph-updated splat_pos/rot/sh0 buffers to <prefix>_{pos,rot,sh0}.npy
     // right after setMorphTime(), for bit-exactness comparison against the
@@ -181,6 +190,9 @@ static void printUsage(const char* program) {
               << "  --output-aux <PREFIX>  Write <PREFIX>_color.png, _depth.npy, _mv.npy + PNG previews\n"
               << "  --camera-json <FILE>   Drive the splat camera from {viewmat_cv, K, width, height}\n"
               << "  --camera-json-prev <FILE> Seed the mv \"previous frame\" camera explicitly (testing)\n"
+              << "  --time-prev <SECONDS> / --frame-prev <N>  Dynamic splats: evaluate the morph at\n"
+              << "                         this previous time into splat_prev_pos, so mv reflects real\n"
+              << "                         actor motion too (default: camera-only mv)\n"
               << "  --sort <MODE>          camera_distance (default, Euclidean) or view_depth (gsplat's z)\n"
               << "  --help                 Show this help message\n"
               << std::endl;
@@ -243,6 +255,12 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.cameraJsonPath = argv[++i];
         } else if (arg == "--camera-json-prev" && i + 1 < argc) {
             opts.cameraJsonPrevPath = argv[++i];
+        } else if (arg == "--time-prev" && i + 1 < argc) {
+            opts.timePrev = std::stof(argv[++i]);
+            opts.hasTimePrev = true;
+        } else if (arg == "--frame-prev" && i + 1 < argc) {
+            opts.framePrev = std::stoi(argv[++i]);
+            opts.hasFramePrev = true;
         } else if (arg == "--dump-splat-buffers" && i + 1 < argc) {
             opts.dumpSplatBuffersPrefix = argv[++i];
         } else if (arg == "--sort" && i + 1 < argc) {
@@ -508,6 +526,18 @@ static int runHeadless(const CLIOptions& opts) {
                     std::cout << "[metal] --camera-json-prev applied" << std::endl;
                 }
             }
+
+            // --- Motion vectors: real previous-time morph evaluation ---
+            // (docs/lux-4d-spec.md section 3's --time-prev/--frame-prev
+            // follow-up). Must come after --camera-json-prev above, same
+            // ordering rationale as the Vulkan main.cpp.
+            if (opts.hasTimePrev || opts.hasFramePrev) {
+                float tPrev = opts.hasFramePrev ? splatR->frameToTime(opts.framePrev) : opts.timePrev;
+                std::cout << "[metal] --time-prev/--frame-prev applied: evaluating morph at t=" << tPrev
+                          << "s for splat_prev_pos" << std::endl;
+                splatR->seedPreviousMorphTime(tPrev);
+            }
+
             if (opts.jitterX != 0.0f || opts.jitterY != 0.0f) {
                 splatR->setJitter(opts.jitterX, opts.jitterY);
             }
@@ -523,6 +553,16 @@ static int runHeadless(const CLIOptions& opts) {
                 uint32_t w = splatR->getWidth(), h = splatR->getHeight();
                 std::string colorPath = opts.outputAuxPrefix + "_color.png";
                 MetalScreenshot::saveTextureToPNG(ctx, splatR->getOutputTexture(), w, h, colorPath);
+
+                // _color.npy: float32 [H,W,4], un-premultiplied RGB + alpha,
+                // read directly from the RGBA16Float color attachment -- no
+                // 8-bit quantization anywhere in this path.
+                {
+                    auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getOutputTexture(), w, h, 8);
+                    std::vector<uint8_t> unusedRgba8;
+                    auto colorF32 = DlssIO::convertRgba16fColorAttachment(raw, w, h, unusedRgba8);
+                    DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_color.npy", colorF32, {h, w, 4});
+                }
 
                 if (splatR->hasExpectedDepth()) {
                     auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getExpectedDepthTexture(), w, h, 8);
@@ -554,7 +594,7 @@ static int runHeadless(const CLIOptions& opts) {
                     DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_mv_preview.png", mv, w, h, 2);
                 }
                 std::cout << "[metal] Wrote aux dumps: " << opts.outputAuxPrefix
-                          << "_{color.png,depth.npy,mv.npy,*_preview.png}" << std::endl;
+                          << "_{color.png,color.npy,depth.npy,mv.npy,*_preview.png}" << std::endl;
             }
 
             splatR->cleanup();

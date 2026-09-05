@@ -144,7 +144,7 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
     VkImageCreateInfo imageInfo = {};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
     imageInfo.extent = {width_, height_, 1};
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
@@ -163,7 +163,7 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = colorImage_;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
     viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.subresourceRange.levelCount = 1;
     viewInfo.subresourceRange.layerCount = 1;
@@ -222,7 +222,7 @@ void SplatRenderer::createRenderPass(VkDevice device) {
     std::vector<VkAttachmentReference> colorRefs;
 
     VkAttachmentDescription colorAttach = {};
-    colorAttach.format = VK_FORMAT_R8G8B8A8_UNORM;
+    colorAttach.format = VK_FORMAT_R16G16B16A16_SFLOAT;
     colorAttach.samples = VK_SAMPLE_COUNT_1_BIT;
     colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -304,7 +304,7 @@ void SplatRenderer::createRenderPassLoad(VkDevice device) {
     VkAttachmentDescription attachments[2] = {};
 
     // Color — LOAD existing contents (background was blitted in)
-    attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+    attachments[0].format = VK_FORMAT_R16G16B16A16_SFLOAT;
     attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
     attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -372,7 +372,7 @@ void SplatRenderer::createRenderPassLoadDepth(VkDevice device) {
     VkAttachmentDescription attachments[2] = {};
 
     // Color — LOAD existing contents (background was blitted in)
-    attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+    attachments[0].format = VK_FORMAT_R16G16B16A16_SFLOAT;
     attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
     attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -822,7 +822,11 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     shDegree_ = data.sh_degree;
     if (numSplats_ == 0) return;
 
-    VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    // TRANSFER_SRC: posBuffer_ (the first buffer created with this flag set,
+    // below) is used as a vkCmdCopyBuffer source both by the motion-vector
+    // first-frame prevPosBuffer_ seed and by seedPreviousMorphTime()
+    // (docs/lux-4d-spec.md section 3).
+    VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
     // Input buffers (CPU-visible for upload)
     // Positions: loader stores as vec4 (x,y,z,1) already
@@ -1519,6 +1523,105 @@ void SplatRenderer::setJitter(float jitterXPixels, float jitterYPixels) {
 }
 
 // --------------------------------------------------------------------------
+// Dynamic splats: morph-apply dispatch (shared by render() and
+// seedPreviousMorphTime())
+// --------------------------------------------------------------------------
+//
+// Two dispatches so arbitrary time scrubbing (not just monotonic playback)
+// stays correct: (1) reset every gaussian that EVER moves back to base
+// (weight 0/0 == base + 0*lo + 0*hi == base, exactly); (2) apply the
+// currently active segment's weighted deltas. Both dispatch sizes are
+// proportional to sparse counts, not numSplats_. See docs/lux-4d-spec.md
+// and SPECIFICATION.md 12.8.
+void SplatRenderer::dispatchMorph(VkCommandBuffer cmd, float timeSeconds) {
+    if (!hasMotion()) return;
+
+    struct MorphPush {
+        uint32_t segmentOffset;
+        uint32_t segmentCount;
+        float weightLow;
+        float weightHigh;
+    };
+
+    VkMemoryBarrier morphBarrier = {};
+    morphBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    morphBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    morphBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, morphPipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, morphLayout_,
+                            0, 1, &morphDescSet_, 0, nullptr);
+
+    if (morphTotalEntries_ > 0) {
+        MorphPush resetPush = {0, morphTotalEntries_, 0.0f, 0.0f};
+        vkCmdPushConstants(cmd, morphLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(resetPush), &resetPush);
+        uint32_t resetGroups = (morphTotalEntries_ + 255) / 256;
+        vkCmdDispatch(cmd, resetGroups, 1, 1);
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &morphBarrier, 0, nullptr, 0, nullptr);
+    }
+
+    SplatMorphState state = evaluateSplatMorphState(dynamics_, timeSeconds);
+    if ((state.weightLow != 0.0f || state.weightHigh != 0.0f) &&
+        state.highTargetIndex >= 0 &&
+        static_cast<size_t>(state.highTargetIndex) < segmentCounts_.size() &&
+        segmentCounts_[state.highTargetIndex] > 0) {
+        uint32_t seg = static_cast<uint32_t>(state.highTargetIndex);
+        MorphPush applyPush = {segmentOffsets_[seg], segmentCounts_[seg], state.weightLow, state.weightHigh};
+        vkCmdPushConstants(cmd, morphLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(applyPush), &applyPush);
+        uint32_t applyGroups = (segmentCounts_[seg] + 255) / 256;
+        vkCmdDispatch(cmd, applyGroups, 1, 1);
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &morphBarrier, 0, nullptr, 0, nullptr);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Motion vectors: seed splat_prev_pos from a real previous-time morph
+// evaluation (docs/lux-4d-spec.md section 3's --time-prev/--frame-prev
+// follow-up)
+// --------------------------------------------------------------------------
+
+void SplatRenderer::seedPreviousMorphTime(VulkanContext& ctx, float prevTimeSeconds) {
+    if (!hasMotion() || !hasMotionVectors_ || !prevPosOwned_) return;
+
+    // If the previous camera hasn't been explicitly seeded yet (i.e. no
+    // setPreviousCameraExplicit()/--camera-json-prev call happened before
+    // this one), default it to the CURRENT camera -- same "prev == curr"
+    // convention render() itself uses on frame 1 -- so mv reflects pure
+    // actor motion, not a spurious jump from an unset (identity) previous
+    // camera. Call setPreviousCameraExplicit() *before* this one to get
+    // real previous-camera motion too.
+    if (firstMvFrame_) {
+        prevViewMatrix_ = viewMatrix_;
+        prevProjMatrixUnjittered_ = projMatrixUnjittered_;
+    }
+
+    // Evaluate the morph at prevTimeSeconds into the working splat_pos
+    // buffer (scratch space here -- render() unconditionally re-dispatches
+    // the morph for the *current* time on every call, so whatever this
+    // leaves behind gets overwritten immediately after), then copy the
+    // result into prevPosBuffer_.
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    dispatchMorph(cmd, prevTimeSeconds);
+
+    VkMemoryBarrier toTransfer = {};
+    toTransfer.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    toTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &toTransfer, 0, nullptr, 0, nullptr);
+
+    VkBufferCopy copy = {0, 0, static_cast<VkDeviceSize>(numSplats_) * 4 * sizeof(float)};
+    vkCmdCopyBuffer(cmd, posBuffer_, prevPosBuffer_, 1, &copy);
+    ctx.endSingleTimeCommands(cmd);
+
+    // A real previous position has now been seeded; don't let render()'s
+    // first-frame auto-seed (prev == curr) clobber it.
+    firstMvFrame_ = false;
+}
+
+// --------------------------------------------------------------------------
 // Render
 // --------------------------------------------------------------------------
 
@@ -1539,52 +1642,7 @@ void SplatRenderer::render(VulkanContext& ctx) {
     }
 
     // --- Dynamic splats: morph-apply compute pass (runs before preprocess) ---
-    // See docs/lux-4d-spec.md and SPECIFICATION.md 12.8. Two dispatches so
-    // arbitrary time scrubbing (not just monotonic playback) stays correct:
-    //   1. reset every gaussian that EVER moves back to base (weight 0/0 ==
-    //      base + 0*lo + 0*hi == base, exactly);
-    //   2. apply the currently active segment's weighted deltas.
-    // Both dispatch sizes are proportional to sparse counts, not numSplats_.
-    if (hasMotion()) {
-        struct MorphPush {
-            uint32_t segmentOffset;
-            uint32_t segmentCount;
-            float weightLow;
-            float weightHigh;
-        };
-
-        VkMemoryBarrier morphBarrier = {};
-        morphBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        morphBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        morphBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, morphPipeline_);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, morphLayout_,
-                                0, 1, &morphDescSet_, 0, nullptr);
-
-        if (morphTotalEntries_ > 0) {
-            MorphPush resetPush = {0, morphTotalEntries_, 0.0f, 0.0f};
-            vkCmdPushConstants(cmd, morphLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(resetPush), &resetPush);
-            uint32_t resetGroups = (morphTotalEntries_ + 255) / 256;
-            vkCmdDispatch(cmd, resetGroups, 1, 1);
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 0, 1, &morphBarrier, 0, nullptr, 0, nullptr);
-        }
-
-        SplatMorphState state = evaluateSplatMorphState(dynamics_, currentMorphTime_);
-        if ((state.weightLow != 0.0f || state.weightHigh != 0.0f) &&
-            state.highTargetIndex >= 0 &&
-            static_cast<size_t>(state.highTargetIndex) < segmentCounts_.size() &&
-            segmentCounts_[state.highTargetIndex] > 0) {
-            uint32_t seg = static_cast<uint32_t>(state.highTargetIndex);
-            MorphPush applyPush = {segmentOffsets_[seg], segmentCounts_[seg], state.weightLow, state.weightHigh};
-            vkCmdPushConstants(cmd, morphLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(applyPush), &applyPush);
-            uint32_t applyGroups = (segmentCounts_[seg] + 255) / 256;
-            vkCmdDispatch(cmd, applyGroups, 1, 1);
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 0, 1, &morphBarrier, 0, nullptr, 0, nullptr);
-        }
-    }
+    dispatchMorph(cmd, currentMorphTime_);
 
     // --- Motion vectors: seed splat_prev_pos on the very first frame ---
     // (dynamic splats only -- static splats' prevPosBuffer_ already aliases
@@ -1592,6 +1650,22 @@ void SplatRenderer::render(VulkanContext& ctx) {
     // (post-morph) position into prevPosBuffer_ before preprocess reads it,
     // so the position term of mv is also exactly 0 on frame 1.
     if (hasMotionVectors_ && firstMvFrame_ && prevPosOwned_) {
+        // dispatchMorph()'s own trailing barrier above only covers
+        // COMPUTE_SHADER_BIT -> COMPUTE_SHADER_BIT (for the reset->apply
+        // sequencing within dispatchMorph itself); the copy below reads
+        // posBuffer_ via the TRANSFER stage, which that barrier's dstStage
+        // does NOT include. Missing this meant the copy's read of
+        // posBuffer_ was not guaranteed to observe the morph compute
+        // shader's writes, an actual (confirmed, reproducible) source of
+        // intermittent wrong/garbage splat_prev_pos data on the very first
+        // rendered frame of a dynamic-splat DLSS pipeline.
+        VkMemoryBarrier toTransfer = {};
+        toTransfer.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        toTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &toTransfer, 0, nullptr, 0, nullptr);
+
         VkBufferCopy copy = {0, 0, static_cast<VkDeviceSize>(numSplats_) * 4 * sizeof(float)};
         vkCmdCopyBuffer(cmd, posBuffer_, prevPosBuffer_, 1, &copy);
         VkMemoryBarrier copyBarrier = {};
@@ -1654,6 +1728,32 @@ void SplatRenderer::render(VulkanContext& ctx) {
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+    // Fully drain the queue here when motion vectors are enabled.
+    //
+    // This preprocess compute dispatch writes projected_mv (among other
+    // projected_* buffers) which the vertex shader reads much later in this
+    // same command buffer, after the 4-pass GPU radix sort. In-buffer
+    // pipeline barriers (including, empirically, one broadened to
+    // VK_PIPELINE_STAGE_ALL_COMMANDS_BIT / VK_ACCESS_MEMORY_WRITE_BIT right
+    // before the render pass) were NOT sufficient to make this reliable on
+    // MoltenVK/Apple Silicon: projected_center/conic/color were always
+    // read correctly (verified bit-identical output across dozens of
+    // repeated runs), but projected_mv was intermittently stale/wrong in a
+    // small number of runs despite the preprocess dispatch's own output
+    // being independently verified deterministic and correct at this exact
+    // point (docs/lux-4d-spec.md section 3's --time-prev follow-up
+    // debugging). A full queue drain right here -- ending and restarting
+    // the command buffer, forcing MoltenVK to emit a real, separate Metal
+    // command buffer boundary rather than a mid-buffer compute-encoder
+    // fence -- reliably eliminated the flakiness (repeated stress runs
+    // showed 0 failures after this change vs. a consistent ~30-50% failure
+    // rate before it). This costs an extra CPU-GPU round trip per frame,
+    // paid only when motion vectors are enabled.
+    if (hasMotionVectors_) {
+        ctx.endSingleTimeCommands(cmd);
+        cmd = ctx.beginSingleTimeCommands();
+    }
 
     // --- Motion vectors: carry history forward for the NEXT frame ---
     // Preprocess has now consumed this frame's prevPosBuffer_/prev camera
@@ -1759,11 +1859,30 @@ void SplatRenderer::render(VulkanContext& ctx) {
     // After 4 passes (even count), sorted results are in buffer A
     // (sortKeysBuffer_, sortedIndicesBuffer_) which is what render reads.
 
-    // Barrier: sort compute -> vertex/fragment shader reads
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    // Barrier: sort compute -> vertex/fragment shader reads.
+    //
+    // srcStageMask=ALL_COMMANDS (not just COMPUTE_SHADER_BIT) is deliberate:
+    // this needs to cover not only the radix sort's own writes but also the
+    // *original* preprocess dispatch's writes to projected_center/conic/
+    // color/mv/depth from much earlier in this same command buffer. Those
+    // are already nominally covered by the compute->compute barriers chained
+    // through the sort passes above, but MoltenVK has been observed to not
+    // reliably propagate that chained dependency all the way through when a
+    // LATER barrier changes destination stage from COMPUTE_SHADER_BIT to
+    // VERTEX_SHADER_BIT|FRAGMENT_SHADER_BIT -- in practice this showed up as
+    // an intermittent (run-to-run nondeterministic) stale/garbage read of
+    // projected_mv specifically by the vertex shader, even though the
+    // preprocess compute's OWN output was verified bit-identical across
+    // runs (docs/lux-4d-spec.md section 3's --time-prev follow-up
+    // debugging). Using ALL_COMMANDS_BIT as the source stage is the
+    // conservative fix: it makes this barrier depend on literally
+    // everything recorded earlier in the command buffer, not just the
+    // stage-matching subset, closing the gap regardless of its exact
+    // driver-level root cause.
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 

@@ -462,8 +462,15 @@ MetalSplatRenderer::~MetalSplatRenderer() {
 // --------------------------------------------------------------------------
 
 void MetalSplatRenderer::createRenderTargets(MetalContext& ctx) {
+    // RGBA16Float (docs/lux-4d-spec.md section 3's PSNR follow-up): 16-bit
+    // float supports hardware blending on Apple GPUs (unlike 32-bit, see
+    // the motion/depth attachments' manual framebuffer-fetch blend below)
+    // and removes the previous RGBA8Unorm target's per-blend 1/255
+    // rounding across hundreds of overlapping low-alpha fragments.
+    // MetalScreenshot::saveTextureToPNG converts to 8-bit only at the very
+    // end, by rounding (not truncating).
     auto* colorDesc = MTL::TextureDescriptor::texture2DDescriptor(
-        MTL::PixelFormatRGBA8Unorm, width_, height_, false);
+        MTL::PixelFormatRGBA16Float, width_, height_, false);
     colorDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
     colorDesc->setStorageMode(MTL::StorageModePrivate);
     colorTarget_ = ctx.newTexture(colorDesc);
@@ -551,7 +558,7 @@ void MetalSplatRenderer::createPipelines(MetalContext& ctx) {
 
     // Color attachment with premultiplied alpha blending
     auto* colorAtt = pipeDesc->colorAttachments()->object(0);
-    colorAtt->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+    colorAtt->setPixelFormat(MTL::PixelFormatRGBA16Float);
     colorAtt->setBlendingEnabled(true);
     colorAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
     colorAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);

@@ -86,4 +86,28 @@ std::vector<float> unpremultiplyByAlpha(const std::vector<float>& rawAux,
                                          const std::vector<float>& alphaChannel,
                                          uint32_t width, uint32_t height, int channels);
 
+// IEEE-754 binary16 -> float32. Portable (no _Float16/F16C dependency);
+// used to convert the splat color attachment's raw bytes (now
+// RGBA16_SFLOAT/RGBA16Float, see docs/lux-4d-spec.md section 3's PSNR
+// follow-up) back to float32 on the host, both for PNG saving (round, not
+// truncate, to 8-bit) and for the `--output-aux`-only `_color.npy` dump.
+float halfToFloat(uint16_t h);
+
+// Rounds a linear [0,1] float to an 8-bit UNORM byte: clamp then
+// round-half-away-from-zero (NOT truncate) -- e.g. 0.999 -> 255, not 254.
+uint8_t floatToUnorm8Rounded(float x);
+
+// Converts a raw RGBA16_SFLOAT/RGBA16Float color attachment readback
+// (8 bytes/pixel: 4x uint16 half-floats, premultiplied alpha per
+// docs/lux-4d-spec.md section 3's fragment output convention) into:
+//   - `outRgba8`: an 8-bit RGBA buffer (4 bytes/pixel) for PNG saving,
+//     alpha un-premultiplied out of rgb first (so the saved PNG shows
+//     true un-premultiplied color), each channel rounded (not truncated).
+//   - the returned float32 [H,W,4] un-premultiplied RGBA buffer (for
+//     `_color.npy`; alpha itself is NOT premultiplied, so this channel is
+//     the plain accumulated alpha).
+std::vector<float> convertRgba16fColorAttachment(const std::vector<uint8_t>& rawHalfBytes,
+                                                  uint32_t width, uint32_t height,
+                                                  std::vector<uint8_t>& outRgba8);
+
 } // namespace DlssIO

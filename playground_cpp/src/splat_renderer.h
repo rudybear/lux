@@ -55,6 +55,20 @@ public:
         firstMvFrame_ = false;
     }
 
+    // Explicitly seeds splat_prev_pos (docs/lux-4d-spec.md section 3) by
+    // evaluating the morph at `prevTimeSeconds` -- for `motion: keyframes`
+    // splats only (no-op otherwise, since static splats' prevPosBuffer_
+    // already aliases posBuffer_). Restores the working splat_pos/rot/sh0
+    // buffers to whatever setMorphTime() last set afterward (they're
+    // scratch space here; render() re-dispatches the morph for the current
+    // time on every call anyway, so this doesn't need to leave them in any
+    // particular state). Without this, a single headless render's mv only
+    // ever reflects camera motion (prevPos defaults to the current frame's
+    // own position) -- call this (mirroring setPreviousCameraExplicit) to
+    // additionally validate mv against a real *positional* delta from one
+    // process invocation.
+    void seedPreviousMorphTime(VulkanContext& ctx, float prevTimeSeconds);
+
     // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
     // True when the compiled shader base was built with `motion_vectors: true`
     // / `expected_depth: true` (splat_expander.py); detected once at init()
@@ -97,7 +111,15 @@ public:
     void cleanup(VulkanContext& ctx);
 
     VkImage getOutputImage() const { return colorImage_; }
-    VkFormat getOutputFormat() const { return VK_FORMAT_R8G8B8A8_UNORM; }
+    // RGBA16_SFLOAT (docs/lux-4d-spec.md section 3's PSNR follow-up): the
+    // splat color target used to be R8G8B8A8_UNORM, which -- with hundreds
+    // of overlapping low-alpha fragments per pixel -- accumulates
+    // per-blend rounding to 1/255 and caps effective precision; 16-bit
+    // float supports hardware blending on Apple GPUs (unlike 32-bit, see
+    // the Metal splat/motion/depth attachments) and removes that rounding
+    // entirely. Screenshot::saveImageToPNG converts to 8-bit only at the
+    // very end, by rounding (not truncating).
+    VkFormat getOutputFormat() const { return VK_FORMAT_R16G16B16A16_SFLOAT; }
     uint32_t getWidth() const { return width_; }
     uint32_t getHeight() const { return height_; }
 
@@ -267,6 +289,10 @@ private:
 
     void createMorphPipeline(VkDevice device, const std::string& shaderBase);
     void createMorphBuffers(VulkanContext& ctx, const GaussianSplatData& data);
+    // Records the two-dispatch morph-apply sequence (reset then weighted
+    // apply) for `timeSeconds` into `cmd`, writing splat_pos/rot/sh0 (the
+    // working buffers). Shared by render() and seedPreviousMorphTime().
+    void dispatchMorph(VkCommandBuffer cmd, float timeSeconds);
 
     // --- DLSS input-contract outputs ---
     void createPrevPosBuffer(VulkanContext& ctx, const GaussianSplatData& data);

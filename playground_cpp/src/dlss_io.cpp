@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -201,6 +202,72 @@ std::vector<float> unpremultiplyByAlpha(const std::vector<float>& rawAux,
         for (int c = 0; c < channels; ++c) {
             out[i * channels + c] = (a > 1e-6f) ? (rawAux[i * channels + c] / a) : 0.0f;
         }
+    }
+    return out;
+}
+
+float halfToFloat(uint16_t h) {
+    // Standard IEEE-754 binary16 -> binary32 bit-twiddling expansion.
+    uint32_t sign = (h & 0x8000u) << 16;
+    uint32_t exp16 = (h >> 10) & 0x1Fu;
+    uint32_t mant16 = h & 0x3FFu;
+    uint32_t bits;
+    if (exp16 == 0) {
+        if (mant16 == 0) {
+            bits = sign;  // +-0
+        } else {
+            // Subnormal half -> normalize into a float32.
+            int e = -1;
+            uint32_t m = mant16;
+            do { m <<= 1; e++; } while ((m & 0x400u) == 0);
+            m &= 0x3FFu;
+            uint32_t exp32 = static_cast<uint32_t>(127 - 15 - e);
+            bits = sign | (exp32 << 23) | (m << 13);
+        }
+    } else if (exp16 == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mant16 << 13);  // Inf/NaN
+    } else {
+        uint32_t exp32 = exp16 - 15 + 127;
+        bits = sign | (exp32 << 23) | (mant16 << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+uint8_t floatToUnorm8Rounded(float x) {
+    x = std::clamp(x, 0.0f, 1.0f);
+    return static_cast<uint8_t>(std::lround(x * 255.0f));
+}
+
+std::vector<float> convertRgba16fColorAttachment(const std::vector<uint8_t>& rawHalfBytes,
+                                                  uint32_t width, uint32_t height,
+                                                  std::vector<uint8_t>& outRgba8) {
+    size_t numPixels = static_cast<size_t>(width) * height;
+    std::vector<float> out(numPixels * 4);
+    outRgba8.assign(numPixels * 4, 0);
+    const uint16_t* half = reinterpret_cast<const uint16_t*>(rawHalfBytes.data());
+    for (size_t i = 0; i < numPixels; ++i) {
+        float rPre = halfToFloat(half[i * 4 + 0]);
+        float gPre = halfToFloat(half[i * 4 + 1]);
+        float bPre = halfToFloat(half[i * 4 + 2]);
+        float a = halfToFloat(half[i * 4 + 3]);
+
+        float r, g, b;
+        if (a > 1e-6f) {
+            r = rPre / a; g = gPre / a; b = bPre / a;
+        } else {
+            r = g = b = 0.0f;
+        }
+        out[i * 4 + 0] = r;
+        out[i * 4 + 1] = g;
+        out[i * 4 + 2] = b;
+        out[i * 4 + 3] = a;
+
+        outRgba8[i * 4 + 0] = floatToUnorm8Rounded(r);
+        outRgba8[i * 4 + 1] = floatToUnorm8Rounded(g);
+        outRgba8[i * 4 + 2] = floatToUnorm8Rounded(b);
+        outRgba8[i * 4 + 3] = floatToUnorm8Rounded(a);
     }
     return out;
 }

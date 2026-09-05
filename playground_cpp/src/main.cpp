@@ -143,6 +143,15 @@ struct CLIOptions {
     std::string outputAuxPrefix;             // --output-aux <prefix>
     std::string cameraJsonPath;              // --camera-json <file>
     std::string cameraJsonPrevPath;          // --camera-json-prev <file> (test/tooling only)
+
+    // Motion vectors: evaluate the morph at a *different* previous time
+    // for a real positional MV delta from one headless render (instead of
+    // the default prev-positions == current-positions "camera-only" mv).
+    // See docs/lux-4d-spec.md section 3's --time-prev/--frame-prev follow-up.
+    bool hasTimePrev = false;
+    float timePrev = 0.0f;
+    bool hasFramePrev = false;
+    int framePrev = 0;
 };
 
 static void printUsage(const char* program) {
@@ -179,6 +188,10 @@ static void printUsage(const char* program) {
               << "                         explicitly instead of the default prev==curr (mv=0) on\n"
               << "                         frame 1 -- lets one headless render produce a deterministic\n"
               << "                         non-zero MV from pure camera motion (testing/tooling)\n"
+              << "  --time-prev <SECONDS> / --frame-prev <N>  Dynamic splats: evaluate the morph at\n"
+              << "                         this previous time into splat_prev_pos, so mv reflects real\n"
+              << "                         actor motion too (default: prev positions = current, i.e.\n"
+              << "                         camera-only mv). Independent of --camera-json-prev.\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -253,6 +266,12 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.cameraJsonPath = argv[++i];
         } else if (arg == "--camera-json-prev" && i + 1 < argc) {
             opts.cameraJsonPrevPath = argv[++i];
+        } else if (arg == "--time-prev" && i + 1 < argc) {
+            opts.timePrev = std::stof(argv[++i]);
+            opts.hasTimePrev = true;
+        } else if (arg == "--frame-prev" && i + 1 < argc) {
+            opts.framePrev = std::stoi(argv[++i]);
+            opts.hasFramePrev = true;
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -721,6 +740,19 @@ static int runHeadless(const CLIOptions& opts) {
                 }
             }
 
+            // --- Motion vectors: real previous-time morph evaluation ---
+            // (docs/lux-4d-spec.md section 3's --time-prev/--frame-prev
+            // follow-up). Must come after --camera-json-prev above so that,
+            // if neither this nor --camera-json-prev seeded the previous
+            // camera, seedPreviousMorphTime()'s own "default to current"
+            // fallback applies consistently.
+            if (opts.hasTimePrev || opts.hasFramePrev) {
+                float tPrev = opts.hasFramePrev ? splatR->frameToTime(opts.framePrev) : opts.timePrev;
+                std::cout << "[info] --time-prev/--frame-prev applied: evaluating morph at t=" << tPrev
+                          << "s for splat_prev_pos (mv will also reflect actor motion)" << std::endl;
+                splatR->seedPreviousMorphTime(ctx, tPrev);
+            }
+
             // --- Sub-pixel jitter (docs/lux-4d-spec.md section 3) ---
             if (opts.jitterX != 0.0f || opts.jitterY != 0.0f) {
                 splatR->setJitter(opts.jitterX, opts.jitterY);
@@ -784,6 +816,18 @@ static int runHeadless(const CLIOptions& opts) {
                 Screenshot::saveImageToPNG(ctx, splatR->getOutputImage(), splatR->getOutputFormat(),
                                             w, h, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, colorPath);
 
+                // _color.npy: float32 [H,W,4], un-premultiplied RGB + alpha,
+                // read directly from the RGBA16_SFLOAT color attachment --
+                // no 8-bit quantization anywhere in this path (unlike
+                // _color.png, which still rounds to 8-bit for viewing).
+                {
+                    auto raw = Screenshot::readImageRaw(ctx, splatR->getOutputImage(), w, h, 8,
+                                                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                    std::vector<uint8_t> unusedRgba8;
+                    auto colorF32 = DlssIO::convertRgba16fColorAttachment(raw, w, h, unusedRgba8);
+                    DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_color.npy", colorF32, {h, w, 4});
+                }
+
                 if (splatR->hasMotionVectors() || splatR->hasExpectedDepth()) {
                     // Each aux attachment carries its OWN alpha in its last
                     // component (out_depth.y / out_motion.w, see
@@ -827,10 +871,10 @@ static int runHeadless(const CLIOptions& opts) {
                                                            mv, w, h, 2);
                     }
                     std::cout << "[info] Wrote aux dumps: " << opts.outputAuxPrefix
-                              << "_{color.png,depth.npy,mv.npy,*_preview.png}" << std::endl;
+                              << "_{color.png,color.npy,depth.npy,mv.npy,*_preview.png}" << std::endl;
                 } else {
                     std::cerr << "[warn] --output-aux given but this pipeline wasn't compiled with "
-                                 "motion_vectors/expected_depth -- only _color.png was written."
+                                 "motion_vectors/expected_depth -- only _color.png/_color.npy were written."
                               << std::endl;
                 }
             }

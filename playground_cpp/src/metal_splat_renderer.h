@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <cstring>
 
 struct GaussianSplatData;
 
@@ -58,6 +59,27 @@ public:
     void setPreviousCameraExplicit(glm::mat4 prevViewMatrix, glm::mat4 prevProjMatrixUnjittered) {
         prevViewMatrix_ = prevViewMatrix;
         prevProjMatrixUnjittered_ = prevProjMatrixUnjittered;
+        firstMvFrame_ = false;
+    }
+
+    // Explicitly seeds splat_prev_pos by evaluating the morph at
+    // `prevTimeSeconds` (motion: keyframes splats only). See the Vulkan
+    // SplatRenderer's identical method for rationale
+    // (docs/lux-4d-spec.md section 3's --time-prev/--frame-prev follow-up).
+    // Metal's setMorphTime() is already synchronous (writes posBuffer_
+    // directly, no deferred GPU dispatch to route around), so this is just:
+    // seed camera history if not already done, evaluate+copy, restore.
+    void seedPreviousMorphTime(float prevTimeSeconds) {
+        if (!dynamics_.has_motion) return;
+        if (firstMvFrame_) {
+            prevViewMatrix_ = viewMatrix_;
+            prevProjMatrixUnjittered_ = projMatrixUnjittered_;
+        }
+        float savedTime = currentMorphTime_;
+        setMorphTime(prevTimeSeconds);
+        std::memcpy(prevPosBuffer_->contents(), hostPositions_.data(),
+                    hostPositions_.size() * sizeof(float));
+        setMorphTime(savedTime);
         firstMvFrame_ = false;
     }
 

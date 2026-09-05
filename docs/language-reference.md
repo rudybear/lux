@@ -594,6 +594,19 @@ splat cloud under camera motion alone can still emit motion vectors.
   view-projection and alias/copy `splat_prev_pos` to the current
   positions, which makes `mv` evaluate to (0, 0) exactly.
 
+  The C++ playgrounds (Vulkan and Metal) apply this same "prev == curr"
+  convention to every *single headless render* by default (there being no
+  real previous frame to double-buffer from), which makes `--camera-json`/
+  `--camera-json-prev` renders reflect the camera delta but *not* a
+  `motion: keyframes` actor's own animation. `--time-prev <SECONDS>` /
+  `--frame-prev <N>` overrides this for validation/tooling purposes: the
+  morph animation is evaluated a second time, at this earlier time, into
+  `splat_prev_pos`, so a single headless render's `mv` reflects real actor
+  motion between two arbitrary times (`mv = projection(pos(time), cam) -
+  projection(pos(time_prev), cam_prev)`). Combine with `--camera-json-prev`
+  to also get a real camera delta in the same render. See
+  `docs/rendering-engines.md`'s CLI flags table.
+
 **`expected_depth: true`** adds an output buffer `projected_depth`
 (scalar): the camera-space depth `t = -view_pos.z` already computed by the
 preprocess stage's Jacobian projection (gsplat's `"ED"` — expected depth

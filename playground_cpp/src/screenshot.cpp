@@ -1,4 +1,5 @@
 #include "screenshot.h"
+#include "dlss_io.h"
 #include "stb_image_write.h"
 #include <stdexcept>
 #include <iostream>
@@ -12,7 +13,14 @@ void saveImageToPNG(VulkanContext& ctx,
                     uint32_t width, uint32_t height,
                     VkImageLayout currentLayout,
                     const std::string& outputPath) {
-    VkDeviceSize imageSize = width * height * 4;
+    // The splat color target is RGBA16_SFLOAT (docs/lux-4d-spec.md section 3's
+    // PSNR follow-up: hardware float blending, no more 1/255 per-blend
+    // rounding across hundreds of overlapping low-alpha fragments) --
+    // convert to 8-bit only here, at the very end, by rounding (not
+    // truncating) after un-premultiplying alpha out of rgb.
+    bool isHalfFloat = (format == VK_FORMAT_R16G16B16A16_SFLOAT);
+    uint32_t bytesPerPixel = isHalfFloat ? 8 : 4;
+    VkDeviceSize imageSize = static_cast<VkDeviceSize>(width) * height * bytesPerPixel;
 
     // Create staging buffer (host-visible, host-coherent)
     VkBufferCreateInfo bufferInfo = {};
@@ -86,8 +94,12 @@ void saveImageToPNG(VulkanContext& ctx,
 
     vmaUnmapMemory(ctx.allocator, stagingAllocation);
 
-    // Handle BGRA -> RGBA swizzle if format is BGRA
-    if (format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB) {
+    if (isHalfFloat) {
+        std::vector<uint8_t> rgba8;
+        DlssIO::convertRgba16fColorAttachment(pixels, width, height, rgba8);
+        pixels.swap(rgba8);
+    } else if (format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB) {
+        // Handle BGRA -> RGBA swizzle if format is BGRA
         for (uint32_t i = 0; i < width * height; i++) {
             std::swap(pixels[i * 4 + 0], pixels[i * 4 + 2]);
         }

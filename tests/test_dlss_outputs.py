@@ -24,6 +24,9 @@ import numpy as np
 import pytest
 from PIL import Image
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from playground.dynamic_splat_gltf import load_dynamic_splat_glb  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VULKAN_BIN = REPO_ROOT / "playground_cpp" / "build" / "lux-playground"
 METAL_BIN = REPO_ROOT / "playground_cpp" / "build-metal" / "lux-playground-metal"
@@ -472,3 +475,101 @@ class TestJitter:
         mask = (alpha_off > 0.5) & (alpha_on > 0.5)
         assert mask.sum() > 20, f"too few stably-covered pixels ({mask.sum()})"
         assert np.max(np.abs(mv_off[mask] - mv_on[mask])) < 1e-3
+
+
+# ===========================================================================
+# Section 3: --time-prev/--frame-prev (real actor motion in a single-shot
+# headless MV render, not just camera-only)
+# ===========================================================================
+
+class TestPreviousMorphTime:
+    """Without --time-prev/--frame-prev, splat_prev_pos defaults to the
+    current frame's own (post-morph) position, so a single headless render's
+    mv only ever reflects camera motion -- fine for validating the
+    projection math (see TestMotionVectors above), but it means a *moving*
+    actor's own motion never shows up unless you have two real frames to
+    diff. --time-prev/--frame-prev fixes that by evaluating the morph at a
+    second, different time into splat_prev_pos."""
+
+    ASSET = REPO_ROOT / "tests" / "assets" / "dynamic_splats_synthetic.glb"
+
+    def test_camera_only_mv_is_zero_without_time_prev(self, binary, tmp_path):
+        if not _supports_dlss_flags(binary):
+            pytest.skip(f"{binary} doesn't support --output-aux yet")
+        width, height = 128, 128
+        cam = tmp_path / "cam.json"
+        _identity_camera_json(cam, (0.0, 0.0, -4.0), width, height)
+        aux_prefix = tmp_path / "aux"
+        _run(binary, ["--scene", str(self.ASSET), "--pipeline", PIPELINE_BASE,
+                      "--headless", "--width", str(width), "--height", str(height),
+                      "--camera-json", str(cam), "--time", "0.13333334028720856",
+                      "--output", str(tmp_path / "out.png"), "--output-aux", str(aux_prefix)])
+        mv = np.load(str(aux_prefix) + "_mv.npy")
+        # Static camera, no --time-prev: prev positions == current positions
+        # by construction, so mv must be ~0 everywhere (not just where
+        # nothing moves -- literally the whole frame, camera-only).
+        assert np.max(np.abs(mv)) < 1e-3
+
+    def test_time_prev_reveals_actor_motion_only_on_moving_gaussians(self, binary, tmp_path):
+        if not _supports_dlss_flags(binary):
+            pytest.skip(f"{binary} doesn't support --time-prev yet")
+        asset = load_dynamic_splat_glb(self.ASSET)
+        moving = set()
+        for t in asset.targets:
+            moving.update(int(i) for i in t.indices)
+        static_idx = [i for i in range(asset.num_splats) if i not in moving]
+        moving_idx = sorted(moving)
+        assert len(static_idx) > 10 and len(moving_idx) > 10
+
+        width, height = 128, 128
+        eye = (0.0, 0.0, -4.0)
+        cam = tmp_path / "cam.json"
+        K = _identity_camera_json(cam, eye, width, height)
+        fx, cx, fy, cy = K[0], K[2], K[4], K[5]
+
+        def project(p):
+            x, y, z = p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]
+            return fx * x / z + cx, fy * y / z + cy
+
+        aux_prefix = tmp_path / "aux"
+        # Static camera (same cam for current+prev, no --camera-json-prev):
+        # isolates pure actor motion between two keyframes.
+        _run(binary, ["--scene", str(self.ASSET), "--pipeline", PIPELINE_BASE,
+                      "--headless", "--width", str(width), "--height", str(height),
+                      "--camera-json", str(cam),
+                      "--time", "0.13333334028720856", "--time-prev", "0.06666667014360428",
+                      "--output", str(tmp_path / "out.png"), "--output-aux", str(aux_prefix)])
+        mv = np.load(str(aux_prefix) + "_mv.npy")
+
+        moving_px = [project(asset.base_pos[i]) for i in moving_idx]
+
+        def min_dist_to_moving(u, v):
+            return min(((u - mu) ** 2 + (v - mv_) ** 2) ** 0.5 for mu, mv_ in moving_px)
+
+        def mv_window_max(u, v, radius=2):
+            px, py = int(round(u - 0.5)), int(round(v - 0.5))
+            x0, x1 = max(0, px - radius), min(width, px + radius + 1)
+            y0, y1 = max(0, py - radius), min(height, py + radius + 1)
+            if x1 <= x0 or y1 <= y0:
+                return None
+            window = mv[y0:y1, x0:x1, :]
+            return float(np.max(np.linalg.norm(window, axis=-1))) if window.size else None
+
+        # Only sample static gaussians whose projection is well clear of
+        # every moving gaussian's projection (>= 10px, generous given the
+        # splats' own screen-space radius) -- with 400 splats packed into a
+        # 128x128 frame, many static/moving pairs project close enough to
+        # bleed alpha-blended mv contributions into each other's immediate
+        # neighborhood, which isn't the "does mv leak onto UNRELATED static
+        # gaussians" question this test asks.
+        isolated_static = [i for i in static_idx
+                            if min_dist_to_moving(*project(asset.base_pos[i])) >= 10.0]
+        assert len(isolated_static) >= 5, "too few isolated static gaussians to test against"
+
+        static_max = max(v for i in isolated_static
+                          if (v := mv_window_max(*project(asset.base_pos[i]))) is not None)
+        moving_max = max(v for i in moving_idx
+                          if (v := mv_window_max(*project(asset.base_pos[i]))) is not None)
+        assert static_max < 0.5, f"isolated static gaussians should show ~0 mv, got {static_max}"
+        assert moving_max > 1.0, f"moving gaussians should show real mv, got {moving_max}"
+        assert moving_max > 10 * max(static_max, 1e-6)

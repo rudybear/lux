@@ -1,5 +1,6 @@
 #include "metal_screenshot.h"
 #include "metal_context.h"
+#include "dlss_io.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -17,8 +18,17 @@ void saveTextureToPNG(MetalContext& ctx, MTL::Texture* texture,
         throw std::runtime_error("Cannot save screenshot: null texture");
     }
 
+    // The splat color target is RGBA16Float (docs/lux-4d-spec.md section 3's
+    // PSNR follow-up: hardware float blending, no more 1/255 per-blend
+    // rounding across hundreds of overlapping low-alpha fragments) --
+    // convert to 8-bit only here, at the very end, by rounding (not
+    // truncating) after un-premultiplying alpha out of rgb.
+    MTL::PixelFormat format = texture->pixelFormat();
+    bool isHalfFloat = (format == MTL::PixelFormatRGBA16Float);
+    uint32_t bytesPerPixel = isHalfFloat ? 8 : 4;
+
     // Create a shared (CPU-readable) staging buffer
-    size_t bytesPerRow = width * 4;
+    size_t bytesPerRow = static_cast<size_t>(width) * bytesPerPixel;
     size_t bufferSize = bytesPerRow * height;
     auto* stagingBuffer = ctx.newBuffer(bufferSize, MTL::ResourceStorageModeShared);
 
@@ -37,9 +47,13 @@ void saveTextureToPNG(MetalContext& ctx, MTL::Texture* texture,
     memcpy(pixels.data(), stagingBuffer->contents(), bufferSize);
     stagingBuffer->release();
 
-    // Handle BGRA → RGBA swizzle if needed
-    MTL::PixelFormat format = texture->pixelFormat();
-    if (format == MTL::PixelFormatBGRA8Unorm || format == MTL::PixelFormatBGRA8Unorm_sRGB) {
+    if (isHalfFloat) {
+        std::vector<uint8_t> rgba8;
+        DlssIO::convertRgba16fColorAttachment(pixels, width, height, rgba8);
+        pixels.swap(rgba8);
+        bytesPerRow = static_cast<size_t>(width) * 4;
+    } else if (format == MTL::PixelFormatBGRA8Unorm || format == MTL::PixelFormatBGRA8Unorm_sRGB) {
+        // Handle BGRA -> RGBA swizzle if needed
         for (size_t i = 0; i < bufferSize; i += 4) {
             std::swap(pixels[i], pixels[i + 2]); // swap R and B
         }
