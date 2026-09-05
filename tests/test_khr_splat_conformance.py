@@ -12,7 +12,19 @@ The conformance assets follow the official KHR_gaussian_splatting spec where:
 - SH coefficients are per-degree attributes: ``KHR_gaussian_splatting:SH_DEGREE_N_COEF_M``
 - The extension object carries rendering hints: ``kernel``, ``colorSpace``,
   ``sortingMethod``, ``projection``
-- Scale and opacity are stored in linear space (not log/logit)
+- Opacity is stored in linear [0, 1] space (not logit).
+- SCALE: the *ratified* KHR_gaussian_splatting spec (finalized in an April-2026
+  editorial pass) requires SCALE to be linear ("MUST NOT be negative"), but the
+  currently-published conformance assets under ``tests/assets/khr_splat_conformance/``
+  predate that pass and still store SCALE in log-space (negative values are valid,
+  representing scales < 1.0) — the same convention as the pre-ratification draft and
+  raw 3DGS PLY training output. ``colorSpace`` in these assets is likewise the older
+  ``"BT.709-sRGB"`` string rather than the ratified ``"srgb_rec709_display"``/
+  ``"lin_rec709_display"`` enum values. All lux loaders (tools/ply_to_gltf.py's
+  ratified default output, playground_cpp/src/gltf_loader.cpp,
+  playground_rust/src/gltf_loader.rs, playground/render_harness.py) auto-detect
+  which SCALE convention a given asset uses (any negative value implies log-space)
+  and are lenient about the exact colorSpace string.
 
 Conformance assets must be downloaded first:
     python -m tools.download_khr_splat_tests
@@ -1045,9 +1057,11 @@ class TestGlbFormatIntegrity:
 class TestGenerateTestSplatsIntegration:
     """Test that generate_test_splats.py output is valid glTF with Gaussian splat data.
 
-    Note: generate_test_splats uses the project's internal KHR format (nested
-    ``attributes`` and ``sh`` arrays), not the official spec format with prefixed
-    attribute names. These tests verify structural integrity regardless of format.
+    generate_test_splats.py writes the *ratified* KHR_gaussian_splatting layout
+    (prefixed attribute names living in primitive.attributes, linear SCALE/OPACITY,
+    kernel/colorSpace on the extension object). These tests also fall back to the
+    legacy pre-ratification nested-attribute convention so they keep working
+    against older/hand-authored fixtures using that format.
     """
 
     def _extract_any_splat_data(self, gltf: dict) -> dict | None:
@@ -1095,21 +1109,26 @@ class TestGenerateTestSplatsIntegration:
         generate_test_splats(str(glb_path), num_splats=100)
 
         gltf, bin_data = _parse_glb(glb_path)
-        # The project format uses _ROTATION attribute or KHR nested attributes
+        found_rotation = False
+        # Ratified prefix, internal underscore convention, or legacy nested attributes.
         for mesh in gltf.get("meshes", []):
             for prim in mesh.get("primitives", []):
                 attrs = prim.get("attributes", {})
-                rot_idx = attrs.get("_ROTATION")
+                rot_idx = attrs.get("KHR_gaussian_splatting:ROTATION")
+                if rot_idx is None:
+                    rot_idx = attrs.get("_ROTATION")
                 if rot_idx is None:
                     ext = prim.get("extensions", {}).get("KHR_gaussian_splatting", {})
                     rot_idx = ext.get("attributes", {}).get("ROTATION")
                 if rot_idx is not None:
+                    found_rotation = True
                     values = _read_accessor_floats(gltf, bin_data, rot_idx)
                     count = len(values) // 4
                     for i in range(count):
                         x, y, z, w = values[i*4:(i+1)*4]
                         length = math.sqrt(x*x + y*y + z*z + w*w)
                         assert abs(length - 1.0) < 1e-6, f"Quaternion {i} not unit: |q|={length}"
+        assert found_rotation, "No ROTATION attribute found in any layout"
 
     def test_generated_glb_sh_dc_present(self, tmp_path):
         """SH degree 0 DC coefficients should be present and finite."""
@@ -1122,15 +1141,30 @@ class TestGenerateTestSplatsIntegration:
         ext = self._extract_any_splat_data(gltf)
         assert ext is not None
 
-        # Project format: sh[0].coefficients is the accessor index
-        sh = ext.get("sh", [])
-        if sh:
-            assert sh[0]["degree"] == 0
-            coeff_idx = sh[0]["coefficients"]
-            values = _read_accessor_floats(gltf, bin_data, coeff_idx)
-            assert len(values) == 50 * 3  # vec3 per splat
-            for v in values:
-                assert math.isfinite(v)
+        coeff_idx = None
+        for mesh in gltf.get("meshes", []):
+            for prim in mesh.get("primitives", []):
+                # Ratified: KHR_gaussian_splatting:SH_DEGREE_0_COEF_0 in primitive.attributes
+                coeff_idx = prim.get("attributes", {}).get(
+                    "KHR_gaussian_splatting:SH_DEGREE_0_COEF_0")
+                if coeff_idx is None:
+                    coeff_idx = prim.get("attributes", {}).get("_SH_0")
+                if coeff_idx is None:
+                    # Legacy nested: sh[0].coefficients is the accessor index
+                    sh = ext.get("sh", [])
+                    if sh:
+                        assert sh[0]["degree"] == 0
+                        coeff_idx = sh[0]["coefficients"]
+                if coeff_idx is not None:
+                    break
+            if coeff_idx is not None:
+                break
+
+        assert coeff_idx is not None, "No SH degree-0 DC coefficient found in any layout"
+        values = _read_accessor_floats(gltf, bin_data, coeff_idx)
+        assert len(values) == 50 * 3  # vec3 per splat
+        for v in values:
+            assert math.isfinite(v)
 
     def test_generated_glb_position_has_min_max(self, tmp_path):
         """POSITION accessor should have min/max as required by glTF spec."""

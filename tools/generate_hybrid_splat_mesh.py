@@ -6,11 +6,6 @@ import math
 import sys
 
 
-def _logit(p):
-    p = max(1e-7, min(1.0 - 1e-7, p))
-    return math.log(p / (1.0 - p))
-
-
 def generate_hybrid(output_path):
     """Create a GLB with a colored cube mesh + surrounding splat cloud."""
 
@@ -85,8 +80,9 @@ def generate_hybrid(output_path):
     splat_opa_data = bytearray()
     splat_sh_data = bytearray()
 
-    log_scale = math.log(0.05)
-    opacity_linear = 0.9  # KHR linear opacity
+    # Ratified KHR_gaussian_splatting layout: SCALE and OPACITY are linear.
+    linear_scale = 0.05
+    linear_opacity = 0.9
 
     splat_positions = []
     for i in range(num_splats):
@@ -99,8 +95,8 @@ def generate_hybrid(output_path):
 
         splat_pos_data += struct.pack('<3f', x, y, z)
         splat_rot_data += struct.pack('<4f', 0.0, 0.0, 0.0, 1.0)
-        splat_scale_data += struct.pack('<3f', log_scale, log_scale, log_scale)
-        splat_opa_data += struct.pack('<f', opacity_linear)  # KHR linear format
+        splat_scale_data += struct.pack('<3f', linear_scale, linear_scale, linear_scale)
+        splat_opa_data += struct.pack('<f', linear_opacity)
 
         # Color: cycle through green/yellow
         sh_c0 = 0.28209479177387814
@@ -184,24 +180,22 @@ def generate_hybrid(output_path):
                 "attributes": {"POSITION": 0, "NORMAL": 1},
                 "indices": 2,
             },
-            # Primitive 1: Gaussian splats (POINTS)
+            # Primitive 1: Gaussian splats (POINTS), ratified KHR_gaussian_splatting layout
             {
                 "mode": 0,  # POINTS
                 "attributes": {
                     "POSITION": 3,
-                    "_ROTATION": 4,
-                    "_SCALE": 5,
-                    "_OPACITY": 6,
-                    "_SH_0": 7,
+                    "KHR_gaussian_splatting:ROTATION": 4,
+                    "KHR_gaussian_splatting:SCALE": 5,
+                    "KHR_gaussian_splatting:OPACITY": 6,
+                    "KHR_gaussian_splatting:SH_DEGREE_0_COEF_0": 7,
                 },
                 "extensions": {
                     "KHR_gaussian_splatting": {
-                        "attributes": {
-                            "ROTATION": 4,
-                            "SCALE": 5,
-                            "OPACITY": 6,
-                        },
-                        "sh": [{"coefficients": 7, "degree": 0}],
+                        "kernel": "ellipse",
+                        "colorSpace": "srgb_rec709_display",
+                        "sortingMethod": "cameraDistance",
+                        "projection": "perspective",
                     }
                 }
             },
@@ -223,6 +217,7 @@ def generate_hybrid(output_path):
     gltf_json = {
         "asset": {"version": "2.0", "generator": "lux-generate-hybrid"},
         "extensionsUsed": ["KHR_gaussian_splatting"],
+        "extensionsRequired": ["KHR_gaussian_splatting"],
         "buffers": [{"byteLength": total_buffer}],
         "bufferViews": buffer_views,
         "accessors": accessors,

@@ -20,12 +20,6 @@ def _fibonacci_sphere(n):
     return points
 
 
-def _logit(p):
-    """Inverse sigmoid: logit(p) = log(p / (1 - p))."""
-    p = max(1e-7, min(1.0 - 1e-7, p))
-    return math.log(p / (1.0 - p))
-
-
 def generate_test_splats(output_path, num_splats=1000, pattern="sphere"):
     """Generate a test .glb with KHR_gaussian_splatting data."""
     points = _fibonacci_sphere(num_splats)
@@ -37,18 +31,19 @@ def generate_test_splats(output_path, num_splats=1000, pattern="sphere"):
     opacity_data = bytearray()
     sh_data = bytearray()
 
-    log_scale = math.log(0.02)
-    opacity_logit = _logit(0.95)
+    # Ratified KHR_gaussian_splatting layout: SCALE and OPACITY are linear.
+    linear_scale = 0.02
+    linear_opacity = 0.95
 
     for i, (x, y, z) in enumerate(points):
         # Position: vec3 float
         pos_data += struct.pack('<3f', x, y, z)
         # Rotation: xyzw quaternion (identity = [0, 0, 0, 1])
         rot_data += struct.pack('<4f', 0.0, 0.0, 0.0, 1.0)
-        # Scale: log-space vec3
-        scale_data += struct.pack('<3f', log_scale, log_scale, log_scale)
-        # Opacity: logit-space scalar
-        opacity_data += struct.pack('<f', opacity_logit)
+        # Scale: linear vec3 (ratified KHR_gaussian_splatting spec)
+        scale_data += struct.pack('<3f', linear_scale, linear_scale, linear_scale)
+        # Opacity: linear scalar (ratified KHR_gaussian_splatting spec)
+        opacity_data += struct.pack('<f', linear_opacity)
         # SH degree 0: DC coefficient = color / SH_C0 where SH_C0 = 0.28209479
         # Red gradient based on latitude (z coordinate): red at top, blue at bottom
         latitude = (z + 1.0) / 2.0  # 0..1
@@ -84,6 +79,7 @@ def generate_test_splats(output_path, num_splats=1000, pattern="sphere"):
     gltf_json = {
         "asset": {"version": "2.0", "generator": "lux-generate-test-splats"},
         "extensionsUsed": ["KHR_gaussian_splatting"],
+        "extensionsRequired": ["KHR_gaussian_splatting"],
         "buffers": [{"byteLength": total_buffer}],
         "bufferViews": [
             {"buffer": 0, "byteOffset": pos_offset,   "byteLength": pos_size},
@@ -103,21 +99,21 @@ def generate_test_splats(output_path, num_splats=1000, pattern="sphere"):
         "meshes": [{
             "primitives": [{
                 "mode": 0,
+                # Ratified KHR_gaussian_splatting layout: attribute semantics live
+                # directly in primitive.attributes, namespaced by extension name.
                 "attributes": {
                     "POSITION": 0,
-                    "_ROTATION": 1,
-                    "_SCALE": 2,
-                    "_OPACITY": 3,
-                    "_SH_0": 4,
+                    "KHR_gaussian_splatting:ROTATION": 1,
+                    "KHR_gaussian_splatting:SCALE": 2,
+                    "KHR_gaussian_splatting:OPACITY": 3,
+                    "KHR_gaussian_splatting:SH_DEGREE_0_COEF_0": 4,
                 },
                 "extensions": {
                     "KHR_gaussian_splatting": {
-                        "attributes": {
-                            "ROTATION": 1,
-                            "SCALE": 2,
-                            "OPACITY": 3,
-                        },
-                        "sh": [{"coefficients": 4, "degree": 0}],
+                        "kernel": "ellipse",
+                        "colorSpace": "srgb_rec709_display",
+                        "sortingMethod": "cameraDistance",
+                        "projection": "perspective",
                     }
                 }
             }]

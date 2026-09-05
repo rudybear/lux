@@ -2,13 +2,7 @@
 
 import struct
 import json
-import math
 import sys
-
-
-def _logit(p):
-    p = max(1e-7, min(1.0 - 1e-7, p))
-    return math.log(p / (1.0 - p))
 
 
 def generate_debug_splats(output_path):
@@ -43,12 +37,11 @@ def generate_debug_splats(output_path):
         # Identity quaternion (XYZW, scalar-last)
         rot_data += struct.pack('<4f', 0.0, 0.0, 0.0, 1.0)
 
-        # Log-scale (isotropic)
-        log_s = math.log(s)
-        scale_data += struct.pack('<3f', log_s, log_s, log_s)
+        # Linear scale (ratified KHR_gaussian_splatting spec, isotropic)
+        scale_data += struct.pack('<3f', s, s, s)
 
-        # Logit opacity (high opacity)
-        opacity_data += struct.pack('<f', _logit(0.99))
+        # Linear opacity (ratified KHR_gaussian_splatting spec, high opacity)
+        opacity_data += struct.pack('<f', 0.99)
 
         # SH DC: color = SH_C0 * sh_dc + 0.5, so sh_dc = (color - 0.5) / SH_C0
         sh_r = (r - 0.5) / SH_C0
@@ -68,6 +61,7 @@ def generate_debug_splats(output_path):
     gltf_json = {
         "asset": {"version": "2.0", "generator": "lux-debug-splats"},
         "extensionsUsed": ["KHR_gaussian_splatting"],
+        "extensionsRequired": ["KHR_gaussian_splatting"],
         "buffers": [{"byteLength": total_size}],
         "bufferViews": [
             {"buffer": 0, "byteOffset": offsets[i], "byteLength": len(buffers[i])}
@@ -84,14 +78,20 @@ def generate_debug_splats(output_path):
         "meshes": [{
             "primitives": [{
                 "mode": 0,
+                # Ratified KHR_gaussian_splatting layout.
                 "attributes": {
-                    "POSITION": 0, "_ROTATION": 1, "_SCALE": 2,
-                    "_OPACITY": 3, "_SH_0": 4,
+                    "POSITION": 0,
+                    "KHR_gaussian_splatting:ROTATION": 1,
+                    "KHR_gaussian_splatting:SCALE": 2,
+                    "KHR_gaussian_splatting:OPACITY": 3,
+                    "KHR_gaussian_splatting:SH_DEGREE_0_COEF_0": 4,
                 },
                 "extensions": {
                     "KHR_gaussian_splatting": {
-                        "attributes": {"ROTATION": 1, "SCALE": 2, "OPACITY": 3},
-                        "sh": [{"coefficients": 4, "degree": 0}],
+                        "kernel": "ellipse",
+                        "colorSpace": "srgb_rec709_display",
+                        "sortingMethod": "cameraDistance",
+                        "projection": "perspective",
                     }
                 }
             }]
