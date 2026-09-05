@@ -250,6 +250,87 @@ kernel void splat_project(
 )";
 
 // --------------------------------------------------------------------------
+// Embedded MSL: Gaussian splat morph-apply compute kernel
+// --------------------------------------------------------------------------
+//
+// Real GPU implementation of the same segment-based algorithm
+// splat_expander._build_morph_apply_body emits for the Vulkan/luxc path
+// (SPECIFICATION.md 12.8, docs/lux-4d-spec.md) -- replaces the earlier
+// CPU-side mirror in MetalSplatRenderer::setMorphTime, so the Metal path is
+// a real runtime candidate (this is what would run on iPhone), not just a
+// correctness reference. Dispatched twice per setMorphTime() call exactly
+// like the Vulkan splat_renderer.cpp: once over ALL concatenated segment
+// entries with weight 0/0 (resets every gaussian that ever moves back to
+// base -- correct under arbitrary time scrubbing, not just monotonic
+// playback), then once over the active segment with its real weights.
+// Arithmetic is written out component-by-component (not `length()`/vector
+// builtins) to match MetalSplatRenderer's old CPU loop (and
+// splat_expander's) operation-for-operation, for bit-exactness.
+static const char* kSplatMorphMSL = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MorphPush {
+    uint segmentOffset;
+    uint segmentCount;
+    float weightLow;
+    float weightHigh;
+};
+
+kernel void splat_morph_apply(
+    device const float4* basePos   [[buffer(0)]],
+    device const float4* baseRot   [[buffer(1)]],
+    device const float4* baseSh0   [[buffer(2)]],
+    device const uint*   morphIndex   [[buffer(3)]],
+    device const float4* deltaPosLo   [[buffer(4)]],
+    device const float4* deltaRotLo   [[buffer(5)]],
+    device const float4* deltaSh0Lo   [[buffer(6)]],
+    device const float4* deltaPosHi   [[buffer(7)]],
+    device const float4* deltaRotHi   [[buffer(8)]],
+    device const float4* deltaSh0Hi   [[buffer(9)]],
+    device float4* outPos   [[buffer(10)]],
+    device float4* outRot   [[buffer(11)]],
+    device float4* outSh0   [[buffer(12)]],
+    constant MorphPush& p   [[buffer(13)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p.segmentCount) return;
+    uint entry = p.segmentOffset + gid;
+    uint idx = morphIndex[entry];
+
+    float4 bp = basePos[idx];
+    float4 br = baseRot[idx];
+    float4 bs = baseSh0[idx];
+    float4 dpLo = deltaPosLo[entry];
+    float4 dpHi = deltaPosHi[entry];
+    float4 drLo = deltaRotLo[entry];
+    float4 drHi = deltaRotHi[entry];
+    float4 dsLo = deltaSh0Lo[entry];
+    float4 dsHi = deltaSh0Hi[entry];
+
+    float newPosX = bp.x + p.weightLow * dpLo.x + p.weightHigh * dpHi.x;
+    float newPosY = bp.y + p.weightLow * dpLo.y + p.weightHigh * dpHi.y;
+    float newPosZ = bp.z + p.weightLow * dpLo.z + p.weightHigh * dpHi.z;
+
+    float newRotX = br.x + p.weightLow * drLo.x + p.weightHigh * drHi.x;
+    float newRotY = br.y + p.weightLow * drLo.y + p.weightHigh * drHi.y;
+    float newRotZ = br.z + p.weightLow * drLo.z + p.weightHigh * drHi.z;
+    float newRotW = br.w + p.weightLow * drLo.w + p.weightHigh * drHi.w;
+    float rotLen = sqrt(newRotX * newRotX + newRotY * newRotY +
+                        newRotZ * newRotZ + newRotW * newRotW);
+    if (rotLen < 1e-8) rotLen = 1.0;
+
+    float newSh0X = bs.x + p.weightLow * dsLo.x + p.weightHigh * dsHi.x;
+    float newSh0Y = bs.y + p.weightLow * dsLo.y + p.weightHigh * dsHi.y;
+    float newSh0Z = bs.z + p.weightLow * dsLo.z + p.weightHigh * dsHi.z;
+
+    outPos[idx] = float4(newPosX, newPosY, newPosZ, 0.0);
+    outRot[idx] = float4(newRotX / rotLen, newRotY / rotLen, newRotZ / rotLen, newRotW / rotLen);
+    outSh0[idx] = float4(newSh0X, newSh0Y, newSh0Z, 0.0);
+}
+)";
+
+// --------------------------------------------------------------------------
 // Embedded MSL: Gaussian splat vertex + fragment shaders
 // --------------------------------------------------------------------------
 
@@ -646,7 +727,99 @@ void MetalSplatRenderer::createBuffers(MetalContext& ctx, const GaussianSplatDat
 
         std::cout << "[metal] Dynamic splats: " << morphSegments_.size() << " segments, "
                   << everMovingIndices_.size() << " gaussians ever move" << std::endl;
+
+        createMorphPipeline(ctx);
+        createMorphBuffers(ctx);
     }
+}
+
+// --------------------------------------------------------------------------
+// Dynamic splats: GPU morph-apply pipeline + buffers
+// --------------------------------------------------------------------------
+
+void MetalSplatRenderer::createMorphPipeline(MetalContext& ctx) {
+    NS::Error* error = nullptr;
+    auto* src = NS::String::string(kSplatMorphMSL, NS::UTF8StringEncoding);
+    auto* lib = ctx.device->newLibrary(src, nullptr, &error);
+    if (!lib) {
+        std::string msg = "Failed to compile splat morph shader";
+        if (error) msg += std::string(": ") + error->localizedDescription()->utf8String();
+        throw std::runtime_error(msg);
+    }
+    auto* func = lib->newFunction(NS::String::string("splat_morph_apply", NS::UTF8StringEncoding));
+    if (!func) {
+        lib->release();
+        throw std::runtime_error("splat_morph_apply function not found in morph library");
+    }
+    morphPipeline_ = ctx.device->newComputePipelineState(func, &error);
+    func->release();
+    lib->release();
+    if (!morphPipeline_) {
+        std::string msg = "Failed to create splat morph compute pipeline";
+        if (error) msg += std::string(": ") + error->localizedDescription()->utf8String();
+        throw std::runtime_error(msg);
+    }
+}
+
+void MetalSplatRenderer::createMorphBuffers(MetalContext& ctx) {
+    segmentOffsets_.resize(morphSegments_.size());
+    segmentCounts_.resize(morphSegments_.size());
+
+    std::vector<uint32_t> catIndex;
+    std::vector<float> catPosLo, catPosHi, catRotLo, catRotHi, catSh0Lo, catSh0Hi;
+    for (size_t seg = 0; seg < morphSegments_.size(); seg++) {
+        const auto& s = morphSegments_[seg];
+        segmentOffsets_[seg] = static_cast<uint32_t>(catIndex.size());
+        segmentCounts_[seg] = static_cast<uint32_t>(s.index.size());
+        catIndex.insert(catIndex.end(), s.index.begin(), s.index.end());
+        catPosLo.insert(catPosLo.end(), s.dposLo.begin(), s.dposLo.end());
+        catPosHi.insert(catPosHi.end(), s.dposHi.begin(), s.dposHi.end());
+        catRotLo.insert(catRotLo.end(), s.drotLo.begin(), s.drotLo.end());
+        catRotHi.insert(catRotHi.end(), s.drotHi.begin(), s.drotHi.end());
+        catSh0Lo.insert(catSh0Lo.end(), s.dsh0Lo.begin(), s.dsh0Lo.end());
+        catSh0Hi.insert(catSh0Hi.end(), s.dsh0Hi.begin(), s.dsh0Hi.end());
+    }
+    morphTotalEntries_ = static_cast<uint32_t>(catIndex.size());
+
+    // Pad vec3 delta arrays to vec4 (matches the compute kernel's float4 reads).
+    auto pad3to4 = [](const std::vector<float>& src) {
+        std::vector<float> out(src.size() / 3 * 4, 0.0f);
+        for (size_t i = 0; i < src.size() / 3; i++) {
+            out[i * 4 + 0] = src[i * 3 + 0];
+            out[i * 4 + 1] = src[i * 3 + 1];
+            out[i * 4 + 2] = src[i * 3 + 2];
+        }
+        return out;
+    };
+    std::vector<float> catPosLo4 = pad3to4(catPosLo), catPosHi4 = pad3to4(catPosHi);
+    std::vector<float> catSh0Lo4 = pad3to4(catSh0Lo), catSh0Hi4 = pad3to4(catSh0Hi);
+
+    // Guarantee a valid non-null pointer + nonzero size even when there are
+    // zero moving gaussians overall (dispatch counts stay 0, so this dummy
+    // data is never actually read).
+    auto ensureNonEmpty = [](std::vector<float>& v, size_t floatsPerEntry) {
+        if (v.empty()) v.resize(floatsPerEntry, 0.0f);
+    };
+    ensureNonEmpty(catPosLo4, 4); ensureNonEmpty(catPosHi4, 4);
+    ensureNonEmpty(catRotLo, 4);  ensureNonEmpty(catRotHi, 4);
+    ensureNonEmpty(catSh0Lo4, 4); ensureNonEmpty(catSh0Hi4, 4);
+    if (catIndex.empty()) catIndex.push_back(0);
+
+    baseGpuPosBuffer_ = ctx.newBuffer(basePositions_.data(), basePositions_.size() * sizeof(float),
+                                       MTL::ResourceStorageModeShared);
+    baseGpuRotBuffer_ = ctx.newBuffer(baseRotations_.data(), baseRotations_.size() * sizeof(float),
+                                       MTL::ResourceStorageModeShared);
+    baseGpuSh0Buffer_ = ctx.newBuffer(baseSH0_.data(), baseSH0_.size() * sizeof(float),
+                                       MTL::ResourceStorageModeShared);
+
+    morphIndexBuffer_ = ctx.newBuffer(catIndex.data(), catIndex.size() * sizeof(uint32_t),
+                                       MTL::ResourceStorageModeShared);
+    morphPosLoBuffer_ = ctx.newBuffer(catPosLo4.data(), catPosLo4.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    morphRotLoBuffer_ = ctx.newBuffer(catRotLo.data(), catRotLo.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    morphSh0LoBuffer_ = ctx.newBuffer(catSh0Lo4.data(), catSh0Lo4.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    morphPosHiBuffer_ = ctx.newBuffer(catPosHi4.data(), catPosHi4.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    morphRotHiBuffer_ = ctx.newBuffer(catRotHi.data(), catRotHi.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    morphSh0HiBuffer_ = ctx.newBuffer(catSh0Hi4.data(), catSh0Hi4.size() * sizeof(float), MTL::ResourceStorageModeShared);
 }
 
 float MetalSplatRenderer::animationDuration() const {
@@ -679,54 +852,65 @@ void MetalSplatRenderer::setMorphTime(float seconds) {
     currentMorphTime_ = seconds;
     SplatMorphState state = evaluateSplatMorphState(dynamics_, seconds);
 
-    auto* posPtr = static_cast<float*>(posBuffer_->contents());
-    auto* rotPtr = static_cast<float*>(rotBuffer_->contents());
-    auto* shPtr = static_cast<float*>(shBuffer_->contents());
+    // GPU morph-apply (see kSplatMorphMSL): two dispatches, exactly like the
+    // Vulkan splat_renderer.cpp -- (1) reset every gaussian that EVER moves
+    // back to base (weight 0/0), so arbitrary time scrubbing (not just
+    // monotonic playback) stays correct, then (2) apply the active
+    // segment's weighted deltas. Both proportional to sparse counts, not
+    // numSplats_.
+    struct MorphPush {
+        uint32_t segmentOffset;
+        uint32_t segmentCount;
+        float weightLow;
+        float weightHigh;
+    };
 
-    // Reset every gaussian that moves *anywhere* in the animation back to
-    // base first (needed for correctness under arbitrary time scrubbing --
-    // not just monotonic playback), then apply the active segment's
-    // weighted deltas. Cost is proportional to the total count of moving
-    // gaussians, not the splat count N.
-    for (uint32_t idx : everMovingIndices_) {
-        std::memcpy(&posPtr[idx * 4], &basePositions_[idx * 4], 3 * sizeof(float));
-        std::memcpy(&rotPtr[idx * 4], &baseRotations_[idx * 4], 4 * sizeof(float));
-        std::memcpy(&shPtr[idx * 4], &baseSH0_[idx * 4], 3 * sizeof(float));
-        hostPositions_[idx * 4 + 0] = basePositions_[idx * 4 + 0];
-        hostPositions_[idx * 4 + 1] = basePositions_[idx * 4 + 1];
-        hostPositions_[idx * 4 + 2] = basePositions_[idx * 4 + 2];
+    auto* cmdBuf = ctx_->beginCommandBuffer();
+    auto* enc = cmdBuf->computeCommandEncoder();
+    enc->setComputePipelineState(morphPipeline_);
+    enc->setBuffer(baseGpuPosBuffer_, 0, 0);
+    enc->setBuffer(baseGpuRotBuffer_, 0, 1);
+    enc->setBuffer(baseGpuSh0Buffer_, 0, 2);
+    enc->setBuffer(morphIndexBuffer_, 0, 3);
+    enc->setBuffer(morphPosLoBuffer_, 0, 4);
+    enc->setBuffer(morphRotLoBuffer_, 0, 5);
+    enc->setBuffer(morphSh0LoBuffer_, 0, 6);
+    enc->setBuffer(morphPosHiBuffer_, 0, 7);
+    enc->setBuffer(morphRotHiBuffer_, 0, 8);
+    enc->setBuffer(morphSh0HiBuffer_, 0, 9);
+    enc->setBuffer(posBuffer_, 0, 10);
+    enc->setBuffer(rotBuffer_, 0, 11);
+    enc->setBuffer(shBuffer_, 0, 12);
+
+    uint32_t threadGroupSize = static_cast<uint32_t>(morphPipeline_->maxTotalThreadsPerThreadgroup());
+    if (threadGroupSize > 256) threadGroupSize = 256;
+
+    if (morphTotalEntries_ > 0) {
+        MorphPush resetPush = {0, morphTotalEntries_, 0.0f, 0.0f};
+        enc->setBytes(&resetPush, sizeof(resetPush), 13);
+        uint32_t groups = (morphTotalEntries_ + threadGroupSize - 1) / threadGroupSize;
+        enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(threadGroupSize, 1, 1));
     }
 
-    if (state.weightLow == 0.0f && state.weightHigh == 0.0f) return;  // at/before the base frame
-
-    const SplatMorphSegment& seg = morphSegments_[state.highTargetIndex];
-    float wlo = state.weightLow, whi = state.weightHigh;
-    for (size_t k = 0; k < seg.index.size(); k++) {
-        uint32_t idx = seg.index[k];
-
-        float newPos[3], newRotRaw[4], newSh0[3];
-        for (int c = 0; c < 3; c++) {
-            newPos[c] = basePositions_[idx * 4 + c]
-                      + wlo * seg.dposLo[k * 3 + c] + whi * seg.dposHi[k * 3 + c];
-            newSh0[c] = baseSH0_[idx * 4 + c]
-                      + wlo * seg.dsh0Lo[k * 3 + c] + whi * seg.dsh0Hi[k * 3 + c];
-        }
-        for (int c = 0; c < 4; c++) {
-            newRotRaw[c] = baseRotations_[idx * 4 + c]
-                         + wlo * seg.drotLo[k * 4 + c] + whi * seg.drotHi[k * 4 + c];
-        }
-        float rotLen = std::sqrt(newRotRaw[0] * newRotRaw[0] + newRotRaw[1] * newRotRaw[1] +
-                                  newRotRaw[2] * newRotRaw[2] + newRotRaw[3] * newRotRaw[3]);
-        if (rotLen < 1e-8f) rotLen = 1.0f;
-
-        std::memcpy(&posPtr[idx * 4], newPos, 3 * sizeof(float));
-        for (int c = 0; c < 4; c++) rotPtr[idx * 4 + c] = newRotRaw[c] / rotLen;
-        std::memcpy(&shPtr[idx * 4], newSh0, 3 * sizeof(float));
-
-        hostPositions_[idx * 4 + 0] = newPos[0];
-        hostPositions_[idx * 4 + 1] = newPos[1];
-        hostPositions_[idx * 4 + 2] = newPos[2];
+    if ((state.weightLow != 0.0f || state.weightHigh != 0.0f) &&
+        state.highTargetIndex >= 0 &&
+        static_cast<size_t>(state.highTargetIndex) < segmentCounts_.size() &&
+        segmentCounts_[state.highTargetIndex] > 0) {
+        uint32_t seg = static_cast<uint32_t>(state.highTargetIndex);
+        MorphPush applyPush = {segmentOffsets_[seg], segmentCounts_[seg], state.weightLow, state.weightHigh};
+        enc->setBytes(&applyPush, sizeof(applyPush), 13);
+        uint32_t groups = (segmentCounts_[seg] + threadGroupSize - 1) / threadGroupSize;
+        enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(threadGroupSize, 1, 1));
     }
+
+    enc->endEncoding();
+    cmdBuf->commit();
+    cmdBuf->waitUntilCompleted();
+
+    // Keep hostPositions_ (used by cpuSort()'s CPU depth sort) in sync with
+    // the GPU-written posBuffer_ -- shared-storage buffers are already
+    // CPU-visible, so this is just a memcpy, no readback needed.
+    std::memcpy(hostPositions_.data(), posBuffer_->contents(), hostPositions_.size() * sizeof(float));
 }
 
 // --------------------------------------------------------------------------
@@ -737,6 +921,7 @@ void MetalSplatRenderer::init(MetalContext& ctx, const GaussianSplatData& data,
                                uint32_t width, uint32_t height) {
     width_ = width;
     height_ = height;
+    ctx_ = &ctx;
 
     createRenderTargets(ctx);
     createPipelines(ctx);
@@ -1075,4 +1260,16 @@ void MetalSplatRenderer::cleanup() {
     if (prevPosBuffer_) { prevPosBuffer_->release(); prevPosBuffer_ = nullptr; }
 
     if (sortedIndicesBuffer_) { sortedIndicesBuffer_->release(); sortedIndicesBuffer_ = nullptr; }
+
+    if (morphPipeline_) { morphPipeline_->release(); morphPipeline_ = nullptr; }
+    if (baseGpuPosBuffer_) { baseGpuPosBuffer_->release(); baseGpuPosBuffer_ = nullptr; }
+    if (baseGpuRotBuffer_) { baseGpuRotBuffer_->release(); baseGpuRotBuffer_ = nullptr; }
+    if (baseGpuSh0Buffer_) { baseGpuSh0Buffer_->release(); baseGpuSh0Buffer_ = nullptr; }
+    if (morphIndexBuffer_) { morphIndexBuffer_->release(); morphIndexBuffer_ = nullptr; }
+    if (morphPosLoBuffer_) { morphPosLoBuffer_->release(); morphPosLoBuffer_ = nullptr; }
+    if (morphRotLoBuffer_) { morphRotLoBuffer_->release(); morphRotLoBuffer_ = nullptr; }
+    if (morphSh0LoBuffer_) { morphSh0LoBuffer_->release(); morphSh0LoBuffer_ = nullptr; }
+    if (morphPosHiBuffer_) { morphPosHiBuffer_->release(); morphPosHiBuffer_ = nullptr; }
+    if (morphRotHiBuffer_) { morphRotHiBuffer_->release(); morphRotHiBuffer_ = nullptr; }
+    if (morphSh0HiBuffer_) { morphSh0HiBuffer_->release(); morphSh0HiBuffer_ = nullptr; }
 }

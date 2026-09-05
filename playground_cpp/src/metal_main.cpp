@@ -147,6 +147,12 @@ struct CLIOptions {
     std::string outputAuxPrefix;
     std::string cameraJsonPath;
     std::string cameraJsonPrevPath;
+
+    // Verification hook (tests/test_metal_morph_gpu.py): dumps the
+    // GPU-morph-updated splat_pos/rot/sh0 buffers to <prefix>_{pos,rot,sh0}.npy
+    // right after setMorphTime(), for bit-exactness comparison against the
+    // Python reference evaluator (playground/dynamic_splat_gltf.py).
+    std::string dumpSplatBuffersPrefix;
 };
 
 static void printUsage(const char* program) {
@@ -231,6 +237,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.cameraJsonPath = argv[++i];
         } else if (arg == "--camera-json-prev" && i + 1 < argc) {
             opts.cameraJsonPrevPath = argv[++i];
+        } else if (arg == "--dump-splat-buffers" && i + 1 < argc) {
+            opts.dumpSplatBuffersPrefix = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -428,9 +436,21 @@ static int runHeadless(const CLIOptions& opts) {
                 auto tMorphStart = std::chrono::steady_clock::now();
                 splatR->setMorphTime(t);
                 auto tMorphEnd = std::chrono::steady_clock::now();
-                std::cout << "[metal] [timing] morph (CPU): "
+                std::cout << "[metal] [timing] morph (GPU compute, incl. wait): "
                           << std::chrono::duration<double, std::milli>(tMorphEnd - tMorphStart).count()
                           << "ms" << std::endl;
+
+                if (!opts.dumpSplatBuffersPrefix.empty()) {
+                    uint32_t n = scene.getSplatData().num_splats;
+                    std::vector<float> pos(splatR->debugPosBufferPtr(), splatR->debugPosBufferPtr() + n * 4);
+                    std::vector<float> rot(splatR->debugRotBufferPtr(), splatR->debugRotBufferPtr() + n * 4);
+                    std::vector<float> sh0(splatR->debugSh0BufferPtr(), splatR->debugSh0BufferPtr() + n * 4);
+                    DlssIO::writeNpyFloat32(opts.dumpSplatBuffersPrefix + "_pos.npy", pos, {n, 4});
+                    DlssIO::writeNpyFloat32(opts.dumpSplatBuffersPrefix + "_rot.npy", rot, {n, 4});
+                    DlssIO::writeNpyFloat32(opts.dumpSplatBuffersPrefix + "_sh0.npy", sh0, {n, 4});
+                    std::cout << "[metal] Dumped splat buffers: " << opts.dumpSplatBuffersPrefix
+                              << "_{pos,rot,sh0}.npy" << std::endl;
+                }
             } else if (opts.hasTime || opts.hasFrame) {
                 std::cerr << "[warn] --time/--frame given but scene has no morph-target animation" << std::endl;
             }

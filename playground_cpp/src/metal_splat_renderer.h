@@ -78,12 +78,26 @@ public:
     uint32_t getWidth() const override { return width_; }
     uint32_t getHeight() const override { return height_; }
 
+    // --- Debug/verification hooks ---
+    // Raw CPU-visible pointers into the (GPU-morph-updated) working
+    // attribute buffers, vec4 per splat -- used to verify the Metal morph
+    // compute kernel bit-exactly against the CPU/Python reference
+    // evaluator (see tests/test_metal_morph_gpu.py).
+    const float* debugPosBufferPtr() const { return static_cast<const float*>(posBuffer_->contents()); }
+    const float* debugRotBufferPtr() const { return static_cast<const float*>(rotBuffer_->contents()); }
+    const float* debugSh0BufferPtr() const { return static_cast<const float*>(shBuffer_->contents()); }
+
     void cleanup() override;
 
 private:
     uint32_t width_ = 0, height_ = 0;
     uint32_t numSplats_ = 0;
     uint32_t shDegree_ = 0;
+
+    // Stashed from init() so setMorphTime() (which has no context parameter
+    // in its public signature, to avoid touching every call site) can
+    // dispatch the GPU morph-apply compute kernel.
+    MetalContext* ctx_ = nullptr;
 
     // Offscreen render targets
     MTL::Texture* colorTarget_ = nullptr;
@@ -142,7 +156,11 @@ private:
     // possibly-morphed, contents)
     std::vector<float> hostPositions_;
 
-    // --- Dynamic splats ---
+    // --- Dynamic splats: GPU morph-apply (docs/lux-4d-spec.md section 12.8) ---
+    // Replaces the earlier CPU mirror of splat_expander._build_morph_apply_body
+    // with an actual Metal compute kernel (same segment-based
+    // reset-then-weighted-apply algorithm), so this is a real runtime
+    // candidate for iPhone, not just a correctness reference.
     SplatDynamics dynamics_;
     std::vector<SplatMorphSegment> morphSegments_;   // one per target/segment, see buildSplatMorphSegments
     std::vector<uint32_t> everMovingIndices_;        // union of all targets' indices (for reset-to-base)
@@ -151,9 +169,26 @@ private:
     std::vector<float> baseSH0_;                     // vec4 per splat, immutable
     float currentMorphTime_ = 0.0f;
 
+    MTL::ComputePipelineState* morphPipeline_ = nullptr;
+    MTL::Buffer* baseGpuPosBuffer_ = nullptr;
+    MTL::Buffer* baseGpuRotBuffer_ = nullptr;
+    MTL::Buffer* baseGpuSh0Buffer_ = nullptr;
+    MTL::Buffer* morphIndexBuffer_ = nullptr;
+    MTL::Buffer* morphPosLoBuffer_ = nullptr;
+    MTL::Buffer* morphRotLoBuffer_ = nullptr;
+    MTL::Buffer* morphSh0LoBuffer_ = nullptr;
+    MTL::Buffer* morphPosHiBuffer_ = nullptr;
+    MTL::Buffer* morphRotHiBuffer_ = nullptr;
+    MTL::Buffer* morphSh0HiBuffer_ = nullptr;
+    std::vector<uint32_t> segmentOffsets_;  // into the concatenated morph_* buffers, one per segment
+    std::vector<uint32_t> segmentCounts_;
+    uint32_t morphTotalEntries_ = 0;
+
     // Helpers
     void createRenderTargets(MetalContext& ctx);
     void createPipelines(MetalContext& ctx);
+    void createMorphPipeline(MetalContext& ctx);
+    void createMorphBuffers(MetalContext& ctx);
     void createBuffers(MetalContext& ctx, const GaussianSplatData& data);
     void cpuSort();
 
