@@ -87,6 +87,60 @@ static std::vector<uint32_t> readIndexAccessor(const cgltf_accessor* accessor) {
     return result;
 }
 
+// Read a (possibly sparse) accessor as compact (index, value) pairs, without
+// materializing a full dense array. Morph target deltas are typically sparse
+// with **no bufferView** (the dense base is implicitly all-zero) -- cgltf
+// exposes this directly via accessor->is_sparse / accessor->sparse, so no
+// custom JSON scanning is needed here (unlike the KHR extension object,
+// which cgltf doesn't understand natively).
+static void readSparseAccessor(const cgltf_accessor* accessor,
+                                std::vector<uint32_t>& outIndices,
+                                std::vector<float>& outValues) {
+    outIndices.clear();
+    outValues.clear();
+    if (!accessor) return;
+    size_t components = cgltf_num_components(accessor->type);
+
+    if (!accessor->is_sparse) {
+        // Dense target (valid glTF, just less common): every index is "touched".
+        outValues = readFloatAccessor(accessor);
+        outIndices.resize(accessor->count);
+        for (size_t i = 0; i < accessor->count; i++) outIndices[i] = static_cast<uint32_t>(i);
+        return;
+    }
+
+    const cgltf_accessor_sparse& sparse = accessor->sparse;
+    const uint8_t* indexData = cgltf_buffer_view_data(sparse.indices_buffer_view);
+    if (!indexData) return;
+    indexData += sparse.indices_byte_offset;
+    size_t indexStride = cgltf_component_size(sparse.indices_component_type);
+
+    outIndices.resize(sparse.count);
+    for (size_t i = 0; i < sparse.count; i++) {
+        outIndices[i] = static_cast<uint32_t>(
+            cgltf_component_read_index(indexData + i * indexStride, sparse.indices_component_type));
+    }
+
+    if (accessor->component_type == cgltf_component_type_r_32f) {
+        // Fast path: sparse.values is tightly-packed float data per spec
+        // (byteStride is disallowed on a sparse values bufferView).
+        const uint8_t* valueData = cgltf_buffer_view_data(sparse.values_buffer_view);
+        outValues.resize(sparse.count * components);
+        if (valueData) {
+            std::memcpy(outValues.data(), valueData + sparse.values_byte_offset,
+                        outValues.size() * sizeof(float));
+        }
+    } else {
+        // Fallback for exotic component types: unpack densely then gather.
+        auto dense = readFloatAccessor(accessor);
+        outValues.resize(sparse.count * components);
+        for (size_t i = 0; i < sparse.count; i++) {
+            std::memcpy(&outValues[i * components], &dense[outIndices[i] * components],
+                        components * sizeof(float));
+        }
+    }
+}
+
 // ===========================================================================
 // Minimal best-effort JSON scanning for unprocessed extension blobs
 // ===========================================================================
@@ -124,6 +178,73 @@ static bool jsonExtractInt(const std::string& json, const std::string& key, int&
     while (pos < json.size() && (std::isdigit(static_cast<unsigned char>(json[pos])) || json[pos] == '-')) pos++;
     if (pos == start) return false;
     out = std::stoi(json.substr(start, pos - start));
+    return true;
+}
+
+// Extract a top-level float value for `"key":N` (or N.N) from a raw JSON blob.
+static bool jsonExtractFloat(const std::string& json, const std::string& key, float& out) {
+    std::string pattern = "\"" + key + "\"";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return false;
+    pos++;
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) pos++;
+    size_t start = pos;
+    while (pos < json.size() && (std::isdigit(static_cast<unsigned char>(json[pos])) ||
+           json[pos] == '-' || json[pos] == '+' || json[pos] == '.' ||
+           json[pos] == 'e' || json[pos] == 'E')) pos++;
+    if (pos == start) return false;
+    out = std::stof(json.substr(start, pos - start));
+    return true;
+}
+
+// Extract a top-level integer array `"key":[1,2,3]` from a raw JSON blob.
+static bool jsonExtractIntArray(const std::string& json, const std::string& key, std::vector<int>& out) {
+    std::string pattern = "\"" + key + "\"";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return false;
+    size_t arrStart = json.find('[', pos);
+    size_t arrEnd = json.find(']', arrStart == std::string::npos ? pos : arrStart);
+    if (arrStart == std::string::npos || arrEnd == std::string::npos) return false;
+    std::string arrText = json.substr(arrStart + 1, arrEnd - arrStart - 1);
+    out.clear();
+    size_t tokStart = 0;
+    while (tokStart <= arrText.size()) {
+        size_t comma = arrText.find(',', tokStart);
+        std::string tok = arrText.substr(tokStart, comma == std::string::npos ? std::string::npos : comma - tokStart);
+        size_t a = tok.find_first_not_of(" \t\n\r");
+        if (a != std::string::npos) {
+            size_t b = tok.find_last_not_of(" \t\n\r");
+            out.push_back(std::stoi(tok.substr(a, b - a + 1)));
+        }
+        if (comma == std::string::npos) break;
+        tokStart = comma + 1;
+    }
+    return true;
+}
+
+// Find the raw JSON text of a named object value `"key":{...}` from a raw JSON blob.
+static bool jsonExtractObject(const std::string& json, const std::string& key, std::string& out) {
+    std::string pattern = "\"" + key + "\"";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return false;
+    size_t braceStart = json.find('{', pos);
+    if (braceStart == std::string::npos) return false;
+    int depth = 0;
+    size_t i = braceStart;
+    for (; i < json.size(); i++) {
+        if (json[i] == '{') depth++;
+        else if (json[i] == '}') {
+            depth--;
+            if (depth == 0) { i++; break; }
+        }
+    }
+    out = json.substr(braceStart, i - braceStart);
     return true;
 }
 
@@ -834,6 +955,131 @@ GltfScene loadGltf(const std::string& path) {
             info.splatCount = primNumSplats;
             splatPrimInfos.push_back(info);
 
+            // --- Dynamic splats: morph targets (see docs/lux-4d-spec.md) ---
+            // Only the first primitive carrying `targets` populates
+            // scene.splat_data.dynamics; multi-primitive dynamic scenes are
+            // not yet supported end-to-end (documented limitation).
+            if (prim.targets_count > 0 && !scene.splat_data.dynamics.has_motion) {
+                scene.splat_data.dynamics.has_motion = true;
+                for (size_t ti = 0; ti < prim.targets_count; ti++) {
+                    auto& target = prim.targets[ti];
+                    SplatMorphTarget morphTarget;
+                    std::vector<uint32_t> posIdx, rotIdx, shIdx;
+                    std::vector<float> posVal, rotVal, shVal;
+                    for (size_t tai = 0; tai < target.attributes_count; tai++) {
+                        auto& tattr = target.attributes[tai];
+                        if (!tattr.name || !tattr.data) continue;
+                        std::string tname(tattr.name);
+                        if (tattr.type == cgltf_attribute_type_position) {
+                            readSparseAccessor(tattr.data, posIdx, posVal);
+                        } else if (isSplatAttr(tname, "ROTATION")) {
+                            readSparseAccessor(tattr.data, rotIdx, rotVal);
+                        } else if (tname == "KHR_gaussian_splatting:SH_DEGREE_0_COEF_0") {
+                            readSparseAccessor(tattr.data, shIdx, shVal);
+                        }
+                        // Other target semantics (scale/opacity/higher SH degrees)
+                        // are static in v1; ignore rather than choke, per spec.
+                    }
+                    // Union the (usually identical) index sets across the three
+                    // semantics, since the runtime representation assumes one
+                    // shared index list per target.
+                    std::vector<uint32_t> unionIdx = posIdx;
+                    unionIdx.insert(unionIdx.end(), rotIdx.begin(), rotIdx.end());
+                    unionIdx.insert(unionIdx.end(), shIdx.begin(), shIdx.end());
+                    std::sort(unionIdx.begin(), unionIdx.end());
+                    unionIdx.erase(std::unique(unionIdx.begin(), unionIdx.end()), unionIdx.end());
+
+                    std::unordered_map<uint32_t, size_t> posMap, rotMap, shMap;
+                    for (size_t i = 0; i < posIdx.size(); i++) posMap[posIdx[i]] = i;
+                    for (size_t i = 0; i < rotIdx.size(); i++) rotMap[rotIdx[i]] = i;
+                    for (size_t i = 0; i < shIdx.size(); i++) shMap[shIdx[i]] = i;
+
+                    morphTarget.indices.reserve(unionIdx.size());
+                    morphTarget.dpos.assign(unionIdx.size() * 3, 0.0f);
+                    morphTarget.drot.assign(unionIdx.size() * 4, 0.0f);
+                    morphTarget.dsh0.assign(unionIdx.size() * 3, 0.0f);
+                    for (size_t u = 0; u < unionIdx.size(); u++) {
+                        // Offset by info.startSplat so indices are valid into the
+                        // scene-level (concatenated across primitives) arrays.
+                        morphTarget.indices.push_back(unionIdx[u] + static_cast<uint32_t>(info.startSplat));
+                        auto pit = posMap.find(unionIdx[u]);
+                        if (pit != posMap.end())
+                            std::memcpy(&morphTarget.dpos[u * 3], &posVal[pit->second * 3], 3 * sizeof(float));
+                        auto rit = rotMap.find(unionIdx[u]);
+                        if (rit != rotMap.end())
+                            std::memcpy(&morphTarget.drot[u * 4], &rotVal[rit->second * 4], 4 * sizeof(float));
+                        auto sit = shMap.find(unionIdx[u]);
+                        if (sit != shMap.end())
+                            std::memcpy(&morphTarget.dsh0[u * 3], &shVal[sit->second * 3], 3 * sizeof(float));
+                    }
+                    scene.splat_data.dynamics.targets.push_back(std::move(morphTarget));
+                }
+
+                // --- node.weights (initial pose) + animation (LINEAR sampler
+                // on the node's `weights` path) -> keyframe times/weights. ---
+                cgltf_node* ownerNode = nullptr;
+                for (size_t ni = 0; ni < data->nodes_count; ni++) {
+                    if (data->nodes[ni].mesh == &mesh) { ownerNode = &data->nodes[ni]; break; }
+                }
+                size_t numTargets = scene.splat_data.dynamics.targets.size();
+                bool gotAnimation = false;
+                if (ownerNode) {
+                    for (size_t ai = 0; ai < data->animations_count; ai++) {
+                        auto& anim = data->animations[ai];
+                        for (size_t ci = 0; ci < anim.channels_count; ci++) {
+                            auto& channel = anim.channels[ci];
+                            if (channel.target_node != ownerNode ||
+                                channel.target_path != cgltf_animation_path_type_weights) continue;
+                            auto* sampler = channel.sampler;
+                            if (!sampler) continue;
+                            auto times = readFloatAccessor(sampler->input);
+                            auto weightsFlat = readFloatAccessor(sampler->output);
+                            if (numTargets == 0 || times.empty()) continue;
+                            size_t numKeyframes = times.size();
+                            if (weightsFlat.size() != numKeyframes * numTargets) continue;
+                            scene.splat_data.dynamics.keyframes.resize(numKeyframes);
+                            for (size_t ki = 0; ki < numKeyframes; ki++) {
+                                scene.splat_data.dynamics.keyframes[ki].time = times[ki];
+                                scene.splat_data.dynamics.keyframes[ki].weights.assign(
+                                    weightsFlat.begin() + ki * numTargets,
+                                    weightsFlat.begin() + (ki + 1) * numTargets);
+                            }
+                            gotAnimation = true;
+                            std::cout << "[info] Dynamic splats: " << numKeyframes
+                                      << " keyframes, " << numTargets << " morph targets, "
+                                      << (sampler->interpolation == cgltf_interpolation_type_linear
+                                              ? "LINEAR" : "non-LINEAR (unsupported, treated as LINEAR)")
+                                      << " interpolation" << std::endl;
+                            break;
+                        }
+                        if (gotAnimation) break;
+                    }
+                }
+                if (!gotAnimation) {
+                    std::cerr << "[warn] Dynamic splat primitive has morph targets but no "
+                                 "weights animation was found; motion will be disabled." << std::endl;
+                    scene.splat_data.dynamics.has_motion = false;
+                }
+
+                // --- mesh.extras.MOBILEDLSS_dynamic_splats (informative) ---
+                if (mesh.extras.data) {
+                    std::string extrasJson(static_cast<const char*>(mesh.extras.data));
+                    std::string convJson;
+                    if (jsonExtractObject(extrasJson, "MOBILEDLSS_dynamic_splats", convJson)) {
+                        float fps = 30.0f;
+                        if (jsonExtractFloat(convJson, "fps", fps)) {
+                            scene.splat_data.dynamics.extrasFps = fps;
+                            scene.splat_data.dynamics.hasExtrasFps = true;
+                        }
+                        jsonExtractIntArray(convJson, "keyframes", scene.splat_data.dynamics.extrasFrames);
+                        std::string blend;
+                        if (jsonExtractString(convJson, "rotationBlend", blend)) {
+                            scene.splat_data.dynamics.rotationBlend = blend;
+                        }
+                    }
+                }
+            }
+
             // Append positions, rotations, scales, opacities to scene-level arrays
             scene.splat_data.positions.insert(scene.splat_data.positions.end(),
                 primPositions.begin(), primPositions.end());
@@ -1325,4 +1571,108 @@ std::vector<DrawItem> flattenScene(GltfScene& scene) {
               });
 
     return items;
+}
+
+// ===========================================================================
+// Dynamic (4D) Gaussian splats: animation evaluation + segment building
+// ===========================================================================
+
+SplatMorphState evaluateSplatMorphState(const SplatDynamics& dyn, float timeSeconds) {
+    SplatMorphState state;
+    if (!dyn.has_motion || dyn.keyframes.size() < 2 || dyn.targets.empty()) {
+        state.highTargetIndex = 0;
+        state.lowTargetIndex = -1;
+        state.weightLow = 0.0f;
+        state.weightHigh = 0.0f;
+        return state;
+    }
+
+    const auto& kf = dyn.keyframes;
+    float t = timeSeconds;
+    if (t <= kf.front().time) {
+        // Exactly at (or before) the base frame: no motion.
+        state.highTargetIndex = 0;
+        state.lowTargetIndex = -1;
+        state.weightLow = 0.0f;
+        state.weightHigh = 0.0f;
+        return state;
+    }
+    if (t >= kf.back().time) t = kf.back().time;
+
+    // Find i such that kf[i].time <= t <= kf[i+1].time.
+    size_t i = 0;
+    for (; i + 1 < kf.size(); i++) {
+        if (t <= kf[i + 1].time) break;
+    }
+    if (i + 1 >= kf.size()) i = kf.size() - 2;
+
+    float t0 = kf[i].time, t1 = kf[i + 1].time;
+    float alpha = (t1 > t0) ? (t - t0) / (t1 - t0) : 1.0f;
+
+    // keyframe index m (1..K) corresponds to targets[m-1]; keyframe 0 is the base.
+    state.highTargetIndex = static_cast<int>(i);       // targets[i] == keyframe (i+1)
+    state.lowTargetIndex = (i >= 1) ? static_cast<int>(i - 1) : -1;  // targets[i-1] == keyframe i (or base)
+    state.weightLow = 1.0f - alpha;
+    state.weightHigh = alpha;
+    return state;
+}
+
+float splatFrameToTime(const SplatDynamics& dyn, int frame) {
+    if (dyn.hasExtrasFps) {
+        return static_cast<float>(frame) / dyn.extrasFps;
+    }
+    if (dyn.keyframes.empty()) return 0.0f;
+    int idx = frame;
+    if (idx < 0) idx = 0;
+    if (idx >= static_cast<int>(dyn.keyframes.size())) idx = static_cast<int>(dyn.keyframes.size()) - 1;
+    return dyn.keyframes[idx].time;
+}
+
+std::vector<SplatMorphSegment> buildSplatMorphSegments(const SplatDynamics& dyn) {
+    std::vector<SplatMorphSegment> segments;
+    size_t numTargets = dyn.targets.size();
+    if (numTargets == 0) return segments;
+    segments.resize(numTargets);
+
+    for (size_t seg = 0; seg < numTargets; seg++) {
+        const SplatMorphTarget* lo = (seg >= 1) ? &dyn.targets[seg - 1] : nullptr;
+        const SplatMorphTarget& hi = dyn.targets[seg];
+
+        std::vector<uint32_t> unionIdx = hi.indices;
+        if (lo) unionIdx.insert(unionIdx.end(), lo->indices.begin(), lo->indices.end());
+        std::sort(unionIdx.begin(), unionIdx.end());
+        unionIdx.erase(std::unique(unionIdx.begin(), unionIdx.end()), unionIdx.end());
+
+        std::unordered_map<uint32_t, size_t> loMap, hiMap;
+        if (lo) for (size_t i = 0; i < lo->indices.size(); i++) loMap[lo->indices[i]] = i;
+        for (size_t i = 0; i < hi.indices.size(); i++) hiMap[hi.indices[i]] = i;
+
+        SplatMorphSegment& s = segments[seg];
+        s.index = unionIdx;
+        s.dposLo.assign(unionIdx.size() * 3, 0.0f);
+        s.dposHi.assign(unionIdx.size() * 3, 0.0f);
+        s.drotLo.assign(unionIdx.size() * 4, 0.0f);
+        s.drotHi.assign(unionIdx.size() * 4, 0.0f);
+        s.dsh0Lo.assign(unionIdx.size() * 3, 0.0f);
+        s.dsh0Hi.assign(unionIdx.size() * 3, 0.0f);
+
+        for (size_t u = 0; u < unionIdx.size(); u++) {
+            uint32_t idx = unionIdx[u];
+            if (lo) {
+                auto it = loMap.find(idx);
+                if (it != loMap.end()) {
+                    std::memcpy(&s.dposLo[u * 3], &lo->dpos[it->second * 3], 3 * sizeof(float));
+                    std::memcpy(&s.drotLo[u * 4], &lo->drot[it->second * 4], 4 * sizeof(float));
+                    std::memcpy(&s.dsh0Lo[u * 3], &lo->dsh0[it->second * 3], 3 * sizeof(float));
+                }
+            }
+            auto it = hiMap.find(idx);
+            if (it != hiMap.end()) {
+                std::memcpy(&s.dposHi[u * 3], &hi.dpos[it->second * 3], 3 * sizeof(float));
+                std::memcpy(&s.drotHi[u * 4], &hi.drot[it->second * 4], 4 * sizeof(float));
+                std::memcpy(&s.dsh0Hi[u * 3], &hi.dsh0[it->second * 3], 3 * sizeof(float));
+            }
+        }
+    }
+    return segments;
 }

@@ -130,6 +130,51 @@ struct GltfLight {
     glm::vec3 direction{0.0f, 0.0f, -1.0f};
 };
 
+// ---------------------------------------------------------------------------
+// Dynamic (4D) Gaussian splats: morph-target keyframe animation.
+// See docs/lux-4d-spec.md and mobiledlss/gltf/dyn_splat_gltf.py (reference
+// writer/reader for the MOBILEDLSS_dynamic_splats convention).
+// ---------------------------------------------------------------------------
+
+// One sparse morph target: deltas from the base attributes at `indices`.
+// Parallel arrays; indices.size() == dpos.size()/3 == drot.size()/4 == dsh0.size()/3.
+struct SplatMorphTarget {
+    std::vector<uint32_t> indices;  // global indices into the base splat arrays
+    std::vector<float> dpos;        // flat vec3 per sparse entry
+    std::vector<float> drot;        // flat vec4 per sparse entry
+    std::vector<float> dsh0;        // flat vec3 per sparse entry
+};
+
+// One animation keyframe: a time (seconds) and the per-target weight vector
+// at that time (as authored -- typically one-hot, weights[0] is all-zero).
+struct SplatKeyframe {
+    float time = 0.0f;
+    std::vector<float> weights;  // length == targets.size()
+};
+
+struct SplatDynamics {
+    bool has_motion = false;
+    std::vector<SplatMorphTarget> targets;    // length K (one per non-base keyframe)
+    std::vector<SplatKeyframe> keyframes;     // length K+1, keyframes[0] = base (all-zero weights)
+    // mesh.extras.MOBILEDLSS_dynamic_splats, when present (informative --
+    // the animation above is authoritative for interpolation semantics).
+    std::vector<int> extrasFrames;   // video-frame index per keyframe, parallel to `keyframes`
+    bool hasExtrasFps = false;
+    float extrasFps = 30.0f;
+    std::string rotationBlend = "lerp_renormalize";
+};
+
+// Result of evaluating the animation at a point in time: which segment
+// (interval between two adjacent keyframes) is active, and the blend
+// weights for its low/high target. `hasLow` is false only for the first
+// segment, where the "low" side is the (all-zero-delta) base frame.
+struct SplatMorphState {
+    int highTargetIndex = 0;   // valid index into dynamics.targets
+    int lowTargetIndex = -1;   // valid index into dynamics.targets, or -1
+    float weightLow = 0.0f;
+    float weightHigh = 1.0f;
+};
+
 struct GaussianSplatData {
     std::vector<float> positions;    // xyz packed as vec4 (w=1)
     std::vector<float> rotations;    // xyzw quaternion per splat
@@ -145,7 +190,42 @@ struct GaussianSplatData {
     // is optional, and the field defaults to the spec's implicit sRGB assumption when absent.
     std::string color_space = "srgb_rec709_display";
     std::string kernel = "ellipse";
+    // Dynamic (morph-target-animated) splats, when the source glTF's splat
+    // primitive has `targets`. Static assets leave this default-constructed
+    // (has_motion == false).
+    SplatDynamics dynamics;
 };
+
+/**
+ * Evaluate the animation at `timeSeconds`, clamped to the keyframe range.
+ * Returns which target(s) are active and their blend weights.
+ */
+SplatMorphState evaluateSplatMorphState(const SplatDynamics& dyn, float timeSeconds);
+
+/**
+ * Map an integer video-frame index to a time in seconds: `frame / fps` when
+ * `mesh.extras.MOBILEDLSS_dynamic_splats.fps` is present, otherwise index
+ * directly into the animation's own keyframe times (clamped).
+ */
+float splatFrameToTime(const SplatDynamics& dyn, int frame);
+
+// A precomputed per-segment (union of the segment's low+high target sparse
+// indices) delta list, ready to upload as the morph-apply compute shader's
+// `morph_index` / `morph_delta_*_lo` / `morph_delta_*_hi` GPU buffers. See
+// SPECIFICATION.md 12.8 and docs/language-reference.md.
+struct SplatMorphSegment {
+    std::vector<uint32_t> index;      // merged, de-duplicated indices
+    std::vector<float> dposLo, dposHi;   // flat vec3 per merged entry (0 where absent)
+    std::vector<float> drotLo, drotHi;   // flat vec4 per merged entry
+    std::vector<float> dsh0Lo, dsh0Hi;   // flat vec3 per merged entry
+};
+
+/**
+ * Build the K precomputed per-segment merged delta lists from `dyn.targets`
+ * (segment i pairs low=targets[i-1] (or none if i==0) with high=targets[i]).
+ * Call once at load time; segments don't depend on animation time.
+ */
+std::vector<SplatMorphSegment> buildSplatMorphSegments(const SplatDynamics& dyn);
 
 struct GltfScene {
     std::vector<GltfMesh> meshes;
