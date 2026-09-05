@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <cmath>
+#include <cctype>
 #include <iostream>
 
 // cgltf — single-header glTF parser
@@ -84,6 +85,56 @@ static std::vector<uint32_t> readIndexAccessor(const cgltf_accessor* accessor) {
         result[i] = static_cast<uint32_t>(cgltf_accessor_read_index(accessor, i));
     }
     return result;
+}
+
+// ===========================================================================
+// Minimal best-effort JSON scanning for unprocessed extension blobs
+// ===========================================================================
+// cgltf surfaces extensions it doesn't natively understand (like
+// KHR_gaussian_splatting) as a raw JSON text blob (cgltf_extension::data).
+// These helpers pull simple flat string/int fields out of such a blob
+// without needing a full JSON parser — sufficient for the KHR_gaussian_splatting
+// extension object, whose top-level fields are plain strings/ints/arrays.
+
+// Extract a top-level string value for `"key":"value"` from a raw JSON blob.
+static bool jsonExtractString(const std::string& json, const std::string& key, std::string& out) {
+    std::string pattern = "\"" + key + "\"";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return false;
+    pos = json.find('"', pos);
+    if (pos == std::string::npos) return false;
+    size_t end = json.find('"', pos + 1);
+    if (end == std::string::npos) return false;
+    out = json.substr(pos + 1, end - pos - 1);
+    return true;
+}
+
+// Extract a top-level integer value for `"key":N` from a raw JSON blob.
+static bool jsonExtractInt(const std::string& json, const std::string& key, int& out) {
+    std::string pattern = "\"" + key + "\"";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return false;
+    pos++;
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) pos++;
+    size_t start = pos;
+    while (pos < json.size() && (std::isdigit(static_cast<unsigned char>(json[pos])) || json[pos] == '-')) pos++;
+    if (pos == start) return false;
+    out = std::stoi(json.substr(start, pos - start));
+    return true;
+}
+
+// Find the raw JSON text of a named unprocessed extension on a primitive, if any.
+static const char* findExtensionData(const cgltf_primitive& prim, const char* name) {
+    for (size_t i = 0; i < prim.extensions_count; i++) {
+        if (prim.extensions[i].name && std::strcmp(prim.extensions[i].name, name) == 0) {
+            return prim.extensions[i].data;
+        }
+    }
+    return nullptr;
 }
 
 // ===========================================================================
@@ -560,13 +611,48 @@ GltfScene loadGltf(const std::string& path) {
             // Check for gaussian splatting attributes (both naming conventions)
             bool hasRotation = false, hasScale = false;
             bool primIsKHR = false;
+            bool hasInternalAttrs = false;  // lux's raw internal fixture convention
+                                             // (_ROTATION/_SCALE/_OPACITY): these are
+                                             // already shader-native (logit opacity,
+                                             // log-space scale), unlike KHR semantics.
             for (size_t ai = 0; ai < prim.attributes_count; ai++) {
                 if (prim.attributes[ai].name) {
                     std::string attrName(prim.attributes[ai].name);
                     if (isSplatAttr(attrName, "ROTATION")) hasRotation = true;
                     if (isSplatAttr(attrName, "SCALE")) hasScale = true;
                     if (attrName.rfind("KHR_gaussian_splatting:", 0) == 0) primIsKHR = true;
+                    if (attrName == "_ROTATION" || attrName == "_SCALE" || attrName == "_OPACITY")
+                        hasInternalAttrs = true;
                 }
+            }
+
+            // Legacy pre-ratification draft layout: ROTATION/SCALE/OPACITY (and SH)
+            // accessor indices live nested under extensions.KHR_gaussian_splatting,
+            // rather than as primitive.attributes entries. Fall back to parsing that
+            // raw extension JSON blob when the attribute scan above found nothing.
+            const char* splatExtJson = findExtensionData(prim, "KHR_gaussian_splatting");
+            std::string extText = splatExtJson ? std::string(splatExtJson) : std::string();
+            int legacyRotationIdx = -1, legacyScaleIdx = -1, legacyOpacityIdx = -1;
+            bool legacyNestedAttrs = false;
+            if (splatExtJson) {
+                // Only treat the primitive as KHR-format (linear opacity/scale
+                // semantics) when it isn't already using lux's internal
+                // shader-native attribute convention — some hand-authored test
+                // fixtures carry a (redundant, historically unused) extension
+                // object alongside _ROTATION/_SCALE/_OPACITY attributes, and
+                // those must keep their original shader-native interpretation.
+                if (!hasInternalAttrs) primIsKHR = true;
+                if (!hasRotation && !hasScale) {
+                    bool foundRot = jsonExtractInt(extText, "ROTATION", legacyRotationIdx);
+                    bool foundScale = jsonExtractInt(extText, "SCALE", legacyScaleIdx);
+                    jsonExtractInt(extText, "OPACITY", legacyOpacityIdx);
+                    hasRotation = hasRotation || foundRot;
+                    hasScale = hasScale || foundScale;
+                    legacyNestedAttrs = foundRot || foundScale;
+                }
+                std::string cs, kernel;
+                if (jsonExtractString(extText, "colorSpace", cs)) scene.splat_data.color_space = cs;
+                if (jsonExtractString(extText, "kernel", kernel)) scene.splat_data.kernel = kernel;
             }
 
             if (!hasRotation && !hasScale) continue;
@@ -576,7 +662,9 @@ GltfScene loadGltf(const std::string& path) {
                           << (mesh.name ? mesh.name : "unnamed") << std::endl;
             } else {
                 std::cout << "[info] Detected KHR_gaussian_splatting primitive in mesh: "
-                          << (mesh.name ? mesh.name : "unnamed") << std::endl;
+                          << (mesh.name ? mesh.name : "unnamed")
+                          << (legacyNestedAttrs ? " (legacy pre-ratification draft layout)" : "")
+                          << std::endl;
             }
 
             if (primIsKHR) scene.splat_data.khr_format = true;
@@ -647,6 +735,56 @@ GltfScene loadGltf(const std::string& path) {
                         }
                         khrSHByDegree[degree][coefIdx] = coeffData;
                     }
+                }
+            }
+
+            // Legacy pre-ratification draft layout: resolve ROTATION/SCALE/OPACITY/SH
+            // accessor indices parsed from extensions.KHR_gaussian_splatting directly,
+            // since they aren't reachable via prim.attributes in this layout.
+            if (legacyNestedAttrs) {
+                if (legacyRotationIdx >= 0 && static_cast<size_t>(legacyRotationIdx) < data->accessors_count)
+                    primRotations = readFloatAccessor(&data->accessors[legacyRotationIdx]);
+                if (legacyScaleIdx >= 0 && static_cast<size_t>(legacyScaleIdx) < data->accessors_count)
+                    primScales = readFloatAccessor(&data->accessors[legacyScaleIdx]);
+                if (legacyOpacityIdx >= 0 && static_cast<size_t>(legacyOpacityIdx) < data->accessors_count)
+                    primOpacities = readFloatAccessor(&data->accessors[legacyOpacityIdx]);
+
+                // Legacy "sh" array: [{"degree":0,"coefficients":[N]}, {"degree":1,"coefficients":[N,N,N]}, ...]
+                // Best-effort scan: walk each "degree"/"coefficients" pair in document order.
+                size_t searchPos = 0;
+                while (true) {
+                    size_t degPos = extText.find("\"degree\"", searchPos);
+                    if (degPos == std::string::npos) break;
+                    int degree = 0;
+                    jsonExtractInt(extText.substr(degPos), "degree", degree);
+                    size_t coefPos = extText.find("\"coefficients\"", degPos);
+                    if (coefPos == std::string::npos) break;
+                    size_t arrStart = extText.find('[', coefPos);
+                    size_t arrEnd = extText.find(']', arrStart == std::string::npos ? coefPos : arrStart);
+                    if (arrStart == std::string::npos || arrEnd == std::string::npos) break;
+                    std::string arrText = extText.substr(arrStart + 1, arrEnd - arrStart - 1);
+                    std::vector<int> coeffIndices;
+                    size_t tokStart = 0;
+                    while (tokStart <= arrText.size()) {
+                        size_t comma = arrText.find(',', tokStart);
+                        std::string tok = arrText.substr(tokStart, comma == std::string::npos ? std::string::npos : comma - tokStart);
+                        size_t a = tok.find_first_not_of(" \t\n\r");
+                        if (a != std::string::npos) {
+                            size_t b = tok.find_last_not_of(" \t\n\r");
+                            coeffIndices.push_back(std::stoi(tok.substr(a, b - a + 1)));
+                        }
+                        if (comma == std::string::npos) break;
+                        tokStart = comma + 1;
+                    }
+                    for (size_t ci = 0; ci < coeffIndices.size(); ci++) {
+                        int accIdx = coeffIndices[ci];
+                        if (accIdx < 0 || static_cast<size_t>(accIdx) >= data->accessors_count) continue;
+                        auto coeffData = readFloatAccessor(&data->accessors[accIdx]);
+                        if (degree >= static_cast<int>(khrSHByDegree.size())) khrSHByDegree[degree];
+                        if (ci >= khrSHByDegree[degree].size()) khrSHByDegree[degree].resize(ci + 1);
+                        khrSHByDegree[degree][ci] = coeffData;
+                    }
+                    searchPos = arrEnd + 1;
                 }
             }
 
@@ -752,8 +890,18 @@ GltfScene loadGltf(const std::string& path) {
 
         // Convert KHR linear opacity to logit space for shader compatibility.
         // The compute shader applies sigmoid() to opacity, so we store logit-space values.
-        // KHR scales are already in log-space per spec (no conversion needed).
         // Only for KHR format; internal format (_SCALE, _OPACITY) already stores raw values.
+        //
+        // SCALE is trickier: the *ratified* KHR_gaussian_splatting spec requires SCALE to
+        // be linear ("Scale values are linear and MUST NOT be negative"), but the
+        // currently-published Khronos conformance test assets predate an April-2026
+        // editorial pass and still store log-space values (matching the pre-ratification
+        // draft and raw 3DGS training convention) — including negative values, which are
+        // invalid under the ratified rule. Since both encodings are seen in the wild for
+        // the exact same attribute name/location, auto-detect: any negative value means
+        // the data is already log-space (leave as-is, as the compute shader applies exp());
+        // all-non-negative, boundedly-small values are treated as ratified linear scale and
+        // converted to log-space here to match the shader's exp()-based reconstruction.
         if (scene.splat_data.khr_format) {
             // Convert linear opacity [0,1] to logit: log(p / (1 - p))
             for (size_t i = 0; i < scene.splat_data.opacities.size(); ++i) {
@@ -762,10 +910,29 @@ GltfScene loadGltf(const std::string& path) {
             }
             std::cout << "[info] Converted KHR linear opacity to logit for "
                       << scene.splat_data.opacities.size() << " splats" << std::endl;
+
+            bool scaleLooksLinear = !scene.splat_data.scales.empty();
+            for (float s : scene.splat_data.scales) {
+                if (s < 0.0f || s >= 20.0f) { scaleLooksLinear = false; break; }
+            }
+            if (scaleLooksLinear) {
+                for (auto& s : scene.splat_data.scales) {
+                    s = std::log(std::max(s, 1e-12f));
+                }
+                std::cout << "[info] Converted ratified linear KHR SCALE to log-space for "
+                          << scene.splat_data.num_splats << " splats" << std::endl;
+            } else {
+                std::cout << "[info] KHR SCALE already log-space (legacy/conformance layout)"
+                          << std::endl;
+            }
         }
 
         std::cout << "[info] Total gaussian splats: " << scene.splat_data.num_splats
                   << ", max SH degree " << scene.splat_data.sh_degree << std::endl;
+        if (scene.splat_data.khr_format) {
+            std::cout << "[info] KHR_gaussian_splatting kernel=" << scene.splat_data.kernel
+                      << " colorSpace=" << scene.splat_data.color_space << std::endl;
+        }
     }
 
     // --- Nodes ---

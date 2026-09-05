@@ -140,6 +140,11 @@ struct GaussianSplatData {
     uint32_t num_splats = 0;
     bool has_splats = false;
     bool khr_format = false;  // true when loaded from KHR_gaussian_splatting attributes
+    // KHR_gaussian_splatting extension-object metadata (ratified spec), when present.
+    // "srgb_rec709_display" (default assumption) or "lin_rec709_display"; the extension
+    // is optional, and the field defaults to the spec's implicit sRGB assumption when absent.
+    std::string color_space = "srgb_rec709_display";
+    std::string kernel = "ellipse";
 };
 
 struct GltfScene {
