@@ -52,9 +52,16 @@ glm::mat4 cvViewToGl(const std::array<float, 16>& viewmatCvRowMajor);
 // for camera-space points converted from lux's GL convention. See
 // docs/lux-4d-spec.md section 4 for the derivation. `nearPlane`/`farPlane`
 // only affect the depth-test Z-buffer, not pixel placement.
+// `metalYConvention`: false (default, Vulkan) assumes the engine's NDC->pixel
+// mapping is the direct `pixel = (ndc*0.5+0.5)*screen_size`. Metal's splat
+// renderer instead applies an EXTRA Y flip outside the projection matrix
+// (`screen.y = (1-(ndc.y*0.5+0.5))*H`, see metal_splat_renderer.cpp), which
+// negates the sign of the y-row's coefficients relative to the Vulkan
+// derivation above -- pass true for MetalSplatRenderer::updateCameraExplicit.
 glm::mat4 buildIntrinsicsProjection(float fx, float fy, float cx, float cy,
                                      float width, float height,
-                                     float nearPlane, float farPlane);
+                                     float nearPlane, float farPlane,
+                                     bool metalYConvention = false);
 
 // Writes a float32 .npy file, row-major, little-endian, with the given
 // shape (e.g. {height, width, channels} or {height, width}). ~20 lines,

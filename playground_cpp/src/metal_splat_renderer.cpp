@@ -8,6 +8,29 @@
 #include <cmath>
 
 // --------------------------------------------------------------------------
+// Sub-pixel jitter (docs/lux-4d-spec.md section 3)
+// --------------------------------------------------------------------------
+//
+// Same "add d*row3 to the row that becomes ndc after the perspective
+// divide" trick as the Vulkan splat renderer's applySplatJitter, EXCEPT
+// Metal's screen mapping applies an extra Y flip *outside* the projection
+// matrix (`screen.y = (1 - (ndc.y*0.5+0.5))*H`, see the compute kernel's
+// `center` and splat_vertex's `ndc`), so d(screen.y)/d(ndc.y) is negative
+// here -- the Y jitter's sign is the opposite of Vulkan's for the same
+// "positive jy moves content down" convention.
+static glm::mat4 applyMetalSplatJitter(glm::mat4 proj, float jitterXPixels, float jitterYPixels,
+                                        uint32_t width, uint32_t height) {
+    if (jitterXPixels == 0.0f && jitterYPixels == 0.0f) return proj;
+    float dx = 2.0f * jitterXPixels / static_cast<float>(width);
+    float dy = -2.0f * jitterYPixels / static_cast<float>(height);
+    for (int c = 0; c < 4; ++c) {
+        proj[c][0] += dx * proj[c][3];
+        proj[c][1] += dy * proj[c][3];
+    }
+    return proj;
+}
+
+// --------------------------------------------------------------------------
 // Embedded MSL: Gaussian splat projection compute kernel
 // --------------------------------------------------------------------------
 
@@ -27,6 +50,11 @@ struct ComputeUniforms {
     float focalY;
     int shDegree;
     float _pad1[2];
+    // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
+    // `proj` above may carry a --jitter offset (rasterization only);
+    // motion vectors always use these unjittered matrices instead.
+    float4x4 projUnjittered;
+    float4x4 prevViewProjUnjittered;  // combined, precomputed host-side
 };
 
 // Build rotation matrix from quaternion (xyzw)
@@ -97,15 +125,18 @@ float3 computeCov2D(float3 mean, float3x3 cov3D,
 }
 
 kernel void splat_project(
-    device const float4* positions [[buffer(0)]],
-    device const float4* rotations [[buffer(1)]],
-    device const float4* scales    [[buffer(2)]],
-    device const float*  opacities [[buffer(3)]],
-    device const float4* sh0       [[buffer(4)]],
-    device float4* projCenters     [[buffer(5)]],
-    device float4* projConics      [[buffer(6)]],
-    device float4* projColors      [[buffer(7)]],
-    constant ComputeUniforms& u    [[buffer(8)]],
+    device const float4* positions     [[buffer(0)]],
+    device const float4* rotations     [[buffer(1)]],
+    device const float4* scales        [[buffer(2)]],
+    device const float*  opacities     [[buffer(3)]],
+    device const float4* sh0           [[buffer(4)]],
+    device float4* projCenters         [[buffer(5)]],
+    device float4* projConics          [[buffer(6)]],
+    device float4* projColors          [[buffer(7)]],
+    constant ComputeUniforms& u        [[buffer(8)]],
+    device const float4* prevPositions [[buffer(9)]],
+    device float2* projMv              [[buffer(10)]],
+    device float* projDepth            [[buffer(11)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= u.numSplats) return;
@@ -151,6 +182,8 @@ kernel void splat_project(
         projCenters[gid] = float4(0.0, 0.0, -1e6, 0.0);
         projConics[gid] = float4(0.0);
         projColors[gid] = float4(0.0);
+        projMv[gid] = float2(0.0);
+        projDepth[gid] = 0.0;
         return;
     }
 
@@ -163,6 +196,8 @@ kernel void splat_project(
         projCenters[gid] = float4(0.0, 0.0, -1e6, 0.0);
         projConics[gid] = float4(0.0);
         projColors[gid] = float4(0.0);
+        projMv[gid] = float2(0.0);
+        projDepth[gid] = 0.0;
         return;
     }
     float inv_det = 1.0 / det;
@@ -178,6 +213,33 @@ kernel void splat_project(
     float3 color = (u.shDegree >= 0)
         ? shColor(sh0[gid].xyz, viewDir)
         : float3(0.5);
+
+    // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
+    // Camera-space depth: view.z is negative in front of the camera here
+    // (right-handed, -Z forward), matching the Vulkan splat pipeline's `t`.
+    float4 viewPos4 = u.view * float4(pos, 1.0);
+    projDepth[gid] = -viewPos4.z;
+
+    // Current-frame NDC using the UNJITTERED projection (reuses the
+    // already-computed view-space position; jitter must never leak into mv).
+    float4 curClipU = u.projUnjittered * viewPos4;
+    float2 curNdcU = curClipU.xy / curClipU.w;
+
+    // Previous frame's animated world position, projected with the
+    // previous frame's (unjittered) combined view-projection.
+    float3 prevPos = prevPositions[gid].xyz;
+    float4 prevClip = u.prevViewProjUnjittered * float4(prevPos, 1.0);
+    float2 prevNdc = prevClip.xy / prevClip.w;
+
+    // Metal's screen mapping (see `center` above) is
+    // screen.x = (ndc.x*0.5+0.5)*W  and  screen.y = (1-(ndc.y*0.5+0.5))*H
+    // (extra Y flip vs. Vulkan, which bakes the flip into the projection
+    // matrix instead) -- differentiate accordingly so mv.y has the correct
+    // sign for "positive mv.y = content moved down".
+    projMv[gid] = float2(
+        (curNdcU.x - prevNdc.x) * 0.5 * u.screenW,
+        (curNdcU.y - prevNdc.y) * -0.5 * u.screenH
+    );
 
     // Store results
     projCenters[gid] = float4(center, p_ndc.z, radius);
@@ -207,6 +269,14 @@ struct VertexOut {
     float4 color;
     float2 center;
     float2 offset;
+    float2 mv;      // DLSS input-contract outputs (docs/lux-4d-spec.md section 3)
+    float depth;
+};
+
+struct FragmentOut {
+    float4 color  [[color(0)]];
+    float4 motion [[color(1)]];  // xy = mv*alpha, z = 0, w = alpha
+    float2 depth  [[color(2)]];  // x = depth*alpha, y = alpha
 };
 
 vertex VertexOut splat_vertex(
@@ -216,7 +286,9 @@ vertex VertexOut splat_vertex(
     device const float4* projConics  [[buffer(1)]],
     device const float4* projColors  [[buffer(2)]],
     device const uint*   sortedIdx   [[buffer(3)]],
-    constant RenderUniforms& u       [[buffer(4)]])
+    constant RenderUniforms& u       [[buffer(4)]],
+    device const float2* projMv      [[buffer(5)]],
+    device const float*  projDepth   [[buffer(6)]])
 {
     VertexOut out;
 
@@ -249,13 +321,17 @@ vertex VertexOut splat_vertex(
     out.color = colorData;
     out.center = center;
     out.offset = offset;
+    out.mv = projMv[idx];
+    out.depth = projDepth[idx];
 
     return out;
 }
 
-fragment float4 splat_fragment(
+fragment FragmentOut splat_fragment(
     VertexOut in [[stage_in]],
-    constant RenderUniforms& u [[buffer(4)]])
+    constant RenderUniforms& u [[buffer(4)]],
+    float4 dstMotion [[color(1)]],
+    float2 dstDepth  [[color(2)]])
 {
     // Evaluate gaussian: exp(-0.5 * (offset^T * conic * offset))
     float2 d = in.offset;
@@ -268,8 +344,26 @@ fragment float4 splat_fragment(
     float alpha = min(0.99, in.color.a * exp(power));
     if (alpha < u.alphaCutoff) discard_fragment();
 
-    // Premultiplied alpha output
-    return float4(in.color.rgb * alpha, alpha);
+    // Premultiplied alpha output. out_color uses hardware
+    // (ONE, ONE_MINUS_SRC_ALPHA) blending (8-bit RGBA, always blendable on
+    // Apple GPUs). Motion/depth are RGBA32Float/RG32Float attachments --
+    // 32-bit float render targets do NOT support hardware blending on
+    // Apple Silicon, so the identical (ONE, ONE_MINUS_SRC_ALPHA) equation
+    // is applied manually here via framebuffer fetch (`dstMotion`/
+    // `dstDepth` read this pixel's current, already-blended contents from
+    // earlier splats drawn in this same instanced draw call -- Apple's
+    // tile-based renderer keeps them in fast on-chip memory across the
+    // whole pass, so per-pixel draw order is preserved exactly like
+    // hardware blending would give). Each also duplicates alpha in its own
+    // last component for full-precision host-side un-premultiply, same as
+    // the Vulkan splat renderer.
+    FragmentOut out;
+    out.color = float4(in.color.rgb * alpha, alpha);
+    float4 srcMotion = float4(in.mv * alpha, 0.0, alpha);
+    out.motion = srcMotion + dstMotion * (1.0 - alpha);
+    float2 srcDepth = float2(in.depth * alpha, alpha);
+    out.depth = srcDepth + dstDepth * (1.0 - alpha);
+    return out;
 }
 )";
 
@@ -299,6 +393,21 @@ void MetalSplatRenderer::createRenderTargets(MetalContext& ctx) {
     depthDesc->setStorageMode(MTL::StorageModePrivate);
     depthTarget_ = ctx.newTexture(depthDesc);
     depthTarget_->setLabel(NS::String::string("SplatDepth", NS::UTF8StringEncoding));
+
+    // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
+    auto* mvDesc = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatRGBA32Float, width_, height_, false);
+    mvDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+    mvDesc->setStorageMode(MTL::StorageModePrivate);
+    motionTarget_ = ctx.newTexture(mvDesc);
+    motionTarget_->setLabel(NS::String::string("SplatMotion", NS::UTF8StringEncoding));
+
+    auto* edDesc = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatRG32Float, width_, height_, false);
+    edDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+    edDesc->setStorageMode(MTL::StorageModePrivate);
+    expectedDepthTarget_ = ctx.newTexture(edDesc);
+    expectedDepthTarget_->setLabel(NS::String::string("SplatExpectedDepth", NS::UTF8StringEncoding));
 }
 
 // --------------------------------------------------------------------------
@@ -368,6 +477,19 @@ void MetalSplatRenderer::createPipelines(MetalContext& ctx) {
     colorAtt->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
     colorAtt->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
     colorAtt->setAlphaBlendOperation(MTL::BlendOperationAdd);
+
+    // DLSS input-contract outputs (docs/lux-4d-spec.md section 3): same
+    // premultiplied-alpha blend equation duplicated onto both attachments.
+    // 32-bit float attachments don't support hardware blending on Apple
+    // GPUs -- splat_fragment blends them manually via framebuffer fetch
+    // instead (see its comment), so hardware blending stays OFF here.
+    auto* motionAtt = pipeDesc->colorAttachments()->object(1);
+    motionAtt->setPixelFormat(MTL::PixelFormatRGBA32Float);
+    motionAtt->setBlendingEnabled(false);
+
+    auto* depthOutAtt = pipeDesc->colorAttachments()->object(2);
+    depthOutAtt->setPixelFormat(MTL::PixelFormatRG32Float);
+    depthOutAtt->setBlendingEnabled(false);
 
     pipeDesc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
 
@@ -474,6 +596,21 @@ void MetalSplatRenderer::createBuffers(MetalContext& ctx, const GaussianSplatDat
 
     projColorBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
     projColorBuffer_->setLabel(NS::String::string("ProjColors", NS::UTF8StringEncoding));
+
+    // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
+    projMvBuffer_ = ctx.newBuffer(numSplats_ * 2 * sizeof(float), MTL::ResourceStorageModeShared);
+    projMvBuffer_->setLabel(NS::String::string("ProjMv", NS::UTF8StringEncoding));
+    projDepthBuffer_ = ctx.newBuffer(numSplats_ * sizeof(float), MTL::ResourceStorageModeShared);
+    projDepthBuffer_->setLabel(NS::String::string("ProjDepth", NS::UTF8StringEncoding));
+
+    // Previous-frame animated position, seeded to the base pose (matches
+    // the Vulkan splat renderer's createPrevPosBuffer -- firstMvFrame_
+    // additionally re-seeds this to the CURRENT frame's own position right
+    // before the first render(), so mv == 0 exactly on frame 1 regardless
+    // of the initial animation time).
+    prevPosBuffer_ = ctx.newBuffer(hostPositions_.data(), hostPositions_.size() * sizeof(float),
+                                    MTL::ResourceStorageModeShared);
+    prevPosBuffer_->setLabel(NS::String::string("SplatPrevPositions", NS::UTF8StringEncoding));
 
     // Sorted indices buffer (shared for CPU upload)
     sortedIndicesBuffer_ = ctx.newBuffer(numSplats_ * sizeof(uint32_t),
@@ -631,6 +768,7 @@ void MetalSplatRenderer::init(MetalContext& ctx, const GaussianSplatData& data,
         viewMatrix_ = glm::lookAt(camPos_, center, upVec);
         projMatrix_ = glm::perspective(fov, aspect, 0.01f, radius * 10.0f);
         // Metal NDC: no Y-flip needed (Metal uses [0,1] depth, top-left origin handled by viewport)
+        projMatrixUnjittered_ = projMatrix_;
 
         focalY_ = 0.5f * static_cast<float>(height) / tanf(fov * 0.5f);
         focalX_ = focalY_;
@@ -649,11 +787,28 @@ void MetalSplatRenderer::updateCamera(glm::vec3 eye, glm::vec3 target, glm::vec3
                                        float nearPlane, float farPlane) {
     camPos_ = eye;
     viewMatrix_ = glm::lookAt(eye, target, up);
-    projMatrix_ = glm::perspective(fovY, aspect, nearPlane, farPlane);
     // No Y-flip for Metal
+    projMatrixUnjittered_ = glm::perspective(fovY, aspect, nearPlane, farPlane);
+    projMatrix_ = applyMetalSplatJitter(projMatrixUnjittered_, jitterX_, jitterY_, width_, height_);
 
     focalY_ = 0.5f * static_cast<float>(height_) / tanf(fovY * 0.5f);
     focalX_ = focalY_;
+}
+
+void MetalSplatRenderer::updateCameraExplicit(glm::vec3 eye, glm::mat4 viewMatrix, glm::mat4 projMatrix,
+                                               float focalX, float focalY) {
+    camPos_ = eye;
+    viewMatrix_ = viewMatrix;
+    projMatrixUnjittered_ = projMatrix;
+    projMatrix_ = applyMetalSplatJitter(projMatrix, jitterX_, jitterY_, width_, height_);
+    focalX_ = focalX;
+    focalY_ = focalY;
+}
+
+void MetalSplatRenderer::setJitter(float jitterXPixels, float jitterYPixels) {
+    jitterX_ = jitterXPixels;
+    jitterY_ = jitterYPixels;
+    projMatrix_ = applyMetalSplatJitter(projMatrixUnjittered_, jitterX_, jitterY_, width_, height_);
 }
 
 // --------------------------------------------------------------------------
@@ -730,8 +885,24 @@ void MetalSplatRenderer::renderToDrawable(MetalContext& ctx, CA::MetalDrawable* 
 void MetalSplatRenderer::renderToTarget(MetalContext& ctx, MTL::Texture* colorTex,
                                          MTL::Texture* depthTex,
                                          uint32_t drawW, uint32_t drawH) {
+    // DLSS aux attachments (docs/lux-4d-spec.md section 3) are fixed-size,
+    // allocated at width_/height_ in createRenderTargets -- only attach
+    // them when rendering to the matching offscreen color target (not an
+    // interactively-resized drawable, out of scope here).
+    bool includeAux = (colorTex == colorTarget_ && drawW == width_ && drawH == height_);
+
+    // --- Motion vectors: seed history on the very first frame so mv == 0 ---
+    if (firstMvFrame_) {
+        prevViewMatrix_ = viewMatrix_;
+        prevProjMatrixUnjittered_ = projMatrixUnjittered_;
+        // Re-seed prevPos to THIS frame's own (already morphed, if
+        // applicable) position too, so the position term of mv is also 0.
+        std::memcpy(prevPosBuffer_->contents(), hostPositions_.data(),
+                    hostPositions_.size() * sizeof(float));
+    }
+
     // --- Build compute uniforms as raw bytes (matching MSL packed_float3 layout) ---
-    uint8_t uniformData[176] = {};
+    uint8_t uniformData[304] = {};
     std::memcpy(uniformData + 0, &viewMatrix_[0][0], 64);    // view: offset 0
     std::memcpy(uniformData + 64, &projMatrix_[0][0], 64);   // proj: offset 64
     float cp[3] = {camPos_.x, camPos_.y, camPos_.z};
@@ -746,6 +917,9 @@ void MetalSplatRenderer::renderToTarget(MetalContext& ctx, MTL::Texture* colorTe
     std::memcpy(uniformData + 160, &focalY_, 4);              // focalY: offset 160
     int32_t shd = static_cast<int32_t>(shDegree_);
     std::memcpy(uniformData + 164, &shd, 4);                  // shDegree: offset 164
+    std::memcpy(uniformData + 176, &projMatrixUnjittered_[0][0], 64);  // projUnjittered: offset 176
+    glm::mat4 prevViewProj = prevProjMatrixUnjittered_ * prevViewMatrix_;
+    std::memcpy(uniformData + 240, &prevViewProj[0][0], 64);  // prevViewProjUnjittered: offset 240
 
     // --- Build render uniforms ---
     struct RenderUniforms {
@@ -774,7 +948,10 @@ void MetalSplatRenderer::renderToTarget(MetalContext& ctx, MTL::Texture* colorTe
     compEnc->setBuffer(projCenterBuffer_, 0, 5);
     compEnc->setBuffer(projConicBuffer_, 0, 6);
     compEnc->setBuffer(projColorBuffer_, 0, 7);
-    compEnc->setBytes(uniformData, 176, 8);
+    compEnc->setBytes(uniformData, sizeof(uniformData), 8);
+    compEnc->setBuffer(prevPosBuffer_, 0, 9);
+    compEnc->setBuffer(projMvBuffer_, 0, 10);
+    compEnc->setBuffer(projDepthBuffer_, 0, 11);
 
     uint32_t threadGroupSize = static_cast<uint32_t>(computePipeline_->maxTotalThreadsPerThreadgroup());
     if (threadGroupSize > 256) threadGroupSize = 256;
@@ -791,7 +968,25 @@ void MetalSplatRenderer::renderToTarget(MetalContext& ctx, MTL::Texture* colorTe
     colorAtt->setTexture(colorTex);
     colorAtt->setLoadAction(MTL::LoadActionClear);
     colorAtt->setStoreAction(MTL::StoreActionStore);
-    colorAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 1.0));
+    // Color's alpha is cleared to 0 (not opaque 1) when aux attachments are
+    // present, so color.a is a genuine coverage signal -- see the Vulkan
+    // splat renderer's identical rationale. Non-aux rendering (interactive/
+    // drawable path) keeps the original opaque-black clear.
+    colorAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, includeAux ? 0.0 : 1.0));
+
+    if (includeAux) {
+        auto* motionAtt = rpDesc->colorAttachments()->object(1);
+        motionAtt->setTexture(motionTarget_);
+        motionAtt->setLoadAction(MTL::LoadActionClear);
+        motionAtt->setStoreAction(MTL::StoreActionStore);
+        motionAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 0.0));
+
+        auto* depthOutAtt = rpDesc->colorAttachments()->object(2);
+        depthOutAtt->setTexture(expectedDepthTarget_);
+        depthOutAtt->setLoadAction(MTL::LoadActionClear);
+        depthOutAtt->setStoreAction(MTL::StoreActionStore);
+        depthOutAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 0.0));
+    }
 
     auto* depthAtt = rpDesc->depthAttachment();
     depthAtt->setTexture(depthTex);
@@ -822,6 +1017,8 @@ void MetalSplatRenderer::renderToTarget(MetalContext& ctx, MTL::Texture* colorTe
     renderEnc->setVertexBuffer(sortedIndicesBuffer_, 0, 3);
     renderEnc->setVertexBytes(&renderUniforms, sizeof(renderUniforms), 4);
     renderEnc->setFragmentBytes(&renderUniforms, sizeof(renderUniforms), 4);
+    renderEnc->setVertexBuffer(projMvBuffer_, 0, 5);
+    renderEnc->setVertexBuffer(projDepthBuffer_, 0, 6);
 
     // Instanced draw: 6 vertices (quad) x numSplats instances
     renderEnc->drawPrimitives(MTL::PrimitiveTypeTriangle, 0u, 6u, numSplats_);
@@ -830,6 +1027,15 @@ void MetalSplatRenderer::renderToTarget(MetalContext& ctx, MTL::Texture* colorTe
 
     cmdBuf->commit();
     cmdBuf->waitUntilCompleted();
+
+    // --- Carry motion-vector history forward for the NEXT frame ---
+    // Shared-storage buffers are already CPU-visible, so this is just a
+    // memcpy (no GPU copy/barrier needed, unlike Vulkan).
+    std::memcpy(prevPosBuffer_->contents(), hostPositions_.data(),
+                hostPositions_.size() * sizeof(float));
+    prevViewMatrix_ = viewMatrix_;
+    prevProjMatrixUnjittered_ = projMatrixUnjittered_;
+    firstMvFrame_ = false;
 }
 
 // --------------------------------------------------------------------------
@@ -839,6 +1045,8 @@ void MetalSplatRenderer::renderToTarget(MetalContext& ctx, MTL::Texture* colorTe
 void MetalSplatRenderer::cleanup() {
     if (colorTarget_) { colorTarget_->release(); colorTarget_ = nullptr; }
     if (depthTarget_) { depthTarget_->release(); depthTarget_ = nullptr; }
+    if (motionTarget_) { motionTarget_->release(); motionTarget_ = nullptr; }
+    if (expectedDepthTarget_) { expectedDepthTarget_->release(); expectedDepthTarget_ = nullptr; }
 
     if (computePipeline_) { computePipeline_->release(); computePipeline_ = nullptr; }
     if (renderPipeline_) { renderPipeline_->release(); renderPipeline_ = nullptr; }
@@ -853,6 +1061,9 @@ void MetalSplatRenderer::cleanup() {
     if (projCenterBuffer_) { projCenterBuffer_->release(); projCenterBuffer_ = nullptr; }
     if (projConicBuffer_) { projConicBuffer_->release(); projConicBuffer_ = nullptr; }
     if (projColorBuffer_) { projColorBuffer_->release(); projColorBuffer_ = nullptr; }
+    if (projMvBuffer_) { projMvBuffer_->release(); projMvBuffer_ = nullptr; }
+    if (projDepthBuffer_) { projDepthBuffer_->release(); projDepthBuffer_ = nullptr; }
+    if (prevPosBuffer_) { prevPosBuffer_->release(); prevPosBuffer_ = nullptr; }
 
     if (sortedIndicesBuffer_) { sortedIndicesBuffer_->release(); sortedIndicesBuffer_ = nullptr; }
 }

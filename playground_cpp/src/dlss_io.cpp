@@ -89,19 +89,25 @@ glm::mat4 cvViewToGl(const std::array<float, 16>& m) {
 
 glm::mat4 buildIntrinsicsProjection(float fx, float fy, float cx, float cy,
                                      float width, float height,
-                                     float nearPlane, float farPlane) {
-    // Derivation (docs/lux-4d-spec.md section 4): lux's vertex stage maps
-    // NDC -> pixel via `pixel = (ndc*0.5 + 0.5) * screen_size`. Requiring
-    // this to reproduce the OpenCV pinhole `u = fx*x_cv/z_cv + cx`,
-    // `v = fy*y_cv/z_cv + cy` for camera-space points converted from lux's
-    // GL convention (x_gl=x_cv, y_gl=-y_cv, z_gl=-z_cv, so
-    // x_cv/z_cv = x_gl/z_gl and y_cv/z_cv = y_gl/(-z_gl)... using
-    // z_cv = -z_gl) and clip.w = -z_gl (the usual convention) gives, after
-    // solving clip_x = ndc_x * clip.w and clip_y = ndc_y * clip.w for the
-    // matrix coefficients:
+                                     float nearPlane, float farPlane,
+                                     bool metalYConvention) {
+    // Derivation (docs/lux-4d-spec.md section 4): the Vulkan splat
+    // pipeline's vertex stage maps NDC -> pixel via
+    // `pixel = (ndc*0.5 + 0.5) * screen_size`. Requiring this to reproduce
+    // the OpenCV pinhole `u = fx*x_cv/z_cv + cx`, `v = fy*y_cv/z_cv + cy`
+    // for camera-space points converted from lux's GL convention
+    // (x_gl=x_cv, y_gl=-y_cv, z_gl=-z_cv, so x_cv/z_cv = x_gl/z_gl and
+    // y_cv/z_cv = y_gl/(-z_gl)... using z_cv = -z_gl) and clip.w = -z_gl
+    // (the usual convention) gives, after solving clip_x = ndc_x * clip.w
+    // and clip_y = ndc_y * clip.w for the matrix coefficients:
     //   clip.x = (2*fx/W)*x_gl + (1 - 2*cx/W)*z_gl
     //   clip.y =      -(2*fy/H)*y_gl + (1 - 2*cy/H)*z_gl
     //   clip.w = -z_gl
+    // Metal's splat renderer instead maps
+    // `screen.y = (1-(ndc.y*0.5+0.5))*H` (an EXTRA flip outside the
+    // projection matrix, see metal_splat_renderer.cpp's `center`/`ndc`),
+    // which negates the y-row's sign in the same derivation:
+    //   clip.y = (2*fy/H)*y_gl - (1 - 2*cy/H)*z_gl
     // The z row (depth-test only, doesn't affect pixel placement) is
     // borrowed from a standard glm::perspective matrix with the same
     // near/far planes, since it already matches this codebase's Vulkan
@@ -110,9 +116,14 @@ glm::mat4 buildIntrinsicsProjection(float fx, float fy, float cx, float cy,
 
     glm::mat4 P(0.0f);
     P[0][0] = 2.0f * fx / width;
-    P[1][1] = -2.0f * fy / height;
     P[2][0] = 1.0f - 2.0f * cx / width;
-    P[2][1] = 1.0f - 2.0f * cy / height;
+    if (metalYConvention) {
+        P[1][1] = 2.0f * fy / height;
+        P[2][1] = -(1.0f - 2.0f * cy / height);
+    } else {
+        P[1][1] = -2.0f * fy / height;
+        P[2][1] = 1.0f - 2.0f * cy / height;
+    }
     P[2][2] = ref[2][2];
     P[2][3] = -1.0f;
     P[3][2] = ref[3][2];

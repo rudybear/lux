@@ -6,6 +6,7 @@
 #include "metal_scene_manager.h"
 #include "metal_renderer_interface.h"
 #include "metal_screenshot.h"
+#include "dlss_io.h"
 #include "reflected_pipeline.h"
 #include "scene_light.h"
 #include "camera.h"
@@ -140,6 +141,12 @@ struct CLIOptions {
     float time = 0.0f;
     bool hasFrame = false;
     int frame = 0;
+
+    // DLSS input-contract outputs (docs/lux-4d-spec.md sections 3-4).
+    float jitterX = 0.0f, jitterY = 0.0f;
+    std::string outputAuxPrefix;
+    std::string cameraJsonPath;
+    std::string cameraJsonPrevPath;
 };
 
 static void printUsage(const char* program) {
@@ -159,6 +166,10 @@ static void printUsage(const char* program) {
               << "  --sponza-lights        Sponza courtyard lights (sun + torch + accent)\n"
               << "  --time <SECONDS>       Dynamic splats: animation time (headless + initial interactive pose)\n"
               << "  --frame <N>            Dynamic splats: animation frame index (extras.fps, else keyframe times)\n"
+              << "  --jitter <JX> <JY>     Sub-pixel jitter in pixels (splat projection matrix only)\n"
+              << "  --output-aux <PREFIX>  Write <PREFIX>_color.png, _depth.npy, _mv.npy + PNG previews\n"
+              << "  --camera-json <FILE>   Drive the splat camera from {viewmat_cv, K, width, height}\n"
+              << "  --camera-json-prev <FILE> Seed the mv \"previous frame\" camera explicitly (testing)\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -211,6 +222,15 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
         } else if (arg == "--frame" && i + 1 < argc) {
             opts.frame = std::stoi(argv[++i]);
             opts.hasFrame = true;
+        } else if (arg == "--jitter" && i + 2 < argc) {
+            opts.jitterX = std::stof(argv[++i]);
+            opts.jitterY = std::stof(argv[++i]);
+        } else if (arg == "--output-aux" && i + 1 < argc) {
+            opts.outputAuxPrefix = argv[++i];
+        } else if (arg == "--camera-json" && i + 1 < argc) {
+            opts.cameraJsonPath = argv[++i];
+        } else if (arg == "--camera-json-prev" && i + 1 < argc) {
+            opts.cameraJsonPrevPath = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -400,11 +420,91 @@ static int runHeadless(const CLIOptions& opts) {
                 std::cerr << "[warn] --time/--frame given but scene has no morph-target animation" << std::endl;
             }
 
+            // --- Camera bridge (docs/lux-4d-spec.md section 4) ---
+            if (!opts.cameraJsonPath.empty()) {
+                DlssIO::CameraJsonData camJson;
+                if (!DlssIO::loadCameraJson(opts.cameraJsonPath, camJson)) {
+                    std::cerr << "[error] Failed to parse --camera-json file: "
+                              << opts.cameraJsonPath << std::endl;
+                    return 1;
+                }
+                glm::mat4 viewGl = DlssIO::cvViewToGl(camJson.viewmatCv);
+                glm::vec3 eye = glm::vec3(glm::inverse(viewGl) * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+                float fx = camJson.K[0], cx = camJson.K[2];
+                float fy = camJson.K[4], cy = camJson.K[5];
+                glm::mat4 proj = DlssIO::buildIntrinsicsProjection(
+                    fx, fy, cx, cy,
+                    static_cast<float>(camJson.width), static_cast<float>(camJson.height),
+                    0.01f, 1000.0f, /*metalYConvention=*/true);
+                splatR->updateCameraExplicit(eye, viewGl, proj, fx, fy);
+                std::cout << "[metal] --camera-json applied: fx=" << fx << " fy=" << fy
+                          << " cx=" << cx << " cy=" << cy
+                          << " (" << camJson.width << "x" << camJson.height << ")" << std::endl;
+
+                if (!opts.cameraJsonPrevPath.empty()) {
+                    DlssIO::CameraJsonData prevJson;
+                    if (!DlssIO::loadCameraJson(opts.cameraJsonPrevPath, prevJson)) {
+                        std::cerr << "[error] Failed to parse --camera-json-prev file: "
+                                  << opts.cameraJsonPrevPath << std::endl;
+                        return 1;
+                    }
+                    glm::mat4 prevViewGl = DlssIO::cvViewToGl(prevJson.viewmatCv);
+                    glm::mat4 prevProj = DlssIO::buildIntrinsicsProjection(
+                        prevJson.K[0], prevJson.K[4], prevJson.K[2], prevJson.K[5],
+                        static_cast<float>(prevJson.width), static_cast<float>(prevJson.height),
+                        0.01f, 1000.0f, /*metalYConvention=*/true);
+                    splatR->setPreviousCameraExplicit(prevViewGl, prevProj);
+                    std::cout << "[metal] --camera-json-prev applied" << std::endl;
+                }
+            }
+            if (opts.jitterX != 0.0f || opts.jitterY != 0.0f) {
+                splatR->setJitter(opts.jitterX, opts.jitterY);
+            }
+
             splatR->render(ctx);
 
             MetalScreenshot::saveTextureToPNG(ctx, splatR->getOutputTexture(),
                                                splatR->getWidth(), splatR->getHeight(),
                                                opts.output);
+
+            // --- Headless aux dumps (docs/lux-4d-spec.md section 3) ---
+            if (!opts.outputAuxPrefix.empty()) {
+                uint32_t w = splatR->getWidth(), h = splatR->getHeight();
+                std::string colorPath = opts.outputAuxPrefix + "_color.png";
+                MetalScreenshot::saveTextureToPNG(ctx, splatR->getOutputTexture(), w, h, colorPath);
+
+                if (splatR->hasExpectedDepth()) {
+                    auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getExpectedDepthTexture(), w, h, 8);
+                    std::vector<float> rg(static_cast<size_t>(w) * h * 2);
+                    std::memcpy(rg.data(), raw.data(), raw.size());
+                    std::vector<float> depthPremul(static_cast<size_t>(w) * h);
+                    std::vector<float> depthAlpha(static_cast<size_t>(w) * h);
+                    for (size_t i = 0; i < depthPremul.size(); ++i) {
+                        depthPremul[i] = rg[i * 2 + 0];
+                        depthAlpha[i] = rg[i * 2 + 1];
+                    }
+                    auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
+                    DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_depth.npy", depth, {h, w});
+                    DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png", depth, w, h, 1);
+                }
+                if (splatR->hasMotionVectors()) {
+                    auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getMotionTexture(), w, h, 16);
+                    std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
+                    std::memcpy(rgba.data(), raw.data(), raw.size());
+                    std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
+                    std::vector<float> mvAlpha(static_cast<size_t>(w) * h);
+                    for (size_t i = 0; i < mvAlpha.size(); ++i) {
+                        mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
+                        mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
+                        mvAlpha[i] = rgba[i * 4 + 3];
+                    }
+                    auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
+                    DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_mv.npy", mv, {h, w, 2});
+                    DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_mv_preview.png", mv, w, h, 2);
+                }
+                std::cout << "[metal] Wrote aux dumps: " << opts.outputAuxPrefix
+                          << "_{color.png,depth.npy,mv.npy,*_preview.png}" << std::endl;
+            }
 
             splatR->cleanup();
             scene.cleanup();

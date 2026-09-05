@@ -56,4 +56,26 @@ void saveTextureToPNG(MetalContext& ctx, MTL::Texture* texture,
               << " (" << width << "x" << height << ")" << std::endl;
 }
 
+std::vector<uint8_t> readTextureRaw(MetalContext& ctx, MTL::Texture* texture,
+                                     uint32_t width, uint32_t height,
+                                     uint32_t bytesPerPixel) {
+    size_t bytesPerRow = static_cast<size_t>(width) * bytesPerPixel;
+    size_t bufferSize = bytesPerRow * height;
+    auto* stagingBuffer = ctx.newBuffer(bufferSize, MTL::ResourceStorageModeShared);
+
+    auto* cmdBuf = ctx.beginCommandBuffer();
+    auto* blit = cmdBuf->blitCommandEncoder();
+    blit->copyFromTexture(texture, 0, 0,
+                          MTL::Origin(0, 0, 0),
+                          MTL::Size(width, height, 1),
+                          stagingBuffer, 0, bytesPerRow, 0);
+    blit->endEncoding();
+    ctx.submitAndWait(cmdBuf);
+
+    std::vector<uint8_t> raw(bufferSize);
+    memcpy(raw.data(), stagingBuffer->contents(), bufferSize);
+    stagingBuffer->release();
+    return raw;
+}
+
 } // namespace MetalScreenshot
