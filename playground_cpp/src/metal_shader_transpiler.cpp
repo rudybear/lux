@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <memory>
+#include <cstdlib>
 
 // ---------------------------------------------------------------------------
 // TranspiledShader helpers
@@ -82,6 +83,18 @@ MTL::Library* ShaderTranspiler::compileMSL(const std::string& source) {
     NS::Error* error = nullptr;
     auto* nsSource = NS::String::string(source.c_str(), NS::UTF8StringEncoding);
     auto* options = MTL::CompileOptions::alloc()->init();
+    // MTLCompileOptions defaults fastMathEnabled to YES (mathMode ==
+    // MathModeFast on newer SDKs): the compiler is then free to reorder/
+    // approximate floating-point ops (including transcendentals like the
+    // Gaussian kernel's exp(-0.5*power)) in ways that assume no NaN/Inf and
+    // aren't strictly IEEE-754-associative. Force safe math -- a leading
+    // hypothesis for this backend's colour-parity gap vs. MoltenVK's own
+    // internal SPIR-V->MSL compile (which may compile with different
+    // defaults), given hundreds of overlapping low-alpha premultiplied
+    // blends per pixel are extremely sensitive to exactly this kind of
+    // per-fragment numerical drift.
+    options->setFastMathEnabled(false);
+    options->setMathMode(MTL::MathModeSafe);
 
     MTL::Library* library = m_device->newLibrary(nsSource, options, &error);
     options->release();
@@ -256,6 +269,18 @@ void ShaderTranspiler::transpileInto(TranspiledShader& result, const std::vector
     // Compile to MSL — let SPIRV-Cross auto-assign texture/sampler indices
     // (except for vertex buffers where we reserved index 0)
     result.mslSource = compiler->compile();
+
+    // Debug: dump generated MSL source when LUX_DUMP_MSL_DIR is set (e.g.
+    // to grep for `half` -- RelaxedPrecision/SPIRV-Cross heuristics lowering
+    // fp32 math to fp16, a leading hypothesis for the splat colour-parity
+    // gap between this transpiler and MoltenVK's own internal transpile).
+    if (const char* dumpDir = std::getenv("LUX_DUMP_MSL_DIR")) {
+        static int dumpCounter = 0;
+        std::string path = std::string(dumpDir) + "/dump_" + std::to_string(dumpCounter++) + ".metal";
+        std::ofstream out(path);
+        out << result.mslSource;
+        std::cerr << "[metal-debug] dumped MSL to " << path << std::endl;
+    }
 
     // After compilation, query the ACTUAL Metal binding indices.
     // This correctly handles dead-code elimination and index compaction.

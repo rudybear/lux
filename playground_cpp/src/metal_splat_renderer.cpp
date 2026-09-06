@@ -8,6 +8,24 @@
 #include <chrono>
 #include <cmath>
 
+namespace {
+// `ctx.device->newLibrary(src, nullptr, &error)` (this file's own previous
+// convention) uses MTLCompileOptions' defaults, which enable fast math
+// (mathMode == MathModeFast on newer SDKs): the compiler is then free to
+// reorder/approximate floating-point ops -- including transcendentals like
+// this shader's exp(-0.5*power) Gaussian kernel evaluation -- in ways that
+// aren't strictly IEEE-754. Force safe math (checked, empirically, as one
+// candidate explanation for this backend's colour-parity gap vs. Vulkan/
+// MoltenVK; see metal_splat_luxc_renderer.h's own identical change and its
+// class-comment note on the measured effect for the luxc backend).
+MTL::CompileOptions* safeMathCompileOptions() {
+    auto* options = MTL::CompileOptions::alloc()->init();
+    options->setFastMathEnabled(false);
+    options->setMathMode(MTL::MathModeSafe);
+    return options;
+}
+} // namespace
+
 // --------------------------------------------------------------------------
 // Sub-pixel jitter (docs/lux-4d-spec.md section 3)
 // --------------------------------------------------------------------------
@@ -521,7 +539,9 @@ void MetalSplatRenderer::createPipelines(MetalContext& ctx) {
 
     // --- Compute pipeline ---
     auto* computeSrc = NS::String::string(kSplatComputeMSL, NS::UTF8StringEncoding);
-    auto* computeLib = ctx.device->newLibrary(computeSrc, nullptr, &error);
+    auto* computeOpts = safeMathCompileOptions();
+    auto* computeLib = ctx.device->newLibrary(computeSrc, computeOpts, &error);
+    computeOpts->release();
     if (!computeLib) {
         std::string msg = "Failed to compile splat compute shader";
         if (error) msg += std::string(": ") + error->localizedDescription()->utf8String();
@@ -547,7 +567,9 @@ void MetalSplatRenderer::createPipelines(MetalContext& ctx) {
 
     // --- Render pipeline ---
     auto* renderSrc = NS::String::string(kSplatRenderMSL, NS::UTF8StringEncoding);
-    auto* renderLib = ctx.device->newLibrary(renderSrc, nullptr, &error);
+    auto* renderOpts = safeMathCompileOptions();
+    auto* renderLib = ctx.device->newLibrary(renderSrc, renderOpts, &error);
+    renderOpts->release();
     if (!renderLib) {
         std::string msg = "Failed to compile splat render shader";
         if (error) msg += std::string(": ") + error->localizedDescription()->utf8String();
@@ -760,7 +782,9 @@ void MetalSplatRenderer::createBuffers(MetalContext& ctx, const GaussianSplatDat
 void MetalSplatRenderer::createMorphPipeline(MetalContext& ctx) {
     NS::Error* error = nullptr;
     auto* src = NS::String::string(kSplatMorphMSL, NS::UTF8StringEncoding);
-    auto* lib = ctx.device->newLibrary(src, nullptr, &error);
+    auto* morphOpts = safeMathCompileOptions();
+    auto* lib = ctx.device->newLibrary(src, morphOpts, &error);
+    morphOpts->release();
     if (!lib) {
         std::string msg = "Failed to compile splat morph shader";
         if (error) msg += std::string(": ") + error->localizedDescription()->utf8String();
