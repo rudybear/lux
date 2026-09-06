@@ -78,8 +78,14 @@ splat_member: IDENT ":" expr
 // --- Reconstruction pass declarations (DLSS-style upscale/accumulate,
 // docs/lux-reconstruct-spec.md) ---
 
-reconstruct_decl: "reconstruct" IDENT "{" reconstruct_member ("," reconstruct_member)* ","? "}"
+reconstruct_decl: "reconstruct" IDENT "{" reconstruct_item ("," reconstruct_item)* ","? "}"
+?reconstruct_item: reconstruct_member | reconstruct_memory
 reconstruct_member: IDENT ":" expr
+
+// Optional explicit scene-memory sub-block (docs/scene-memory-spec.md in the
+// mobiledlss repo): `memory: { channels: 8, hidden: 16 }`. Reuses
+// reconstruct_member for its own fields (also plain IDENT ":" expr pairs).
+reconstruct_memory: "memory" ":" "{" reconstruct_member ("," reconstruct_member)* ","? "}"
 
 // --- Geometry declarations ---
 

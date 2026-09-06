@@ -174,15 +174,16 @@ void writeNpyFloat32(const std::string& path, const std::vector<float>& data,
             static_cast<std::streamsize>(data.size() * sizeof(float)));
 }
 
-NpyArray readNpyFloat32(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) {
-        throw std::runtime_error("readNpyFloat32: failed to open " + path);
-    }
+namespace {
+
+// Shared by readNpyFloat32 (file) and readNpzMemberFloat32 (in-memory,
+// extracted from one stored .npz entry) -- both are the identical .npy
+// binary format, just from a different backing stream.
+NpyArray parseNpyStream(std::istream& f, const std::string& debugName) {
     char magic[6];
     f.read(magic, 6);
     if (f.gcount() != 6 || std::memcmp(magic, "\x93NUMPY", 6) != 0) {
-        throw std::runtime_error("readNpyFloat32: bad magic in " + path);
+        throw std::runtime_error("parseNpyStream: bad magic in " + debugName);
     }
     uint8_t version[2];
     f.read(reinterpret_cast<char*>(version), 2);
@@ -198,11 +199,11 @@ NpyArray readNpyFloat32(const std::string& path) {
     f.read(header.data(), static_cast<std::streamsize>(headerLen));
 
     if (header.find("'<f4'") == std::string::npos) {
-        throw std::runtime_error("readNpyFloat32: expected dtype '<f4' in " + path + " header: " + header);
+        throw std::runtime_error("parseNpyStream: expected dtype '<f4' in " + debugName + " header: " + header);
     }
     if (header.find("'fortran_order': False") == std::string::npos &&
         header.find("'fortran_order': True") != std::string::npos) {
-        throw std::runtime_error("readNpyFloat32: fortran-order arrays not supported: " + path);
+        throw std::runtime_error("parseNpyStream: fortran-order arrays not supported: " + debugName);
     }
 
     // Parse the 'shape': (a, b, c) tuple -- ints and commas only, so a
@@ -210,12 +211,12 @@ NpyArray readNpyFloat32(const std::string& path) {
     NpyArray out;
     size_t shapeKey = header.find("'shape':");
     if (shapeKey == std::string::npos) {
-        throw std::runtime_error("readNpyFloat32: no 'shape' key in " + path);
+        throw std::runtime_error("parseNpyStream: no 'shape' key in " + debugName);
     }
     size_t open = header.find('(', shapeKey);
     size_t close = header.find(')', open);
     if (open == std::string::npos || close == std::string::npos) {
-        throw std::runtime_error("readNpyFloat32: malformed shape tuple in " + path);
+        throw std::runtime_error("parseNpyStream: malformed shape tuple in " + debugName);
     }
     std::string shapeBody = header.substr(open + 1, close - open - 1);
     std::string cur;
@@ -235,9 +236,123 @@ NpyArray readNpyFloat32(const std::string& path) {
     f.read(reinterpret_cast<char*>(out.data.data()),
            static_cast<std::streamsize>(total * static_cast<int64_t>(sizeof(float))));
     if (f.gcount() != static_cast<std::streamsize>(total * static_cast<int64_t>(sizeof(float)))) {
-        throw std::runtime_error("readNpyFloat32: short read on " + path);
+        throw std::runtime_error("parseNpyStream: short read on " + debugName);
     }
     return out;
+}
+
+uint16_t readLE16(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+}
+
+uint32_t readLE32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+uint64_t readLE64(const uint8_t* p) {
+    uint64_t lo = readLE32(p);
+    uint64_t hi = readLE32(p + 4);
+    return lo | (hi << 32);
+}
+
+// `np.savez` (numpy >= ~1.22 or so) writes each member by streaming
+// directly into the zip (it doesn't know the compressed/uncompressed size
+// until the write completes), so Python's zipfile always escapes both
+// 32-bit size fields in the LOCAL file header to 0xFFFFFFFF and puts the
+// real 64-bit sizes in a Zip64 extended-information extra field (tag
+// 0x0001) instead -- even for small, well under 4GB, arrays. `uncomp32`/
+// `comp32` are the local header's raw (possibly-escaped) 32-bit fields;
+// returns the resolved (uncompressed size, compressed size) pair.
+std::pair<uint64_t, uint64_t> resolveZip64Sizes(uint32_t uncomp32, uint32_t comp32,
+                                                 const std::vector<uint8_t>& extra) {
+    if (uncomp32 != 0xFFFFFFFFu && comp32 != 0xFFFFFFFFu) {
+        return {uncomp32, comp32};
+    }
+    size_t pos = 0;
+    while (pos + 4 <= extra.size()) {
+        uint16_t tag = readLE16(&extra[pos]);
+        uint16_t size = readLE16(&extra[pos + 2]);
+        if (tag == 0x0001 && pos + 4 + size <= extra.size()) {
+            // Zip64 extra field data order (only escaped fields are
+            // present, in this fixed order): original (uncompressed)
+            // size, compressed size, relative header offset, disk start
+            // number. Both size fields are escaped together here.
+            size_t off = pos + 4;
+            uint64_t uncomp = uncomp32, comp = comp32;
+            if (uncomp32 == 0xFFFFFFFFu && off + 8 <= extra.size()) { uncomp = readLE64(&extra[off]); off += 8; }
+            if (comp32 == 0xFFFFFFFFu && off + 8 <= extra.size()) { comp = readLE64(&extra[off]); off += 8; }
+            return {uncomp, comp};
+        }
+        pos += 4 + size;
+    }
+    throw std::runtime_error("resolveZip64Sizes: escaped size but no Zip64 extra field found");
+}
+
+} // namespace
+
+NpyArray readNpyFloat32(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        throw std::runtime_error("readNpyFloat32: failed to open " + path);
+    }
+    return parseNpyStream(f, path);
+}
+
+NpyArray readNpzMemberFloat32(const std::string& path, const std::string& member) {
+    // np.savez(path, name=array, ...) with no explicit compression uses
+    // zipfile.ZIP_STORED (uncompressed) by default, so this only needs to
+    // walk ZIP local file headers looking for `member + ".npy"` (numpy's
+    // own per-array naming convention inside the archive) -- no deflate,
+    // no central-directory parsing needed.
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        throw std::runtime_error("readNpzMemberFloat32: failed to open " + path);
+    }
+    const std::string wantName = member + ".npy";
+    while (true) {
+        uint8_t sigBytes[4];
+        f.read(reinterpret_cast<char*>(sigBytes), 4);
+        if (f.gcount() != 4) break;
+        uint32_t sig = readLE32(sigBytes);
+        if (sig != 0x04034b50u) break;  // not a local file header -> central directory / EOCD reached
+
+        uint8_t hdr[26];
+        f.read(reinterpret_cast<char*>(hdr), 26);
+        if (f.gcount() != 26) {
+            throw std::runtime_error("readNpzMemberFloat32: truncated local file header in " + path);
+        }
+        uint16_t compMethod = readLE16(hdr + 4);
+        uint32_t compSize32 = readLE32(hdr + 14);
+        uint32_t uncompSize32 = readLE32(hdr + 18);
+        uint16_t nameLen = readLE16(hdr + 22);
+        uint16_t extraLen = readLE16(hdr + 24);
+
+        std::string name(nameLen, '\0');
+        f.read(name.data(), nameLen);
+        std::vector<uint8_t> extra(extraLen);
+        if (extraLen > 0) f.read(reinterpret_cast<char*>(extra.data()), extraLen);
+
+        auto [uncompSize64, compSize64] = resolveZip64Sizes(uncompSize32, compSize32, extra);
+        (void)uncompSize64;
+
+        if (name == wantName) {
+            if (compMethod != 0) {
+                throw std::runtime_error("readNpzMemberFloat32: member '" + name +
+                                          "' is compressed (only ZIP_STORED is supported) in " + path);
+            }
+            std::vector<char> buf(static_cast<size_t>(compSize64));
+            f.read(buf.data(), static_cast<std::streamsize>(compSize64));
+            if (static_cast<uint64_t>(f.gcount()) != compSize64) {
+                throw std::runtime_error("readNpzMemberFloat32: short read on member '" + name + "' in " + path);
+            }
+            std::string membuf(buf.begin(), buf.end());
+            std::istringstream iss(membuf, std::ios::binary);
+            return parseNpyStream(iss, path + ":" + name);
+        }
+        f.seekg(static_cast<std::streamoff>(compSize64), std::ios::cur);
+    }
+    throw std::runtime_error("readNpzMemberFloat32: member '" + wantName + "' not found in " + path);
 }
 
 void writeNormalizedPreviewPNG(const std::string& path, const std::vector<float>& data,

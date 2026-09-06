@@ -1059,7 +1059,8 @@ pipeline ReconstructPass {
 fixed network architecture); the three stages take runtime push-constant fields
 for resolution (`target_w/h`, `proxy_w/h`, `net_w/h`) and per-frame jitter, so the
 same compiled pipeline is reused across every clip/frame. Only the 2-way blend
-(no scene-memory `blend3`) is covered.
+(no scene-memory `blend3`) is covered, unless a `memory` sub-block is present
+(below).
 
 This is stage 1 of the port: the packed per-pixel network parameters
 (`kernel_logits`/`blend_logits`/`hidden_raw`, concatenated exactly as
@@ -1067,15 +1068,91 @@ This is stage 1 of the port: the packed per-pixel network parameters
 `packed_params` input, not computed by a network running inside lux -- see
 `docs/lux-reconstruct-spec.md`'s stage 2 scope note.
 
-Both playgrounds can run these three stages standalone, driven entirely by a
+### Scene-memory path (`memory` sub-block)
+
+An optional `memory: { channels, hidden }` sub-block ports mobiledlss's explicit
+per-scene memory (`docs/scene-memory-spec.md` in the mobiledlss repo --
+`mobiledlss.train.scene_texture.SceneTexture` + `MemoryColorHead`): a learnable
+per-scene feature texture, addressed by the sphere UV of each pixel's view ray,
+decoded into an RGB "memory colour" that gives the blend a third option --
+unlike the spatial upsample or warped history (both convex combinations of the
+proxy image), the memory colour can be an arbitrary per-pixel colour, exactly
+what an aggressively-pruned background needs (measured on mobiledlss:
+28.4 -> 36.7 dB PSNR recovered at 80% background pruning, `m_juggle_p0.8`).
+
+```
+reconstruct DlssReconstructMem {
+    s: 2,
+    k: 4,
+    param_stride: 1,
+    hidden: 8,
+    memory: {
+        channels: 8,   // scene-texture feature channel count
+        hidden: 16,    // MemoryColorHead decoder hidden width
+    },
+}
+
+pipeline ReconstructMemPass {
+    mode: reconstruct,
+    reconstruct: DlssReconstructMem,
+}
+```
+
+`memory.channels`/`memory.hidden` are compile-time, exactly like the parent
+block's fields. When `memory` is present, luxc emits two additional compute
+stages and changes the shape of `apply`/`blend`:
+
+- **`bguv`**: per-pixel sphere UV (`mobiledlss.datagen.camera.sphere_uv` --
+  the *far* intersection of the pixel's world-space view ray with a bounding
+  sphere `bg_sphere` (`vec4`: centre.xyz, radius), `u = atan2(d.z, d.x)/2pi +
+  0.5`, `v = acos(d.y)/pi`). Resolution- and camera-generic (`width`/`height`,
+  pinhole intrinsics `k_params` (`fx,fy,cx,cy`), and a `cam_to_world` `mat4`
+  are all push constants), so the host runs the *same* compiled stage twice
+  per frame -- once at proxy resolution (feeding the network's own extra
+  input-channel block, dumped via `--dump-bg-features`, see below) and once
+  at target resolution (feeding `memory`) -- mirroring
+  `mobiledlss.train.train.rollout`'s own dual sampling of `SceneTexture`. The
+  camera-to-world matrix is convention-free once expressed as a world-space
+  ray -- lux's camera bridge already handles the OpenCV -> GL conversion
+  upstream of this push field.
+- **`memory`**: bilinearly samples the `channels x tex_h x tex_w` feature
+  texture at each pixel's sphere UV (`u` wraps around the seam, `v` clamps at
+  the poles) and decodes the sampled feature vector through the
+  `channels -> hidden -> 3` decoder MLP (`LeakyReLU(0.1)`, then `sigmoid`) --
+  `MemoryColorHead`'s exact architecture. Writes both `bg_features_out` (the
+  raw sampled feature, before decoding -- what `--dump-bg-features` saves at
+  proxy resolution for the network host to consume) and `memory_color_out`
+  (the decoded RGB, used by `blend` at target resolution).
+- **`apply`** now predicts a 3-way blend: `blend_logits` selects 2-way vs.
+  3-way purely by its own channel count (`s*s` vs. `3*s*s`, matching
+  `pixel_shuffle_params`), softmax over `{spatial, history, memory}` instead
+  of a single sigmoid alpha, written to a 3-channel `blend_out` buffer instead
+  of `alpha_out`.
+- **`blend`** performs the 3-way `blend3`/`renormalized_blend_weights` mix
+  instead of the 2-way lerp: the history share is zeroed on disocclusion, the
+  three (already-softmaxed) weights are renormalised to sum to 1, then
+  `out = w_s*spatial + w_h*warped + w_m*memory`.
+
+The network itself (proxy-resolution feature sampling feeding
+`ParamPredUNet`'s extra input-channel block) still runs outside this pass --
+see the stage-2 scope note above -- but `--dump-bg-features <DIR>` runs the
+`bguv`+`memory` stages standalone at proxy resolution and writes the sampled
+features as `.npy` so the network host can consume them.
+
+Both playgrounds can run these stages standalone, driven entirely by a
 directory of dumped `.npy` inputs (produced offline, e.g. by mobiledlss's
 `tools/reconstruct_reference_dump.py`) instead of any splat rendering:
 
 ```
 lux-playground --reconstruct-dump <DIR> [--reconstruct-out <DIR>] \
                [--reconstruct-pipeline examples/reconstruct]
+lux-playground --dump-bg-features <DIR> [--reconstruct-pipeline examples/reconstruct_mem]
 ```
 
 writing `out_f{t}.npy` / `hidden_f{t}.npy` per frame into the output directory
-(default: the dump directory itself). See `docs/rendering-engines.md`'s CLI
-table for the dump directory's expected file layout.
+(default: the dump directory itself); when the compiled pipeline has the
+memory path, the dump directory may additionally carry `bg_sphere.npy` (`[4]`,
+centre+radius), `texture.npy` (`[C, H, W]`), `memory_head.npz` (`fc1_w, fc1_b,
+fc2_w, fc2_b`) and per-frame `k_params_f{t}.npy`/`cam_to_world_f{t}.npy`, and
+`out_f{t}.npy` reflects the memory path. See `docs/rendering-engines.md`'s CLI
+table for the dump directory's full expected file layout.

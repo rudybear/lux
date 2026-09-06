@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "source": "reconstruct_mem.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "bguv_in",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "bg_texture",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_buffer",
+        "name": "mem_fc1_w",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "storage_buffer",
+        "name": "mem_fc1_b",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "storage_buffer",
+        "name": "mem_fc2_w",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 5,
+        "type": "storage_buffer",
+        "name": "mem_fc2_b",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 6,
+        "type": "storage_buffer",
+        "name": "bg_features_out",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 7,
+        "type": "storage_buffer",
+        "name": "memory_color_out",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "push",
+      "fields": [
+        {
+          "name": "width",
+          "type": "uint",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "height",
+          "type": "uint",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "tex_w",
+          "type": "uint",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "tex_h",
+          "type": "uint",
+          "offset": 12,
+          "size": 4
+        }
+      ],
+      "size": 16,
+      "stage_flags": [
+        "compute"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      256,
+      1,
+      1
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 1507,
+    "alu_ops": 516,
+    "texture_samples": 0,
+    "branches": 1,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

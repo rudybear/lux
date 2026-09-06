@@ -40,6 +40,8 @@ from luxc.parser.ast_nodes import (
 
 __all__ = ["expand_reconstruct_pipeline"]
 
+_PI = 3.14159265358979323846
+
 
 # ---------------------------------------------------------------------------
 # Small AST-construction helpers (same vocabulary/style as splat_expander.py)
@@ -71,6 +73,10 @@ def _call(fn: str, args: list) -> CallExpr:
 
 def _swizzle(expr, components: str) -> SwizzleAccess:
     return SwizzleAccess(expr, components)
+
+
+def _ctor(ty: str, args: list) -> ConstructorExpr:
+    return ConstructorExpr(ty, args)
 
 
 def _binop(op: str, left, right) -> BinaryOp:
@@ -124,6 +130,23 @@ def _get_reconstruct_config(reconstruct) -> dict:
         if isinstance(m.value, NumberLit) and m.name in cfg:
             cfg[m.name] = int(float(m.value.value))
     cfg["sp"] = cfg["s"] * cfg["param_stride"]  # un-multiplex factor
+    return cfg
+
+
+def _get_memory_config(reconstruct) -> dict | None:
+    """Optional `memory: { channels: 8, hidden: 16 }` sub-block (explicit
+    per-scene memory -- mobiledlss's docs/scene-memory-spec.md /
+    `mobiledlss.train.scene_texture.SceneTexture`/`MemoryColorHead`).
+    Defaults match those classes' own defaults. `None` when the reconstruct
+    declaration has no memory sub-block -- the 2-way blend, byte-identical
+    to the stage-1 port, is unaffected."""
+    memory = getattr(reconstruct, "memory", None)
+    if memory is None:
+        return None
+    cfg = {"channels": 8, "hidden": 16}
+    for m in memory.members:
+        if isinstance(m.value, NumberLit) and m.name in cfg:
+            cfg[m.name] = int(float(m.value.value))
     return cfg
 
 
@@ -234,20 +257,268 @@ def _compute_main(body: list) -> FunctionDef:
 
 
 # ---------------------------------------------------------------------------
+# Scene-memory pass A: sphere UV (mobiledlss.datagen.camera.sphere_uv)
+# ---------------------------------------------------------------------------
+
+def _build_bguv_stage(config: dict) -> StageBlock:
+    """Per-pixel sphere UV: the *far* intersection of the pixel's world-
+    space view ray with a bounding sphere `(bg_sphere.xyz, bg_sphere.w)`,
+    expressed as (azimuth, polar) in `[0, 1]` -- exactly
+    `mobiledlss.datagen.camera.sphere_uv`. Resolution- and camera-generic
+    (everything is a push constant): the host runs this same compiled
+    stage twice per frame -- once at proxy resolution (feeding the
+    network's own extra texture-feature input channels, dumped via
+    `--dump-bg-features`) and once at target resolution (feeding the
+    memory-colour decode stage below) -- mirroring
+    `mobiledlss.train.train.rollout`'s own dual sampling of `SceneTexture`
+    at both resolutions. Camera convention is OpenCV (+x right, +y down,
+    +z forward); the host's camera bridge already handles OpenCV -> GL,
+    so this stage only needs a plain camera-to-world matrix and pinhole
+    intrinsics -- both convention-free once expressed as a world-space ray.
+    """
+    stage = StageBlock(stage_type="compute")
+    stage.storage_buffers = [
+        StorageBufferDecl("bguv_out", "scalar"),
+    ]
+    fields = [
+        BlockField("width", "uint"),
+        BlockField("height", "uint"),
+        BlockField("k_params", "vec4"),       # fx, fy, cx, cy
+        BlockField("cam_to_world", "mat4"),   # camera -> world (OpenCV convention)
+        BlockField("bg_sphere", "vec4"),      # centre.xyz, radius
+    ]
+    stage.push_constants = [PushBlock("push", fields)]
+
+    body = []
+    body.append(_let("gid", "uint", _swizzle(_ref("global_invocation_id"), "x")))
+    body.append(_let("total", "uint", _binop("*", _ref("width"), _ref("height"))))
+    body.append(_if(_binop(">=", _ref("gid"), _ref("total")), [ReturnStmt(None)]))
+    body.append(_let("Y", "uint", _binop("/", _ref("gid"), _ref("width"))))
+    body.append(_let("X", "uint", _binop("%", _ref("gid"), _ref("width"))))
+    body.append(_let("Xf", "scalar", _ref("X")))
+    body.append(_let("Yf", "scalar", _ref("Y")))
+
+    # Camera-space ray direction (pixel-centre, pinhole):
+    # ((x+0.5-cx)/fx, (y+0.5-cy)/fy, 1) -- camera.sphere_uv's dirs_cam.
+    body.append(_let("dcx", "scalar",
+        _binop("/", _binop("-", _binop("+", _ref("Xf"), _lit(0.5)), _swizzle(_ref("k_params"), "z")),
+               _swizzle(_ref("k_params"), "x"))))
+    body.append(_let("dcy", "scalar",
+        _binop("/", _binop("-", _binop("+", _ref("Yf"), _lit(0.5)), _swizzle(_ref("k_params"), "w")),
+               _swizzle(_ref("k_params"), "y"))))
+
+    # World-space ray direction/origin: mat4 * vec4 with w=0 transforms a
+    # direction (rotation only, matches `dirs_cam @ c2w[:3,:3].T`); w=1
+    # transforms the camera origin (matches `c2w[:3, 3]`).
+    body.append(_let("dir_cam4", "vec4", _ctor("vec4", [_ref("dcx"), _ref("dcy"), _lit(1.0), _lit(0.0)])))
+    body.append(_let("dir_world4", "vec4", _binop("*", _ref("cam_to_world"), _ref("dir_cam4"))))
+    body.append(_let("dir", "vec3", _call("normalize", [_swizzle(_ref("dir_world4"), "xyz")])))
+    body.append(_let("origin4", "vec4", _binop("*", _ref("cam_to_world"),
+        _ctor("vec4", [_lit(0.0), _lit(0.0), _lit(0.0), _lit(1.0)]))))
+    body.append(_let("o", "vec3", _swizzle(_ref("origin4"), "xyz")))
+
+    # Far intersection with the bounding sphere (camera.sphere_uv's exact
+    # geometry: b = dot(dir, oc), disc = b^2 - (dot(oc,oc) - r^2),
+    # t = -b + sqrt(max(disc, 0))).
+    body.append(_let("center", "vec3", _swizzle(_ref("bg_sphere"), "xyz")))
+    body.append(_let("radius", "scalar", _swizzle(_ref("bg_sphere"), "w")))
+    body.append(_let("oc", "vec3", _binop("-", _ref("o"), _ref("center"))))
+    body.append(_let("b", "scalar", _call("dot", [_ref("dir"), _ref("oc")])))
+    body.append(_let("oc_dot", "scalar", _call("dot", [_ref("oc"), _ref("oc")])))
+    body.append(_let("disc", "scalar",
+        _binop("-", _mul(_ref("b"), _ref("b")),
+               _binop("-", _ref("oc_dot"), _mul(_ref("radius"), _ref("radius"))))))
+    body.append(_let("t", "scalar",
+        _add(_binop("-", _lit(0.0), _ref("b")),
+             _call("sqrt", [_call("max", [_ref("disc"), _lit(0.0)])]))))
+    body.append(_let("p", "vec3",
+        _binop("-", _add(_ref("o"), _mul(_ref("dir"), _ref("t"))), _ref("center"))))
+    body.append(_let("d", "vec3", _call("normalize", [_ref("p")])))
+
+    body.append(_let("u", "scalar",
+        _add(_binop("/", _call("atan", [_swizzle(_ref("d"), "z"), _swizzle(_ref("d"), "x")]),
+                    _lit(2.0 * _PI)),
+             _lit(0.5))))
+    body.append(_let("v", "scalar",
+        _binop("/", _call("acos", [_call("clamp", [_swizzle(_ref("d"), "y"), _lit(-1.0), _lit(1.0)])]),
+               _lit(_PI))))
+
+    out_base = _mul(_ref("gid"), _uint_lit(2))
+    body.append(_assign_idx("bguv_out", _binop("+", out_base, _uint_lit(0)), _ref("u")))
+    body.append(_assign_idx("bguv_out", _binop("+", out_base, _uint_lit(1)), _ref("v")))
+
+    stage.functions = [_compute_main(body)]
+    return stage
+
+
+# ---------------------------------------------------------------------------
+# Scene-memory pass B: texture sample + decoder MLP
+# (mobiledlss.train.scene_texture.SceneTexture + MemoryColorHead)
+# ---------------------------------------------------------------------------
+
+def _build_memory_stage(config: dict, memory_config: dict) -> StageBlock:
+    """Bilinear-sample the per-scene feature texture at each pixel's sphere
+    UV (`u` wraps, `v` clamps -- `SceneTexture.forward`'s exact semantics,
+    implemented as a direct wrap/clamp bilinear gather rather than
+    `SceneTexture`'s reference implementation's one-texel-pad trick, since
+    a compute storage buffer has no sampler/border-mode hardware to lean
+    on -- both are exactly equivalent, see docs/language-reference.md),
+    then decode through the `channels -> hidden -> 3` 1x1-conv MLP
+    (`MemoryColorHead`: `LeakyReLU(0.1)` between, `sigmoid` on the output).
+    `channels`/`hidden` are compile-time (baked into the SPIR-V, exactly
+    like `s`/`k`/`param_stride`/`hidden` are for the main config), so the
+    whole per-pixel computation -- texture gather and both MLP layers --
+    is fully unrolled.
+
+    Resolution-generic (`width`/`height` push fields): the host runs this
+    same compiled stage at proxy resolution (only `bg_features_out`
+    matters there -- the raw sampled feature vector fed to the network as
+    an extra input channel block outside this pass, dumped via
+    `--dump-bg-features`) and at target resolution (`memory_color_out`
+    feeds the blend stage's 3-way blend).
+    """
+    C, HIDDEN = memory_config["channels"], memory_config["hidden"]
+
+    stage = StageBlock(stage_type="compute")
+    stage.storage_buffers = [
+        StorageBufferDecl("bguv_in", "scalar"),
+        StorageBufferDecl("bg_texture", "scalar"),
+        StorageBufferDecl("mem_fc1_w", "scalar"),
+        StorageBufferDecl("mem_fc1_b", "scalar"),
+        StorageBufferDecl("mem_fc2_w", "scalar"),
+        StorageBufferDecl("mem_fc2_b", "scalar"),
+        StorageBufferDecl("bg_features_out", "scalar"),
+        StorageBufferDecl("memory_color_out", "scalar"),
+    ]
+    fields = [
+        BlockField("width", "uint"),
+        BlockField("height", "uint"),
+        BlockField("tex_w", "uint"),
+        BlockField("tex_h", "uint"),
+    ]
+    stage.push_constants = [PushBlock("push", fields)]
+
+    body = []
+    body.append(_let("gid", "uint", _swizzle(_ref("global_invocation_id"), "x")))
+    body.append(_let("total", "uint", _binop("*", _ref("width"), _ref("height"))))
+    body.append(_if(_binop(">=", _ref("gid"), _ref("total")), [ReturnStmt(None)]))
+
+    # u (azimuth) wraps to [0, 1) via fract (== torch.remainder(u, 1.0));
+    # v (polar) clamps -- SceneTexture.forward / rollout._addressed_uv.
+    body.append(_let("u_raw", "scalar", _idx("bguv_in", _mul(_ref("gid"), _uint_lit(2)))))
+    body.append(_let("v_raw", "scalar",
+        _idx("bguv_in", _add(_mul(_ref("gid"), _uint_lit(2)), _uint_lit(1)))))
+    body.append(_let("u", "scalar", _call("fract", [_ref("u_raw")])))
+    body.append(_let("v", "scalar", _call("clamp", [_ref("v_raw"), _lit(0.0), _lit(1.0)])))
+
+    body.append(_let("tex_wf", "scalar", _ref("tex_w")))
+    body.append(_let("tex_hf", "scalar", _ref("tex_h")))
+
+    # Continuous texel-index coordinate (align_corners=False convention,
+    # matching grid_sample's own px = u*W - 0.5 -- see
+    # docs/language-reference.md's derivation from SceneTexture.forward's
+    # one-texel-pad trick).
+    body.append(_let("px", "scalar", _binop("-", _mul(_ref("u"), _ref("tex_wf")), _lit(0.5))))
+    body.append(_let("py", "scalar", _binop("-", _mul(_ref("v"), _ref("tex_hf")), _lit(0.5))))
+    body.append(_let("x0f", "scalar", _call("floor", [_ref("px")])))
+    body.append(_let("y0f", "scalar", _call("floor", [_ref("py")])))
+    body.append(_let("fx", "scalar", _binop("-", _ref("px"), _ref("x0f"))))
+    body.append(_let("fy", "scalar", _binop("-", _ref("py"), _ref("y0f"))))
+    body.append(_let("x1f", "scalar", _add(_ref("x0f"), _lit(1.0))))
+    body.append(_let("y1f", "scalar", _add(_ref("y0f"), _lit(1.0))))
+
+    # u wraps (OpFMod, always non-negative for a positive divisor); v clamps.
+    body.append(_let("x0w", "scalar", _call("mod", [_ref("x0f"), _ref("tex_wf")])))
+    body.append(_let("x1w", "scalar", _call("mod", [_ref("x1f"), _ref("tex_wf")])))
+    body.append(_let("y0c", "scalar",
+        _call("clamp", [_ref("y0f"), _lit(0.0), _binop("-", _ref("tex_hf"), _lit(1.0))])))
+    body.append(_let("y1c", "scalar",
+        _call("clamp", [_ref("y1f"), _lit(0.0), _binop("-", _ref("tex_hf"), _lit(1.0))])))
+
+    body.append(_let("x0i", "uint", _ref("x0w")))
+    body.append(_let("x1i", "uint", _ref("x1w")))
+    body.append(_let("y0i", "uint", _ref("y0c")))
+    body.append(_let("y1i", "uint", _ref("y1c")))
+
+    body.append(_let("row0", "uint", _mul(_ref("y0i"), _ref("tex_w"))))
+    body.append(_let("row1", "uint", _mul(_ref("y1i"), _ref("tex_w"))))
+    body.append(_let("plane_stride", "uint", _mul(_ref("tex_w"), _ref("tex_h"))))
+
+    body.append(_let("w00", "scalar", _mul(_binop("-", _lit(1.0), _ref("fx")), _binop("-", _lit(1.0), _ref("fy")))))
+    body.append(_let("w01", "scalar", _mul(_ref("fx"), _binop("-", _lit(1.0), _ref("fy")))))
+    body.append(_let("w10", "scalar", _mul(_binop("-", _lit(1.0), _ref("fx")), _ref("fy"))))
+    body.append(_let("w11", "scalar", _mul(_ref("fx"), _ref("fy"))))
+
+    feat_base = _mul(_ref("gid"), _uint_lit(C))
+    for c in range(C):
+        plane_off = _mul(_uint_lit(c), _ref("plane_stride"))
+        idx00 = _add(plane_off, _add(_ref("row0"), _ref("x0i")))
+        idx01 = _add(plane_off, _add(_ref("row0"), _ref("x1i")))
+        idx10 = _add(plane_off, _add(_ref("row1"), _ref("x0i")))
+        idx11 = _add(plane_off, _add(_ref("row1"), _ref("x1i")))
+        body.append(_let(f"t00_{c}", "scalar", _idx("bg_texture", idx00)))
+        body.append(_let(f"t01_{c}", "scalar", _idx("bg_texture", idx01)))
+        body.append(_let(f"t10_{c}", "scalar", _idx("bg_texture", idx10)))
+        body.append(_let(f"t11_{c}", "scalar", _idx("bg_texture", idx11)))
+        body.append(_let(f"feat{c}", "scalar", _add(
+            _mul(_ref("w00"), _ref(f"t00_{c}")),
+            _mul(_ref("w01"), _ref(f"t01_{c}")),
+            _mul(_ref("w10"), _ref(f"t10_{c}")),
+            _mul(_ref("w11"), _ref(f"t11_{c}")),
+        )))
+        body.append(_assign_idx("bg_features_out", _add(feat_base, _uint_lit(c)), _ref(f"feat{c}")))
+
+    # --- Decoder MLP: channels -> hidden (LeakyReLU 0.1) -> 3 (sigmoid). ---
+    # leaky_relu(x, 0.1) == max(x, 0.1*x) for any real x (0.1 < 1, so the
+    # positive branch keeps x and the negative branch keeps the smaller-
+    # magnitude 0.1*x) -- avoids a per-element branch/select.
+    for h in range(HIDDEN):
+        terms = [_idx("mem_fc1_b", _uint_lit(h))]
+        for c in range(C):
+            w_idx = _uint_lit(h * C + c)
+            terms.append(_mul(_idx("mem_fc1_w", w_idx), _ref(f"feat{c}")))
+        body.append(_let(f"h_pre{h}", "scalar", _add(*terms)))
+        body.append(_let(f"h{h}", "scalar",
+            _call("max", [_ref(f"h_pre{h}"), _mul(_lit(0.1), _ref(f"h_pre{h}"))])))
+
+    color_base = _mul(_ref("gid"), _uint_lit(3))
+    for o in range(3):
+        terms = [_idx("mem_fc2_b", _uint_lit(o))]
+        for h in range(HIDDEN):
+            w_idx = _uint_lit(o * HIDDEN + h)
+            terms.append(_mul(_idx("mem_fc2_w", w_idx), _ref(f"h{h}")))
+        body.append(_let(f"o_pre{o}", "scalar", _add(*terms)))
+        body.append(_let(f"sig{o}", "scalar",
+            _binop("/", _lit(1.0),
+                   _binop("+", _lit(1.0), _call("exp", [_binop("-", _lit(0.0), _ref(f"o_pre{o}"))])))))
+        body.append(_assign_idx("memory_color_out", _binop("+", color_base, _uint_lit(o)), _ref(f"sig{o}")))
+
+    stage.functions = [_compute_main(body)]
+    return stage
+
+
+# ---------------------------------------------------------------------------
 # Pass 2: un-multiplex params + apply kernel
 # (mobiledlss.train.reconstruct.pixel_shuffle_params + apply_kernel)
 # ---------------------------------------------------------------------------
 
-def _build_apply_stage(config: dict) -> StageBlock:
+def _build_apply_stage(config: dict, memory_config: dict | None = None) -> StageBlock:
     S, K, SP, HIDDEN = config["s"], config["k"], config["sp"], config["hidden"]
-    total_ch = SP * SP * K * K + SP * SP + HIDDEN
+    # 2-way (no scene memory): 1 blend-logit channel per output pixel
+    # (sigmoid "alpha"). 3-way (scene memory present): 3 channels per
+    # output pixel ({spatial, history, memory}, softmax) -- selected
+    # purely by blend_logits' own channel count, matching
+    # `pixel_shuffle_params`'s own dispatch (no extra flag there either).
+    n_blend = 3 if memory_config else 1
+    total_ch = SP * SP * K * K + SP * SP * n_blend + HIDDEN
+    blend_buf = "blend_out" if memory_config else "alpha_out"
 
     stage = StageBlock(stage_type="compute")
     stage.storage_buffers = [
         StorageBufferDecl("packed_params", "scalar"),
         StorageBufferDecl("proxy_color", "scalar"),
         StorageBufferDecl("spatial_out", "scalar"),
-        StorageBufferDecl("alpha_out", "scalar"),
+        StorageBufferDecl(blend_buf, "scalar"),
         StorageBufferDecl("hidden_out", "scalar"),
     ]
     fields = _shared_push_fields() + [
@@ -303,17 +574,38 @@ def _build_apply_stage(config: dict) -> StageBlock:
     for kk in range(n_taps):
         body.append(_let(f"kw{kk}", "scalar", _binop("/", _ref(f"kexp{kk}"), _ref("kexpsum"))))
 
-    # --- Alpha: sigmoid of the one alpha-logit channel for this block offset. ---
-    alpha_ch = SP * SP * K * K
-    body.append(_let("alpha_logit", "scalar",
-        _idx("packed_params", _add(_ref("net_base"),
-                                    _binop("+", _uint_lit(alpha_ch), _ref("block_off"))))))
-    body.append(_let("alpha", "scalar",
-        _binop("/", _lit(1.0), _binop("+", _lit(1.0), _call("exp", [_binop("-", _lit(0.0), _ref("alpha_logit"))])))))
-    body.append(_assign_idx("alpha_out", _ref("gid"), _ref("alpha")))
+    # --- Blend weight(s): 2-way sigmoid alpha, or 3-way softmax over
+    # {spatial, history, memory} logits (same PixelShuffle channel
+    # convention as the kernel taps: channel = kk*SP*SP + block_off). ---
+    blend_ch0 = SP * SP * K * K
+    if memory_config is None:
+        body.append(_let("alpha_logit", "scalar",
+            _idx("packed_params", _add(_ref("net_base"),
+                                        _binop("+", _uint_lit(blend_ch0), _ref("block_off"))))))
+        body.append(_let("alpha", "scalar",
+            _binop("/", _lit(1.0),
+                   _binop("+", _lit(1.0), _call("exp", [_binop("-", _lit(0.0), _ref("alpha_logit"))])))))
+        body.append(_assign_idx("alpha_out", _ref("gid"), _ref("alpha")))
+    else:
+        for kk in range(3):
+            ch = blend_ch0 + kk * SP * SP
+            body.append(_let(f"blogit{kk}", "scalar",
+                _idx("packed_params", _add(_ref("net_base"),
+                                            _binop("+", _uint_lit(ch), _ref("block_off"))))))
+        body.append(_let("bmax01", "scalar", _call("max", [_ref("blogit0"), _ref("blogit1")])))
+        body.append(_let("bmax", "scalar", _call("max", [_ref("bmax01"), _ref("blogit2")])))
+        for kk in range(3):
+            body.append(_let(f"bexp{kk}", "scalar",
+                _call("exp", [_binop("-", _ref(f"blogit{kk}"), _ref("bmax"))])))
+        body.append(_let("bsum01", "scalar", _add(_ref("bexp0"), _ref("bexp1"))))
+        body.append(_let("bsum", "scalar", _add(_ref("bsum01"), _ref("bexp2"))))
+        blend_out_base = _mul(_ref("gid"), _uint_lit(3))
+        for kk in range(3):
+            body.append(_let(f"bw{kk}", "scalar", _binop("/", _ref(f"bexp{kk}"), _ref("bsum"))))
+            body.append(_assign_idx("blend_out", _binop("+", blend_out_base, _uint_lit(kk)), _ref(f"bw{kk}")))
 
     # --- Hidden: broadcast copy, NOT pixel-shuffled (nearest upsample). ---
-    hidden_ch0 = SP * SP * K * K + SP * SP
+    hidden_ch0 = SP * SP * K * K + SP * SP * n_blend
     hidden_out_base = _mul(_ref("gid"), _uint_lit(HIDDEN))
     for h in range(HIDDEN):
         body.append(_assign_idx("hidden_out", _binop("+", hidden_out_base, _uint_lit(h)),
@@ -372,13 +664,55 @@ def _build_apply_stage(config: dict) -> StageBlock:
 # Pass 3: blend (mobiledlss.train.reconstruct.blend)
 # ---------------------------------------------------------------------------
 
-def _build_blend_stage(config: dict) -> StageBlock:
+def _build_blend_stage(config: dict, memory_config: dict | None = None) -> StageBlock:
     stage = StageBlock(stage_type="compute")
+
+    if memory_config is None:
+        stage.storage_buffers = [
+            StorageBufferDecl("spatial_out", "scalar"),
+            StorageBufferDecl("warped_color", "scalar"),
+            StorageBufferDecl("alpha_out", "scalar"),
+            StorageBufferDecl("disocc", "scalar"),
+            StorageBufferDecl("out_color", "scalar"),
+        ]
+        stage.push_constants = [PushBlock("push", _shared_push_fields())]
+
+        body = []
+        body.append(_let("gid", "uint", _swizzle(_ref("global_invocation_id"), "x")))
+        body.append(_let("total", "uint", _binop("*", _ref("target_w"), _ref("target_h"))))
+        body.append(_if(_binop(">=", _ref("gid"), _ref("total")), [ReturnStmt(None)]))
+
+        body.append(_let("d", "scalar", _idx("disocc", _ref("gid"))))
+        body.append(_let("a", "scalar", _idx("alpha_out", _ref("gid"))))
+        body.append(_let("alpha_eff", "scalar", _lit(0.0)))
+        body.append(_if(_binop(">", _ref("d"), _lit(0.5)),
+                         [_assign("alpha_eff", _lit(1.0))],
+                         [_assign("alpha_eff", _ref("a"))]))
+
+        base = _mul(_ref("gid"), _uint_lit(3))
+        for c in range(3):
+            idx = _binop("+", base, _uint_lit(c))
+            warped = _idx("warped_color", idx)
+            spatial = _idx("spatial_out", idx)
+            out_expr = _add(
+                _mul(warped, _binop("-", _lit(1.0), _ref("alpha_eff"))),
+                _mul(spatial, _ref("alpha_eff")),
+            )
+            body.append(_assign_idx("out_color", idx, out_expr))
+
+        stage.functions = [_compute_main(body)]
+        return stage
+
+    # --- 3-way (scene memory): mobiledlss.train.reconstruct.blend3 /
+    # renormalized_blend_weights -- zero the history share on disocclusion,
+    # renormalise the three (already-softmaxed) weights to sum to 1, blend
+    # spatial/warped/memory. ---
     stage.storage_buffers = [
         StorageBufferDecl("spatial_out", "scalar"),
         StorageBufferDecl("warped_color", "scalar"),
-        StorageBufferDecl("alpha_out", "scalar"),
+        StorageBufferDecl("blend_out", "scalar"),
         StorageBufferDecl("disocc", "scalar"),
+        StorageBufferDecl("memory_color", "scalar"),
         StorageBufferDecl("out_color", "scalar"),
     ]
     stage.push_constants = [PushBlock("push", _shared_push_fields())]
@@ -389,20 +723,27 @@ def _build_blend_stage(config: dict) -> StageBlock:
     body.append(_if(_binop(">=", _ref("gid"), _ref("total")), [ReturnStmt(None)]))
 
     body.append(_let("d", "scalar", _idx("disocc", _ref("gid"))))
-    body.append(_let("a", "scalar", _idx("alpha_out", _ref("gid"))))
-    body.append(_let("alpha_eff", "scalar", _lit(0.0)))
+    bbase = _mul(_ref("gid"), _uint_lit(3))
+    body.append(_let("ws0", "scalar", _idx("blend_out", _binop("+", bbase, _uint_lit(0)))))
+    body.append(_let("wh0", "scalar", _idx("blend_out", _binop("+", bbase, _uint_lit(1)))))
+    body.append(_let("wm0", "scalar", _idx("blend_out", _binop("+", bbase, _uint_lit(2)))))
+    body.append(_let("wh", "scalar", _lit(0.0)))
     body.append(_if(_binop(">", _ref("d"), _lit(0.5)),
-                     [_assign("alpha_eff", _lit(1.0))],
-                     [_assign("alpha_eff", _ref("a"))]))
+                     [_assign("wh", _lit(0.0))],
+                     [_assign("wh", _ref("wh0"))]))
+    body.append(_let("wtotal_raw", "scalar", _add(_ref("ws0"), _ref("wh"), _ref("wm0"))))
+    body.append(_let("wtotal", "scalar", _call("max", [_ref("wtotal_raw"), _lit(1e-8)])))
+    body.append(_let("ws", "scalar", _binop("/", _ref("ws0"), _ref("wtotal"))))
+    body.append(_let("whn", "scalar", _binop("/", _ref("wh"), _ref("wtotal"))))
+    body.append(_let("wmn", "scalar", _binop("/", _ref("wm0"), _ref("wtotal"))))
 
     base = _mul(_ref("gid"), _uint_lit(3))
     for c in range(3):
         idx = _binop("+", base, _uint_lit(c))
-        warped = _idx("warped_color", idx)
-        spatial = _idx("spatial_out", idx)
         out_expr = _add(
-            _mul(warped, _binop("-", _lit(1.0), _ref("alpha_eff"))),
-            _mul(spatial, _ref("alpha_eff")),
+            _mul(_ref("ws"), _idx("spatial_out", idx)),
+            _mul(_ref("whn"), _idx("warped_color", idx)),
+            _mul(_ref("wmn"), _idx("memory_color", idx)),
         )
         body.append(_assign_idx("out_color", idx, out_expr))
 
@@ -415,31 +756,44 @@ def _build_blend_stage(config: dict) -> StageBlock:
 # ---------------------------------------------------------------------------
 
 def expand_reconstruct_pipeline(reconstruct, pipeline, module) -> list:
-    """Expand a `reconstruct` declaration into the warp/apply/blend compute
-    stages. `s`, `k`, `param_stride`, `hidden` are baked in at compile time
-    (one compiled pipeline == one fixed network architecture, exactly like
-    a splat block's `sh_degree`); `target_w/h`, `proxy_w/h`, `net_w/h` and
-    `jitter` are runtime push-constant fields."""
+    """Expand a `reconstruct` declaration into its compute stages: always
+    warp/apply/blend; additionally bguv/memory when the declaration has an
+    optional `memory: { channels, hidden }` sub-block (explicit per-scene
+    memory, mobiledlss's docs/scene-memory-spec.md), in which case `apply`
+    predicts a 3-way ({spatial, history, memory}) blend and `blend`
+    performs the renormalized 3-way mix instead of the 2-way lerp. `s`,
+    `k`, `param_stride`, `hidden` (and, when present, `memory.channels`/
+    `memory.hidden`) are baked in at compile time (one compiled pipeline ==
+    one fixed network/memory architecture, exactly like a splat block's
+    `sh_degree`); resolutions, camera and jitter are runtime push-constant
+    fields."""
     config = _get_reconstruct_config(reconstruct)
+    memory_config = _get_memory_config(reconstruct)
 
     module._defines = getattr(module, "_defines", {})
     module._defines["workgroup_size_x"] = 256
     module._defines["workgroup_size_y"] = 1
     module._defines["workgroup_size_z"] = 1
 
-    warp_stage = _build_warp_stage(config)
-    warp_stage._output_stem_suffix = "warp"
-    warp_stage._reconstruct_config = config
-    warp_stage._reconstruct_name = reconstruct.name
+    def _tag(stage, suffix):
+        stage._output_stem_suffix = suffix
+        stage._reconstruct_config = config
+        stage._reconstruct_name = reconstruct.name
+        return stage
 
-    apply_stage = _build_apply_stage(config)
-    apply_stage._output_stem_suffix = "apply"
-    apply_stage._reconstruct_config = config
-    apply_stage._reconstruct_name = reconstruct.name
+    warp_stage = _tag(_build_warp_stage(config), "warp")
+    apply_stage = _tag(_build_apply_stage(config, memory_config), "apply")
 
-    blend_stage = _build_blend_stage(config)
-    blend_stage._output_stem_suffix = "blend"
-    blend_stage._reconstruct_config = config
-    blend_stage._reconstruct_name = reconstruct.name
+    stages = [warp_stage, apply_stage]
 
-    return [warp_stage, apply_stage, blend_stage]
+    if memory_config:
+        bguv_stage = _tag(_build_bguv_stage(config), "bguv")
+        memory_stage = _tag(_build_memory_stage(config, memory_config), "memory")
+        for s in (bguv_stage, memory_stage):
+            s._memory_config = memory_config
+        stages += [bguv_stage, memory_stage]
+
+    blend_stage = _tag(_build_blend_stage(config, memory_config), "blend")
+    stages.append(blend_stage)
+
+    return stages

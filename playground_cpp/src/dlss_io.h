@@ -78,6 +78,14 @@ struct NpyArray {
 };
 NpyArray readNpyFloat32(const std::string& path);
 
+// Reads one member's float32 array from a numpy `.npz` archive written by
+// `np.savez(path, name=array, ...)` (uncompressed/ZIP_STORED by default --
+// this does not implement deflate, only stored entries). `member` should
+// NOT include the ".npy" suffix numpy appends internally (e.g. "fc1_w" for
+// an array saved as `np.savez(path, fc1_w=arr)`). Throws if the member
+// isn't found or is compressed.
+NpyArray readNpzMemberFloat32(const std::string& path, const std::string& member);
+
 // Minimal flat-JSON integer field reader (same "find the key, strtol what
 // follows the colon" approach as loadCameraJson's own scalarAfterKey) --
 // used to read a --reconstruct-dump directory's meta.json (s, k,

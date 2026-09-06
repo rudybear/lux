@@ -1,0 +1,29 @@
+// DLSS-style reconstruction pass with explicit scene-memory (3-way blend):
+// same as examples/reconstruct.lux, plus a `memory: { channels, hidden }`
+// sub-block (mobiledlss's docs/scene-memory-spec.md). Emits five compute
+// stages instead of three: warp, apply (now predicting a 3-way blend),
+// bguv (sphere UV from camera + bg_sphere), memory (texture sample +
+// MemoryColorHead decode), blend (3-way blend3).
+//
+// Compile: python -m luxc examples/reconstruct_mem.lux
+//   -> reconstruct_mem.warp.comp.spv
+//   -> reconstruct_mem.apply.comp.spv
+//   -> reconstruct_mem.bguv.comp.spv
+//   -> reconstruct_mem.memory.comp.spv
+//   -> reconstruct_mem.blend.comp.spv
+
+reconstruct DlssReconstructMem {
+    s: 2,
+    k: 4,
+    param_stride: 1,
+    hidden: 8,
+    memory: {
+        channels: 8,
+        hidden: 16,
+    },
+}
+
+pipeline ReconstructMemPass {
+    mode: reconstruct,
+    reconstruct: DlssReconstructMem,
+}

@@ -145,20 +145,26 @@ run_mesh_interactive_rust.bat # Interactive mesh shader viewer (Rust)
 | `--time-prev <SECONDS>` / `--frame-prev <N>` | Dynamic (`motion: keyframes`) splats only: evaluate the morph animation a *second* time, at this earlier time, into `splat_prev_pos` -- so a single headless render's motion vectors reflect real actor motion (`mv = projection(pos(time), cam) - projection(pos(time_prev), cam_prev)`), not just camera motion. Without this flag, `splat_prev_pos` defaults to the current frame's own (post-morph) position, i.e. `mv` is camera-motion-only (see `--camera-json-prev` above) -- this is still what sequential playback wants (`prev` = last rendered frame), it's specifically a single-shot-validation convenience. Combine with `--camera-json-prev` for a real actor-plus-camera delta between two arbitrary frames |
 | `--output-aux <PREFIX>` | Splats compiled with `motion_vectors`/`expected_depth`: write `<PREFIX>_color.png`, `_color.npy` (float32 `[H,W,4]`, un-premultiplied RGBA read directly off the RGBA16F color attachment, no 8-bit quantization), `_depth.npy`, `_mv.npy` (float32, row-major `[H,W,C]`) plus normalized PNG previews |
 | `--sort <MODE>` (Metal only) | `camera_distance` (default, Euclidean) or `view_depth` (gsplat's raw view-space z) -- a host-level mirror of the `splat` block's `sort` option (SPECIFICATION.md 12.8), since Metal's splat pipeline is hand-written MSL with no compiled `.lux` config to read `sort:` from. On Vulkan, `sort` is a compile-time `splat` block member instead (recompile with `sort: view_depth` to switch) |
-| `--reconstruct-dump <DIR>` | Run the compiled `reconstruct.{warp,apply,blend}.comp.spv` stages (SPECIFICATION.md 12.9) standalone against a directory of dumped `.npy` inputs -- no splat rendering, `--scene`/`--pipeline` are ignored. See the dump directory layout below |
-| `--reconstruct-out <DIR>` | Output directory for `--reconstruct-dump` (default: the dump directory itself) |
-| `--reconstruct-pipeline <BASE>` | Compiled reconstruct pipeline base path for `--reconstruct-dump` (default: `examples/reconstruct`) |
+| `--reconstruct-dump <DIR>` | Run the compiled `reconstruct.{warp,apply,blend}.comp.spv` stages (SPECIFICATION.md 12.9) standalone against a directory of dumped `.npy` inputs -- no splat rendering, `--scene`/`--pipeline` are ignored. When the compiled pipeline (`--reconstruct-pipeline`) also has `bguv`/`memory` stages (a `memory` sub-block was declared), the memory path runs too and `out_f{t}.npy` reflects it. See the dump directory layout below |
+| `--reconstruct-out <DIR>` | Output directory for `--reconstruct-dump`/`--dump-bg-features` (default: the dump directory itself) |
+| `--reconstruct-pipeline <BASE>` | Compiled reconstruct pipeline base path for `--reconstruct-dump`/`--dump-bg-features` (default: `examples/reconstruct`) |
+| `--dump-bg-features <DIR>` | Run only the `bguv`+`memory` stages (SPECIFICATION.md 12.9's scene-memory path) at *proxy* resolution against a dump directory's `bg_sphere.npy`/`texture.npy`/`k_params_f{t}.npy`/`cam_to_world_f{t}.npy`/`meta.json` -- no `--reconstruct-dump`, no splat rendering. Writes `bg_features_f{t}.npy` (`[proxy_h, proxy_w, memory.channels]`, the raw sampled scene-texture feature, pre-decode) per frame into the output directory, for the network host (which runs outside this pass) to concatenate onto `ParamPredUNet`'s other input channels |
 
 **`--reconstruct-dump` directory layout** (all `.npy`, fp32, `[H, W, C]` row-major; `T` = `num_frames`, `t` = `0..T-1`):
 
 | File | Shape | Notes |
 |------|-------|-------|
-| `meta.json` | -- | `{s, k, param_stride, hidden, proxy_w, proxy_h, target_w, target_h, net_w, net_h, num_frames}` |
+| `meta.json` | -- | `{s, k, param_stride, hidden, proxy_w, proxy_h, target_w, target_h, net_w, net_h, num_frames}`, plus `{memory_channels, memory_hidden, tex_w, tex_h}` when the memory path is present |
 | `proxy_color_f{t}.npy` | `[proxy_h, proxy_w, 3]` | this frame's (jittered) proxy colour |
 | `mv_proxy_f{t}.npy` | `[proxy_h, proxy_w, 2]` | backward, jitter-free proxy-resolution motion vectors |
 | `jitter_f{t}.npy` | `[2]` | raw, target-pixel-unit jitter |
-| `packed_params_f{t}.npy` | `[net_h, net_w, sp*sp*k*k + sp*sp + hidden]` (`sp = s*param_stride`) | `ParamPredUNet.forward_packed`'s own layout |
-| `disocc_f{t}.npy` | `[target_h, target_w]` | 1 = disoccluded (forces pure-spatial) |
+| `packed_params_f{t}.npy` | `[net_h, net_w, sp*sp*k*k + sp*sp*n_blend + hidden]` (`sp = s*param_stride`, `n_blend` = 1 or 3) | `ParamPredUNet.forward_packed`'s own layout; `n_blend=3` (scene memory) iff `blend_logits`' own channel count says so |
+| `disocc_f{t}.npy` | `[target_h, target_w]` | 1 = disoccluded (forces pure-spatial / zeroes the history share) |
+| `bg_sphere.npy` *(memory only)* | `[4]` | `cx, cy, cz, r` -- `mobiledlss.datagen.make_clips`'s `bg_sphere` field, constant across the clip |
+| `texture.npy` *(memory only)* | `[memory.channels, tex_h, tex_w]` | the per-scene feature texture (`SceneTexture.export`'s fp16 layout, upcast to fp32 on load) |
+| `memory_head.npz` *(memory only)* | -- | `fc1_w [hidden, channels]`, `fc1_b [hidden]`, `fc2_w [3, hidden]`, `fc2_b [3]` -- `MemoryColorHead`'s shared-decoder weights |
+| `k_params_f{t}.npy` *(memory only)* | `[4]` | `fx, fy, cx, cy` for this frame's *target*-resolution camera |
+| `cam_to_world_f{t}.npy` *(memory only)* | `[4, 4]` | this frame's camera-to-world matrix (OpenCV convention) |
 
 Writes `out_f{t}.npy` (`[target_h, target_w, 3]`) and `hidden_f{t}.npy` (`[target_h, target_w, hidden]`) per frame into the output directory. `prev_color`/`prev_hidden` are double-buffered host-side between frames (starting at zero, matching `mobiledlss.train.train.rollout`'s initial state); this port runs no network between frames, so `hidden_out` is a pure per-frame function of `packed_params_f{t}.npy` (see SPECIFICATION.md 12.9's scope note).
 

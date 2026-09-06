@@ -188,6 +188,7 @@ class SplatMember:
 class ReconstructDecl:
     name: str
     members: list["ReconstructMember"]
+    memory: Optional["ReconstructMemory"] = None
     loc: Optional[SourceLocation] = None
 
 
@@ -195,6 +196,15 @@ class ReconstructDecl:
 class ReconstructMember:
     name: str
     value: Expr
+
+
+@dataclass
+class ReconstructMemory:
+    """Optional `memory: { channels: 8, hidden: 16 }` sub-block of a
+    `reconstruct` declaration -- explicit per-scene memory (mobiledlss's
+    docs/scene-memory-spec.md), same member syntax as the parent block."""
+    members: list["ReconstructMember"]
+    loc: Optional[SourceLocation] = None
 
 
 # --- Geometry declarations ---

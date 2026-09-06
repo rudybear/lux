@@ -175,6 +175,10 @@ struct CLIOptions {
     std::string reconstructDumpDir;
     std::string reconstructOutDir;
     std::string reconstructPipeline = "examples/reconstruct";
+    // Scene-memory path only (SPECIFICATION.md 12.9): runs bguv+memory at
+    // proxy resolution, for the network host to consume the sampled
+    // scene-texture features. Mutually exclusive with reconstructDumpDir.
+    std::string dumpBgFeaturesDir;
 
     // Fused-GPU-compute ParamPredUNet (docs/lux-unet-spec.md).
     std::string unetInput;
@@ -293,6 +297,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.reconstructOutDir = argv[++i];
         } else if (arg == "--reconstruct-pipeline" && i + 1 < argc) {
             opts.reconstructPipeline = argv[++i];
+        } else if (arg == "--dump-bg-features" && i + 1 < argc) {
+            opts.dumpBgFeaturesDir = argv[++i];
         } else if (arg == "--unet-input" && i + 1 < argc) {
             opts.unetInput = argv[++i];
         } else if (arg == "--unet-weights" && i + 1 < argc) {
@@ -312,7 +318,7 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
         }
     }
 
-    if (!opts.reconstructDumpDir.empty() || !opts.unetInput.empty()) {
+    if (!opts.reconstructDumpDir.empty() || !opts.unetInput.empty() || !opts.dumpBgFeaturesDir.empty()) {
         return opts;
     }
 
@@ -1225,6 +1231,11 @@ int main(int argc, char* argv[]) {
     if (!opts.reconstructDumpDir.empty()) {
         return runReconstructDumpMetal(opts.reconstructDumpDir, opts.reconstructOutDir,
                                         opts.reconstructPipeline);
+    }
+
+    if (!opts.dumpBgFeaturesDir.empty()) {
+        return runDumpBgFeaturesMetal(opts.dumpBgFeaturesDir, opts.reconstructOutDir,
+                                       opts.reconstructPipeline);
     }
 
     if (!opts.unetInput.empty()) {
