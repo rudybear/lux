@@ -196,7 +196,8 @@ param: IDENT ":" type
 let_stmt: "let" IDENT ":" type "=" expr ";"
 assign_stmt: assign_target "=" expr ";"
 return_stmt: "return" expr ";"
-if_stmt: "if" "(" expr ")" "{" statement* "}" ("else" "{" statement* "}")?
+if_stmt: "if" "(" expr ")" "{" statement* "}" else_clause?
+else_clause: "else" "{" statement* "}"
 
 expr_stmt: expr ";"
 

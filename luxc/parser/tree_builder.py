@@ -568,24 +568,31 @@ class LuxTransformer(Transformer):
     def return_stmt(self, args):
         return ReturnStmt(args[0], loc=_node_loc(args[0]))
 
+    def else_clause(self, args):
+        # Wrapped in its own grammar rule (luxc/grammar/lux.lark's
+        # `else_clause: "else" "{" statement* "}"`) specifically so its
+        # statements arrive here as a single list, distinguishable from
+        # if_stmt's own (flattened) then-body statements below. Without
+        # this wrapper, Lark flattens BOTH the then- and else-blocks'
+        # `statement*` repetitions directly into if_stmt's children with
+        # no delimiter between them at all -- there is no reliable way,
+        # post-flattening, to tell where "then" ends and "else" begins.
+        # (A `None`-sentinel/isinstance(a, list) heuristic used to live
+        # directly in if_stmt() to guess the boundary; it could never
+        # actually fire for a real else-clause under the old grammar, so
+        # `if cond { A } else { B }` silently compiled to `if cond { A; B
+        # }` with an always-empty else body -- see the commit message.)
+        return list(args)
+
     def if_stmt(self, args):
         condition = args[0]
         then_body = []
         else_body = []
-        collecting_else = False
         for a in args[1:]:
-            if a is None:
-                collecting_else = True
-            elif isinstance(a, list):
-                if not collecting_else:
-                    then_body = a
-                else:
-                    else_body = a
+            if isinstance(a, list):
+                else_body = a
             else:
-                if not collecting_else:
-                    then_body.append(a)
-                else:
-                    else_body.append(a)
+                then_body.append(a)
         return IfStmt(condition, then_body, else_body, loc=_node_loc(condition))
 
     def expr_stmt(self, args):
