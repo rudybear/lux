@@ -162,6 +162,7 @@ struct CLIOptions {
     std::string reconstructDumpDir;   // --reconstruct-dump <dir>
     std::string reconstructOutDir;    // --reconstruct-out <dir> (default: dump dir)
     std::string reconstructPipeline = "examples/reconstruct"; // --reconstruct-pipeline <base>
+    std::string dumpBgFeaturesDir;     // --dump-bg-features <dir> (scene-memory path only)
 
     // Fused-GPU-compute ParamPredUNet (docs/lux-unet-spec.md).
     std::string unetInput;     // --unet-input <build_input.npy>
@@ -304,6 +305,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.reconstructOutDir = argv[++i];
         } else if (arg == "--reconstruct-pipeline" && i + 1 < argc) {
             opts.reconstructPipeline = argv[++i];
+        } else if (arg == "--dump-bg-features" && i + 1 < argc) {
+            opts.dumpBgFeaturesDir = argv[++i];
         } else if (arg == "--unet-input" && i + 1 < argc) {
             opts.unetInput = argv[++i];
         } else if (arg == "--unet-weights" && i + 1 < argc) {
@@ -343,7 +346,7 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
     }
 
     // --reconstruct-dump / --unet-input modes need neither --scene nor --pipeline.
-    if (!opts.reconstructDumpDir.empty() || !opts.unetInput.empty()) {
+    if (!opts.reconstructDumpDir.empty() || !opts.unetInput.empty() || !opts.dumpBgFeaturesDir.empty()) {
         return opts;
     }
 
@@ -1807,6 +1810,11 @@ int main(int argc, char* argv[]) {
     if (!opts.reconstructDumpDir.empty()) {
         return runReconstructDump(opts.reconstructDumpDir, opts.reconstructOutDir,
                                    opts.reconstructPipeline);
+    }
+
+    if (!opts.dumpBgFeaturesDir.empty()) {
+        return runDumpBgFeatures(opts.dumpBgFeaturesDir, opts.reconstructOutDir,
+                                  opts.reconstructPipeline);
     }
 
     // Fused-GPU-compute ParamPredUNet (docs/lux-unet-spec.md): also fully
