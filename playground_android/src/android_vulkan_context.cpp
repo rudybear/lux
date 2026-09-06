@@ -142,11 +142,32 @@ void init(VulkanContext& ctx, ANativeWindow* window, bool forceValidation) {
 }
 
 void createSwapchain(VulkanContext& ctx, uint32_t width, uint32_t height) {
+    // Android Vulkan pre-rotation gotcha: vk-bootstrap's SwapchainBuilder
+    // defaults preTransform to VkSurfaceCapabilitiesKHR::currentTransform
+    // when unset. Declaring preTransform == currentTransform tells the
+    // platform "the pixels I hand you are ALREADY rotated by that much",
+    // so the compositor does NOT apply any further correcting rotation --
+    // but our render+blit path (splat_renderer.cpp's blitToSwapchain, an
+    // axis-aligned vkCmdBlitImage, reused unmodified) never actually
+    // pre-rotates anything. On this device currentTransform came back as a
+    // 90 degree rotation (Mali-G715 pixel 9 pro xl, landscape-locked
+    // activity on a portrait-native panel), so the untouched content got
+    // displayed literally sideways -- a correctly-shaped landscape buffer
+    // (matching ANativeWindow's 2244x1008) with its CONTENT still oriented
+    // for a 0-degree transform. Force preTransform = IDENTITY explicitly
+    // instead: this is always among a Vulkan surface's supportedTransforms
+    // and tells the compositor to do the (cheap, GPU/hwcomposer-side)
+    // rotate itself, matching what our simple axis-aligned blit assumes.
+    VkSurfaceCapabilitiesKHR caps{};
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(ctx.physicalDevice, ctx.surface, &caps);
+    LOGI("Surface currentTransform=0x%x, forcing preTransform=IDENTITY", caps.currentTransform);
+
     vkb::SwapchainBuilder swapchainBuilder(ctx.physicalDevice, ctx.device, ctx.surface);
     auto swapResult = swapchainBuilder
         .set_desired_format({VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR})
         .set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
         .set_desired_extent(width, height)
+        .set_pre_transform_flags(VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
         .add_image_usage_flags(VK_IMAGE_USAGE_TRANSFER_DST_BIT)
         .build();
     if (!swapResult) {
