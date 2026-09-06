@@ -1,0 +1,88 @@
+// Nearest-2x-upsample of `input_a`, channel-concat with `input_b` (already
+// at output resolution), then a 3x3 zero-padded conv + LeakyReLU(0.1) --
+// lux's fused-GPU-compute UNet's decoder block (docs/lux-unet-spec.md,
+// mobiledlss.train.model._UpBlock). NHWC scalar (fp32) buffers.
+//
+// The concatenated tensor (`cin = cin_a + cin_b` channels) never actually
+// exists as a buffer: each tap's contribution is accumulated in two
+// separate input-channel loops instead of one branchy loop over the
+// concatenated channel range -- weight[oc, kh, kw, 0:cin_a] pairs with
+// upsample(input_a), weight[oc, kh, kw, cin_a:cin_a+cin_b] with input_b,
+// out of the SAME weight buffer (export_lux_weights.py writes the weight
+// with its channel-last cin axis already covering the full concatenated
+// range, matching nn.Conv2d(cin_a+cin_b, cout, ...) applied to
+// torch.cat([upsample(a), b], dim=1)).
+//
+// `out_h`/`out_w` (input_b's / the output's resolution) are pushed
+// directly; input_a is implicitly at half that resolution.
+//
+// Compile: python -m luxc examples/unet_upsample_concat_conv_lrelu.lux --define workgroup_size=256
+
+compute {
+    storage_buffer input_a: scalar;
+    storage_buffer input_b: scalar;
+    storage_buffer weights: scalar;
+    storage_buffer output_buf: scalar;
+
+    push params {
+        out_h: uint,
+        out_w: uint,
+        cin_a: uint,
+        cin_b: uint,
+        cout: uint,
+        weight_offset: uint,
+        bias_offset: uint,
+    }
+
+    fn main() {
+        let gid: uint = global_invocation_id.x;
+        let total: uint = out_h * out_w * cout;
+        if (gid < total) {
+            let oc: uint = gid % cout;
+            let pixel: uint = gid / cout;
+            let oy: uint = pixel / out_w;
+            let ox: uint = pixel % out_w;
+            let cin_total: uint = cin_a + cin_b;
+
+            let acc: scalar = weights[bias_offset + oc];
+
+            for (let kh: uint = 0; kh < 3; kh = kh + 1) {
+                let iy_b: uint = oy + kh;
+                if (iy_b >= 1) {
+                    if (iy_b <= out_h) {
+                        let iy: uint = iy_b - 1;
+                        let iy_a: uint = iy / 2;  // nearest-upsample source row
+                        for (let kw: uint = 0; kw < 3; kw = kw + 1) {
+                            let ix_b: uint = ox + kw;
+                            if (ix_b >= 1) {
+                                if (ix_b <= out_w) {
+                                    let ix: uint = ix_b - 1;
+                                    let ix_a: uint = ix / 2;
+                                    let w_tap_base: uint = weight_offset + ((oc * 3 + kh) * 3 + kw) * cin_total;
+
+                                    // upsample(input_a) contributes channels [0, cin_a).
+                                    let a_pixel_base: uint = (iy_a * (out_w / 2) + ix_a) * cin_a;
+                                    for (let ica: uint = 0; ica < cin_a; ica = ica + 1) {
+                                        acc = acc + input_a[a_pixel_base + ica] * weights[w_tap_base + ica];
+                                    }
+
+                                    // input_b contributes channels [cin_a, cin_a+cin_b).
+                                    let b_pixel_base: uint = (iy * out_w + ix) * cin_b;
+                                    for (let icb: uint = 0; icb < cin_b; icb = icb + 1) {
+                                        acc = acc + input_b[b_pixel_base + icb] * weights[w_tap_base + cin_a + icb];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let result: scalar = acc;
+            if (acc < 0.0) {
+                result = acc * 0.1;
+            }
+            output_buf[gid] = result;
+        }
+    }
+}

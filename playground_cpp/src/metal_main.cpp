@@ -8,6 +8,7 @@
 #include "metal_screenshot.h"
 #include "dlss_io.h"
 #include "metal_reconstruct_runner.h"
+#include "metal_unet_runner.h"
 #include "reflected_pipeline.h"
 #include "scene_light.h"
 #include "camera.h"
@@ -174,6 +175,13 @@ struct CLIOptions {
     std::string reconstructDumpDir;
     std::string reconstructOutDir;
     std::string reconstructPipeline = "examples/reconstruct";
+
+    // Fused-GPU-compute ParamPredUNet (docs/lux-unet-spec.md).
+    std::string unetInput;
+    std::string unetWeights;
+    std::string unetManifest;
+    std::string unetOutput;
+    std::string unetKernelDir = "examples";
 };
 
 static void printUsage(const char* program) {
@@ -285,6 +293,16 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.reconstructOutDir = argv[++i];
         } else if (arg == "--reconstruct-pipeline" && i + 1 < argc) {
             opts.reconstructPipeline = argv[++i];
+        } else if (arg == "--unet-input" && i + 1 < argc) {
+            opts.unetInput = argv[++i];
+        } else if (arg == "--unet-weights" && i + 1 < argc) {
+            opts.unetWeights = argv[++i];
+        } else if (arg == "--unet-manifest" && i + 1 < argc) {
+            opts.unetManifest = argv[++i];
+        } else if (arg == "--unet-output" && i + 1 < argc) {
+            opts.unetOutput = argv[++i];
+        } else if (arg == "--unet-kernel-dir" && i + 1 < argc) {
+            opts.unetKernelDir = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -294,7 +312,7 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
         }
     }
 
-    if (!opts.reconstructDumpDir.empty()) {
+    if (!opts.reconstructDumpDir.empty() || !opts.unetInput.empty()) {
         return opts;
     }
 
@@ -1207,6 +1225,11 @@ int main(int argc, char* argv[]) {
     if (!opts.reconstructDumpDir.empty()) {
         return runReconstructDumpMetal(opts.reconstructDumpDir, opts.reconstructOutDir,
                                         opts.reconstructPipeline);
+    }
+
+    if (!opts.unetInput.empty()) {
+        return runUnetDumpMetal(opts.unetInput, opts.unetWeights, opts.unetManifest,
+                                 opts.unetOutput, opts.unetKernelDir);
     }
 
     if (opts.shaderBase.empty()) {

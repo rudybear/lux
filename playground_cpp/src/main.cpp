@@ -14,6 +14,7 @@
 #include "editor_ui.h"
 #include "dlss_io.h"
 #include "reconstruct_runner.h"
+#include "unet_runner.h"
 
 #include <GLFW/glfw3.h>
 #include <iostream>
@@ -161,6 +162,13 @@ struct CLIOptions {
     std::string reconstructDumpDir;   // --reconstruct-dump <dir>
     std::string reconstructOutDir;    // --reconstruct-out <dir> (default: dump dir)
     std::string reconstructPipeline = "examples/reconstruct"; // --reconstruct-pipeline <base>
+
+    // Fused-GPU-compute ParamPredUNet (docs/lux-unet-spec.md).
+    std::string unetInput;     // --unet-input <build_input.npy>
+    std::string unetWeights;   // --unet-weights <blob.fp16.bin>
+    std::string unetManifest;  // --unet-manifest <manifest.json>
+    std::string unetOutput;    // --unet-output <out.npy>
+    std::string unetKernelDir = "examples"; // --unet-kernel-dir <dir> (compiled unet_*.comp.spv location)
 };
 
 static void printUsage(const char* program) {
@@ -296,6 +304,16 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.reconstructOutDir = argv[++i];
         } else if (arg == "--reconstruct-pipeline" && i + 1 < argc) {
             opts.reconstructPipeline = argv[++i];
+        } else if (arg == "--unet-input" && i + 1 < argc) {
+            opts.unetInput = argv[++i];
+        } else if (arg == "--unet-weights" && i + 1 < argc) {
+            opts.unetWeights = argv[++i];
+        } else if (arg == "--unet-manifest" && i + 1 < argc) {
+            opts.unetManifest = argv[++i];
+        } else if (arg == "--unet-output" && i + 1 < argc) {
+            opts.unetOutput = argv[++i];
+        } else if (arg == "--unet-kernel-dir" && i + 1 < argc) {
+            opts.unetKernelDir = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -324,8 +342,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
         }
     }
 
-    // --reconstruct-dump mode needs neither --scene nor --pipeline.
-    if (!opts.reconstructDumpDir.empty()) {
+    // --reconstruct-dump / --unet-input modes need neither --scene nor --pipeline.
+    if (!opts.reconstructDumpDir.empty() || !opts.unetInput.empty()) {
         return opts;
     }
 
@@ -1789,6 +1807,13 @@ int main(int argc, char* argv[]) {
     if (!opts.reconstructDumpDir.empty()) {
         return runReconstructDump(opts.reconstructDumpDir, opts.reconstructOutDir,
                                    opts.reconstructPipeline);
+    }
+
+    // Fused-GPU-compute ParamPredUNet (docs/lux-unet-spec.md): also fully
+    // standalone, no scene/pipeline resolution.
+    if (!opts.unetInput.empty()) {
+        return runUnetDump(opts.unetInput, opts.unetWeights, opts.unetManifest,
+                            opts.unetOutput, opts.unetKernelDir);
     }
 
     // Resolve pipeline from scene if not explicitly given

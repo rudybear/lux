@@ -1,0 +1,70 @@
+// Generic 3x3, stride-2, zero-padded (PyTorch Conv2d(stride=2, padding=1)
+// convention) convolution + LeakyReLU(0.1), for lux's fused-GPU-compute
+// UNet (docs/lux-unet-spec.md, mobiledlss.train.model._DownBlock.down).
+// NHWC scalar (fp32) buffers; weight/bias in a shared blob (see
+// unet_conv3x3_lrelu.lux's header comment for the layout).
+//
+// `in_h`/`in_w` are the FULL input resolution (2x the output); output
+// resolution is in_h/2 x in_w/2 (exact for even in_h/in_w, which
+// ParamPredUNet requires -- divisible by 8 at the stem).
+//
+// Compile: python -m luxc examples/unet_conv3x3_s2_lrelu.lux --define workgroup_size=256
+
+compute {
+    storage_buffer input_buf: scalar;
+    storage_buffer weights: scalar;
+    storage_buffer output_buf: scalar;
+
+    push params {
+        in_h: uint,
+        in_w: uint,
+        cin: uint,
+        cout: uint,
+        weight_offset: uint,
+        bias_offset: uint,
+    }
+
+    fn main() {
+        let gid: uint = global_invocation_id.x;
+        let out_h: uint = in_h / 2;
+        let out_w: uint = in_w / 2;
+        let total: uint = out_h * out_w * cout;
+        if (gid < total) {
+            let oc: uint = gid % cout;
+            let pixel: uint = gid / cout;
+            let oy: uint = pixel / out_w;
+            let ox: uint = pixel % out_w;
+
+            let acc: scalar = weights[bias_offset + oc];
+
+            // iy = oy*2 - 1 + kh; biased iy_b = oy*2 + kh represents (iy+1).
+            for (let kh: uint = 0; kh < 3; kh = kh + 1) {
+                let iy_b: uint = oy * 2 + kh;
+                if (iy_b >= 1) {
+                    if (iy_b <= in_h) {
+                        let iy: uint = iy_b - 1;
+                        for (let kw: uint = 0; kw < 3; kw = kw + 1) {
+                            let ix_b: uint = ox * 2 + kw;
+                            if (ix_b >= 1) {
+                                if (ix_b <= in_w) {
+                                    let ix: uint = ix_b - 1;
+                                    let in_pixel_base: uint = (iy * in_w + ix) * cin;
+                                    let w_tap_base: uint = weight_offset + ((oc * 3 + kh) * 3 + kw) * cin;
+                                    for (let ic: uint = 0; ic < cin; ic = ic + 1) {
+                                        acc = acc + input_buf[in_pixel_base + ic] * weights[w_tap_base + ic];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let result: scalar = acc;
+            if (acc < 0.0) {
+                result = acc * 0.1;
+            }
+            output_buf[gid] = result;
+        }
+    }
+}

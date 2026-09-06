@@ -1,0 +1,40 @@
+// Generic 1x1 convolution, no activation (raw logits) -- lux's
+// fused-GPU-compute UNet's head (docs/lux-unet-spec.md,
+// ParamPredUNet.head = nn.Conv2d(c0, out_ch, 1)). NHWC scalar (fp32)
+// buffers; weight [cout, cin] (kh=kw=1 collapsed), bias [cout], in the
+// shared weight blob (see unet_conv3x3_lrelu.lux's header comment).
+//
+// Compile: python -m luxc examples/unet_conv1x1.lux --define workgroup_size=256
+
+compute {
+    storage_buffer input_buf: scalar;
+    storage_buffer weights: scalar;
+    storage_buffer output_buf: scalar;
+
+    push params {
+        in_h: uint,
+        in_w: uint,
+        cin: uint,
+        cout: uint,
+        weight_offset: uint,
+        bias_offset: uint,
+    }
+
+    fn main() {
+        let gid: uint = global_invocation_id.x;
+        let total: uint = in_h * in_w * cout;
+        if (gid < total) {
+            let oc: uint = gid % cout;
+            let pixel: uint = gid / cout;
+
+            let acc: scalar = weights[bias_offset + oc];
+            let in_pixel_base: uint = pixel * cin;
+            let w_base: uint = weight_offset + oc * cin;
+            for (let ic: uint = 0; ic < cin; ic = ic + 1) {
+                acc = acc + input_buf[in_pixel_base + ic] * weights[w_base + ic];
+            }
+
+            output_buf[gid] = acc;
+        }
+    }
+}

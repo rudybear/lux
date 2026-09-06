@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "source": "unet_upsample_concat_conv_lrelu.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "input_a",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "input_b",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_buffer",
+        "name": "weights",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "storage_buffer",
+        "name": "output_buf",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "params",
+      "fields": [
+        {
+          "name": "out_h",
+          "type": "uint",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "out_w",
+          "type": "uint",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "cin_a",
+          "type": "uint",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "cin_b",
+          "type": "uint",
+          "offset": 12,
+          "size": 4
+        },
+        {
+          "name": "cout",
+          "type": "uint",
+          "offset": 16,
+          "size": 4
+        },
+        {
+          "name": "weight_offset",
+          "type": "uint",
+          "offset": 20,
+          "size": 4
+        },
+        {
+          "name": "bias_offset",
+          "type": "uint",
+          "offset": 24,
+          "size": 4
+        }
+      ],
+      "size": 32,
+      "stage_flags": [
+        "compute"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      256,
+      1,
+      1
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 319,
+    "alu_ops": 39,
+    "texture_samples": 0,
+    "branches": 10,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

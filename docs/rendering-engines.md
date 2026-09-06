@@ -162,6 +162,20 @@ run_mesh_interactive_rust.bat # Interactive mesh shader viewer (Rust)
 
 Writes `out_f{t}.npy` (`[target_h, target_w, 3]`) and `hidden_f{t}.npy` (`[target_h, target_w, hidden]`) per frame into the output directory. `prev_color`/`prev_hidden` are double-buffered host-side between frames (starting at zero, matching `mobiledlss.train.train.rollout`'s initial state); this port runs no network between frames, so `hidden_out` is a pure per-frame function of `packed_params_f{t}.npy` (see SPECIFICATION.md 12.9's scope note).
 
+### Fused-GPU-compute ParamPredUNet (docs/lux-unet-spec.md, steps 1-3)
+
+Hand-written (not yet a declarative `network` block -- step 4, only after these numbers are validated) generic conv kernels running `mobiledlss.train.model.ParamPredUNet`'s forward pass on GPU: `examples/unet_conv3x3_lrelu.lux`, `unet_conv3x3_s2_lrelu.lux`, `unet_upsample_concat_conv_lrelu.lux`, `unet_conv1x1.lux` (each a raw `compute { ... }` block, compiled like the `radix_sort_*.lux` examples: `python -m luxc examples/unet_conv3x3_lrelu.lux --define workgroup_size=256`, etc.). NHWC fp32 buffers (weights loaded from an fp16 blob and converted on load); Cin/Cout/spatial dims are runtime push-constant fields, so one compiled kernel handles every layer of that type. `playground_cpp/src/unet_runner.cpp` (Vulkan) / `metal_unet_runner.cpp` (Metal, via the same `ShaderTranspiler` as the reconstruct pass) chain the network's fixed 12-layer sequence host-side, reading a `mobiledlss/tools/export_lux_weights.py`-exported weight blob + manifest.
+
+| Flag | Description |
+|------|-------------|
+| `--unet-input <NPY>` | The exact tensor `ParamPredUNet.stem` consumes -- `build_input_f{t}.npy` from `reconstruct_reference_dump.py`, `[net_h, net_w, 10+hidden]` |
+| `--unet-weights <BIN>` | fp16 weight blob from `export_lux_weights.py --out-blob` |
+| `--unet-manifest <JSON>` | Manifest from `export_lux_weights.py --out-manifest` (reads the `.layers.txt` sidecar written alongside it) |
+| `--unet-output <NPY>` | Where to write the packed `forward_packed`-equivalent output, `[net_h, net_w, sp*sp*K*K + sp*sp + hidden]` |
+| `--unet-kernel-dir <DIR>` | Directory holding the compiled `unet_*.comp.spv` kernels (default: `examples`) |
+
+Only the 2-way blend (no scene memory) is covered, matching `checkpoints/expA_r1_spatial.pt`'s architecture exactly. Validated against the real checkpoint: max abs error on raw logits 9.4e-3 (< 2e-2 spec bound, fp16 weight quantisation), < 1.2e-3 after softmax/sigmoid (< 5e-3 bound) -- see `mobiledlss/tests/test_lux_unet.py`. Per-pass timing is logged per layer; current kernels are correctness-first (no threadgroup-memory tiling, no fp16-storage activations), so they do not yet beat Core ML's ANE floor -- see the commit message for measured numbers and the optimisation gap.
+
 This table covers flags common to the Vulkan and Metal playgrounds; `--jitter`/`--camera-json`/`--camera-json-prev`/`--time-prev`/`--frame-prev`/`--output-aux` are implemented identically in both (`playground_cpp/src/main.cpp` and `playground_cpp/src/metal_main.cpp`), sharing their camera-math/`.npy`-writing/un-premultiply logic via `playground_cpp/src/dlss_io.h`.
 
 ## IBL Preprocessing
