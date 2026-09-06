@@ -77,7 +77,20 @@ float3x3 quatToMat(float4 q) {
 float3 shColor(float3 sh0, float3 dir) {
     // SH DC: C0 = 0.28209479 (Y_0^0)
     float C0 = 0.28209479;
-    return max(float3(0.0), float3(0.5) + C0 * sh0);
+    // Clamp to [0,1] -- matching the Vulkan/compiled splat pipeline's own
+    // clamp (luxc/expansion/splat_expander.py's clamped_r/g/b, applied to
+    // sh_color before it's stored for the fragment shader's premultiplied-
+    // alpha "over" compositing). Metal previously only clamped the lower
+    // bound (max(0, ...)); bright/overexposed splat colours could exceed
+    // 1.0 and, once premultiplied and accumulated across many overlapping
+    // splats, overshoot in a way an 8-bit PNG's final clamp doesn't
+    // correct for -- unlike Vulkan, which clamps per-splat before that
+    // accumulation ever happens. This was a real, pre-existing (not
+    // recently introduced) accuracy gap between the two backends: measured
+    // on mobiledlss's juggle clip (frame 40) against a gsplat reference,
+    // Metal was stuck at ~31 dB colour PSNR regardless of sort mode while
+    // the (already-correct) Vulkan path reached 51 dB with sort:view_depth.
+    return clamp(float3(0.5) + C0 * sh0, float3(0.0), float3(1.0));
 }
 
 // Compute 2D covariance from 3D covariance
