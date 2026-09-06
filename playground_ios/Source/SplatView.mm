@@ -30,6 +30,8 @@
 #include <memory>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
+#include <vector>
 
 // --- Scene-specific constants (demo/data/scene_meta.json for
 // juggle_p0.8_stride4.glb / juggle_p0.8_stride2.glb -- see
@@ -49,15 +51,30 @@ static const float kSimFps = 30.0f;  // frame-index <-> morph-time mapping caden
 static const uint32_t kTargetW = 960;
 static const uint32_t kTargetH = 540;
 
+// Proxy resolution (B1: s=2 downscale of target, per task spec's per-frame
+// pipeline). S = kTargetW/kProxyW = kTargetH/kProxyH = 2.
+static const uint32_t kProxyW = 480;
+static const uint32_t kProxyH = 270;
+static const float kProxyScale = static_cast<float>(kProxyW) / static_cast<float>(kTargetW);  // 0.5
+
+// One-shot proxy aux dump for B1 validation against the macOS CLI, at this
+// frame index (has both real camera motion and real actor motion, unlike
+// frame 0). See -dumpProxyFrame.
+static const int kProxyDumpFrame = 10;
+
 // Toggle to "juggle_p0.8_stride2" once app size / load time budget allows
 // (see task notes: stride4 first for size).
 static NSString *const kSceneAssetName = @"juggle_p0.8_stride4";
 
 // Builds the OpenCV-convention world->camera viewmat + GL view/proj matrices
-// for orbit frame `frame`, exactly matching
+// for orbit frame `frame` at resolution `width x height`, exactly matching
 // mobiledlss/datagen/camera.py::look_at + orbit_path + intrinsics, and the
-// DlssIO conversion metal_main.cpp's --camera-json path uses.
-static void computeOrbitCamera(int frame, glm::vec3 &eyeOut, glm::mat4 &viewGlOut,
+// DlssIO conversion metal_main.cpp's --camera-json path uses. Used for both
+// the target-res live view and the proxy-res DLSS pass (B1) -- orbit_path's
+// own `intrinsics(w,h,fovYdeg)` scales linearly with height, so calling this
+// directly at proxy resolution is equivalent to `Camera.scaled()`.
+static void computeOrbitCamera(int frame, uint32_t width, uint32_t height,
+                                glm::vec3 &eyeOut, glm::mat4 &viewGlOut,
                                 glm::mat4 &projOut, float &fxOut, float &fyOut) {
     const float elRad = glm::radians(kElevationDeg);
     const float az = glm::radians(kDegPerFrame * static_cast<float>(frame));
@@ -79,12 +96,12 @@ static void computeOrbitCamera(int frame, glm::vec3 &eyeOut, glm::mat4 &viewGlOu
 
     const glm::mat4 viewGl = DlssIO::cvViewToGl(viewCv);
 
-    const float fy = 0.5f * static_cast<float>(kTargetH) / tanf(glm::radians(kFovYDeg) * 0.5f);
+    const float fy = 0.5f * static_cast<float>(height) / tanf(glm::radians(kFovYDeg) * 0.5f);
     const float fx = fy;
-    const float cx = 0.5f * static_cast<float>(kTargetW);
-    const float cy = 0.5f * static_cast<float>(kTargetH);
+    const float cx = 0.5f * static_cast<float>(width);
+    const float cy = 0.5f * static_cast<float>(height);
     const glm::mat4 proj = DlssIO::buildIntrinsicsProjection(
-        fx, fy, cx, cy, static_cast<float>(kTargetW), static_cast<float>(kTargetH),
+        fx, fy, cx, cy, static_cast<float>(width), static_cast<float>(height),
         0.01f, 1000.0f, /*metalYConvention=*/true);
 
     eyeOut = eye;
@@ -94,14 +111,39 @@ static void computeOrbitCamera(int frame, glm::vec3 &eyeOut, glm::mat4 &viewGlOu
     fyOut = fy;
 }
 
+// mobiledlss/datagen/camera.py::halton (1-indexed Halton low-discrepancy sequence).
+static float haltonSeq(int index, int base) {
+    float f = 1.0f, r = 0.0f;
+    int i = index;
+    while (i > 0) {
+        f /= static_cast<float>(base);
+        r += f * static_cast<float>(i % base);
+        i /= base;
+    }
+    return r;
+}
+
+// mobiledlss/datagen/camera.py::taa_jitter -- Halton(2,3) TAA jitter in
+// TARGET-pixel units, cycling every `period` frames. Callers wanting the
+// proxy-pixel jitter (what MetalSplatRenderer::setJitter expects when
+// applied to a proxy-res renderer) must scale by kProxyScale themselves
+// (mobiledlss/train/data.py's "jitter_proxy = jitter / S" convention).
+static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut) {
+    const int i = (frame % period) + 1;
+    jxOut = haltonSeq(i, 2) - 0.5f;
+    jyOut = haltonSeq(i, 3) - 0.5f;
+}
+
 @interface SplatView () {
     MetalContext _ctx;
     MetalSceneManager _scene;
-    std::unique_ptr<MetalSplatRenderer> _splatR;
+    std::unique_ptr<MetalSplatRenderer> _splatR;       // target-res, live drawable (Stage A)
+    std::unique_ptr<MetalSplatRenderer> _splatRProxy;  // proxy-res, offscreen DLSS attachments (B1)
     int _frame;
     int _loopFrames;
     BOOL _ready;
     BOOL _wantScreenshot;
+    BOOL _proxyDumped;
 }
 @property(nonatomic, strong) CADisplayLink *displayLink;
 @property(nonatomic, strong) UILabel *hudLabel;
@@ -202,6 +244,13 @@ static void computeOrbitCamera(int frame, glm::vec3 &eyeOut, glm::mat4 &viewGlOu
         _splatR = std::make_unique<MetalSplatRenderer>();
         _splatR->init(_ctx, _scene.getSplatData(), kTargetW, kTargetH);
 
+        // B1: a second renderer instance dedicated to the proxy-res (480x270)
+        // DLSS-attachment pass -- MetalSplatRenderer::init() fixes its
+        // offscreen colorTarget_/motionTarget_/expectedDepthTarget_ at the
+        // given width/height, so this can't share _splatR's instance.
+        _splatRProxy = std::make_unique<MetalSplatRenderer>();
+        _splatRProxy->init(_ctx, _scene.getSplatData(), kProxyW, kProxyH);
+
         if (_splatR->hasMotion()) {
             float dur = _splatR->animationDuration();
             _loopFrames = std::max(1, static_cast<int>(std::round(dur * kSimFps)));
@@ -237,8 +286,8 @@ static void computeOrbitCamera(int frame, glm::vec3 &eyeOut, glm::mat4 &viewGlOu
     float fxCur, fyCur, fxPrev, fyPrev;
 
     int prevFrame = (_frame > 0) ? (_frame - 1) : 0;
-    computeOrbitCamera(_frame, eyeCur, viewCur, projCur, fxCur, fyCur);
-    computeOrbitCamera(prevFrame, eyePrev, viewPrev, projPrev, fxPrev, fyPrev);
+    computeOrbitCamera(_frame, kTargetW, kTargetH, eyeCur, viewCur, projCur, fxCur, fyCur);
+    computeOrbitCamera(prevFrame, kTargetW, kTargetH, eyePrev, viewPrev, projPrev, fxPrev, fyPrev);
 
     float tCur = _splatR->hasMotion() ? _splatR->frameToTime(_frame) : 0.0f;
     float tPrev = _splatR->hasMotion() ? _splatR->frameToTime(prevFrame) : 0.0f;
@@ -261,6 +310,48 @@ static void computeOrbitCamera(int frame, glm::vec3 &eyeOut, glm::mat4 &viewGlOu
             }
         }
         pool->release();
+    }
+
+    // --- B1: proxy-res (480x270) DLSS-attachment pass, jittered, MV/morph
+    // history seeded exactly like the target-res pass above. Offscreen
+    // (render(), not renderToDrawable()) -- correct-size aux attachments
+    // only populate when colorTex == colorTarget_ at the renderer's own
+    // width/height (see MetalSplatRenderer::renderToTarget's `includeAux`).
+    {
+        glm::vec3 peyeCur, peyePrev;
+        glm::mat4 pviewCur, pviewPrev, pprojCur, pprojPrev;
+        float pfxCur, pfyCur, pfxPrev, pfyPrev;
+        computeOrbitCamera(_frame, kProxyW, kProxyH, peyeCur, pviewCur, pprojCur, pfxCur, pfyCur);
+        computeOrbitCamera(prevFrame, kProxyW, kProxyH, peyePrev, pviewPrev, pprojPrev, pfxPrev, pfyPrev);
+
+        // mobiledlss/train/data.py convention: jitter_proxy = jitter_target / S.
+        float jxTarget, jyTarget;
+        taaJitterTargetPx(_frame, /*period=*/16, jxTarget, jyTarget);
+        float jxProxy = jxTarget * kProxyScale;
+        float jyProxy = jyTarget * kProxyScale;
+
+        _splatRProxy->updateCameraExplicit(peyeCur, pviewCur, pprojCur, pfxCur, pfyCur);
+        _splatRProxy->setPreviousCameraExplicit(pviewPrev, pprojPrev);
+        if (_splatRProxy->hasMotion()) {
+            _splatRProxy->setMorphTime(tCur);
+            _splatRProxy->seedPreviousMorphTime(tPrev);
+        }
+        _splatRProxy->setJitter(jxProxy, jyProxy);
+
+        @autoreleasepool {
+            NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
+            _splatRProxy->render(_ctx);
+            pool->release();
+        }
+
+        if (_frame == kProxyDumpFrame && !_proxyDumped) {
+            _proxyDumped = YES;
+            NSLog(@"[SplatView] B1 dump: frame=%d prevFrame=%d jitterTargetPx=(%.6f,%.6f) "
+                  @"jitterProxyPx=(%.6f,%.6f) tCur=%.6f tPrev=%.6f eyeCur=(%.6f,%.6f,%.6f)",
+                  _frame, prevFrame, jxTarget, jyTarget, jxProxy, jyProxy, tCur, tPrev,
+                  peyeCur.x, peyeCur.y, peyeCur.z);
+            [self dumpProxyFrame];
+        }
     }
 
     _frame = (_frame + 1) % _loopFrames;
@@ -287,6 +378,68 @@ static void computeOrbitCamera(int frame, glm::vec3 &eyeOut, glm::mat4 &viewGlOu
 
 - (void)handleTap:(UITapGestureRecognizer *)tap {
     _wantScreenshot = YES;
+}
+
+// B1 validation dump: replicates metal_main.cpp's `--output-aux` aux-dump
+// logic exactly (same DlssIO/MetalScreenshot calls, same un-premultiply
+// convention) against _splatRProxy's own colour/motion/expected-depth
+// targets, writing <Documents>/proxy_f10_{color,depth,mv}.npy +
+// _color.png so it can be pulled with `devicectl device copy from` and
+// compared against `lux-playground-metal --output-aux` run on the Mac with
+// the identical camera/jitter (logged to NSLog just before this call).
+- (void)dumpProxyFrame {
+    NSArray<NSString *> *docPaths =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *prefix = [docPaths.firstObject stringByAppendingPathComponent:@"proxy_f10"];
+    std::string p = std::string(prefix.UTF8String);
+    uint32_t w = kProxyW, h = kProxyH;
+    try {
+        MetalScreenshot::saveTextureToPNG(_ctx, _splatRProxy->getOutputTexture(), w, h, p + "_color.png");
+
+        {
+            auto raw = MetalScreenshot::readTextureRaw(_ctx, _splatRProxy->getOutputTexture(), w, h, 8);
+            std::vector<uint8_t> unusedRgba8;
+            auto colorF32 = DlssIO::convertRgba16fColorAttachment(raw, w, h, unusedRgba8);
+            DlssIO::writeNpyFloat32(p + "_color.npy", colorF32, {h, w, 4});
+        }
+
+        if (_splatRProxy->hasExpectedDepth()) {
+            constexpr uint32_t C = MetalSplatRenderer::kExpectedDepthChannels;  // 2: depth*alpha, alpha
+            auto raw = MetalScreenshot::readTextureRaw(_ctx, _splatRProxy->getExpectedDepthTexture(), w, h, C * 4);
+            std::vector<float> chans(static_cast<size_t>(w) * h * C);
+            std::memcpy(chans.data(), raw.data(), raw.size());
+            std::vector<float> depthPremul(static_cast<size_t>(w) * h);
+            std::vector<float> depthAlpha(static_cast<size_t>(w) * h);
+            for (size_t i = 0; i < depthPremul.size(); ++i) {
+                depthPremul[i] = chans[i * C + 0];
+                depthAlpha[i] = chans[i * C + (C - 1)];
+            }
+            auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
+            DlssIO::writeNpyFloat32(p + "_depth.npy", depth, {h, w});
+        }
+
+        if (_splatRProxy->hasMotionVectors()) {
+            auto raw = MetalScreenshot::readTextureRaw(_ctx, _splatRProxy->getMotionTexture(), w, h, 16);
+            std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
+            std::memcpy(rgba.data(), raw.data(), raw.size());
+            std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
+            std::vector<float> mvAlpha(static_cast<size_t>(w) * h);
+            for (size_t i = 0; i < mvAlpha.size(); ++i) {
+                mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
+                mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
+                mvAlpha[i] = rgba[i * 4 + 3];
+            }
+            auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
+            DlssIO::writeNpyFloat32(p + "_mv.npy", mv, {h, w, 2});
+        }
+
+        NSLog(@"[SplatView] B1 dump written: %@_{color.png,color.npy,depth.npy,mv.npy}", prefix);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.hudLabel.text = [self.hudLabel.text stringByAppendingString:@"\n[B1 proxy dump saved]"];
+        });
+    } catch (const std::exception &e) {
+        NSLog(@"[SplatView] B1 dump failed: %s", e.what());
+    }
 }
 
 - (void)saveScreenshotFromTexture:(MTL::Texture *)texture {
