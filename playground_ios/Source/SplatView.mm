@@ -22,8 +22,10 @@
 #include "metal_context.h"
 #include "metal_scene_manager.h"
 #include "metal_splat_renderer.h"
+#include "metal_splat_luxc_renderer.h"
 #include "dlss_io.h"
 #include "metal_screenshot.h"
+#include "NetInputAssembly.h"
 
 #include <glm/glm.hpp>
 #include <array>
@@ -32,6 +34,18 @@
 #include <algorithm>
 #include <cstring>
 #include <vector>
+#include <unistd.h>
+
+// B1 update (per coordinator): the luxc-transpiled splat backend
+// (metal_splat_luxc_renderer.*) is now at parity with Vulkan/gsplat (commit
+// 08cfe8e: 51.3dB vs gsplat, 83.7dB vs Vulkan) and is the network's actual
+// training-time renderer, so the proxy pass uses it instead of the
+// hand-written path. Flip this typedef (+ the two backend-specific spots
+// marked below: init()'s extra shaderBase arg, kMetalYConvention,
+// kExpectedDepthChannels -- all already backend-agnostic via this alias/
+// the class's own static constants) back to MetalSplatRenderer as a
+// fallback if the luxc path ever regresses.
+using ProxyRenderer = MetalSplatLuxcRenderer;
 
 // --- Scene-specific constants (demo/data/scene_meta.json for
 // juggle_p0.8_stride4.glb / juggle_p0.8_stride2.glb -- see
@@ -73,9 +87,9 @@ static NSString *const kSceneAssetName = @"juggle_p0.8_stride4";
 // the target-res live view and the proxy-res DLSS pass (B1) -- orbit_path's
 // own `intrinsics(w,h,fovYdeg)` scales linearly with height, so calling this
 // directly at proxy resolution is equivalent to `Camera.scaled()`.
-static void computeOrbitCamera(int frame, uint32_t width, uint32_t height,
-                                glm::vec3 &eyeOut, glm::mat4 &viewGlOut,
-                                glm::mat4 &projOut, float &fxOut, float &fyOut) {
+static void computeOrbitCamera(int frame, uint32_t width, uint32_t height, bool metalYConvention,
+                                glm::vec3 &eyeOut, glm::vec3 &rOut, glm::vec3 &uOut, glm::vec3 &fOut,
+                                glm::mat4 &viewGlOut, glm::mat4 &projOut, float &fxOut, float &fyOut) {
     const float elRad = glm::radians(kElevationDeg);
     const float az = glm::radians(kDegPerFrame * static_cast<float>(frame));
     const glm::vec3 eye = kFgCenter + kOrbitRadius * glm::vec3(cosf(elRad) * cosf(az),
@@ -102,9 +116,10 @@ static void computeOrbitCamera(int frame, uint32_t width, uint32_t height,
     const float cy = 0.5f * static_cast<float>(height);
     const glm::mat4 proj = DlssIO::buildIntrinsicsProjection(
         fx, fy, cx, cy, static_cast<float>(width), static_cast<float>(height),
-        0.01f, 1000.0f, /*metalYConvention=*/true);
+        0.01f, 1000.0f, metalYConvention);
 
     eyeOut = eye;
+    rOut = r; uOut = u; fOut = f;
     viewGlOut = viewGl;
     projOut = proj;
     fxOut = fx;
@@ -137,8 +152,9 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
 @interface SplatView () {
     MetalContext _ctx;
     MetalSceneManager _scene;
-    std::unique_ptr<MetalSplatRenderer> _splatR;       // target-res, live drawable (Stage A)
-    std::unique_ptr<MetalSplatRenderer> _splatRProxy;  // proxy-res, offscreen DLSS attachments (B1)
+    std::unique_ptr<MetalSplatRenderer> _splatR;    // target-res, live drawable (Stage A, hand path -- fine to keep as-is, just a display)
+    std::unique_ptr<ProxyRenderer> _splatRProxy;    // proxy-res, offscreen DLSS attachments (B1, luxc path)
+    NetInputAssembly _netInput;                     // B2: 26-ch net input assembly compute pass
     int _frame;
     int _loopFrames;
     BOOL _ready;
@@ -228,6 +244,17 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
         // on the main thread in startDisplayLink instead).
         _ctx.initHeadless();
 
+        // MetalSplatLuxcRenderer::init() (and its ShaderTranspiler) reads its
+        // compiled pipeline via HARDCODED paths relative to the process's
+        // current working directory ("examples/gaussian_splat_dlss.*.spv",
+        // "shaders/radix_sort/*.comp.spv" -- see metal_splat_luxc_renderer.cpp),
+        // exactly like the macOS CLI run from the repo root. iOS has no
+        // meaningful default CWD, so chdir into the bundle's resource dir
+        // (where the `examples`/`shaders` folder references below land,
+        // preserving that same relative layout) before touching it.
+        NSString *resourcePath = [[NSBundle mainBundle] resourcePath];
+        chdir(resourcePath.UTF8String);
+
         NSString *path = [[NSBundle mainBundle] pathForResource:kSceneAssetName ofType:@"glb"];
         if (!path) {
             *errorOut = "bundle resource not found: " + std::string(kSceneAssetName.UTF8String) + ".glb";
@@ -245,11 +272,28 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
         _splatR->init(_ctx, _scene.getSplatData(), kTargetW, kTargetH);
 
         // B1: a second renderer instance dedicated to the proxy-res (480x270)
-        // DLSS-attachment pass -- MetalSplatRenderer::init() fixes its
-        // offscreen colorTarget_/motionTarget_/expectedDepthTarget_ at the
-        // given width/height, so this can't share _splatR's instance.
-        _splatRProxy = std::make_unique<MetalSplatRenderer>();
-        _splatRProxy->init(_ctx, _scene.getSplatData(), kProxyW, kProxyH);
+        // DLSS-attachment pass -- ProxyRenderer::init() fixes its offscreen
+        // colorTarget_/motionTarget_/expectedDepthTarget_ at the given
+        // width/height, so this can't share _splatR's instance. luxc needs
+        // the compiled pipeline base (examples/gaussian_splat_dlss.*.spv,
+        // bundled as a folder reference) -- the same pipeline
+        // gaussian_splat_dlss.lux compiles to for the Vulkan/hand-Metal
+        // parity comparison in commit 08cfe8e.
+        _splatRProxy = std::make_unique<ProxyRenderer>();
+        _splatRProxy->init(_ctx, _scene.getSplatData(), "examples/gaussian_splat_dlss", kProxyW, kProxyH);
+
+        // B2: net input assembly (bg-sphere UV + texture sample + disocclusion
+        // + box-pool). texture.npy/bg_sphere.npy exported by
+        // demo/ios_assets/export_ios_weights.py (mobiledlss repo).
+        NSString *texPath = [[NSBundle mainBundle] pathForResource:@"texture" ofType:@"npy"];
+        NSString *spherePath = [[NSBundle mainBundle] pathForResource:@"bg_sphere" ofType:@"npy"];
+        if (!texPath || !spherePath) {
+            *errorOut = "bundle resource not found: texture.npy / bg_sphere.npy";
+            return NO;
+        }
+        _netInput.init(_ctx, std::string(texPath.UTF8String), std::string(spherePath.UTF8String),
+                        kProxyW, kProxyH, /*paramStride=*/2, /*hiddenChannels=*/8,
+                        /*depthAlphaOffset=*/ProxyRenderer::kExpectedDepthChannels - 1);
 
         if (_splatR->hasMotion()) {
             float dur = _splatR->animationDuration();
@@ -281,13 +325,15 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
 - (void)tick:(CADisplayLink *)link {
     if (!_ready || !_splatR) return;
 
-    glm::vec3 eyeCur, eyePrev;
+    glm::vec3 eyeCur, eyePrev, rCur, uCur, fCur, rPrev, uPrev, fPrev;
     glm::mat4 viewCur, viewPrev, projCur, projPrev;
     float fxCur, fyCur, fxPrev, fyPrev;
 
     int prevFrame = (_frame > 0) ? (_frame - 1) : 0;
-    computeOrbitCamera(_frame, kTargetW, kTargetH, eyeCur, viewCur, projCur, fxCur, fyCur);
-    computeOrbitCamera(prevFrame, kTargetW, kTargetH, eyePrev, viewPrev, projPrev, fxPrev, fyPrev);
+    computeOrbitCamera(_frame, kTargetW, kTargetH, MetalSplatRenderer::kMetalYConvention,
+                        eyeCur, rCur, uCur, fCur, viewCur, projCur, fxCur, fyCur);
+    computeOrbitCamera(prevFrame, kTargetW, kTargetH, MetalSplatRenderer::kMetalYConvention,
+                        eyePrev, rPrev, uPrev, fPrev, viewPrev, projPrev, fxPrev, fyPrev);
 
     float tCur = _splatR->hasMotion() ? _splatR->frameToTime(_frame) : 0.0f;
     float tPrev = _splatR->hasMotion() ? _splatR->frameToTime(prevFrame) : 0.0f;
@@ -318,11 +364,13 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
     // only populate when colorTex == colorTarget_ at the renderer's own
     // width/height (see MetalSplatRenderer::renderToTarget's `includeAux`).
     {
-        glm::vec3 peyeCur, peyePrev;
+        glm::vec3 peyeCur, peyePrev, prCur, puCur, pfCur, prPrev, puPrev, pfPrev;
         glm::mat4 pviewCur, pviewPrev, pprojCur, pprojPrev;
         float pfxCur, pfyCur, pfxPrev, pfyPrev;
-        computeOrbitCamera(_frame, kProxyW, kProxyH, peyeCur, pviewCur, pprojCur, pfxCur, pfyCur);
-        computeOrbitCamera(prevFrame, kProxyW, kProxyH, peyePrev, pviewPrev, pprojPrev, pfxPrev, pfyPrev);
+        computeOrbitCamera(_frame, kProxyW, kProxyH, ProxyRenderer::kMetalYConvention,
+                            peyeCur, prCur, puCur, pfCur, pviewCur, pprojCur, pfxCur, pfyCur);
+        computeOrbitCamera(prevFrame, kProxyW, kProxyH, ProxyRenderer::kMetalYConvention,
+                            peyePrev, prPrev, puPrev, pfPrev, pviewPrev, pprojPrev, pfxPrev, pfyPrev);
 
         // mobiledlss/train/data.py convention: jitter_proxy = jitter_target / S.
         float jxTarget, jyTarget;
@@ -344,6 +392,15 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
             pool->release();
         }
 
+        // B2: assemble the 26-ch net input from this frame's proxy DLSS
+        // attachments (hidden_in = zero -- see NetInputAssembly.h's
+        // validation-config note; the real recurrent hidden state arrives
+        // in B4/B5).
+        _netInput.run(_ctx, _splatRProxy->getOutputTexture(), _splatRProxy->getExpectedDepthTexture(),
+                      _splatRProxy->getMotionTexture(), /*hiddenIn=*/nullptr,
+                      peyeCur, prCur, puCur, pfCur, pfxCur, pfyCur,
+                      0.5f * kProxyW, 0.5f * kProxyH, jxProxy, jyProxy);
+
         if (_frame == kProxyDumpFrame && !_proxyDumped) {
             _proxyDumped = YES;
             NSLog(@"[SplatView] B1 dump: frame=%d prevFrame=%d jitterTargetPx=(%.6f,%.6f) "
@@ -351,6 +408,7 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
                   _frame, prevFrame, jxTarget, jyTarget, jxProxy, jyProxy, tCur, tPrev,
                   peyeCur.x, peyeCur.y, peyeCur.z);
             [self dumpProxyFrame];
+            [self dumpNetInput];
         }
     }
 
@@ -404,7 +462,7 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
         }
 
         if (_splatRProxy->hasExpectedDepth()) {
-            constexpr uint32_t C = MetalSplatRenderer::kExpectedDepthChannels;  // 2: depth*alpha, alpha
+            constexpr uint32_t C = ProxyRenderer::kExpectedDepthChannels;  // luxc: 4 (RGBA32Float)
             auto raw = MetalScreenshot::readTextureRaw(_ctx, _splatRProxy->getExpectedDepthTexture(), w, h, C * 4);
             std::vector<float> chans(static_cast<size_t>(w) * h * C);
             std::memcpy(chans.data(), raw.data(), raw.size());
@@ -439,6 +497,34 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
         });
     } catch (const std::exception &e) {
         NSLog(@"[SplatView] B1 dump failed: %s", e.what());
+    }
+}
+
+// B2 validation dump: reads _netInput's packed fp16 NHWC output buffer back
+// to CPU, converts to float32 (DlssIO::halfToFloat -- already linked, no new
+// fp16 dependency), and writes <Documents>/netinput_f10.npy
+// [netH, netW, 18+hiddenChannels] for comparison against
+// mobiledlss.train.model.build_input (+ sphere_uv, disocclusion_mask, and
+// SceneTexture.forward folded in -- see NetInputAssembly.mm) on the same
+// dumped B1 frame, via the mobiledlss venv.
+- (void)dumpNetInput {
+    NSArray<NSString *> *docPaths =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *outPath = [docPaths.firstObject stringByAppendingPathComponent:@"netinput_f10.npy"];
+    try {
+        uint32_t netW = _netInput.getNetW(), netH = _netInput.getNetH(), ch = _netInput.getChannels();
+        MTL::Buffer *buf = _netInput.getOutputBuffer();
+        const uint16_t *halfData = static_cast<const uint16_t *>(buf->contents());
+        size_t count = static_cast<size_t>(netW) * netH * ch;
+        std::vector<float> f32(count);
+        for (size_t i = 0; i < count; i++) f32[i] = DlssIO::halfToFloat(halfData[i]);
+        DlssIO::writeNpyFloat32(std::string(outPath.UTF8String), f32, {netH, netW, ch});
+        NSLog(@"[SplatView] B2 dump written: %@ (%u x %u x %u)", outPath, netH, netW, ch);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.hudLabel.text = [self.hudLabel.text stringByAppendingString:@"\n[B2 net-input dump saved]"];
+        });
+    } catch (const std::exception &e) {
+        NSLog(@"[SplatView] B2 dump failed: %s", e.what());
     }
 }
 
