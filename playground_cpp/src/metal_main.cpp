@@ -3,6 +3,7 @@
 #include "metal_raster_renderer.h"
 #include "metal_mesh_renderer.h"
 #include "metal_splat_renderer.h"
+#include "metal_splat_luxc_renderer.h"
 #include "metal_scene_manager.h"
 #include "metal_renderer_interface.h"
 #include "metal_screenshot.h"
@@ -168,7 +169,20 @@ struct CLIOptions {
     // Sort convention (SPECIFICATION.md 12.8's `sort` splat option, mirrored
     // as a host-level flag here since Metal's splat pipeline is hand-written
     // MSL with no compiled .lux splat config to read `sort:` from).
-    bool sortByViewDepth = false;  // false = camera_distance (default)
+    bool sortByViewDepth = false;  // false = camera_distance (default) -- --splat-backend hand only
+
+    // --splat-backend hand|luxc. "hand" (default -- see
+    // metal_splat_luxc_renderer.h's class comment for current status) is
+    // MetalSplatRenderer's own embedded-MSL implementation (no compiled
+    // .lux source of truth); "luxc" runs the actual compiled
+    // examples/<pipeline>.{comp,vert,frag,morph.comp}.spv (+ the shared GPU
+    // radix sort) transpiled to MSL. luxc is NOT YET the default: it does
+    // not yet meet the ≥45 dB colour-PSNR / <1e-3 depth-parity bar on the
+    // juggle DLSS scene (measured ~28 dB colour, 0.36% depth vs. Vulkan --
+    // see the class comment), and defaulting to it broke
+    // tests/test_dlss_outputs.py::test_mv_matches_cpu_reprojection_of_depth
+    // (Metal). Flip this default once that gap is closed.
+    std::string splatBackend = "hand";
 
     // Reconstruction pass (docs/lux-reconstruct-spec.md): see main.cpp's
     // identical Vulkan-side flags / runReconstructDump().
@@ -289,6 +303,13 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             else {
                 std::cerr << "Unknown --sort mode: " << mode
                           << " (expected camera_distance or view_depth)" << std::endl;
+                std::exit(1);
+            }
+        } else if (arg == "--splat-backend" && i + 1 < argc) {
+            opts.splatBackend = argv[++i];
+            if (opts.splatBackend != "hand" && opts.splatBackend != "luxc") {
+                std::cerr << "Unknown --splat-backend: " << opts.splatBackend
+                          << " (expected hand or luxc)" << std::endl;
                 std::exit(1);
             }
         } else if (arg == "--reconstruct-dump" && i + 1 < argc) {
@@ -460,6 +481,174 @@ static void setupSponzaLights(MetalSceneManager& scene) {
 }
 
 // --------------------------------------------------------------------------
+// Splat rendering (shared between --splat-backend hand and luxc): both
+// MetalSplatRenderer and MetalSplatLuxcRenderer expose the identical public
+// method surface (see metal_splat_luxc_renderer.h's class comment), so the
+// whole camera-bridge/morph/DLSS-aux-dump sequence is written once here and
+// templated on the renderer type; `initFn` is the one call whose signature
+// genuinely differs between the two (luxc's init() also takes shaderBase).
+// --------------------------------------------------------------------------
+
+template <typename Renderer, typename InitFn>
+static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLIOptions& opts,
+                           NS::AutoreleasePool* pool, const char* backendLabel, InitFn&& initFn) {
+    std::cout << "[metal] Detected gaussian splat data, using " << backendLabel << std::endl;
+    auto splatR = std::make_unique<Renderer>();
+    splatR->setSortByViewDepth(opts.sortByViewDepth);
+    auto tInitStart = std::chrono::steady_clock::now();
+    initFn(*splatR);
+    auto tInitEnd = std::chrono::steady_clock::now();
+    std::cout << "[metal] [timing] splat init (buffers+pipelines): "
+              << std::chrono::duration<double, std::milli>(tInitEnd - tInitStart).count()
+              << "ms" << std::endl;
+
+    if (splatR->hasMotion()) {
+        float t = 0.0f;
+        if (opts.hasFrame) t = splatR->frameToTime(opts.frame);
+        else if (opts.hasTime) t = opts.time;
+        std::cout << "[metal] Dynamic splats: evaluating at t=" << t << "s"
+                  << (opts.hasFrame ? " (--frame " + std::to_string(opts.frame) + ")" : "")
+                  << std::endl;
+        auto tMorphStart = std::chrono::steady_clock::now();
+        splatR->setMorphTime(t);
+        auto tMorphEnd = std::chrono::steady_clock::now();
+        std::cout << "[metal] [timing] morph (GPU compute, incl. wait): "
+                  << std::chrono::duration<double, std::milli>(tMorphEnd - tMorphStart).count()
+                  << "ms" << std::endl;
+
+        if (!opts.dumpSplatBuffersPrefix.empty()) {
+            uint32_t n = scene.getSplatData().num_splats;
+            std::vector<float> pos(splatR->debugPosBufferPtr(), splatR->debugPosBufferPtr() + n * 4);
+            std::vector<float> rot(splatR->debugRotBufferPtr(), splatR->debugRotBufferPtr() + n * 4);
+            std::vector<float> sh0(splatR->debugSh0BufferPtr(), splatR->debugSh0BufferPtr() + n * 4);
+            DlssIO::writeNpyFloat32(opts.dumpSplatBuffersPrefix + "_pos.npy", pos, {n, 4});
+            DlssIO::writeNpyFloat32(opts.dumpSplatBuffersPrefix + "_rot.npy", rot, {n, 4});
+            DlssIO::writeNpyFloat32(opts.dumpSplatBuffersPrefix + "_sh0.npy", sh0, {n, 4});
+            std::cout << "[metal] Dumped splat buffers: " << opts.dumpSplatBuffersPrefix
+                      << "_{pos,rot,sh0}.npy" << std::endl;
+        }
+    } else if (opts.hasTime || opts.hasFrame) {
+        std::cerr << "[warn] --time/--frame given but scene has no morph-target animation" << std::endl;
+    }
+
+    // --- Camera bridge (docs/lux-4d-spec.md section 4) ---
+    if (!opts.cameraJsonPath.empty()) {
+        DlssIO::CameraJsonData camJson;
+        if (!DlssIO::loadCameraJson(opts.cameraJsonPath, camJson)) {
+            std::cerr << "[error] Failed to parse --camera-json file: "
+                      << opts.cameraJsonPath << std::endl;
+            return 1;
+        }
+        glm::mat4 viewGl = DlssIO::cvViewToGl(camJson.viewmatCv);
+        glm::vec3 eye = glm::vec3(glm::inverse(viewGl) * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+        float fx = camJson.K[0], cx = camJson.K[2];
+        float fy = camJson.K[4], cy = camJson.K[5];
+        glm::mat4 proj = DlssIO::buildIntrinsicsProjection(
+            fx, fy, cx, cy,
+            static_cast<float>(camJson.width), static_cast<float>(camJson.height),
+            0.01f, 1000.0f, /*metalYConvention=*/true);
+        splatR->updateCameraExplicit(eye, viewGl, proj, fx, fy);
+        std::cout << "[metal] --camera-json applied: fx=" << fx << " fy=" << fy
+                  << " cx=" << cx << " cy=" << cy
+                  << " (" << camJson.width << "x" << camJson.height << ")" << std::endl;
+
+        if (!opts.cameraJsonPrevPath.empty()) {
+            DlssIO::CameraJsonData prevJson;
+            if (!DlssIO::loadCameraJson(opts.cameraJsonPrevPath, prevJson)) {
+                std::cerr << "[error] Failed to parse --camera-json-prev file: "
+                          << opts.cameraJsonPrevPath << std::endl;
+                return 1;
+            }
+            glm::mat4 prevViewGl = DlssIO::cvViewToGl(prevJson.viewmatCv);
+            glm::mat4 prevProj = DlssIO::buildIntrinsicsProjection(
+                prevJson.K[0], prevJson.K[4], prevJson.K[2], prevJson.K[5],
+                static_cast<float>(prevJson.width), static_cast<float>(prevJson.height),
+                0.01f, 1000.0f, /*metalYConvention=*/true);
+            splatR->setPreviousCameraExplicit(prevViewGl, prevProj);
+            std::cout << "[metal] --camera-json-prev applied" << std::endl;
+        }
+    }
+
+    // --- Motion vectors: real previous-time morph evaluation ---
+    if (opts.hasTimePrev || opts.hasFramePrev) {
+        float tPrev = opts.hasFramePrev ? splatR->frameToTime(opts.framePrev) : opts.timePrev;
+        std::cout << "[metal] --time-prev/--frame-prev applied: evaluating morph at t=" << tPrev
+                  << "s for splat_prev_pos" << std::endl;
+        splatR->seedPreviousMorphTime(tPrev);
+    }
+
+    if (opts.jitterX != 0.0f || opts.jitterY != 0.0f) {
+        splatR->setJitter(opts.jitterX, opts.jitterY);
+    }
+
+    splatR->render(ctx);
+
+    MetalScreenshot::saveTextureToPNG(ctx, splatR->getOutputTexture(),
+                                       splatR->getWidth(), splatR->getHeight(),
+                                       opts.output);
+
+    // --- Headless aux dumps (docs/lux-4d-spec.md section 3) ---
+    if (!opts.outputAuxPrefix.empty()) {
+        uint32_t w = splatR->getWidth(), h = splatR->getHeight();
+        std::string colorPath = opts.outputAuxPrefix + "_color.png";
+        MetalScreenshot::saveTextureToPNG(ctx, splatR->getOutputTexture(), w, h, colorPath);
+
+        {
+            auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getOutputTexture(), w, h, 8);
+            std::vector<uint8_t> unusedRgba8;
+            auto colorF32 = DlssIO::convertRgba16fColorAttachment(raw, w, h, unusedRgba8);
+            DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_color.npy", colorF32, {h, w, 4});
+        }
+
+        if (splatR->hasExpectedDepth()) {
+            // MetalSplatRenderer's expected-depth target is RG32Float (2
+            // floats/pixel: depth*alpha, alpha); MetalSplatLuxcRenderer's is
+            // RGBA32Float (4 floats/pixel: depth*alpha, unused, unused,
+            // alpha -- commit 1445ec3's out_depth fix, needed for hardware
+            // alpha blending) -- kExpectedDepthChannels tells us which, and
+            // alpha is always the LAST channel either way.
+            constexpr uint32_t C = Renderer::kExpectedDepthChannels;
+            auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getExpectedDepthTexture(), w, h, C * 4);
+            std::vector<float> chans(static_cast<size_t>(w) * h * C);
+            std::memcpy(chans.data(), raw.data(), raw.size());
+            std::vector<float> depthPremul(static_cast<size_t>(w) * h);
+            std::vector<float> depthAlpha(static_cast<size_t>(w) * h);
+            for (size_t i = 0; i < depthPremul.size(); ++i) {
+                depthPremul[i] = chans[i * C + 0];
+                depthAlpha[i] = chans[i * C + (C - 1)];
+            }
+            auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
+            DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_depth.npy", depth, {h, w});
+            DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png", depth, w, h, 1);
+        }
+        if (splatR->hasMotionVectors()) {
+            auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getMotionTexture(), w, h, 16);
+            std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
+            std::memcpy(rgba.data(), raw.data(), raw.size());
+            std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
+            std::vector<float> mvAlpha(static_cast<size_t>(w) * h);
+            for (size_t i = 0; i < mvAlpha.size(); ++i) {
+                mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
+                mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
+                mvAlpha[i] = rgba[i * 4 + 3];
+            }
+            auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
+            DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_mv.npy", mv, {h, w, 2});
+            DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_mv_preview.png", mv, w, h, 2);
+        }
+        std::cout << "[metal] Wrote aux dumps: " << opts.outputAuxPrefix
+                  << "_{color.png,color.npy,depth.npy,mv.npy,*_preview.png}" << std::endl;
+    }
+
+    splatR->cleanup();
+    scene.cleanup();
+    ctx.cleanup();
+    pool->release();
+    std::cout << "[metal] Done." << std::endl;
+    return 0;
+}
+
+// --------------------------------------------------------------------------
 // Headless rendering
 // --------------------------------------------------------------------------
 
@@ -488,163 +677,24 @@ static int runHeadless(const CLIOptions& opts) {
                   << std::chrono::duration<double, std::milli>(tLoadEnd - tLoadStart).count()
                   << "ms" << std::endl;
 
-        // Check for gaussian splat data early — splat scenes use embedded MSL,
-        // no external shader pipeline needed
+        // Check for gaussian splat data early -- splat scenes use embedded MSL
+        // (hand backend) or the luxc-compiled pipeline (luxc backend, default).
         if (scene.hasSplatData()) {
-            std::cout << "[metal] Detected gaussian splat data, using MetalSplatRenderer" << std::endl;
-            auto splatR = std::make_unique<MetalSplatRenderer>();
-            splatR->setSortByViewDepth(opts.sortByViewDepth);
-            auto tInitStart = std::chrono::steady_clock::now();
-            splatR->init(ctx, scene.getSplatData(), opts.width, opts.height);
-            auto tInitEnd = std::chrono::steady_clock::now();
-            std::cout << "[metal] [timing] splat init (buffers+pipelines): "
-                      << std::chrono::duration<double, std::milli>(tInitEnd - tInitStart).count()
-                      << "ms" << std::endl;
-
-            if (splatR->hasMotion()) {
-                float t = 0.0f;
-                if (opts.hasFrame) t = splatR->frameToTime(opts.frame);
-                else if (opts.hasTime) t = opts.time;
-                std::cout << "[metal] Dynamic splats: evaluating at t=" << t << "s"
-                          << (opts.hasFrame ? " (--frame " + std::to_string(opts.frame) + ")" : "")
-                          << std::endl;
-                auto tMorphStart = std::chrono::steady_clock::now();
-                splatR->setMorphTime(t);
-                auto tMorphEnd = std::chrono::steady_clock::now();
-                std::cout << "[metal] [timing] morph (GPU compute, incl. wait): "
-                          << std::chrono::duration<double, std::milli>(tMorphEnd - tMorphStart).count()
-                          << "ms" << std::endl;
-
-                if (!opts.dumpSplatBuffersPrefix.empty()) {
-                    uint32_t n = scene.getSplatData().num_splats;
-                    std::vector<float> pos(splatR->debugPosBufferPtr(), splatR->debugPosBufferPtr() + n * 4);
-                    std::vector<float> rot(splatR->debugRotBufferPtr(), splatR->debugRotBufferPtr() + n * 4);
-                    std::vector<float> sh0(splatR->debugSh0BufferPtr(), splatR->debugSh0BufferPtr() + n * 4);
-                    DlssIO::writeNpyFloat32(opts.dumpSplatBuffersPrefix + "_pos.npy", pos, {n, 4});
-                    DlssIO::writeNpyFloat32(opts.dumpSplatBuffersPrefix + "_rot.npy", rot, {n, 4});
-                    DlssIO::writeNpyFloat32(opts.dumpSplatBuffersPrefix + "_sh0.npy", sh0, {n, 4});
-                    std::cout << "[metal] Dumped splat buffers: " << opts.dumpSplatBuffersPrefix
-                              << "_{pos,rot,sh0}.npy" << std::endl;
-                }
-            } else if (opts.hasTime || opts.hasFrame) {
-                std::cerr << "[warn] --time/--frame given but scene has no morph-target animation" << std::endl;
+            if (opts.splatBackend == "hand") {
+                return runSplatBranch<MetalSplatRenderer>(ctx, scene, opts, pool, "MetalSplatRenderer (hand)",
+                    [&](MetalSplatRenderer& r) { r.init(ctx, scene.getSplatData(), opts.width, opts.height); });
             }
-
-            // --- Camera bridge (docs/lux-4d-spec.md section 4) ---
-            if (!opts.cameraJsonPath.empty()) {
-                DlssIO::CameraJsonData camJson;
-                if (!DlssIO::loadCameraJson(opts.cameraJsonPath, camJson)) {
-                    std::cerr << "[error] Failed to parse --camera-json file: "
-                              << opts.cameraJsonPath << std::endl;
-                    return 1;
-                }
-                glm::mat4 viewGl = DlssIO::cvViewToGl(camJson.viewmatCv);
-                glm::vec3 eye = glm::vec3(glm::inverse(viewGl) * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
-                float fx = camJson.K[0], cx = camJson.K[2];
-                float fy = camJson.K[4], cy = camJson.K[5];
-                glm::mat4 proj = DlssIO::buildIntrinsicsProjection(
-                    fx, fy, cx, cy,
-                    static_cast<float>(camJson.width), static_cast<float>(camJson.height),
-                    0.01f, 1000.0f, /*metalYConvention=*/true);
-                splatR->updateCameraExplicit(eye, viewGl, proj, fx, fy);
-                std::cout << "[metal] --camera-json applied: fx=" << fx << " fy=" << fy
-                          << " cx=" << cx << " cy=" << cy
-                          << " (" << camJson.width << "x" << camJson.height << ")" << std::endl;
-
-                if (!opts.cameraJsonPrevPath.empty()) {
-                    DlssIO::CameraJsonData prevJson;
-                    if (!DlssIO::loadCameraJson(opts.cameraJsonPrevPath, prevJson)) {
-                        std::cerr << "[error] Failed to parse --camera-json-prev file: "
-                                  << opts.cameraJsonPrevPath << std::endl;
-                        return 1;
-                    }
-                    glm::mat4 prevViewGl = DlssIO::cvViewToGl(prevJson.viewmatCv);
-                    glm::mat4 prevProj = DlssIO::buildIntrinsicsProjection(
-                        prevJson.K[0], prevJson.K[4], prevJson.K[2], prevJson.K[5],
-                        static_cast<float>(prevJson.width), static_cast<float>(prevJson.height),
-                        0.01f, 1000.0f, /*metalYConvention=*/true);
-                    splatR->setPreviousCameraExplicit(prevViewGl, prevProj);
-                    std::cout << "[metal] --camera-json-prev applied" << std::endl;
-                }
+            if (opts.shaderBase.empty()) {
+                std::cerr << "[error] --splat-backend luxc requires --pipeline <base> "
+                             "(e.g. --pipeline examples/gaussian_splat_dlss)" << std::endl;
+                return 1;
             }
-
-            // --- Motion vectors: real previous-time morph evaluation ---
-            // (docs/lux-4d-spec.md section 3's --time-prev/--frame-prev
-            // follow-up). Must come after --camera-json-prev above, same
-            // ordering rationale as the Vulkan main.cpp.
-            if (opts.hasTimePrev || opts.hasFramePrev) {
-                float tPrev = opts.hasFramePrev ? splatR->frameToTime(opts.framePrev) : opts.timePrev;
-                std::cout << "[metal] --time-prev/--frame-prev applied: evaluating morph at t=" << tPrev
-                          << "s for splat_prev_pos" << std::endl;
-                splatR->seedPreviousMorphTime(tPrev);
-            }
-
-            if (opts.jitterX != 0.0f || opts.jitterY != 0.0f) {
-                splatR->setJitter(opts.jitterX, opts.jitterY);
-            }
-
-            splatR->render(ctx);
-
-            MetalScreenshot::saveTextureToPNG(ctx, splatR->getOutputTexture(),
-                                               splatR->getWidth(), splatR->getHeight(),
-                                               opts.output);
-
-            // --- Headless aux dumps (docs/lux-4d-spec.md section 3) ---
-            if (!opts.outputAuxPrefix.empty()) {
-                uint32_t w = splatR->getWidth(), h = splatR->getHeight();
-                std::string colorPath = opts.outputAuxPrefix + "_color.png";
-                MetalScreenshot::saveTextureToPNG(ctx, splatR->getOutputTexture(), w, h, colorPath);
-
-                // _color.npy: float32 [H,W,4], un-premultiplied RGB + alpha,
-                // read directly from the RGBA16Float color attachment -- no
-                // 8-bit quantization anywhere in this path.
-                {
-                    auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getOutputTexture(), w, h, 8);
-                    std::vector<uint8_t> unusedRgba8;
-                    auto colorF32 = DlssIO::convertRgba16fColorAttachment(raw, w, h, unusedRgba8);
-                    DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_color.npy", colorF32, {h, w, 4});
-                }
-
-                if (splatR->hasExpectedDepth()) {
-                    auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getExpectedDepthTexture(), w, h, 8);
-                    std::vector<float> rg(static_cast<size_t>(w) * h * 2);
-                    std::memcpy(rg.data(), raw.data(), raw.size());
-                    std::vector<float> depthPremul(static_cast<size_t>(w) * h);
-                    std::vector<float> depthAlpha(static_cast<size_t>(w) * h);
-                    for (size_t i = 0; i < depthPremul.size(); ++i) {
-                        depthPremul[i] = rg[i * 2 + 0];
-                        depthAlpha[i] = rg[i * 2 + 1];
-                    }
-                    auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
-                    DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_depth.npy", depth, {h, w});
-                    DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png", depth, w, h, 1);
-                }
-                if (splatR->hasMotionVectors()) {
-                    auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getMotionTexture(), w, h, 16);
-                    std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
-                    std::memcpy(rgba.data(), raw.data(), raw.size());
-                    std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
-                    std::vector<float> mvAlpha(static_cast<size_t>(w) * h);
-                    for (size_t i = 0; i < mvAlpha.size(); ++i) {
-                        mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
-                        mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
-                        mvAlpha[i] = rgba[i * 4 + 3];
-                    }
-                    auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
-                    DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_mv.npy", mv, {h, w, 2});
-                    DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_mv_preview.png", mv, w, h, 2);
-                }
-                std::cout << "[metal] Wrote aux dumps: " << opts.outputAuxPrefix
-                          << "_{color.png,color.npy,depth.npy,mv.npy,*_preview.png}" << std::endl;
-            }
-
-            splatR->cleanup();
-            scene.cleanup();
-            ctx.cleanup();
-            pool->release();
-            std::cout << "[metal] Done." << std::endl;
-            return 0;
+            return runSplatBranch<MetalSplatLuxcRenderer>(ctx, scene, opts, pool, "MetalSplatLuxcRenderer (luxc)",
+                [&](MetalSplatLuxcRenderer& r) {
+                    r.init(ctx, scene.getSplatData(), opts.shaderBase, opts.width, opts.height);
+                });
         }
+
 
         // Non-splat path: populate lights from glTF scene data
         if (scene.hasGltfScene()) {

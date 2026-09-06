@@ -193,6 +193,7 @@ if(APPLE)
         src/metal_raster_renderer.cpp
         src/metal_mesh_renderer.cpp
         src/metal_splat_renderer.cpp
+        src/metal_splat_luxc_renderer.cpp
         src/metal_scene.cpp
         src/metal_scene_manager.cpp
         src/metal_screenshot.cpp

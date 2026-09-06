@@ -95,6 +95,9 @@ public:
 
     MTL::Texture* getMotionTexture() const { return motionTarget_; }
     MTL::Texture* getExpectedDepthTexture() const { return expectedDepthTarget_; }
+    // RG32Float (2 floats/pixel) -- see MetalSplatLuxcRenderer's
+    // kExpectedDepthChannels for why the luxc backend needs 4 instead.
+    static constexpr uint32_t kExpectedDepthChannels = 2;
 
     // --- Sort convention (SPECIFICATION.md 12.8's `sort` splat option) ---
     // Metal's splat pipeline is hand-written (no compiled .lux splat config

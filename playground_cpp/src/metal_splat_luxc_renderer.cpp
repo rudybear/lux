@@ -1,0 +1,835 @@
+#include "metal_splat_luxc_renderer.h"
+#include "gltf_loader.h"
+#include <algorithm>
+#include <numeric>
+#include <cstring>
+#include <stdexcept>
+#include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <chrono>
+#include <cmath>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+// Same lightweight substring-scan JSON reader as splat_renderer.cpp's
+// readShaderShDegree/readShaderBoolFlag (luxc's reflection writer always
+// emits `"key": true`/`"key": false`/`"key": N` with exact spacing).
+std::string readFile(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) return {};
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+bool readGsBoolFlag(const std::string& content, const std::string& key) {
+    auto gsPos = content.find("\"gaussian_splatting\"");
+    if (gsPos == std::string::npos) return false;
+    std::string needleTrue = "\"" + key + "\": true";
+    auto keyPos = content.find("\"" + key + "\"", gsPos);
+    if (keyPos == std::string::npos) return false;
+    return content.compare(keyPos, needleTrue.size(), needleTrue) == 0;
+}
+
+// SPIRV-Cross's MSL backend drops resource bindings that are declared but
+// never actually read/written in the shader body (e.g. splat_expander.py's
+// `visible_count` -- described as "atomic counter (incremented per visible
+// splat)" but not yet wired to an actual atomic_add anywhere; it's declared
+// solely for a future compaction pass) -- unlike Vulkan, which keeps every
+// declared descriptor-set binding regardless of whether the shader body
+// touches it, since VkDescriptorSetLayout is declaration-based, not
+// usage-based. `trySetBuffer` treats a missing binding as "this shader
+// build doesn't need it" rather than an error.
+void trySetBuffer(MTL::ComputeCommandEncoder* enc, const TranspiledShader& s,
+                   MTL::Buffer* buf, uint32_t binding) {
+    uint32_t idx = s.findBufferIndex(0, binding);
+    if (idx != UINT32_MAX) enc->setBuffer(buf, 0, idx);
+}
+
+void trySetVertexBuffer(MTL::RenderCommandEncoder* enc, const TranspiledShader& s,
+                         MTL::Buffer* buf, uint32_t binding) {
+    uint32_t idx = s.findBufferIndex(0, binding);
+    if (idx != UINT32_MAX) enc->setVertexBuffer(buf, 0, idx);
+}
+
+// Same jitter trick as MetalSplatRenderer's applyMetalSplatJitter: Metal's
+// splat_vertex applies an extra Y flip *outside* the projection matrix
+// (`screen.y = (1-(ndc.y*0.5+0.5))*H`), matching the luxc-compiled vertex
+// shader's own screen-space mapping (see splat_expander.py's vertex body,
+// which -- like Vulkan's -- treats +Y as *down* in pixel space after the
+// SPIR-V->MSL transpile's standard Vulkan-clip-space handling), so the
+// jitter's Y sign here also follows the Metal (not Vulkan) convention.
+glm::mat4 applyLuxcSplatJitter(glm::mat4 proj, float jitterXPixels, float jitterYPixels,
+                                uint32_t width, uint32_t height) {
+    if (jitterXPixels == 0.0f && jitterYPixels == 0.0f) return proj;
+    float dx = 2.0f * jitterXPixels / static_cast<float>(width);
+    float dy = -2.0f * jitterYPixels / static_cast<float>(height);
+    for (int c = 0; c < 4; ++c) {
+        proj[c][0] += dx * proj[c][3];
+        proj[c][1] += dy * proj[c][3];
+    }
+    return proj;
+}
+
+} // namespace
+
+MetalSplatLuxcRenderer::~MetalSplatLuxcRenderer() {}
+
+// --------------------------------------------------------------------------
+// Render targets (identical formats to MetalSplatRenderer)
+// --------------------------------------------------------------------------
+
+void MetalSplatLuxcRenderer::createRenderTargets(MetalContext& ctx) {
+    auto* colorDesc = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatRGBA16Float, width_, height_, false);
+    colorDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+    colorDesc->setStorageMode(MTL::StorageModePrivate);
+    colorTarget_ = ctx.newTexture(colorDesc);
+    colorTarget_->setLabel(NS::String::string("SplatColorLuxc", NS::UTF8StringEncoding));
+
+    auto* depthDesc = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatDepth32Float, width_, height_, false);
+    depthDesc->setUsage(MTL::TextureUsageRenderTarget);
+    depthDesc->setStorageMode(MTL::StorageModePrivate);
+    depthTarget_ = ctx.newTexture(depthDesc);
+    depthTarget_->setLabel(NS::String::string("SplatDepthLuxc", NS::UTF8StringEncoding));
+
+    if (hasMotionVectors_) {
+        auto* mvDesc = MTL::TextureDescriptor::texture2DDescriptor(
+            MTL::PixelFormatRGBA32Float, width_, height_, false);
+        mvDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+        mvDesc->setStorageMode(MTL::StorageModePrivate);
+        motionTarget_ = ctx.newTexture(mvDesc);
+        motionTarget_->setLabel(NS::String::string("SplatMotionLuxc", NS::UTF8StringEncoding));
+    }
+    if (hasExpectedDepth_) {
+        // RGBA32Float, not RG32Float (unlike MetalSplatRenderer's manually-
+        // blended 2-channel target): the luxc-compiled fragment shader
+        // outputs a genuine vec4 (x=depth*alpha, y/z unused, w=alpha) --
+        // exactly commit 1445ec3's out_depth fix -- so hardware blending's
+        // ONE_MINUS_SRC_ALPHA factor has a real 4th component to read.
+        auto* edDesc = MTL::TextureDescriptor::texture2DDescriptor(
+            MTL::PixelFormatRGBA32Float, width_, height_, false);
+        edDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+        edDesc->setStorageMode(MTL::StorageModePrivate);
+        expectedDepthTarget_ = ctx.newTexture(edDesc);
+        expectedDepthTarget_->setLabel(NS::String::string("SplatExpectedDepthLuxc", NS::UTF8StringEncoding));
+    }
+}
+
+// --------------------------------------------------------------------------
+// Pipeline creation: transpile the luxc-compiled SPIR-V to MSL
+// --------------------------------------------------------------------------
+
+void MetalSplatLuxcRenderer::createPipelines(MetalContext& ctx) {
+    NS::Error* error = nullptr;
+
+    std::string compJson = readFile(shaderBase_ + ".comp.json");
+    hasMotionVectors_ = readGsBoolFlag(compJson, "motion_vectors");
+    hasExpectedDepth_ = readGsBoolFlag(compJson, "expected_depth");
+
+    transpiler_.transpileInto(compShader_, shaderBase_ + ".comp.spv", SpvExecModel::GLCompute);
+    computePipeline_ = ctx.device->newComputePipelineState(compShader_.function, &error);
+    if (!computePipeline_) {
+        std::string msg = "luxc splat: failed to create compute pipeline";
+        if (error) msg += std::string(": ") + error->localizedDescription()->utf8String();
+        throw std::runtime_error(msg);
+    }
+
+    transpiler_.transpileInto(vertShader_, shaderBase_ + ".vert.spv", SpvExecModel::Vertex);
+    transpiler_.transpileInto(fragShader_, shaderBase_ + ".frag.spv", SpvExecModel::Fragment);
+
+    auto* pipeDesc = MTL::RenderPipelineDescriptor::alloc()->init();
+    pipeDesc->setVertexFunction(vertShader_.function);
+    pipeDesc->setFragmentFunction(fragShader_.function);
+
+    auto* colorAtt = pipeDesc->colorAttachments()->object(0);
+    colorAtt->setPixelFormat(MTL::PixelFormatRGBA16Float);
+    colorAtt->setBlendingEnabled(true);
+    colorAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
+    colorAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+    colorAtt->setRgbBlendOperation(MTL::BlendOperationAdd);
+    colorAtt->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
+    colorAtt->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+    colorAtt->setAlphaBlendOperation(MTL::BlendOperationAdd);
+
+    // Unlike MetalSplatRenderer's hand-written splat_fragment (which blends
+    // motion/depth manually via framebuffer fetch because 32-bit float
+    // attachments were found not to support hardware blending on earlier
+    // Apple GPUs), this backend runs the luxc-compiled fragment shader
+    // unmodified -- it was authored assuming Vulkan's fixed-function
+    // ONE/ONE_MINUS_SRC_ALPHA hardware blend (splat_expander.py's
+    // _build_fragment_stage has no manual accumulation logic at all), so
+    // hardware blending must actually be enabled here for these attachments
+    // to composite correctly across overlapping splats. Empirically, Apple
+    // Silicon (M4 Max) DOES support blending on RGBA32Float/RG32Float
+    // render targets (verified by this backend's own MV/depth parity
+    // numbers) -- MetalSplatRenderer's comment may reflect older hardware
+    // or a since-resolved driver limitation.
+    if (hasMotionVectors_) {
+        auto* motionAtt = pipeDesc->colorAttachments()->object(1);
+        motionAtt->setPixelFormat(MTL::PixelFormatRGBA32Float);
+        motionAtt->setBlendingEnabled(true);
+        motionAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
+        motionAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        motionAtt->setRgbBlendOperation(MTL::BlendOperationAdd);
+        motionAtt->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
+        motionAtt->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        motionAtt->setAlphaBlendOperation(MTL::BlendOperationAdd);
+    }
+    if (hasExpectedDepth_) {
+        auto* depthOutAtt = pipeDesc->colorAttachments()->object(hasMotionVectors_ ? 2 : 1);
+        depthOutAtt->setPixelFormat(MTL::PixelFormatRGBA32Float);
+        depthOutAtt->setBlendingEnabled(true);
+        depthOutAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
+        depthOutAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        depthOutAtt->setRgbBlendOperation(MTL::BlendOperationAdd);
+        depthOutAtt->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
+        depthOutAtt->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        depthOutAtt->setAlphaBlendOperation(MTL::BlendOperationAdd);
+    }
+
+    pipeDesc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
+
+    renderPipeline_ = ctx.device->newRenderPipelineState(pipeDesc, &error);
+    pipeDesc->release();
+    if (!renderPipeline_) {
+        std::string msg = "luxc splat: failed to create render pipeline";
+        if (error) msg += std::string(": ") + error->localizedDescription()->utf8String();
+        throw std::runtime_error(msg);
+    }
+
+    auto* dsDesc = MTL::DepthStencilDescriptor::alloc()->init();
+    dsDesc->setDepthCompareFunction(MTL::CompareFunctionLessEqual);
+    dsDesc->setDepthWriteEnabled(false);
+    depthStencilState_ = ctx.device->newDepthStencilState(dsDesc);
+    dsDesc->release();
+}
+
+void MetalSplatLuxcRenderer::createSortPipelines(MetalContext& ctx) {
+    NS::Error* error = nullptr;
+    transpiler_.transpileInto(sortHistogramShader_, "shaders/radix_sort/histogram.comp.spv", SpvExecModel::GLCompute);
+    transpiler_.transpileInto(sortPrefixSumShader_, "shaders/radix_sort/prefix_sum.comp.spv", SpvExecModel::GLCompute);
+    transpiler_.transpileInto(sortScatterShader_, "shaders/radix_sort/scatter.comp.spv", SpvExecModel::GLCompute);
+
+    sortHistogramPipeline_ = ctx.device->newComputePipelineState(sortHistogramShader_.function, &error);
+    if (!sortHistogramPipeline_) throw std::runtime_error("luxc splat: failed to create sort-histogram pipeline");
+    sortPrefixSumPipeline_ = ctx.device->newComputePipelineState(sortPrefixSumShader_.function, &error);
+    if (!sortPrefixSumPipeline_) throw std::runtime_error("luxc splat: failed to create sort-prefix-sum pipeline");
+    sortScatterPipeline_ = ctx.device->newComputePipelineState(sortScatterShader_.function, &error);
+    if (!sortScatterPipeline_) throw std::runtime_error("luxc splat: failed to create sort-scatter pipeline");
+}
+
+// --------------------------------------------------------------------------
+// Buffer creation and data upload (identical layout to MetalSplatRenderer)
+// --------------------------------------------------------------------------
+
+void MetalSplatLuxcRenderer::createBuffers(MetalContext& ctx, const GaussianSplatData& data) {
+    numSplats_ = data.num_splats;
+    shDegree_ = data.sh_degree;
+    if (numSplats_ == 0) return;
+
+    hostPositions_ = data.positions;
+    posBuffer_ = ctx.newBuffer(hostPositions_.data(), hostPositions_.size() * sizeof(float),
+                                MTL::ResourceStorageModeShared);
+    posBuffer_->setLabel(NS::String::string("SplatPositionsLuxc", NS::UTF8StringEncoding));
+
+    rotBuffer_ = ctx.newBuffer(data.rotations.data(), numSplats_ * 4 * sizeof(float),
+                                MTL::ResourceStorageModeShared);
+    rotBuffer_->setLabel(NS::String::string("SplatRotationsLuxc", NS::UTF8StringEncoding));
+
+    std::vector<float> scale4(numSplats_ * 4);
+    for (uint32_t i = 0; i < numSplats_; ++i) {
+        scale4[i * 4 + 0] = data.scales[i * 3 + 0];
+        scale4[i * 4 + 1] = data.scales[i * 3 + 1];
+        scale4[i * 4 + 2] = data.scales[i * 3 + 2];
+        scale4[i * 4 + 3] = 0.0f;
+    }
+    scaleBuffer_ = ctx.newBuffer(scale4.data(), scale4.size() * sizeof(float),
+                                  MTL::ResourceStorageModeShared);
+    scaleBuffer_->setLabel(NS::String::string("SplatScalesLuxc", NS::UTF8StringEncoding));
+
+    opacityBuffer_ = ctx.newBuffer(data.opacities.data(), numSplats_ * sizeof(float),
+                                    MTL::ResourceStorageModeShared);
+    opacityBuffer_->setLabel(NS::String::string("SplatOpacitiesLuxc", NS::UTF8StringEncoding));
+
+    if (!data.sh_coefficients.empty() && !data.sh_coefficients[0].empty()) {
+        const auto& coeffs = data.sh_coefficients[0];
+        uint32_t srcFloatsPerSplat = static_cast<uint32_t>(coeffs.size() / numSplats_);
+        if (srcFloatsPerSplat == 3) {
+            std::vector<float> padded(numSplats_ * 4, 0.0f);
+            for (uint32_t i = 0; i < numSplats_; ++i) {
+                padded[i * 4 + 0] = coeffs[i * 3 + 0];
+                padded[i * 4 + 1] = coeffs[i * 3 + 1];
+                padded[i * 4 + 2] = coeffs[i * 3 + 2];
+            }
+            shBuffer_ = ctx.newBuffer(padded.data(), padded.size() * sizeof(float), MTL::ResourceStorageModeShared);
+        } else {
+            shBuffer_ = ctx.newBuffer(coeffs.data(), coeffs.size() * sizeof(float), MTL::ResourceStorageModeShared);
+        }
+    } else {
+        std::vector<float> dummy(numSplats_ * 4, 0.0f);
+        shBuffer_ = ctx.newBuffer(dummy.data(), dummy.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    }
+    shBuffer_->setLabel(NS::String::string("SplatSH0Luxc", NS::UTF8StringEncoding));
+
+    size_t vec4Size = numSplats_ * 4 * sizeof(float);
+    projCenterBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
+    projConicBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
+    projColorBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
+    visibleCountBuffer_ = ctx.newBuffer(std::max<size_t>(4, sizeof(uint32_t)), MTL::ResourceStorageModeShared);
+
+    if (hasMotionVectors_) {
+        projMvBuffer_ = ctx.newBuffer(numSplats_ * 2 * sizeof(float), MTL::ResourceStorageModeShared);
+        prevPosBuffer_ = ctx.newBuffer(hostPositions_.data(), hostPositions_.size() * sizeof(float),
+                                        MTL::ResourceStorageModeShared);
+    } else {
+        // Dummy 1-element buffers -- the compute stage only declares these
+        // storage buffers when motion_vectors/expected_depth are enabled
+        // (splat_expander.py), so they're never actually bound in that case,
+        // but keep pointers non-null for uniform code below.
+        projMvBuffer_ = ctx.newBuffer(8, MTL::ResourceStorageModeShared);
+        prevPosBuffer_ = ctx.newBuffer(16, MTL::ResourceStorageModeShared);
+    }
+    if (hasExpectedDepth_) {
+        projDepthBuffer_ = ctx.newBuffer(numSplats_ * sizeof(float), MTL::ResourceStorageModeShared);
+    } else {
+        projDepthBuffer_ = ctx.newBuffer(4, MTL::ResourceStorageModeShared);
+    }
+
+    // --- Sort buffers (GPU radix sort, ping-pong A/B) ---
+    sortKeysBuffer_ = ctx.newBuffer(numSplats_ * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    sortKeysBBuffer_ = ctx.newBuffer(numSplats_ * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    sortedIndicesBuffer_ = ctx.newBuffer(numSplats_ * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    sortValsBBuffer_ = ctx.newBuffer(numSplats_ * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+
+    static const uint32_t SORT_TILE_SIZE = 3840;
+    static const uint32_t PREFIX_SUM_BLOCK_SIZE = 2048;
+    sortNumWg_ = (numSplats_ + SORT_TILE_SIZE - 1) / SORT_TILE_SIZE;
+    uint32_t histogramSize = std::max(256u * sortNumWg_ * 4u, 4u);
+    histogramBuffer_ = ctx.newBuffer(histogramSize, MTL::ResourceStorageModeShared);
+    uint32_t totalHistEntries = 256 * sortNumWg_;
+    uint32_t numPartitions = (totalHistEntries + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
+    uint32_t partitionSumsSize = std::max(numPartitions * 4u, 4u);
+    partitionSumsBuffer_ = ctx.newBuffer(partitionSumsSize, MTL::ResourceStorageModeShared);
+
+    std::cout << "[metal-luxc] GPU radix sort: " << numSplats_ << " splats, "
+              << sortNumWg_ << " workgroups, " << totalHistEntries << " histogram entries, "
+              << numPartitions << " partitions" << std::endl;
+
+    // --- Dynamic splats: cache base attributes + precompute segments ---
+    dynamics_ = data.dynamics;
+    if (dynamics_.has_motion) {
+        basePositions_ = hostPositions_;
+        baseRotations_.assign(data.rotations.begin(), data.rotations.end());
+        baseSH0_.assign(numSplats_ * 4, 0.0f);
+        if (!dynamics_.targets.empty()) {
+            auto* shPtr = static_cast<const float*>(shBuffer_->contents());
+            std::memcpy(baseSH0_.data(), shPtr, numSplats_ * 4 * sizeof(float));
+        }
+
+        morphSegments_ = buildSplatMorphSegments(dynamics_);
+
+        std::vector<uint32_t> allIdx;
+        for (auto& t : dynamics_.targets) allIdx.insert(allIdx.end(), t.indices.begin(), t.indices.end());
+        std::sort(allIdx.begin(), allIdx.end());
+        allIdx.erase(std::unique(allIdx.begin(), allIdx.end()), allIdx.end());
+        everMovingIndices_ = std::move(allIdx);
+
+        std::cout << "[metal-luxc] Dynamic splats: " << morphSegments_.size() << " segments, "
+                  << everMovingIndices_.size() << " gaussians ever move" << std::endl;
+
+        createMorphPipeline(ctx);
+        createMorphBuffers(ctx);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Dynamic splats: GPU morph-apply (transpiled <shaderBase>.morph.comp.spv)
+// --------------------------------------------------------------------------
+
+void MetalSplatLuxcRenderer::createMorphPipeline(MetalContext& ctx) {
+    NS::Error* error = nullptr;
+    transpiler_.transpileInto(morphShader_, shaderBase_ + ".morph.comp.spv", SpvExecModel::GLCompute);
+    morphPipeline_ = ctx.device->newComputePipelineState(morphShader_.function, &error);
+    if (!morphPipeline_) {
+        std::string msg = "luxc splat: failed to create morph compute pipeline";
+        if (error) msg += std::string(": ") + error->localizedDescription()->utf8String();
+        throw std::runtime_error(msg);
+    }
+}
+
+void MetalSplatLuxcRenderer::createMorphBuffers(MetalContext& ctx) {
+    segmentOffsets_.resize(morphSegments_.size());
+    segmentCounts_.resize(morphSegments_.size());
+
+    std::vector<uint32_t> catIndex;
+    std::vector<float> catPosLo, catPosHi, catRotLo, catRotHi, catSh0Lo, catSh0Hi;
+    for (size_t seg = 0; seg < morphSegments_.size(); seg++) {
+        const auto& s = morphSegments_[seg];
+        segmentOffsets_[seg] = static_cast<uint32_t>(catIndex.size());
+        segmentCounts_[seg] = static_cast<uint32_t>(s.index.size());
+        catIndex.insert(catIndex.end(), s.index.begin(), s.index.end());
+        catPosLo.insert(catPosLo.end(), s.dposLo.begin(), s.dposLo.end());
+        catPosHi.insert(catPosHi.end(), s.dposHi.begin(), s.dposHi.end());
+        catRotLo.insert(catRotLo.end(), s.drotLo.begin(), s.drotLo.end());
+        catRotHi.insert(catRotHi.end(), s.drotHi.begin(), s.drotHi.end());
+        catSh0Lo.insert(catSh0Lo.end(), s.dsh0Lo.begin(), s.dsh0Lo.end());
+        catSh0Hi.insert(catSh0Hi.end(), s.dsh0Hi.begin(), s.dsh0Hi.end());
+    }
+    morphTotalEntries_ = static_cast<uint32_t>(catIndex.size());
+
+    auto pad3to4 = [](const std::vector<float>& src) {
+        std::vector<float> out(src.size() / 3 * 4, 0.0f);
+        for (size_t i = 0; i < src.size() / 3; i++) {
+            out[i * 4 + 0] = src[i * 3 + 0];
+            out[i * 4 + 1] = src[i * 3 + 1];
+            out[i * 4 + 2] = src[i * 3 + 2];
+        }
+        return out;
+    };
+    std::vector<float> catPosLo4 = pad3to4(catPosLo), catPosHi4 = pad3to4(catPosHi);
+    std::vector<float> catSh0Lo4 = pad3to4(catSh0Lo), catSh0Hi4 = pad3to4(catSh0Hi);
+
+    auto ensureNonEmpty = [](std::vector<float>& v, size_t floatsPerEntry) {
+        if (v.empty()) v.resize(floatsPerEntry, 0.0f);
+    };
+    ensureNonEmpty(catPosLo4, 4); ensureNonEmpty(catPosHi4, 4);
+    ensureNonEmpty(catRotLo, 4);  ensureNonEmpty(catRotHi, 4);
+    ensureNonEmpty(catSh0Lo4, 4); ensureNonEmpty(catSh0Hi4, 4);
+    if (catIndex.empty()) catIndex.push_back(0);
+
+    baseGpuPosBuffer_ = ctx.newBuffer(basePositions_.data(), basePositions_.size() * sizeof(float),
+                                       MTL::ResourceStorageModeShared);
+    baseGpuRotBuffer_ = ctx.newBuffer(baseRotations_.data(), baseRotations_.size() * sizeof(float),
+                                       MTL::ResourceStorageModeShared);
+    baseGpuSh0Buffer_ = ctx.newBuffer(baseSH0_.data(), baseSH0_.size() * sizeof(float),
+                                       MTL::ResourceStorageModeShared);
+
+    morphIndexBuffer_ = ctx.newBuffer(catIndex.data(), catIndex.size() * sizeof(uint32_t),
+                                       MTL::ResourceStorageModeShared);
+    morphPosLoBuffer_ = ctx.newBuffer(catPosLo4.data(), catPosLo4.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    morphRotLoBuffer_ = ctx.newBuffer(catRotLo.data(), catRotLo.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    morphSh0LoBuffer_ = ctx.newBuffer(catSh0Lo4.data(), catSh0Lo4.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    morphPosHiBuffer_ = ctx.newBuffer(catPosHi4.data(), catPosHi4.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    morphRotHiBuffer_ = ctx.newBuffer(catRotHi.data(), catRotHi.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    morphSh0HiBuffer_ = ctx.newBuffer(catSh0Hi4.data(), catSh0Hi4.size() * sizeof(float), MTL::ResourceStorageModeShared);
+}
+
+float MetalSplatLuxcRenderer::animationDuration() const {
+    if (!dynamics_.has_motion || dynamics_.keyframes.empty()) return 0.0f;
+    return dynamics_.keyframes.back().time;
+}
+
+float MetalSplatLuxcRenderer::frameToTime(int frame) const {
+    return splatFrameToTime(dynamics_, frame);
+}
+
+void MetalSplatLuxcRenderer::stepKeyframe(int direction) {
+    if (!dynamics_.has_motion || dynamics_.keyframes.empty()) return;
+    const auto& kf = dynamics_.keyframes;
+    size_t nearest = 0;
+    float best = std::fabs(kf[0].time - currentMorphTime_);
+    for (size_t i = 1; i < kf.size(); i++) {
+        float d = std::fabs(kf[i].time - currentMorphTime_);
+        if (d < best) { best = d; nearest = i; }
+    }
+    long stepped = static_cast<long>(nearest) + direction;
+    stepped = std::max<long>(0, std::min<long>(stepped, static_cast<long>(kf.size()) - 1));
+    setMorphTime(kf[static_cast<size_t>(stepped)].time);
+}
+
+void MetalSplatLuxcRenderer::setMorphTime(float seconds) {
+    if (!dynamics_.has_motion) return;
+    currentMorphTime_ = seconds;
+    SplatMorphState state = evaluateSplatMorphState(dynamics_, seconds);
+
+    struct MorphPush {
+        uint32_t segmentOffset;
+        uint32_t segmentCount;
+        float weightLow;
+        float weightHigh;
+    };
+
+    auto* cmdBuf = ctx_->beginCommandBuffer();
+    auto* enc = cmdBuf->computeCommandEncoder();
+    enc->setComputePipelineState(morphPipeline_);
+    trySetBuffer(enc, morphShader_, baseGpuPosBuffer_, 0);
+    trySetBuffer(enc, morphShader_, baseGpuRotBuffer_, 1);
+    trySetBuffer(enc, morphShader_, baseGpuSh0Buffer_, 2);
+    trySetBuffer(enc, morphShader_, morphIndexBuffer_, 3);
+    trySetBuffer(enc, morphShader_, morphPosLoBuffer_, 4);
+    trySetBuffer(enc, morphShader_, morphRotLoBuffer_, 5);
+    trySetBuffer(enc, morphShader_, morphSh0LoBuffer_, 6);
+    trySetBuffer(enc, morphShader_, morphPosHiBuffer_, 7);
+    trySetBuffer(enc, morphShader_, morphRotHiBuffer_, 8);
+    trySetBuffer(enc, morphShader_, morphSh0HiBuffer_, 9);
+    trySetBuffer(enc, morphShader_, posBuffer_, 10);
+    trySetBuffer(enc, morphShader_, rotBuffer_, 11);
+    trySetBuffer(enc, morphShader_, shBuffer_, 12);
+
+    uint32_t threadGroupSize = static_cast<uint32_t>(morphPipeline_->maxTotalThreadsPerThreadgroup());
+    if (threadGroupSize > 256) threadGroupSize = 256;
+
+    if (morphTotalEntries_ > 0) {
+        MorphPush resetPush = {0, morphTotalEntries_, 0.0f, 0.0f};
+        enc->setBytes(&resetPush, sizeof(resetPush), morphShader_.pushConstantBufferIndex);
+        uint32_t groups = (morphTotalEntries_ + threadGroupSize - 1) / threadGroupSize;
+        enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(threadGroupSize, 1, 1));
+    }
+
+    if ((state.weightLow != 0.0f || state.weightHigh != 0.0f) &&
+        state.highTargetIndex >= 0 &&
+        static_cast<size_t>(state.highTargetIndex) < segmentCounts_.size() &&
+        segmentCounts_[state.highTargetIndex] > 0) {
+        uint32_t seg = static_cast<uint32_t>(state.highTargetIndex);
+        MorphPush applyPush = {segmentOffsets_[seg], segmentCounts_[seg], state.weightLow, state.weightHigh};
+        enc->setBytes(&applyPush, sizeof(applyPush), morphShader_.pushConstantBufferIndex);
+        uint32_t groups = (segmentCounts_[seg] + threadGroupSize - 1) / threadGroupSize;
+        enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(threadGroupSize, 1, 1));
+    }
+
+    enc->endEncoding();
+    cmdBuf->commit();
+    cmdBuf->waitUntilCompleted();
+
+    std::memcpy(hostPositions_.data(), posBuffer_->contents(), hostPositions_.size() * sizeof(float));
+}
+
+// --------------------------------------------------------------------------
+// Camera
+// --------------------------------------------------------------------------
+
+void MetalSplatLuxcRenderer::updateCamera(glm::vec3 eye, glm::vec3 target, glm::vec3 up,
+                                           float fovY, float aspect, float nearPlane, float farPlane) {
+    camPos_ = eye;
+    viewMatrix_ = glm::lookAt(eye, target, up);
+    projMatrixUnjittered_ = glm::perspective(fovY, aspect, nearPlane, farPlane);
+    projMatrix_ = applyLuxcSplatJitter(projMatrixUnjittered_, jitterX_, jitterY_, width_, height_);
+    focalY_ = 0.5f * static_cast<float>(height_) / tanf(fovY * 0.5f);
+    focalX_ = focalY_;
+}
+
+void MetalSplatLuxcRenderer::updateCameraExplicit(glm::vec3 eye, glm::mat4 viewMatrix, glm::mat4 projMatrix,
+                                                   float focalX, float focalY) {
+    camPos_ = eye;
+    viewMatrix_ = viewMatrix;
+    projMatrixUnjittered_ = projMatrix;
+    projMatrix_ = applyLuxcSplatJitter(projMatrix, jitterX_, jitterY_, width_, height_);
+    focalX_ = focalX;
+    focalY_ = focalY;
+}
+
+void MetalSplatLuxcRenderer::setJitter(float jitterXPixels, float jitterYPixels) {
+    jitterX_ = jitterXPixels;
+    jitterY_ = jitterYPixels;
+    projMatrix_ = applyLuxcSplatJitter(projMatrixUnjittered_, jitterX_, jitterY_, width_, height_);
+}
+
+// --------------------------------------------------------------------------
+// init
+// --------------------------------------------------------------------------
+
+void MetalSplatLuxcRenderer::init(MetalContext& ctx, const GaussianSplatData& data,
+                                   const std::string& shaderBase, uint32_t width, uint32_t height) {
+    ctx_ = &ctx;
+    shaderBase_ = shaderBase;
+    width_ = width;
+    height_ = height;
+    transpiler_.init(ctx.device);
+
+    // hasMotionVectors_/hasExpectedDepth_ are set inside createPipelines()
+    // (reads the compute stage's reflection JSON) -- createBuffers() and
+    // createRenderTargets() both depend on them, so pipelines must be
+    // created first here (unlike MetalSplatRenderer, where both flags are
+    // hardcoded `true` and buffer/render-target creation order doesn't
+    // matter).
+    createPipelines(ctx);
+    createSortPipelines(ctx);
+    createBuffers(ctx, data);
+    createRenderTargets(ctx);
+
+    std::cout << "[metal-luxc] MetalSplatLuxcRenderer initialized: " << numSplats_ << " splats, "
+              << width << "x" << height
+              << " (motion_vectors=" << hasMotionVectors_ << " expected_depth=" << hasExpectedDepth_ << ")"
+              << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// render()
+// --------------------------------------------------------------------------
+
+void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
+    if (numSplats_ == 0) return;
+
+    if (hasMotionVectors_ && firstMvFrame_) {
+        prevViewMatrix_ = viewMatrix_;
+        prevProjMatrixUnjittered_ = projMatrixUnjittered_;
+        std::memcpy(prevPosBuffer_->contents(), hostPositions_.data(), hostPositions_.size() * sizeof(float));
+    }
+
+    // --- Preprocess compute: projection, covariance, SH, sort-key gen ---
+    struct ComputePush {
+        float view[16];
+        float proj[16];
+        float camPos[3];
+        float _pad0;
+        float screenW, screenH;
+        uint32_t numSplats;
+        float focalX;
+        float focalY;
+        int32_t shDegree;
+        float _pad1[2];
+        float projUnjittered[16];
+        float prevViewProjUnjittered[16];
+    } push = {};
+    std::memcpy(push.view, &viewMatrix_[0][0], 64);
+    std::memcpy(push.proj, &projMatrix_[0][0], 64);
+    push.camPos[0] = camPos_.x; push.camPos[1] = camPos_.y; push.camPos[2] = camPos_.z;
+    push.screenW = static_cast<float>(width_);
+    push.screenH = static_cast<float>(height_);
+    push.numSplats = numSplats_;
+    push.focalX = focalX_;
+    push.focalY = focalY_;
+    push.shDegree = static_cast<int32_t>(shDegree_);
+    if (hasMotionVectors_) {
+        glm::mat4 prevViewProj = prevProjMatrixUnjittered_ * prevViewMatrix_;
+        std::memcpy(push.projUnjittered, &projMatrixUnjittered_[0][0], 64);
+        std::memcpy(push.prevViewProjUnjittered, &prevViewProj[0][0], 64);
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    {
+        auto* cmdBuf = ctx.beginCommandBuffer();
+        auto* enc = cmdBuf->computeCommandEncoder();
+        enc->setComputePipelineState(computePipeline_);
+        trySetBuffer(enc, compShader_, posBuffer_, 0);
+        trySetBuffer(enc, compShader_, rotBuffer_, 1);
+        trySetBuffer(enc, compShader_, scaleBuffer_, 2);
+        trySetBuffer(enc, compShader_, opacityBuffer_, 3);
+        trySetBuffer(enc, compShader_, shBuffer_, 4);
+        trySetBuffer(enc, compShader_, projCenterBuffer_, 5);
+        trySetBuffer(enc, compShader_, projConicBuffer_, 6);
+        trySetBuffer(enc, compShader_, projColorBuffer_, 7);
+        trySetBuffer(enc, compShader_, sortKeysBuffer_, 8);
+        trySetBuffer(enc, compShader_, sortedIndicesBuffer_, 9);
+        trySetBuffer(enc, compShader_, visibleCountBuffer_, 10);
+        uint32_t nextBinding = 11;
+        if (hasMotionVectors_) {
+            trySetBuffer(enc, compShader_, prevPosBuffer_, nextBinding++);
+            trySetBuffer(enc, compShader_, projMvBuffer_, nextBinding++);
+        }
+        if (hasExpectedDepth_) {
+            trySetBuffer(enc, compShader_, projDepthBuffer_, nextBinding++);
+        }
+        enc->setBytes(&push, sizeof(push), compShader_.pushConstantBufferIndex);
+        uint32_t groups = (numSplats_ + 255) / 256;
+        enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(256, 1, 1));
+        enc->endEncoding();
+        cmdBuf->commit();
+        cmdBuf->waitUntilCompleted();
+    }
+    lastPreprocessMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+    if (hasMotionVectors_) {
+        std::memcpy(prevPosBuffer_->contents(), posBuffer_->contents(), hostPositions_.size() * sizeof(float));
+        prevViewMatrix_ = viewMatrix_;
+        prevProjMatrixUnjittered_ = projMatrixUnjittered_;
+        firstMvFrame_ = false;
+    }
+
+    // --- GPU radix sort (4 passes, 8 bits/pass = 32-bit keys) ---
+    auto t1 = std::chrono::steady_clock::now();
+    {
+        static const uint32_t PREFIX_SUM_BLOCK_SIZE = 2048;
+        uint32_t numElements = numSplats_;
+        uint32_t numWg = sortNumWg_;
+        uint32_t totalHistogram = 256 * numWg;
+        uint32_t numParts = (totalHistogram + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
+
+        struct SortPush { uint32_t numElements; uint32_t bitOffset; };
+
+        for (uint32_t pass = 0; pass < 4; ++pass) {
+            uint32_t bitOffset = pass * 8;
+            uint32_t ping = pass % 2;  // 0 = A->B, 1 = B->A
+            MTL::Buffer* keysIn = ping == 0 ? sortKeysBuffer_ : sortKeysBBuffer_;
+            MTL::Buffer* keysOut = ping == 0 ? sortKeysBBuffer_ : sortKeysBuffer_;
+            MTL::Buffer* valsIn = ping == 0 ? sortedIndicesBuffer_ : sortValsBBuffer_;
+            MTL::Buffer* valsOut = ping == 0 ? sortValsBBuffer_ : sortedIndicesBuffer_;
+
+            // Histogram
+            {
+                auto* cmdBuf = ctx.beginCommandBuffer();
+                auto* enc = cmdBuf->computeCommandEncoder();
+                enc->setComputePipelineState(sortHistogramPipeline_);
+                trySetBuffer(enc, sortHistogramShader_, keysIn, 0);
+                trySetBuffer(enc, sortHistogramShader_, histogramBuffer_, 1);
+                SortPush hp = {numElements, bitOffset};
+                enc->setBytes(&hp, sizeof(hp), sortHistogramShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numWg, 1, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+                cmdBuf->commit();
+                cmdBuf->waitUntilCompleted();
+            }
+            // Prefix sum (3 sub-passes)
+            {
+                auto* cmdBuf = ctx.beginCommandBuffer();
+                auto* enc = cmdBuf->computeCommandEncoder();
+                enc->setComputePipelineState(sortPrefixSumPipeline_);
+                trySetBuffer(enc, sortPrefixSumShader_, histogramBuffer_, 0);
+                trySetBuffer(enc, sortPrefixSumShader_, partitionSumsBuffer_, 1);
+                SortPush ps0 = {totalHistogram, 0};
+                enc->setBytes(&ps0, sizeof(ps0), sortPrefixSumShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numParts, 1, 1), MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+                cmdBuf->commit();
+                cmdBuf->waitUntilCompleted();
+            }
+            {
+                auto* cmdBuf = ctx.beginCommandBuffer();
+                auto* enc = cmdBuf->computeCommandEncoder();
+                enc->setComputePipelineState(sortPrefixSumPipeline_);
+                trySetBuffer(enc, sortPrefixSumShader_, histogramBuffer_, 0);
+                trySetBuffer(enc, sortPrefixSumShader_, partitionSumsBuffer_, 1);
+                SortPush ps1 = {numParts, 1};
+                enc->setBytes(&ps1, sizeof(ps1), sortPrefixSumShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+                cmdBuf->commit();
+                cmdBuf->waitUntilCompleted();
+            }
+            {
+                auto* cmdBuf = ctx.beginCommandBuffer();
+                auto* enc = cmdBuf->computeCommandEncoder();
+                enc->setComputePipelineState(sortPrefixSumPipeline_);
+                trySetBuffer(enc, sortPrefixSumShader_, histogramBuffer_, 0);
+                trySetBuffer(enc, sortPrefixSumShader_, partitionSumsBuffer_, 1);
+                SortPush ps2 = {totalHistogram, 2};
+                enc->setBytes(&ps2, sizeof(ps2), sortPrefixSumShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numParts, 1, 1), MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+                cmdBuf->commit();
+                cmdBuf->waitUntilCompleted();
+            }
+            // Scatter
+            {
+                auto* cmdBuf = ctx.beginCommandBuffer();
+                auto* enc = cmdBuf->computeCommandEncoder();
+                enc->setComputePipelineState(sortScatterPipeline_);
+                trySetBuffer(enc, sortScatterShader_, keysIn, 0);
+                trySetBuffer(enc, sortScatterShader_, keysOut, 1);
+                trySetBuffer(enc, sortScatterShader_, valsIn, 2);
+                trySetBuffer(enc, sortScatterShader_, valsOut, 3);
+                trySetBuffer(enc, sortScatterShader_, histogramBuffer_, 4);
+                SortPush sp = {numElements, bitOffset};
+                enc->setBytes(&sp, sizeof(sp), sortScatterShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numWg, 1, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+                cmdBuf->commit();
+                cmdBuf->waitUntilCompleted();
+            }
+        }
+        // After 4 (even) passes, sorted result is back in buffer A
+        // (sortKeysBuffer_ / sortedIndicesBuffer_), matching Vulkan.
+    }
+    lastSortMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+
+    if (std::getenv("LUX_DEBUG_SORT_DUMP")) {
+        std::string prefix = std::getenv("LUX_DEBUG_SORT_DUMP");
+        std::vector<uint32_t> keys(numSplats_), idx(numSplats_);
+        std::memcpy(keys.data(), sortKeysBuffer_->contents(), numSplats_ * sizeof(uint32_t));
+        std::memcpy(idx.data(), sortedIndicesBuffer_->contents(), numSplats_ * sizeof(uint32_t));
+        uint32_t numOutOfOrder = 0;
+        for (uint32_t i = 1; i < numSplats_; ++i) if (keys[i] < keys[i - 1]) numOutOfOrder++;
+        std::cout << "[debug-sort] numSplats=" << numSplats_ << " numOutOfOrder=" << numOutOfOrder
+                  << " first10keys=";
+        for (int i = 0; i < 10 && i < (int)numSplats_; ++i) std::cout << keys[i] << " ";
+        std::cout << " last10keys=";
+        for (uint32_t i = numSplats_ > 10 ? numSplats_ - 10 : 0; i < numSplats_; ++i) std::cout << keys[i] << " ";
+        std::cout << std::endl;
+    }
+
+    // --- Render pass ---
+    auto t2 = std::chrono::steady_clock::now();
+    auto* rpDesc = MTL::RenderPassDescriptor::alloc()->init();
+    auto* colorAtt = rpDesc->colorAttachments()->object(0);
+    colorAtt->setTexture(colorTarget_);
+    colorAtt->setLoadAction(MTL::LoadActionClear);
+    colorAtt->setStoreAction(MTL::StoreActionStore);
+    // Alpha clears to 0 (not opaque) whenever DLSS outputs are enabled, so
+    // color.a is a genuine coverage signal for host-side un-premultiply --
+    // same rationale as the Vulkan splat renderer.
+    float clearA = (hasMotionVectors_ || hasExpectedDepth_) ? 0.0f : 1.0f;
+    colorAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, clearA));
+
+    uint32_t nextColorIdx = 1;
+    if (hasMotionVectors_) {
+        auto* motionAtt = rpDesc->colorAttachments()->object(nextColorIdx++);
+        motionAtt->setTexture(motionTarget_);
+        motionAtt->setLoadAction(MTL::LoadActionClear);
+        motionAtt->setStoreAction(MTL::StoreActionStore);
+        motionAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 0.0));
+    }
+    if (hasExpectedDepth_) {
+        auto* depthOutAtt = rpDesc->colorAttachments()->object(nextColorIdx++);
+        depthOutAtt->setTexture(expectedDepthTarget_);
+        depthOutAtt->setLoadAction(MTL::LoadActionClear);
+        depthOutAtt->setStoreAction(MTL::StoreActionStore);
+        depthOutAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 0.0));
+    }
+
+    auto* depthAtt = rpDesc->depthAttachment();
+    depthAtt->setTexture(depthTarget_);
+    depthAtt->setLoadAction(MTL::LoadActionClear);
+    depthAtt->setStoreAction(MTL::StoreActionDontCare);
+    depthAtt->setClearDepth(1.0);
+
+    auto* cmdBuf = ctx.beginCommandBuffer();
+    auto* enc = cmdBuf->renderCommandEncoder(rpDesc);
+    enc->setViewport(MTL::Viewport{0.0, 0.0, static_cast<double>(width_), static_cast<double>(height_), 0.0, 1.0});
+    enc->setScissorRect(MTL::ScissorRect{0, 0, width_, height_});
+    enc->setRenderPipelineState(renderPipeline_);
+    enc->setDepthStencilState(depthStencilState_);
+
+    // Fragment stage in this pipeline has no storage-buffer bindings
+    // (splat_expander.py's fragment reflection is empty) -- only the
+    // vertex stage pulls from buffers.
+    trySetVertexBuffer(enc, vertShader_, projCenterBuffer_, 0);
+    trySetVertexBuffer(enc, vertShader_, projConicBuffer_, 1);
+    trySetVertexBuffer(enc, vertShader_, projColorBuffer_, 2);
+    trySetVertexBuffer(enc, vertShader_, sortedIndicesBuffer_, 3);
+    uint32_t vNext = 4;
+    if (hasMotionVectors_) trySetVertexBuffer(enc, vertShader_, projMvBuffer_, vNext++);
+    if (hasExpectedDepth_) trySetVertexBuffer(enc, vertShader_, projDepthBuffer_, vNext++);
+
+    struct RenderPush { float screenW, screenH; uint32_t visibleCount; float alphaMin; } renderPush = {};
+    renderPush.screenW = static_cast<float>(width_);
+    renderPush.screenH = static_cast<float>(height_);
+    renderPush.visibleCount = numSplats_;
+    renderPush.alphaMin = 1.0f / 255.0f;
+    if (vertShader_.pushConstantBufferIndex != UINT32_MAX)
+        enc->setVertexBytes(&renderPush, sizeof(renderPush), vertShader_.pushConstantBufferIndex);
+    if (fragShader_.pushConstantBufferIndex != UINT32_MAX)
+        enc->setFragmentBytes(&renderPush, sizeof(renderPush), fragShader_.pushConstantBufferIndex);
+
+    enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(6), NS::UInteger(numSplats_));
+    enc->endEncoding();
+    rpDesc->release();
+    cmdBuf->commit();
+    cmdBuf->waitUntilCompleted();
+    lastRenderMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
+
+    std::cout << "[metal-luxc] render(): preprocess=" << lastPreprocessMs_ << "ms sort="
+              << lastSortMs_ << "ms render=" << lastRenderMs_ << "ms" << std::endl;
+}
+
+void MetalSplatLuxcRenderer::renderToDrawable(MetalContext&, CA::MetalDrawable*) {
+    throw std::runtime_error("MetalSplatLuxcRenderer::renderToDrawable not implemented (headless-only backend)");
+}
+
+void MetalSplatLuxcRenderer::cleanup() {
+    // Intentionally leaks MTL::Buffer*/Texture*/PipelineState* -- matches
+    // MetalSplatRenderer::cleanup()'s own scope (process-lifetime headless
+    // tool; Metal objects are released when the process exits).
+}
