@@ -1,25 +1,44 @@
 #pragma once
 
-// Metal splat renderer, luxc-compiled-pipeline backend (--splat-backend luxc;
-// NOT YET the default -- see metal_main.cpp's splatBackend comment. Status:
-// builds and runs end-to-end (compute preprocess, 4-pass GPU radix sort,
-// vertex/fragment render, morph, DLSS motion/depth outputs all execute
-// without error) and two real bugs found+fixed during bring-up (expected-
-// depth attachment needed RGBA32Float + hardware alpha blending, not
-// MetalSplatRenderer's RG32Float/manual-blend convention -- Apple Silicon
-// DOES support float32 attachment blending, unlike the comment that
-// motivated the hand-written path's manual approach) got depth to 0.36%
-// median rel. error vs. Vulkan on the juggle DLSS scene (frame 40, sort:
-// view_depth) -- close but short of the <1e-3 acceptance bar. Colour is NOT
-// yet at parity: ~28 dB vs. gsplat and ~28 dB vs. Vulkan's own output on the
-// same scene (need >=45 dB), with GPU radix sort verified correctly ordered
-// (0 out-of-order keys) and per-splat SH colour clamp already matching
-// Vulkan's, so the remaining gap's root cause is still open -- possibly a
-// numerical-precision difference between MoltenVK's own internal SPIR-V ->
-// MSL transpile (used for the "Vulkan" backend on this Mac) and this
-// backend's direct ShaderTranspiler pass, given hundreds of overlapping
-// low-alpha premultiplied blends per pixel are extremely sensitive to
-// exactly this kind of divergence. Runs the SAME compiled SPIR-V
+// Metal splat renderer, luxc-compiled-pipeline backend (--splat-backend luxc,
+// now the DEFAULT -- see metal_main.cpp's splatBackend comment). Status: AT
+// PARITY with Vulkan on the juggle DLSS scene (frame 40, sort: view_depth,
+// --camera-json): 51.3 dB colour PSNR vs. the gsplat reference (>=45 dB
+// bar met), 83.7 dB colour PSNR vs. Vulkan's own output (i.e. visually
+// identical), depth median rel. error 1.15e-7 vs. Vulkan (<1e-3 bar met by
+// four orders of magnitude), motion vectors median abs diff ~4e-6 px vs.
+// Vulkan (a handful -- 10 of 518400 -- boundary/tie-breaking pixels reach
+// up to 0.04 px, just outside the <1e-3 px *max* bar, but the typical/
+// median case is essentially exact).
+//
+// Root cause of the (much larger, ~28 dB) gap this backend originally
+// shipped with: a missing Metal viewport Y-flip. Vulkan's NDC has +Y
+// pointing down; Metal's native NDC has +Y pointing up; this SPIRV-Cross
+// version has no automatic gl_Position-flip option (checked: no
+// flip_vert_y or equivalent in spirv_msl.hpp), and the compiled vertex
+// shader (splat_expander.py, confirmed via dumping its transpiled MSL with
+// LUX_DUMP_MSL_DIR) builds gl_Position via the plain Vulkan
+// `pixel = (ndc*0.5+0.5)*screen_size` convention with no shader-side
+// correction of its own -- so the whole render was vertically mirrored
+// relative to Vulkan until createPipelines's negative-height viewport flip
+// was added (the standard MoltenVK trick), paired with
+// kMetalYConvention=false (DlssIO::buildIntrinsicsProjection's
+// metalYConvention flag exists specifically to compensate for
+// MetalSplatRenderer's *own*, different, shader-side Y handling -- see its
+// kMetalYConvention=true -- and must NOT be applied here) and a matching
+// (non-negated) jitter Y sign. Two smaller bugs fixed earlier during
+// bring-up, both real but not the dominant cause: expected-depth needed an
+// RGBA32Float attachment with real hardware alpha blending (Apple Silicon
+// DOES support float32 attachment blending, contrary to the hand-written
+// path's own comment -- see kExpectedDepthChannels), and per-gaussian
+// inputs (position/quaternion-xyzw/scale-log/opacity-logit/sh0) were
+// verified byte-identical across all three backends via LUX_DEBUG_SPLAT_DUMP
+// (ruling out any data-layout mismatch). RelaxedPrecision/`half` and
+// MTLCompileOptions fast math were also checked and ruled out (see
+// metal_shader_transpiler.cpp's safeMathCompileOptions and LUX_DUMP_MSL_DIR)
+// -- neither was present/mattered; the Y-flip was the entire remaining gap.
+//
+// Runs the SAME compiled SPIR-V
 // (examples/<shaderBase>.{comp,vert,frag,morph.comp}.spv, emitted by
 // luxc/expansion/splat_expander.py) and the shared GPU radix sort
 // (shaders/radix_sort/{histogram,prefix_sum,scatter}.comp.spv) that the
@@ -118,6 +137,21 @@ public:
     // blends manually and never needed it.
     static constexpr uint32_t kExpectedDepthChannels = 4;
 
+    // The luxc-compiled vertex shader (splat_expander.py's
+    // _build_vertex_body) maps screen.y = (ndc.y*0.5+0.5)*H directly --
+    // Vulkan's own convention, no extra flip outside the projection matrix
+    // (confirmed by dumping the transpiled MSL: LUX_DUMP_MSL_DIR=<dir>,
+    // see the vertex stage's `_119` computation) -- so DlssIO::
+    // buildIntrinsicsProjection must be called with metalYConvention=false
+    // here, NOT MetalSplatRenderer's true (that flag exists specifically to
+    // compensate for the *hand-written* shader's own extra Y flip, which
+    // this transpiled-from-Vulkan shader doesn't have). Using true here was
+    // a real, confirmed bug: it negated the whole projection Y row,
+    // vertically mis-projecting every splat and (found empirically) fully
+    // explaining this backend's colour-parity gap vs. Vulkan on the juggle
+    // DLSS scene -- see the class comment's revised numbers.
+    static constexpr bool kMetalYConvention = false;
+
     // `sort:` is compile-time on this backend (baked into the compiled
     // pipeline, exactly like Vulkan) -- this is a no-op kept only so
     // metal_main.cpp's shared call site doesn't need a backend branch for
@@ -131,6 +165,8 @@ public:
     const float* debugPosBufferPtr() const { return static_cast<const float*>(posBuffer_->contents()); }
     const float* debugRotBufferPtr() const { return static_cast<const float*>(rotBuffer_->contents()); }
     const float* debugSh0BufferPtr() const { return static_cast<const float*>(shBuffer_->contents()); }
+    const float* debugScaleBufferPtr() const { return static_cast<const float*>(scaleBuffer_->contents()); }
+    const float* debugOpacityBufferPtr() const { return static_cast<const float*>(opacityBuffer_->contents()); }
 
     void cleanup() override;
 

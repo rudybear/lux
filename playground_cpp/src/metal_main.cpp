@@ -32,6 +32,8 @@
 #include <stdexcept>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 
 namespace fs = std::filesystem;
 
@@ -171,18 +173,14 @@ struct CLIOptions {
     // MSL with no compiled .lux splat config to read `sort:` from).
     bool sortByViewDepth = false;  // false = camera_distance (default) -- --splat-backend hand only
 
-    // --splat-backend hand|luxc. "hand" (default -- see
-    // metal_splat_luxc_renderer.h's class comment for current status) is
-    // MetalSplatRenderer's own embedded-MSL implementation (no compiled
-    // .lux source of truth); "luxc" runs the actual compiled
-    // examples/<pipeline>.{comp,vert,frag,morph.comp}.spv (+ the shared GPU
-    // radix sort) transpiled to MSL. luxc is NOT YET the default: it does
-    // not yet meet the ≥45 dB colour-PSNR / <1e-3 depth-parity bar on the
-    // juggle DLSS scene (measured ~28 dB colour, 0.36% depth vs. Vulkan --
-    // see the class comment), and defaulting to it broke
-    // tests/test_dlss_outputs.py::test_mv_matches_cpu_reprojection_of_depth
-    // (Metal). Flip this default once that gap is closed.
-    std::string splatBackend = "hand";
+    // --splat-backend hand|luxc. "luxc" (default, since it now meets the
+    // Metal-vs-Vulkan parity bar -- see metal_splat_luxc_renderer.h's class
+    // comment) runs the actual compiled examples/<pipeline>.{comp,vert,
+    // frag,morph.comp}.spv (+ the shared GPU radix sort) transpiled to MSL,
+    // i.e. the exact same shader Vulkan runs. "hand" is MetalSplatRenderer's
+    // own embedded-MSL implementation (no compiled .lux source of truth,
+    // kept selectable for comparison/fallback).
+    std::string splatBackend = "luxc";
 
     // Reconstruction pass (docs/lux-reconstruct-spec.md): see main.cpp's
     // identical Vulkan-side flags / runReconstructDump().
@@ -531,6 +529,35 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
         std::cerr << "[warn] --time/--frame given but scene has no morph-target animation" << std::endl;
     }
 
+    // Debug: same LUX_DEBUG_SPLAT_DUMP convention as the Vulkan
+    // SplatRenderer::render() -- dumps the first N post-morph splat
+    // attributes exactly as they're about to be handed to the preprocess
+    // stage, for diffing across all three backends. Metal's setMorphTime()
+    // is already synchronous (writes straight into shared-storage buffers,
+    // no deferred GPU dispatch to wait on), so no extra sync is needed here
+    // (unlike Vulkan's, which forces an early command-buffer submit).
+    if (const char* dumpPath = std::getenv("LUX_DEBUG_SPLAT_DUMP")) {
+        uint32_t n = std::min<uint32_t>(16, scene.getSplatData().num_splats);
+        std::ofstream out(dumpPath);
+        out << "# backend=" << opts.splatBackend << " n=" << n << " time=" << splatR->currentMorphTimeSeconds() << "\n";
+        const float* pos = splatR->debugPosBufferPtr();
+        for (uint32_t i = 0; i < n; ++i)
+            out << "pos " << i << " " << pos[i*4] << " " << pos[i*4+1] << " " << pos[i*4+2] << " " << pos[i*4+3] << "\n";
+        const float* rot = splatR->debugRotBufferPtr();
+        for (uint32_t i = 0; i < n; ++i)
+            out << "rot_xyzw " << i << " " << rot[i*4] << " " << rot[i*4+1] << " " << rot[i*4+2] << " " << rot[i*4+3] << "\n";
+        const float* scl = splatR->debugScaleBufferPtr();
+        for (uint32_t i = 0; i < n; ++i)
+            out << "scale_log " << i << " " << scl[i*4] << " " << scl[i*4+1] << " " << scl[i*4+2] << "\n";
+        const float* op = splatR->debugOpacityBufferPtr();
+        for (uint32_t i = 0; i < n; ++i)
+            out << "opacity_logit " << i << " " << op[i] << "\n";
+        const float* sh0 = splatR->debugSh0BufferPtr();
+        for (uint32_t i = 0; i < n; ++i)
+            out << "sh0 " << i << " " << sh0[i*4] << " " << sh0[i*4+1] << " " << sh0[i*4+2] << "\n";
+        std::cout << "[debug-splat] dumped " << n << " splats to " << dumpPath << std::endl;
+    }
+
     // --- Camera bridge (docs/lux-4d-spec.md section 4) ---
     if (!opts.cameraJsonPath.empty()) {
         DlssIO::CameraJsonData camJson;
@@ -546,7 +573,7 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
         glm::mat4 proj = DlssIO::buildIntrinsicsProjection(
             fx, fy, cx, cy,
             static_cast<float>(camJson.width), static_cast<float>(camJson.height),
-            0.01f, 1000.0f, /*metalYConvention=*/true);
+            0.01f, 1000.0f, /*metalYConvention=*/Renderer::kMetalYConvention);
         splatR->updateCameraExplicit(eye, viewGl, proj, fx, fy);
         std::cout << "[metal] --camera-json applied: fx=" << fx << " fy=" << fy
                   << " cx=" << cx << " cy=" << cy
@@ -563,7 +590,7 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
             glm::mat4 prevProj = DlssIO::buildIntrinsicsProjection(
                 prevJson.K[0], prevJson.K[4], prevJson.K[2], prevJson.K[5],
                 static_cast<float>(prevJson.width), static_cast<float>(prevJson.height),
-                0.01f, 1000.0f, /*metalYConvention=*/true);
+                0.01f, 1000.0f, /*metalYConvention=*/Renderer::kMetalYConvention);
             splatR->setPreviousCameraExplicit(prevViewGl, prevProj);
             std::cout << "[metal] --camera-json-prev applied" << std::endl;
         }

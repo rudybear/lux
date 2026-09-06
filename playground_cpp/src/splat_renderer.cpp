@@ -8,6 +8,7 @@
 #include <iostream>
 #include <fstream>
 #include <filesystem>
+#include <cstdlib>
 
 namespace fs = std::filesystem;
 
@@ -1643,6 +1644,58 @@ void SplatRenderer::render(VulkanContext& ctx) {
 
     // --- Dynamic splats: morph-apply compute pass (runs before preprocess) ---
     dispatchMorph(cmd, currentMorphTime_);
+
+    // Debug: dump the first N post-morph splat attributes (position,
+    // rotation xyzw, scale log-space, opacity logit-space, sh0) as fed to
+    // the preprocess compute stage -- for diffing against the Metal
+    // backends' equivalent dump (LUX_DEBUG_SPLAT_DUMP env var on all three
+    // backends). Forces an early command-buffer submit+wait here (like the
+    // existing hasMotionVectors_ one below, just earlier) purely for this
+    // diagnostic readback -- posBuffer_/rotBuffer_/shBuffers_[0] are
+    // VMA_MEMORY_USAGE_CPU_TO_GPU (host-visible), and dispatchMorph()
+    // writes them in place.
+    if (const char* dumpPath = std::getenv("LUX_DEBUG_SPLAT_DUMP")) {
+        ctx.endSingleTimeCommands(cmd);
+        cmd = ctx.beginSingleTimeCommands();
+
+        uint32_t n = std::min<uint32_t>(16, numSplats_);
+        std::ofstream out(dumpPath);
+        out << "# backend=vulkan n=" << n << " time=" << currentMorphTime_ << "\n";
+        void* mapped = nullptr;
+
+        vmaMapMemory(ctx.allocator, posAlloc_, &mapped);
+        auto* pos = static_cast<float*>(mapped);
+        for (uint32_t i = 0; i < n; ++i)
+            out << "pos " << i << " " << pos[i*4] << " " << pos[i*4+1] << " " << pos[i*4+2] << " " << pos[i*4+3] << "\n";
+        vmaUnmapMemory(ctx.allocator, posAlloc_);
+
+        vmaMapMemory(ctx.allocator, rotAlloc_, &mapped);
+        auto* rot = static_cast<float*>(mapped);
+        for (uint32_t i = 0; i < n; ++i)
+            out << "rot_xyzw " << i << " " << rot[i*4] << " " << rot[i*4+1] << " " << rot[i*4+2] << " " << rot[i*4+3] << "\n";
+        vmaUnmapMemory(ctx.allocator, rotAlloc_);
+
+        vmaMapMemory(ctx.allocator, scaleAlloc_, &mapped);
+        auto* scl = static_cast<float*>(mapped);
+        for (uint32_t i = 0; i < n; ++i)
+            out << "scale_log " << i << " " << scl[i*4] << " " << scl[i*4+1] << " " << scl[i*4+2] << "\n";
+        vmaUnmapMemory(ctx.allocator, scaleAlloc_);
+
+        vmaMapMemory(ctx.allocator, opacityAlloc_, &mapped);
+        auto* op = static_cast<float*>(mapped);
+        for (uint32_t i = 0; i < n; ++i)
+            out << "opacity_logit " << i << " " << op[i] << "\n";
+        vmaUnmapMemory(ctx.allocator, opacityAlloc_);
+
+        if (!shAllocs_.empty()) {
+            vmaMapMemory(ctx.allocator, shAllocs_[0], &mapped);
+            auto* sh0 = static_cast<float*>(mapped);
+            for (uint32_t i = 0; i < n; ++i)
+                out << "sh0 " << i << " " << sh0[i*4] << " " << sh0[i*4+1] << " " << sh0[i*4+2] << "\n";
+            vmaUnmapMemory(ctx.allocator, shAllocs_[0]);
+        }
+        std::cout << "[debug-splat] dumped " << n << " splats to " << dumpPath << std::endl;
+    }
 
     // --- Motion vectors: seed splat_prev_pos on the very first frame ---
     // (dynamic splats only -- static splats' prevPosBuffer_ already aliases

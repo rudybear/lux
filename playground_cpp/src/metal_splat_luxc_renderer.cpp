@@ -53,18 +53,18 @@ void trySetVertexBuffer(MTL::RenderCommandEncoder* enc, const TranspiledShader& 
     if (idx != UINT32_MAX) enc->setVertexBuffer(buf, 0, idx);
 }
 
-// Same jitter trick as MetalSplatRenderer's applyMetalSplatJitter: Metal's
-// splat_vertex applies an extra Y flip *outside* the projection matrix
-// (`screen.y = (1-(ndc.y*0.5+0.5))*H`), matching the luxc-compiled vertex
-// shader's own screen-space mapping (see splat_expander.py's vertex body,
-// which -- like Vulkan's -- treats +Y as *down* in pixel space after the
-// SPIR-V->MSL transpile's standard Vulkan-clip-space handling), so the
-// jitter's Y sign here also follows the Metal (not Vulkan) convention.
+// Same jitter math as the Vulkan splat renderer's applySplatJitter (NOT
+// MetalSplatRenderer's negated Y version): this backend runs the actual
+// Vulkan-authored, unmodified compiled shader, and (since the createPipelines
+// negative-height viewport flip) now reproduces Vulkan's rendering
+// convention exactly end to end -- confirmed empirically (83.7 dB colour
+// match, 1.15e-7 depth error, vs. Vulkan on the juggle DLSS scene) -- so
+// the jitter's Y sign must follow Vulkan's convention too, not Metal's.
 glm::mat4 applyLuxcSplatJitter(glm::mat4 proj, float jitterXPixels, float jitterYPixels,
                                 uint32_t width, uint32_t height) {
     if (jitterXPixels == 0.0f && jitterYPixels == 0.0f) return proj;
     float dx = 2.0f * jitterXPixels / static_cast<float>(width);
-    float dy = -2.0f * jitterYPixels / static_cast<float>(height);
+    float dy = 2.0f * jitterYPixels / static_cast<float>(height);
     for (int c = 0; c < 4; ++c) {
         proj[c][0] += dx * proj[c][3];
         proj[c][1] += dy * proj[c][3];
@@ -787,7 +787,18 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
 
     auto* cmdBuf = ctx.beginCommandBuffer();
     auto* enc = cmdBuf->renderCommandEncoder(rpDesc);
-    enc->setViewport(MTL::Viewport{0.0, 0.0, static_cast<double>(width_), static_cast<double>(height_), 0.0, 1.0});
+    // Negative-height viewport flip (the standard MoltenVK/Vulkan-on-Metal
+    // trick): Vulkan's NDC has +Y pointing down; Metal's native NDC has +Y
+    // pointing up. This compiled vertex shader (splat_expander.py) computes
+    // gl_Position assuming a Vulkan-convention rasterizer -- confirmed via
+    // LUX_DUMP_MSL_DIR: it builds screen pixel coordinates via the plain
+    // Vulkan `pixel = (ndc*0.5+0.5)*screen_size` mapping with no shader-side
+    // correction -- and this SPIRV-Cross version's MSL backend has no
+    // automatic gl_Position Y-flip option (checked: no flip_vert_y or
+    // similar in spirv_msl.hpp), so without this the whole render is
+    // vertically mirrored relative to Vulkan's output.
+    enc->setViewport(MTL::Viewport{0.0, static_cast<double>(height_),
+                                    static_cast<double>(width_), -static_cast<double>(height_), 0.0, 1.0});
     enc->setScissorRect(MTL::ScissorRect{0, 0, width_, height_});
     enc->setRenderPipelineState(renderPipeline_);
     enc->setDepthStencilState(depthStencilState_);

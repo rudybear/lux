@@ -99,6 +99,14 @@ public:
     // kExpectedDepthChannels for why the luxc backend needs 4 instead.
     static constexpr uint32_t kExpectedDepthChannels = 2;
 
+    // This hand-written shader maps screen.y = (1-(ndc.y*0.5+0.5))*H (an
+    // EXTRA flip outside the projection matrix -- see splat_project's
+    // `center` above) -- DlssIO::buildIntrinsicsProjection's
+    // metalYConvention=true pre-negates the projection's Y row specifically
+    // to compensate for that extra flip. See MetalSplatLuxcRenderer's
+    // kMetalYConvention=false for why the luxc backend must NOT do this.
+    static constexpr bool kMetalYConvention = true;
+
     // --- Sort convention (SPECIFICATION.md 12.8's `sort` splat option) ---
     // Metal's splat pipeline is hand-written (no compiled .lux splat config
     // to read a `sort:` member from -- see the class-level comment), so
@@ -120,6 +128,8 @@ public:
     const float* debugPosBufferPtr() const { return static_cast<const float*>(posBuffer_->contents()); }
     const float* debugRotBufferPtr() const { return static_cast<const float*>(rotBuffer_->contents()); }
     const float* debugSh0BufferPtr() const { return static_cast<const float*>(shBuffer_->contents()); }
+    const float* debugScaleBufferPtr() const { return static_cast<const float*>(scaleBuffer_->contents()); }
+    const float* debugOpacityBufferPtr() const { return static_cast<const float*>(opacityBuffer_->contents()); }
 
     void cleanup() override;
 
