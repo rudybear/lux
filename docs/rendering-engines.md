@@ -197,3 +197,7 @@ python -m playground.preprocess_ibl my_environment.hdr
 ```
 
 Output: specular cubemap (6 faces x 5 mips), irradiance cubemap, and BRDF integration LUT.
+
+## iOS live-rendering demo (playground_ios/)
+
+Stage A of the mobile-DLSS live demo: a bare UIKit + CAMetalLayer iOS app (`playground_ios/`, `playground_ios.xcodeproj`) that reuses `playground_cpp/src`'s Metal classes as-is (`MetalContext`, `MetalSceneManager`, `MetalSplatRenderer` -- the hand-written MSL splat path, `--splat-backend hand`; switch to `MetalSplatLuxcRenderer` once that path is validated) by reference (no changes to those files) to live-render the pruned PanopticSports juggle scene (`demo/ios_assets/juggle_p0.8_stride{2,4}.glb`, `mobiledlss/demo/`) on-device with a synthetic orbit camera matching `mobiledlss/datagen/camera.py::orbit_path` exactly (verified against the macOS `lux-playground-metal --camera-json` CLI path before porting). Runs at 960x540 on an iPad Pro M1 at ~17fps unoptimized (CPU gaussian sort + full 119.8k-splat draw every frame, no proxy-res/jitter/network/reconstruct pass yet -- those are Stage B/C, see the task's per-stage plan). One gotcha worth recording: `MetalSplatRenderer`'s render pipeline hardcodes color attachment 0 to `MTL::PixelFormatRGBA16Float` (to match its own offscreen `colorTarget_`), so a `CAMetalLayer` driving `renderToDrawable()` directly must set `pixelFormat = MTLPixelFormatRGBA16Float` too -- the CAMetalLayer default (`BGRA8Unorm`) silently reinterprets the half-float bytes as 8-bit UNORM instead of failing loudly.

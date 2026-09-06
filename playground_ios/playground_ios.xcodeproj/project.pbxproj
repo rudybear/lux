@@ -1,0 +1,359 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		08BA9FA7E54B4A71824375EF /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = E0802142ACB140038F13B697 /* main.mm */; };
+		0978CD32677F430C97AF6855 /* AppDelegate.mm in Sources */ = {isa = PBXBuildFile; fileRef = 58E8E8E1EF324B57A789E95E /* AppDelegate.mm */; };
+		610929FFD4AC4CE2867ABFB6 /* SplatView.mm in Sources */ = {isa = PBXBuildFile; fileRef = 65F5609D4C194BD6A4535C10 /* SplatView.mm */; };
+		9CAF47923B284476B9E30DCC /* ios_metal_bridge_stub.mm in Sources */ = {isa = PBXBuildFile; fileRef = D5F97D10263C4B5785D36D1C /* ios_metal_bridge_stub.mm */; };
+		DF63C967A26D4946A51FB775 /* metal_context.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 07E03D36384745818C75A799 /* metal_context.cpp */; settings = {COMPILER_FLAGS = "-DNS_PRIVATE_IMPLEMENTATION -DCA_PRIVATE_IMPLEMENTATION -DMTL_PRIVATE_IMPLEMENTATION"; }; };
+		F1E497534FF9459591D4052B /* metal_scene.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 306C4BC2551A458D93DCB8C1 /* metal_scene.cpp */; };
+		D12A5C5F6DEC41619E0B590D /* metal_scene_manager.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D8C67E462510421F87CDC06D /* metal_scene_manager.cpp */; };
+		C340CDD9B8684665A236D7A1 /* gltf_loader.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 02D0DF59929D4E30824907A5 /* gltf_loader.cpp */; };
+		8A76AEF63D9844A1948E6C03 /* camera.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 2931BA2D4E6D4815BABEFB04 /* camera.cpp */; };
+		3137A4468628433AB00F9F4C /* metal_splat_renderer.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 274DC28B2B584C0BA27DF22A /* metal_splat_renderer.cpp */; };
+		C6D4BAF57470485A95F7A8BC /* dlss_io.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A9958BFDFFEB4B25A7DB62B2 /* dlss_io.cpp */; };
+		EB5538F0964A4E2C9C752637 /* scene_geometry.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F632B36F2A5D418AB2A85BE3 /* scene_geometry.cpp */; };
+		69A6527205E64DEFBDD1E117 /* metal_screenshot.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 8E1EEDEFAC0A4F4EB5397544 /* metal_screenshot.cpp */; };
+		B4647AC8C0284ED6A53B72D6 /* juggle_p0.8_stride4.glb in Resources */ = {isa = PBXBuildFile; fileRef = 8313202CBC794207A914ECE5 /* juggle_p0.8_stride4.glb */; };
+		76E965D2C69E4DC3A75EBE6E /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4CC367C2359F4C2DAAF258FF /* Metal.framework */; };
+		E1282CA934CA42AE9812EF0D /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 49DF897390D34A87951D074F /* QuartzCore.framework */; };
+		A1980183A72F4901B825D6FC /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0B073FD805C04E97BFCBA7B3 /* Foundation.framework */; };
+		3F45DFE114D24552B9F23EDF /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FDFB094FA3814525AD0BE3FA /* UIKit.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		E0802142ACB140038F13B697 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		ACC0E2C15F9F49E2B0ABD271 /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
+		58E8E8E1EF324B57A789E95E /* AppDelegate.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = AppDelegate.mm; sourceTree = "<group>"; };
+		0676F38E92224273BC027CDF /* SplatView.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SplatView.h; sourceTree = "<group>"; };
+		65F5609D4C194BD6A4535C10 /* SplatView.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = SplatView.mm; sourceTree = "<group>"; };
+		D5F97D10263C4B5785D36D1C /* ios_metal_bridge_stub.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = ios_metal_bridge_stub.mm; sourceTree = "<group>"; };
+		0BFEFD6DF61D4AB2BD89C528 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		07E03D36384745818C75A799 /* metal_context.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = metal_context.cpp; path = ../playground_cpp/src/metal_context.cpp; sourceTree = "<group>"; };
+		306C4BC2551A458D93DCB8C1 /* metal_scene.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = metal_scene.cpp; path = ../playground_cpp/src/metal_scene.cpp; sourceTree = "<group>"; };
+		D8C67E462510421F87CDC06D /* metal_scene_manager.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = metal_scene_manager.cpp; path = ../playground_cpp/src/metal_scene_manager.cpp; sourceTree = "<group>"; };
+		02D0DF59929D4E30824907A5 /* gltf_loader.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = gltf_loader.cpp; path = ../playground_cpp/src/gltf_loader.cpp; sourceTree = "<group>"; };
+		2931BA2D4E6D4815BABEFB04 /* camera.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = camera.cpp; path = ../playground_cpp/src/camera.cpp; sourceTree = "<group>"; };
+		274DC28B2B584C0BA27DF22A /* metal_splat_renderer.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = metal_splat_renderer.cpp; path = ../playground_cpp/src/metal_splat_renderer.cpp; sourceTree = "<group>"; };
+		A9958BFDFFEB4B25A7DB62B2 /* dlss_io.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = dlss_io.cpp; path = ../playground_cpp/src/dlss_io.cpp; sourceTree = "<group>"; };
+		F632B36F2A5D418AB2A85BE3 /* scene_geometry.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = scene_geometry.cpp; path = ../playground_cpp/src/scene_geometry.cpp; sourceTree = "<group>"; };
+		8E1EEDEFAC0A4F4EB5397544 /* metal_screenshot.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = metal_screenshot.cpp; path = ../playground_cpp/src/metal_screenshot.cpp; sourceTree = "<group>"; };
+		8313202CBC794207A914ECE5 /* juggle_p0.8_stride4.glb */ = {isa = PBXFileReference; lastKnownFileType = file; name = juggle_p0.8_stride4.glb; path = ../../mobiledlss/demo/ios_assets/juggle_p0.8_stride4.glb; sourceTree = "<group>"; };
+		4CC367C2359F4C2DAAF258FF /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		49DF897390D34A87951D074F /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		0B073FD805C04E97BFCBA7B3 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+		FDFB094FA3814525AD0BE3FA /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		CC1694FB466C4D56A8088036 /* playground_ios.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = playground_ios.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		01BA59D09C59403286BC3B93 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				76E965D2C69E4DC3A75EBE6E /* Metal.framework in Frameworks */,
+				E1282CA934CA42AE9812EF0D /* QuartzCore.framework in Frameworks */,
+				A1980183A72F4901B825D6FC /* Foundation.framework in Frameworks */,
+				3F45DFE114D24552B9F23EDF /* UIKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		36A91E1A2BF6476988AEBD53 = {
+			isa = PBXGroup;
+			children = (
+				A0C34482EBCF4775BE223A91 /* Source */,
+				5A30D7C0BDC449A38F410AEA /* playground_cpp (external, read-only reuse) */,
+				8313202CBC794207A914ECE5 /* juggle_p0.8_stride4.glb */,
+				AC786C0384784C4FBBB812E6 /* Frameworks */,
+				795BD2B26D204ECFB37BEC43 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A0C34482EBCF4775BE223A91 /* Source */ = {
+			isa = PBXGroup;
+			children = (
+				E0802142ACB140038F13B697 /* main.mm */,
+				ACC0E2C15F9F49E2B0ABD271 /* AppDelegate.h */,
+				58E8E8E1EF324B57A789E95E /* AppDelegate.mm */,
+				0676F38E92224273BC027CDF /* SplatView.h */,
+				65F5609D4C194BD6A4535C10 /* SplatView.mm */,
+				D5F97D10263C4B5785D36D1C /* ios_metal_bridge_stub.mm */,
+				0BFEFD6DF61D4AB2BD89C528 /* Info.plist */,
+			);
+			path = Source;
+			sourceTree = "<group>";
+		};
+		5A30D7C0BDC449A38F410AEA /* playground_cpp (external, read-only reuse) */ = {
+			isa = PBXGroup;
+			children = (
+				07E03D36384745818C75A799 /* metal_context.cpp */,
+				306C4BC2551A458D93DCB8C1 /* metal_scene.cpp */,
+				D8C67E462510421F87CDC06D /* metal_scene_manager.cpp */,
+				02D0DF59929D4E30824907A5 /* gltf_loader.cpp */,
+				2931BA2D4E6D4815BABEFB04 /* camera.cpp */,
+				274DC28B2B584C0BA27DF22A /* metal_splat_renderer.cpp */,
+				A9958BFDFFEB4B25A7DB62B2 /* dlss_io.cpp */,
+				F632B36F2A5D418AB2A85BE3 /* scene_geometry.cpp */,
+				8E1EEDEFAC0A4F4EB5397544 /* metal_screenshot.cpp */,
+			);
+			name = "playground_cpp (external, read-only reuse)";
+			sourceTree = "<group>";
+		};
+		AC786C0384784C4FBBB812E6 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				4CC367C2359F4C2DAAF258FF /* Metal.framework */,
+				49DF897390D34A87951D074F /* QuartzCore.framework */,
+				0B073FD805C04E97BFCBA7B3 /* Foundation.framework */,
+				FDFB094FA3814525AD0BE3FA /* UIKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		795BD2B26D204ECFB37BEC43 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				CC1694FB466C4D56A8088036 /* playground_ios.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		7965CEDF6C294CFEA9DE3FA2 /* playground_ios */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 827F4463AB924192BFBCB78C /* Build configuration list for PBXNativeTarget "playground_ios" */;
+			buildPhases = (
+				884E8D667A8241EBB951F3C3 /* Sources */,
+				01BA59D09C59403286BC3B93 /* Frameworks */,
+				C1C15B4786DA4CBFAA0A6EBE /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = playground_ios;
+			productName = playground_ios;
+			productReference = CC1694FB466C4D56A8088036 /* playground_ios.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		1A2EF7D763F14622A846ACD1 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					7965CEDF6C294CFEA9DE3FA2 = {
+						CreatedOnToolsVersion = 16.0;
+						DevelopmentTeam = 5FT3566K9X;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 63AB0F8A5D184B62A7C96C10 /* Build configuration list for PBXProject "playground_ios" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 36A91E1A2BF6476988AEBD53;
+			productRefGroup = 795BD2B26D204ECFB37BEC43 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				7965CEDF6C294CFEA9DE3FA2 /* playground_ios */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		C1C15B4786DA4CBFAA0A6EBE /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B4647AC8C0284ED6A53B72D6 /* juggle_p0.8_stride4.glb in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		884E8D667A8241EBB951F3C3 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				08BA9FA7E54B4A71824375EF /* main.mm in Sources */,
+				0978CD32677F430C97AF6855 /* AppDelegate.mm in Sources */,
+				610929FFD4AC4CE2867ABFB6 /* SplatView.mm in Sources */,
+				9CAF47923B284476B9E30DCC /* ios_metal_bridge_stub.mm in Sources */,
+				DF63C967A26D4946A51FB775 /* metal_context.cpp in Sources */,
+				F1E497534FF9459591D4052B /* metal_scene.cpp in Sources */,
+				D12A5C5F6DEC41619E0B590D /* metal_scene_manager.cpp in Sources */,
+				C340CDD9B8684665A236D7A1 /* gltf_loader.cpp in Sources */,
+				8A76AEF63D9844A1948E6C03 /* camera.cpp in Sources */,
+				3137A4468628433AB00F9F4C /* metal_splat_renderer.cpp in Sources */,
+				C6D4BAF57470485A95F7A8BC /* dlss_io.cpp in Sources */,
+				EB5538F0964A4E2C9C752637 /* scene_geometry.cpp in Sources */,
+				69A6527205E64DEFBDD1E117 /* metal_screenshot.cpp in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		CCADD215F5E444F3852E86FC /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"GLM_FORCE_DEPTH_ZERO_TO_ONE=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../playground_cpp/src",
+					"$(SRCROOT)/../playground_cpp/deps",
+					"$(SRCROOT)/../playground_cpp/deps/metal-cpp",
+					"$(SRCROOT)/../playground_cpp/build-metal/_deps/glm-src",
+				);
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+			};
+			name = Debug;
+		};
+		26CAB6FDD47A4D0285E8EBEA /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"GLM_FORCE_DEPTH_ZERO_TO_ONE=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../playground_cpp/src",
+					"$(SRCROOT)/../playground_cpp/deps",
+					"$(SRCROOT)/../playground_cpp/deps/metal-cpp",
+					"$(SRCROOT)/../playground_cpp/build-metal/_deps/glm-src",
+				);
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		9A8614C8859E4AA091B3C117 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 5FT3566K9X;
+				ENABLE_PREVIEWS = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Source/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.rudybear.lux4dgs.playgroundios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		38C0A5F3608F46879D871A78 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 5FT3566K9X;
+				ENABLE_PREVIEWS = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Source/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.rudybear.lux4dgs.playgroundios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		63AB0F8A5D184B62A7C96C10 /* Build configuration list for PBXProject "playground_ios" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CCADD215F5E444F3852E86FC /* Debug */,
+				26CAB6FDD47A4D0285E8EBEA /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		827F4463AB924192BFBCB78C /* Build configuration list for PBXNativeTarget "playground_ios" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9A8614C8859E4AA091B3C117 /* Debug */,
+				38C0A5F3608F46879D871A78 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = 1A2EF7D763F14622A846ACD1 /* Project object */;
+}
