@@ -19,7 +19,14 @@ splat DlssGaussianCloud {
     sh_degree: 0,
     kernel: ellipse,
     color_space: linear,
-    sort: camera_distance,
+    // view_depth (not the camera_distance spec default -- SPECIFICATION.md
+    // 12.8): this pipeline's whole purpose is producing DLSS input-contract
+    // outputs (proxy colour/MV/depth) for a downstream network trained
+    // against the 3DGS/gsplat reference convention, so its sort key must
+    // match theirs. Measured on juggle frame 40 (sync bugs fixed): 49.4 dB
+    // colour PSNR + exact depth vs. gsplat with view_depth, vs. only
+    // 30.9 dB / 0.8% depth median rel. error with camera_distance.
+    sort: view_depth,
     alpha_cutoff: 0.004,
     motion: keyframes,
     motion_vectors: true,

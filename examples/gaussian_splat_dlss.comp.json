@@ -222,7 +222,7 @@
     "sh_degree": 0,
     "kernel": "ellipse",
     "color_space": "linear",
-    "sort": "camera_distance",
+    "sort": "view_depth",
     "alpha_cutoff": 0.004,
     "alpha_min": 0.004,
     "dilation": 0.3,
@@ -253,8 +253,8 @@
     ]
   },
   "performance_hints": {
-    "instruction_count": 648,
-    "alu_ops": 174,
+    "instruction_count": 646,
+    "alu_ops": 173,
     "texture_samples": 0,
     "branches": 5,
     "function_calls": 0,
