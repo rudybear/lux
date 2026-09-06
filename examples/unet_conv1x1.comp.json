@@ -95,10 +95,10 @@
     ]
   },
   "performance_hints": {
-    "instruction_count": 164,
-    "alu_ops": 12,
+    "instruction_count": 180,
+    "alu_ops": 13,
     "texture_samples": 0,
-    "branches": 2,
+    "branches": 3,
     "function_calls": 0,
     "vgpr_estimate": "high"
   }

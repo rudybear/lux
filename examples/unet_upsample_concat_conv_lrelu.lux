@@ -4,25 +4,69 @@
 // mobiledlss.train.model._UpBlock). NHWC scalar (fp32) buffers.
 //
 // The concatenated tensor (`cin = cin_a + cin_b` channels) never actually
-// exists as a buffer: each tap's contribution is accumulated in two
-// separate input-channel loops instead of one branchy loop over the
-// concatenated channel range -- weight[oc, kh, kw, 0:cin_a] pairs with
+// exists as a buffer: weight[oc, kh, kw, 0:cin_a] pairs with
 // upsample(input_a), weight[oc, kh, kw, cin_a:cin_a+cin_b] with input_b,
-// out of the SAME weight buffer (export_lux_weights.py writes the weight
-// with its channel-last cin axis already covering the full concatenated
-// range, matching nn.Conv2d(cin_a+cin_b, cout, ...) applied to
-// torch.cat([upsample(a), b], dim=1)).
+// out of the SAME weight buffer (export_lux_weights.py's layout).
+//
+// Threadgroup-tiled (see unet_conv3x3_lrelu.lux's header for the general
+// approach): each 8(w)x4(h) = 32-thread threadgroup owns one output tile.
+// TWO shared tiles are staged once per threadgroup, both shaped like the
+// SAME (4+2)x(8+2) = 6 rows x 10 cols halo (i.e. at OUTPUT resolution,
+// zero-padded identically) so the inner conv loop needs no per-tap bounds
+// check and reads both tiles with the same (ly+kh, lx+kw) index. Row-major
+// storage: linear index = row*10 + col (10 = halo width, the tile's COLUMN
+// count) -- both the load loop's idx-to-(row,col) split and the compute
+// loop's (row,col)-to-idx formula must use the SAME stride (10); an
+// earlier version of this file used 6 (the halo's ROW count) in both
+// places, which is self-consistent only for a SQUARE tile (as
+// unet_conv3x3_lrelu.lux's 10x10 tile happens to be) and silently computed
+// garbage for this kernel's non-square 6x10 tile -- caught by comparing
+// this kernel's real GPU output (via LUX_UNET_DEBUG_SKIP_NPY) against a
+// PyTorch reference for `up3`, not by unit-testing the algorithm in numpy
+// (which had used a correct, matching convention throughout and thus
+// didn't reproduce the bug):
+//   - tile_b: input_b's own pixels, direct load (CINB_MAX=48, up3's cin_b).
+//   - tile_a: input_a's pixels *pre-upsampled* into the same output-res
+//     grid (nearest, matching torch's `F.interpolate(..., mode="nearest")`)
+//     at load time -- each cell independently maps to its own
+//     upsample-source pixel and its own zero-padding validity check, so a
+//     tap that's out of the conv's padded window is zero from BOTH tiles,
+//     not just tile_b (CINA_MAX=64, up3's cin_a). This costs a 2x2-
+//     redundant load of input_a (small: it's already at half resolution)
+//     in exchange for a branch-free inner loop.
+// 10*6 = 60 cells; tile_a=60*64=3840, tile_b=60*48=2880 scalars (26.25KB
+// total) comfortably under Apple's 32KB/threadgroup budget.
 //
 // `out_h`/`out_w` (input_b's / the output's resolution) are pushed
 // directly; input_a is implicitly at half that resolution.
 //
-// Compile: python -m luxc examples/unet_upsample_concat_conv_lrelu.lux --define workgroup_size=256
+// Channel-parallel (Z dimension -- see unet_conv3x3_lrelu.lux's header
+// for why: a spatial-only tile with few threads and a large fixed shared-
+// memory reservation collapses threadgroup occupancy on large-resolution
+// layers, up1 alone measured 47ms/960x544 before this). Z=8:
+// local_invocation_id.z in [0,8) splits `cout` 8 ways across threads
+// sharing the SAME loaded tiles (32*8 = 256 threads/threadgroup); only
+// the z==0 slice does the cooperative load.
+//
+// NOTE (luxc limitation, worked around here): `for`-loop induction
+// variables are registered by NAME across the whole function in luxc's
+// SPIR-V codegen, not per lexical scope. Two `for` loops that share a
+// loop-variable name (e.g. one in an `if` branch, another in its `else`)
+// share one OpVariable, which SPIRV-Cross's MSL backend can mis-decompile
+// into an infinite loop (reproduced: hangs indefinitely on an Apple M4
+// Max) -- see unet_conv3x3_lrelu.lux's header for the full writeup. Every
+// `for` loop below that would otherwise collide with another in this file
+// uses a distinct name (ica0/ica1/ica, icb0/icb1/icb).
+//
+// Compile: python -m luxc examples/unet_upsample_concat_conv_lrelu.lux --define workgroup_size_x=8 --define workgroup_size_y=4 --define workgroup_size_z=8
 
 compute {
     storage_buffer input_a: scalar;
     storage_buffer input_b: scalar;
     storage_buffer weights: scalar;
     storage_buffer output_buf: scalar;
+    shared tile_a: scalar[3840]; // 10*6*64
+    shared tile_b: scalar[2880]; // 10*6*48
 
     push params {
         out_h: uint,
@@ -35,54 +79,98 @@ compute {
     }
 
     fn main() {
-        let gid: uint = global_invocation_id.x;
-        let total: uint = out_h * out_w * cout;
-        if (gid < total) {
-            let oc: uint = gid % cout;
-            let pixel: uint = gid / cout;
-            let oy: uint = pixel / out_w;
-            let ox: uint = pixel % out_w;
-            let cin_total: uint = cin_a + cin_b;
+        let in_a_h: uint = out_h / 2;
+        let in_a_w: uint = out_w / 2;
+        let group_oy0: uint = workgroup_id.y * 4;
+        let group_ox0: uint = workgroup_id.x * 8;
+        let lx: uint = local_invocation_id.x;
+        let ly: uint = local_invocation_id.y;
+        let lz: uint = local_invocation_id.z;
+        let tid: uint = local_invocation_index;
 
-            let acc: scalar = weights[bias_offset + oc];
-
-            for (let kh: uint = 0; kh < 3; kh = kh + 1) {
-                let iy_b: uint = oy + kh;
+        // Cooperative load of the 10x6 halo'd tiles -- only the lz==0
+        // slice (32 threads, 60 cells) does this; every thread still
+        // hits the barrier() below uniformly. Cell (ty,tx) represents
+        // OUTPUT row/col (group_oy0+ty-1, group_ox0+tx-1) -- biased
+        // unsigned indexing, same convention as unet_conv3x3_lrelu.lux.
+        // tile_b reads input_b directly at that position; tile_a reads
+        // input_a at the nearest-upsample source position
+        // ((row)/2, (col)/2) -- both zero when the position falls
+        // outside [0,out_h)x[0,out_w).
+        if (lz < 1) {
+            for (let idx: uint = tid; idx < 60; idx = idx + 32) {
+                let ty: uint = idx / 10;
+                let tx: uint = idx % 10;
+                let iy_b: uint = group_oy0 + ty;
+                let ix_b: uint = group_ox0 + tx;
+                let tile_a_base: uint = idx * 64;
+                let tile_b_base: uint = idx * 48;
+                let valid: uint = 0;
                 if (iy_b >= 1) {
                     if (iy_b <= out_h) {
-                        let iy: uint = iy_b - 1;
-                        let iy_a: uint = iy / 2;  // nearest-upsample source row
-                        for (let kw: uint = 0; kw < 3; kw = kw + 1) {
-                            let ix_b: uint = ox + kw;
-                            if (ix_b >= 1) {
-                                if (ix_b <= out_w) {
-                                    let ix: uint = ix_b - 1;
-                                    let ix_a: uint = ix / 2;
-                                    let w_tap_base: uint = weight_offset + ((oc * 3 + kh) * 3 + kw) * cin_total;
-
-                                    // upsample(input_a) contributes channels [0, cin_a).
-                                    let a_pixel_base: uint = (iy_a * (out_w / 2) + ix_a) * cin_a;
-                                    for (let ica: uint = 0; ica < cin_a; ica = ica + 1) {
-                                        acc = acc + input_a[a_pixel_base + ica] * weights[w_tap_base + ica];
-                                    }
-
-                                    // input_b contributes channels [cin_a, cin_a+cin_b).
-                                    let b_pixel_base: uint = (iy * out_w + ix) * cin_b;
-                                    for (let icb: uint = 0; icb < cin_b; icb = icb + 1) {
-                                        acc = acc + input_b[b_pixel_base + icb] * weights[w_tap_base + cin_a + icb];
-                                    }
-                                }
+                        if (ix_b >= 1) {
+                            if (ix_b <= out_w) {
+                                valid = 1;
                             }
                         }
                     }
                 }
+                if (valid >= 1) {
+                    let iy: uint = iy_b - 1;
+                    let ix: uint = ix_b - 1;
+                    let iy_a: uint = iy / 2;
+                    let ix_a: uint = ix / 2;
+                    let a_pixel_base: uint = (iy_a * in_a_w + ix_a) * cin_a;
+                    let b_pixel_base: uint = (iy * out_w + ix) * cin_b;
+                    for (let ica0: uint = 0; ica0 < cin_a; ica0 = ica0 + 1) {
+                        tile_a[tile_a_base + ica0] = input_a[a_pixel_base + ica0];
+                    }
+                    for (let icb0: uint = 0; icb0 < cin_b; icb0 = icb0 + 1) {
+                        tile_b[tile_b_base + icb0] = input_b[b_pixel_base + icb0];
+                    }
+                } else {
+                    for (let ica1: uint = 0; ica1 < cin_a; ica1 = ica1 + 1) {
+                        tile_a[tile_a_base + ica1] = 0.0;
+                    }
+                    for (let icb1: uint = 0; icb1 < cin_b; icb1 = icb1 + 1) {
+                        tile_b[tile_b_base + icb1] = 0.0;
+                    }
+                }
             }
+        }
+        barrier();
 
-            let result: scalar = acc;
-            if (acc < 0.0) {
-                result = acc * 0.1;
+        let oy: uint = group_oy0 + ly;
+        let ox: uint = group_ox0 + lx;
+        if (oy < out_h) {
+            if (ox < out_w) {
+                let out_pixel_base: uint = (oy * out_w + ox) * cout;
+                let cin_total: uint = cin_a + cin_b;
+                for (let oc: uint = lz; oc < cout; oc = oc + 8) {
+                    let acc: scalar = weights[bias_offset + oc];
+                    for (let kh: uint = 0; kh < 3; kh = kh + 1) {
+                        let ty: uint = ly + kh;
+                        let w_row_base: uint = weight_offset + (oc * 3 + kh) * 3 * cin_total;
+                        for (let kw: uint = 0; kw < 3; kw = kw + 1) {
+                            let tx: uint = lx + kw;
+                            let tile_a_base: uint = (ty * 10 + tx) * 64;
+                            let tile_b_base: uint = (ty * 10 + tx) * 48;
+                            let w_tap_base: uint = w_row_base + kw * cin_total;
+                            for (let ica: uint = 0; ica < cin_a; ica = ica + 1) {
+                                acc = acc + tile_a[tile_a_base + ica] * weights[w_tap_base + ica];
+                            }
+                            for (let icb: uint = 0; icb < cin_b; icb = icb + 1) {
+                                acc = acc + tile_b[tile_b_base + icb] * weights[w_tap_base + cin_a + icb];
+                            }
+                        }
+                    }
+                    let result: scalar = acc;
+                    if (acc < 0.0) {
+                        result = acc * 0.1;
+                    }
+                    output_buf[out_pixel_base + oc] = result;
+                }
             }
-            output_buf[gid] = result;
         }
     }
 }

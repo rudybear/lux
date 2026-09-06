@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "source": "unet_upsample_concat_conv_lrelu.lux",
+  "source": "unet_upsample_concat_conv_lrelu_lo.lux",
   "stage": "compute",
   "execution_model": "GLCompute",
   "features": {},
@@ -105,7 +105,7 @@
   "compute": {
     "workgroup_size": [
       8,
-      4,
+      8,
       8
     ]
   },
@@ -113,19 +113,19 @@
     {
       "name": "tile_a",
       "type": "scalar",
-      "size_bytes": 15360,
-      "array_size": 3840
+      "size_bytes": 19200,
+      "array_size": 4800
     },
     {
       "name": "tile_b",
       "type": "scalar",
-      "size_bytes": 11520,
-      "array_size": 2880
+      "size_bytes": 12800,
+      "array_size": 3200
     }
   ],
-  "shared_memory_total_bytes": 26880,
+  "shared_memory_total_bytes": 32000,
   "performance_hints": {
-    "instruction_count": 526,
+    "instruction_count": 525,
     "alu_ops": 65,
     "texture_samples": 0,
     "branches": 19,

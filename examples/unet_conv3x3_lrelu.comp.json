@@ -89,16 +89,25 @@
   "vertex_stride": 0,
   "compute": {
     "workgroup_size": [
-      256,
-      1,
-      1
+      8,
+      8,
+      8
     ]
   },
+  "shared_memory": [
+    {
+      "name": "tile",
+      "type": "scalar",
+      "size_bytes": 25600,
+      "array_size": 6400
+    }
+  ],
+  "shared_memory_total_bytes": 25600,
   "performance_hints": {
-    "instruction_count": 261,
-    "alu_ops": 26,
+    "instruction_count": 412,
+    "alu_ops": 45,
     "texture_samples": 0,
-    "branches": 9,
+    "branches": 16,
     "function_calls": 0,
     "vgpr_estimate": "high"
   }

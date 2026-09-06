@@ -8,12 +8,44 @@
 // resolution is in_h/2 x in_w/2 (exact for even in_h/in_w, which
 // ParamPredUNet requires -- divisible by 8 at the stem).
 //
-// Compile: python -m luxc examples/unet_conv3x3_s2_lrelu.lux --define workgroup_size=256
+// Threadgroup-tiled (see unet_conv3x3_lrelu.lux's header for the general
+// approach): each threadgroup owns an 8(w)x3(h) = 24-thread output tile.
+// Since a stride-2 tap's receptive field spans 2 output pixels per input
+// pixel, the halo'd input tile is (8*2+2)x(3*2+2) = 18x8, staged into
+// `shared` memory once (CIN_MAX=48, the largest cin any
+// conv3x3_s2_lrelu-typed layer uses -- down3.down); 18*8*48 = 6912
+// scalars (27KB) -- under Apple's hard 32768-byte/threadgroup limit
+// (measured: an 8x4/18x10 tile needs 34560B and the Metal pipeline
+// fails to create with "Threadgroup memory size exceeds the maximum
+// threadgroup memory allowed"; no rectangular tile with exactly 32
+// threads -- a full SIMD group -- fits cin=48 in 32KB, so this kernel
+// runs at 24/32 threads per SIMD group instead of the other three
+// kernels' full occupancy).
+//
+// Channel-parallel (Z dimension -- see unet_conv3x3_lrelu.lux's header
+// for why: a spatial-only tile with few threads and a large fixed shared-
+// memory reservation collapses threadgroup occupancy on large-resolution
+// layers). Z=8: local_invocation_id.z in [0,8) splits `cout` 8 ways
+// across threads sharing the SAME loaded tile (24*8 = 192 threads/
+// threadgroup); only the z==0 slice does the cooperative load.
+//
+// NOTE (luxc limitation, worked around here): `for`-loop induction
+// variables are registered by NAME across the whole function in luxc's
+// SPIR-V codegen, not per lexical scope. Two `for` loops that share a
+// loop-variable name (e.g. one in an `if` branch, another in its `else`)
+// share one OpVariable, which SPIRV-Cross's MSL backend can mis-decompile
+// into an infinite loop (reproduced: hangs indefinitely on an Apple M4
+// Max) -- see unet_conv3x3_lrelu.lux's header for the full writeup. Every
+// `for` loop below that would otherwise collide with another in this file
+// uses a distinct name (ic0/ic1/ic).
+//
+// Compile: python -m luxc examples/unet_conv3x3_s2_lrelu.lux --define workgroup_size_x=8 --define workgroup_size_y=3 --define workgroup_size_z=8
 
 compute {
     storage_buffer input_buf: scalar;
     storage_buffer weights: scalar;
     storage_buffer output_buf: scalar;
+    shared tile: scalar[6912]; // 18*8*48
 
     push params {
         in_h: uint,
@@ -25,46 +57,80 @@ compute {
     }
 
     fn main() {
-        let gid: uint = global_invocation_id.x;
         let out_h: uint = in_h / 2;
         let out_w: uint = in_w / 2;
-        let total: uint = out_h * out_w * cout;
-        if (gid < total) {
-            let oc: uint = gid % cout;
-            let pixel: uint = gid / cout;
-            let oy: uint = pixel / out_w;
-            let ox: uint = pixel % out_w;
+        let group_oy0: uint = workgroup_id.y * 3;
+        let group_ox0: uint = workgroup_id.x * 8;
+        let lx: uint = local_invocation_id.x;
+        let ly: uint = local_invocation_id.y;
+        let lz: uint = local_invocation_id.z;
+        let tid: uint = local_invocation_index;
 
-            let acc: scalar = weights[bias_offset + oc];
-
-            // iy = oy*2 - 1 + kh; biased iy_b = oy*2 + kh represents (iy+1).
-            for (let kh: uint = 0; kh < 3; kh = kh + 1) {
-                let iy_b: uint = oy * 2 + kh;
+        // Cooperative load of the 18x8 halo'd input tile -- only the
+        // lz==0 slice (24 threads, 144 cells -> 6 cells/thread) does
+        // this; every thread still hits the barrier() below uniformly.
+        // Cell (ty,tx) represents input row/col (group_oy0*2+ty-1,
+        // group_ox0*2+tx-1) -- biased unsigned indexing, same convention
+        // as unet_conv3x3_lrelu.lux.
+        if (lz < 1) {
+            for (let idx: uint = tid; idx < 144; idx = idx + 24) {
+                let ty: uint = idx / 18;
+                let tx: uint = idx % 18;
+                let iy_b: uint = group_oy0 * 2 + ty;
+                let ix_b: uint = group_ox0 * 2 + tx;
+                let tile_base: uint = idx * 48;
+                let valid: uint = 0;
                 if (iy_b >= 1) {
                     if (iy_b <= in_h) {
-                        let iy: uint = iy_b - 1;
-                        for (let kw: uint = 0; kw < 3; kw = kw + 1) {
-                            let ix_b: uint = ox * 2 + kw;
-                            if (ix_b >= 1) {
-                                if (ix_b <= in_w) {
-                                    let ix: uint = ix_b - 1;
-                                    let in_pixel_base: uint = (iy * in_w + ix) * cin;
-                                    let w_tap_base: uint = weight_offset + ((oc * 3 + kh) * 3 + kw) * cin;
-                                    for (let ic: uint = 0; ic < cin; ic = ic + 1) {
-                                        acc = acc + input_buf[in_pixel_base + ic] * weights[w_tap_base + ic];
-                                    }
-                                }
+                        if (ix_b >= 1) {
+                            if (ix_b <= in_w) {
+                                valid = 1;
                             }
                         }
                     }
                 }
+                if (valid >= 1) {
+                    let iy: uint = iy_b - 1;
+                    let ix: uint = ix_b - 1;
+                    let in_pixel_base: uint = (iy * in_w + ix) * cin;
+                    for (let ic0: uint = 0; ic0 < cin; ic0 = ic0 + 1) {
+                        tile[tile_base + ic0] = input_buf[in_pixel_base + ic0];
+                    }
+                } else {
+                    for (let ic1: uint = 0; ic1 < cin; ic1 = ic1 + 1) {
+                        tile[tile_base + ic1] = 0.0;
+                    }
+                }
             }
+        }
+        barrier();
 
-            let result: scalar = acc;
-            if (acc < 0.0) {
-                result = acc * 0.1;
+        let oy: uint = group_oy0 + ly;
+        let ox: uint = group_ox0 + lx;
+        if (oy < out_h) {
+            if (ox < out_w) {
+                let out_pixel_base: uint = (oy * out_w + ox) * cout;
+                for (let oc: uint = lz; oc < cout; oc = oc + 8) {
+                    let acc: scalar = weights[bias_offset + oc];
+                    for (let kh: uint = 0; kh < 3; kh = kh + 1) {
+                        let ty: uint = ly * 2 + kh;
+                        let w_row_base: uint = weight_offset + (oc * 3 + kh) * 3 * cin;
+                        for (let kw: uint = 0; kw < 3; kw = kw + 1) {
+                            let tx: uint = lx * 2 + kw;
+                            let tile_base: uint = (ty * 18 + tx) * 48;
+                            let w_tap_base: uint = w_row_base + kw * cin;
+                            for (let ic: uint = 0; ic < cin; ic = ic + 1) {
+                                acc = acc + tile[tile_base + ic] * weights[w_tap_base + ic];
+                            }
+                        }
+                    }
+                    let result: scalar = acc;
+                    if (acc < 0.0) {
+                        result = acc * 0.1;
+                    }
+                    output_buf[out_pixel_base + oc] = result;
+                }
             }
-            output_buf[gid] = result;
         }
     }
 }

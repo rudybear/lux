@@ -1,0 +1,134 @@
+// Low-channel-count variant of unet_upsample_concat_conv_lrelu.lux
+// (CINA_MAX=48, CINB_MAX=32, TILE=8x8 instead of 8x4) for the up1/up2
+// decoder blocks (up1: cin_a=32,cin_b=16; up2: cin_a=48,cin_b=32), kept
+// separate from up3 (cin_a=64,cin_b=48, the other kernel) so up3's larger
+// worst-case channel count doesn't force a smaller, worse-occupancy tile
+// onto up1/up2 -- which run at MUCH higher resolution (up1 is full
+// network resolution) and dominated end-to-end time even after adding
+// the Z channel-parallel dimension to the single shared kernel (up1
+// alone: 44ms/960x544 with an 8x4x8=256-thread/16320-threadgroup
+// dispatch). Doubling the spatial tile to 8x8 here HALVES the
+// threadgroup count (8160 for up1) and, with Z=8, gives 512 threads/
+// threadgroup. Host selects this kernel vs. the other by comparing a
+// layer's cin_a/cin_b against CINA_MAX/CINB_MAX at runner time
+// (playground_cpp/src/{unet_runner,metal_unet_runner}.cpp).
+//
+// 10x10 = 100 cells; tile_a=100*48=4800, tile_b=100*32=3200 scalars
+// (32000 bytes) -- just under Apple's 32768-byte/threadgroup limit.
+//
+// See unet_upsample_concat_conv_lrelu.lux for the full design writeup
+// (upsample+concat-fused tiling, zero-padding-in-both-tiles, the row-
+// major-stride bug that lived here once, and the loop-variable-name
+// luxc/SPIRV-Cross codegen limitation) -- this file mirrors it exactly,
+// just with different tile/channel-max constants.
+//
+// Compile: python -m luxc examples/unet_upsample_concat_conv_lrelu_lo.lux --define workgroup_size_x=8 --define workgroup_size_y=8 --define workgroup_size_z=8
+
+compute {
+    storage_buffer input_a: scalar;
+    storage_buffer input_b: scalar;
+    storage_buffer weights: scalar;
+    storage_buffer output_buf: scalar;
+    shared tile_a: scalar[4800]; // 10*10*48
+    shared tile_b: scalar[3200]; // 10*10*32
+
+    push params {
+        out_h: uint,
+        out_w: uint,
+        cin_a: uint,
+        cin_b: uint,
+        cout: uint,
+        weight_offset: uint,
+        bias_offset: uint,
+    }
+
+    fn main() {
+        let in_a_h: uint = out_h / 2;
+        let in_a_w: uint = out_w / 2;
+        let group_oy0: uint = workgroup_id.y * 8;
+        let group_ox0: uint = workgroup_id.x * 8;
+        let lx: uint = local_invocation_id.x;
+        let ly: uint = local_invocation_id.y;
+        let lz: uint = local_invocation_id.z;
+        let tid: uint = local_invocation_index;
+
+        // Cooperative load of the 10x10 halo'd tiles -- only the lz==0
+        // slice (64 threads, 100 cells) does this; every thread still
+        // hits the barrier() below uniformly.
+        if (lz < 1) {
+            for (let idx: uint = tid; idx < 100; idx = idx + 64) {
+                let ty: uint = idx / 10;
+                let tx: uint = idx % 10;
+                let iy_b: uint = group_oy0 + ty;
+                let ix_b: uint = group_ox0 + tx;
+                let tile_a_base: uint = idx * 48;
+                let tile_b_base: uint = idx * 32;
+                let valid: uint = 0;
+                if (iy_b >= 1) {
+                    if (iy_b <= out_h) {
+                        if (ix_b >= 1) {
+                            if (ix_b <= out_w) {
+                                valid = 1;
+                            }
+                        }
+                    }
+                }
+                if (valid >= 1) {
+                    let iy: uint = iy_b - 1;
+                    let ix: uint = ix_b - 1;
+                    let iy_a: uint = iy / 2;
+                    let ix_a: uint = ix / 2;
+                    let a_pixel_base: uint = (iy_a * in_a_w + ix_a) * cin_a;
+                    let b_pixel_base: uint = (iy * out_w + ix) * cin_b;
+                    for (let ica0: uint = 0; ica0 < cin_a; ica0 = ica0 + 1) {
+                        tile_a[tile_a_base + ica0] = input_a[a_pixel_base + ica0];
+                    }
+                    for (let icb0: uint = 0; icb0 < cin_b; icb0 = icb0 + 1) {
+                        tile_b[tile_b_base + icb0] = input_b[b_pixel_base + icb0];
+                    }
+                } else {
+                    for (let ica1: uint = 0; ica1 < cin_a; ica1 = ica1 + 1) {
+                        tile_a[tile_a_base + ica1] = 0.0;
+                    }
+                    for (let icb1: uint = 0; icb1 < cin_b; icb1 = icb1 + 1) {
+                        tile_b[tile_b_base + icb1] = 0.0;
+                    }
+                }
+            }
+        }
+        barrier();
+
+        let oy: uint = group_oy0 + ly;
+        let ox: uint = group_ox0 + lx;
+        if (oy < out_h) {
+            if (ox < out_w) {
+                let out_pixel_base: uint = (oy * out_w + ox) * cout;
+                let cin_total: uint = cin_a + cin_b;
+                for (let oc: uint = lz; oc < cout; oc = oc + 8) {
+                    let acc: scalar = weights[bias_offset + oc];
+                    for (let kh: uint = 0; kh < 3; kh = kh + 1) {
+                        let ty: uint = ly + kh;
+                        let w_row_base: uint = weight_offset + (oc * 3 + kh) * 3 * cin_total;
+                        for (let kw: uint = 0; kw < 3; kw = kw + 1) {
+                            let tx: uint = lx + kw;
+                            let tile_a_base: uint = (ty * 10 + tx) * 48;
+                            let tile_b_base: uint = (ty * 10 + tx) * 32;
+                            let w_tap_base: uint = w_row_base + kw * cin_total;
+                            for (let ica: uint = 0; ica < cin_a; ica = ica + 1) {
+                                acc = acc + tile_a[tile_a_base + ica] * weights[w_tap_base + ica];
+                            }
+                            for (let icb: uint = 0; icb < cin_b; icb = icb + 1) {
+                                acc = acc + tile_b[tile_b_base + icb] * weights[w_tap_base + cin_a + icb];
+                            }
+                        }
+                    }
+                    let result: scalar = acc;
+                    if (acc < 0.0) {
+                        result = acc * 0.1;
+                    }
+                    output_buf[out_pixel_base + oc] = result;
+                }
+            }
+        }
+    }
+}

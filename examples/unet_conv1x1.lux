@@ -4,6 +4,14 @@
 // buffers; weight [cout, cin] (kh=kw=1 collapsed), bias [cout], in the
 // shared weight blob (see unet_conv3x3_lrelu.lux's header comment).
 //
+// A 1x1 conv has no spatial receptive field beyond its own pixel, so
+// there's no neighbor overlap to stage into shared memory -- unlike the
+// 3x3 kernels, threadgroup tiling buys nothing here. The only redundancy
+// worth fixing is the original one-thread-per-(pixel,channel) design's
+// cout-way re-read of the SAME pixel's `cin` inputs: one thread per pixel
+// now loops over all `cout` output channels, so each input value is read
+// from global memory exactly once per pixel.
+//
 // Compile: python -m luxc examples/unet_conv1x1.lux --define workgroup_size=256
 
 compute {
@@ -21,20 +29,19 @@ compute {
     }
 
     fn main() {
-        let gid: uint = global_invocation_id.x;
-        let total: uint = in_h * in_w * cout;
-        if (gid < total) {
-            let oc: uint = gid % cout;
-            let pixel: uint = gid / cout;
-
-            let acc: scalar = weights[bias_offset + oc];
+        let pixel: uint = global_invocation_id.x;
+        let total: uint = in_h * in_w;
+        if (pixel < total) {
             let in_pixel_base: uint = pixel * cin;
-            let w_base: uint = weight_offset + oc * cin;
-            for (let ic: uint = 0; ic < cin; ic = ic + 1) {
-                acc = acc + input_buf[in_pixel_base + ic] * weights[w_base + ic];
+            let out_pixel_base: uint = pixel * cout;
+            for (let oc: uint = 0; oc < cout; oc = oc + 1) {
+                let acc: scalar = weights[bias_offset + oc];
+                let w_base: uint = weight_offset + oc * cin;
+                for (let ic: uint = 0; ic < cin; ic = ic + 1) {
+                    acc = acc + input_buf[in_pixel_base + ic] * weights[w_base + ic];
+                }
+                output_buf[out_pixel_base + oc] = acc;
             }
-
-            output_buf[gid] = acc;
         }
     }
 }

@@ -111,6 +111,43 @@ double dispatchOne(VulkanContext& ctx, VkPipeline pipeline, VkPipelineLayout lay
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
+// 2-D tiled dispatch (the conv3x3/conv3x3_s2/upsample_concat_conv kernels):
+// one workgroup per (tileW x tileH) output tile -- tileW/tileH must match
+// the --define workgroup_size_x/_y each kernel's SPIR-V module was
+// compiled with (examples/unet_*.lux header comments); vkCmdDispatch's
+// group counts are in *workgroups*, not threads, so no local-size args
+// are needed here (baked into the shader module's OpExecutionMode).
+double dispatchTiled(VulkanContext& ctx, VkPipeline pipeline, VkPipelineLayout layout, VkDescriptorSet set,
+                      const void* pushData, uint32_t pushSize,
+                      uint32_t outW, uint32_t outH, uint32_t tileW, uint32_t tileH) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, pushData);
+    uint32_t groupsX = (outW + tileW - 1) / tileW;
+    uint32_t groupsY = (outH + tileH - 1) / tileH;
+    vkCmdDispatch(cmd, groupsX, groupsY, 1);
+    ctx.endSingleTimeCommands(cmd);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+// Tile sizes must match the --define workgroup_size_x/_y each kernel was
+// compiled with (examples/unet_*.lux header comments).
+// See metal_unet_runner.cpp's matching constants for why the "Lo" variants
+// exist (a single worst-case-sized tile caps every caller's occupancy at
+// the worst caller's requirement -- costly for high-res/low-channel
+// layers). Vulkan's local size is baked into each kernel's SPIR-V module
+// (OpExecutionMode LocalSize), so dispatchTiled here only needs the
+// spatial tile dims to compute group counts -- no Z argument required.
+constexpr uint32_t kConv3x3TileW = 8, kConv3x3TileH = 8;
+constexpr uint32_t kConv3x3LoTileW = 10, kConv3x3LoTileH = 10, kConv3x3LoCinMax = 48;
+constexpr uint32_t kConv3x3S2TileW = 8, kConv3x3S2TileH = 3;
+constexpr uint32_t kUpConcatTileW = 8, kUpConcatTileH = 4;
+constexpr uint32_t kUpConcatLoTileW = 8, kUpConcatLoTileH = 8;
+constexpr uint32_t kUpConcatLoCinAMax = 48, kUpConcatLoCinBMax = 32;
+
 struct Layer {
     std::string name, type;
     uint32_t cin, cout, kh, kw, weightOffset, biasOffset;
@@ -199,11 +236,13 @@ int runUnetDump(const std::string& inputNpyPath, const std::string& weightsBlobP
     VkPipelineLayout pl3 = makePipelineLayout(ctx.device, layout3, 24);
     VkPipelineLayout pl4 = makePipelineLayout(ctx.device, layout4, 28);
 
-    VkPipeline pConv3x3, pConv3x3S2, pUpConcat, pConv1x1;
+    VkPipeline pConv3x3, pConv3x3Lo, pConv3x3S2, pUpConcat, pUpConcatLo, pConv1x1;
     try {
         pConv3x3 = makeComputePipeline(ctx.device, pl3, kernelPipelineDir + "/unet_conv3x3_lrelu.comp.spv");
+        pConv3x3Lo = makeComputePipeline(ctx.device, pl3, kernelPipelineDir + "/unet_conv3x3_lrelu_lo.comp.spv");
         pConv3x3S2 = makeComputePipeline(ctx.device, pl3, kernelPipelineDir + "/unet_conv3x3_s2_lrelu.comp.spv");
         pUpConcat = makeComputePipeline(ctx.device, pl4, kernelPipelineDir + "/unet_upsample_concat_conv_lrelu.comp.spv");
+        pUpConcatLo = makeComputePipeline(ctx.device, pl4, kernelPipelineDir + "/unet_upsample_concat_conv_lrelu_lo.comp.spv");
         pConv1x1 = makeComputePipeline(ctx.device, pl3, kernelPipelineDir + "/unet_conv1x1.comp.spv");
     } catch (const std::exception& e) {
         std::cerr << "[error] " << e.what() << std::endl;
@@ -263,18 +302,26 @@ int runUnetDump(const std::string& inputNpyPath, const std::string& weightsBlobP
         double ms;
         uint32_t newH = curH, newW = curW;
 
-        if (layer.type == "conv3x3_lrelu" || layer.type == "conv1x1") {
+        if (layer.type == "conv3x3_lrelu") {
             set = allocSet(layout3);
             writeDescriptorSet(ctx.device, set, {curBuf, bWeights, otherBuf});
             Push3 push = {curH, curW, layer.cin, layer.cout, layer.weightOffset, layer.biasOffset};
-            VkPipeline p = (layer.type == "conv1x1") ? pConv1x1 : pConv3x3;
-            ms = dispatchOne(ctx, p, pl3, set, &push, sizeof(push), curH * curW * layer.cout);
+            if (layer.cin <= kConv3x3LoCinMax) {
+                ms = dispatchTiled(ctx, pConv3x3Lo, pl3, set, &push, sizeof(push), curW, curH, kConv3x3LoTileW, kConv3x3LoTileH);
+            } else {
+                ms = dispatchTiled(ctx, pConv3x3, pl3, set, &push, sizeof(push), curW, curH, kConv3x3TileW, kConv3x3TileH);
+            }
+        } else if (layer.type == "conv1x1") {
+            set = allocSet(layout3);
+            writeDescriptorSet(ctx.device, set, {curBuf, bWeights, otherBuf});
+            Push3 push = {curH, curW, layer.cin, layer.cout, layer.weightOffset, layer.biasOffset};
+            ms = dispatchOne(ctx, pConv1x1, pl3, set, &push, sizeof(push), curH * curW);
         } else if (layer.type == "conv3x3_s2_lrelu") {
             set = allocSet(layout3);
             writeDescriptorSet(ctx.device, set, {curBuf, bWeights, otherBuf});
             Push3 push = {curH, curW, layer.cin, layer.cout, layer.weightOffset, layer.biasOffset};
             newH = curH / 2; newW = curW / 2;
-            ms = dispatchOne(ctx, pConv3x3S2, pl3, set, &push, sizeof(push), newH * newW * layer.cout);
+            ms = dispatchTiled(ctx, pConv3x3S2, pl3, set, &push, sizeof(push), newW, newH, kConv3x3S2TileW, kConv3x3S2TileH);
         } else if (layer.type == "upsample_concat_conv_lrelu") {
             SkipBuf skip = skipStack.back();
             skipStack.pop_back();
@@ -284,7 +331,11 @@ int runUnetDump(const std::string& inputNpyPath, const std::string& weightsBlobP
             writeDescriptorSet(ctx.device, set, {curBuf, skip.buf, bWeights, otherBuf});
             Push4 push = {skip.h, skip.w, cinA, cinB, layer.cout, layer.weightOffset, layer.biasOffset};
             newH = skip.h; newW = skip.w;
-            ms = dispatchOne(ctx, pUpConcat, pl4, set, &push, sizeof(push), newH * newW * layer.cout);
+            if (cinA <= kUpConcatLoCinAMax && cinB <= kUpConcatLoCinBMax) {
+                ms = dispatchTiled(ctx, pUpConcatLo, pl4, set, &push, sizeof(push), newW, newH, kUpConcatLoTileW, kUpConcatLoTileH);
+            } else {
+                ms = dispatchTiled(ctx, pUpConcat, pl4, set, &push, sizeof(push), newW, newH, kUpConcatTileW, kUpConcatTileH);
+            }
             vmaDestroyBuffer(ctx.allocator, skip.buf, skip.alloc);
         } else {
             std::cerr << "[error] unet_runner: unknown layer type " << layer.type << std::endl;

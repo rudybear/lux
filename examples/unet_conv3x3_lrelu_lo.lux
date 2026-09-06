@@ -1,0 +1,111 @@
+// Low-channel-count variant of unet_conv3x3_lrelu.lux (CIN_MAX=48 instead
+// of 64, TILE=10x10 instead of 8x8) for the conv3x3_lrelu-typed layers
+// that don't need the other kernel's full CIN_MAX=64 budget: stem (18),
+// down1.refine (32), down2.refine (48) -- kept separate from
+// down3.refine/bottleneck (64) so THEIR worst-case channel count doesn't
+// force a smaller, worse-occupancy tile onto these (much higher
+// resolution) layers too. See unet_conv3x3_lrelu.lux's header for the
+// general tiling/channel-parallel design and why the plain 8x8x1-thread
+// version of that kernel measured slower end-to-end than the untiled
+// original; splitting by channel count is the same idea taken further --
+// stem alone (960x544, cin=18) was still 19ms on the CIN_MAX=64/tile-8x8
+// kernel because that kernel's tile is sized for cin=64 regardless of
+// what a given call site actually needs, capping occupancy for every
+// caller at the worst caller's requirement. Host selects this kernel vs.
+// the other by comparing a layer's `cin` against CIN_MAX at weight-export/
+// runner time (playground_cpp/src/{unet_runner,metal_unet_runner}.cpp).
+//
+// halo = TILE+2 = 12x12 = 144 cells * CIN_MAX=48 = 6912 scalars (27KB) --
+// under Apple's 32768-byte/threadgroup limit. TILE=10x10 (100 spatial
+// threads) * Z=8 = 800 threads/threadgroup.
+//
+// Compile: python -m luxc examples/unet_conv3x3_lrelu_lo.lux --define workgroup_size_x=10 --define workgroup_size_y=10 --define workgroup_size_z=8
+
+compute {
+    storage_buffer input_buf: scalar;
+    storage_buffer weights: scalar;
+    storage_buffer output_buf: scalar;
+    shared tile: scalar[6912]; // (10+2)*(10+2)*48 = 6912
+
+    push params {
+        in_h: uint,
+        in_w: uint,
+        cin: uint,
+        cout: uint,
+        weight_offset: uint,
+        bias_offset: uint,
+    }
+
+    fn main() {
+        let group_oy0: uint = workgroup_id.y * 10;
+        let group_ox0: uint = workgroup_id.x * 10;
+        let lx: uint = local_invocation_id.x;
+        let ly: uint = local_invocation_id.y;
+        let lz: uint = local_invocation_id.z;
+        let tid: uint = local_invocation_index;
+
+        // Cooperative load of the 12x12 halo'd input tile into shared
+        // memory -- only the lz==0 slice (100 threads, 144 cells) does
+        // this; every thread still hits the barrier() below uniformly.
+        if (lz < 1) {
+            for (let idx: uint = tid; idx < 144; idx = idx + 100) {
+                let ty: uint = idx / 12;
+                let tx: uint = idx % 12;
+                let iy_b: uint = group_oy0 + ty;
+                let ix_b: uint = group_ox0 + tx;
+                let tile_base: uint = idx * 48;
+                let valid: uint = 0;
+                if (iy_b >= 1) {
+                    if (iy_b <= in_h) {
+                        if (ix_b >= 1) {
+                            if (ix_b <= in_w) {
+                                valid = 1;
+                            }
+                        }
+                    }
+                }
+                if (valid >= 1) {
+                    let iy: uint = iy_b - 1;
+                    let ix: uint = ix_b - 1;
+                    let in_pixel_base: uint = (iy * in_w + ix) * cin;
+                    for (let ic0: uint = 0; ic0 < cin; ic0 = ic0 + 1) {
+                        tile[tile_base + ic0] = input_buf[in_pixel_base + ic0];
+                    }
+                } else {
+                    for (let ic1: uint = 0; ic1 < cin; ic1 = ic1 + 1) {
+                        tile[tile_base + ic1] = 0.0;
+                    }
+                }
+            }
+        }
+        barrier();
+
+        let oy: uint = group_oy0 + ly;
+        let ox: uint = group_ox0 + lx;
+        if (oy < in_h) {
+            if (ox < in_w) {
+                let out_pixel_base: uint = (oy * in_w + ox) * cout;
+                for (let oc: uint = lz; oc < cout; oc = oc + 8) {
+                    let acc: scalar = weights[bias_offset + oc];
+                    for (let kh: uint = 0; kh < 3; kh = kh + 1) {
+                        let ty: uint = ly + kh;
+                        let w_row_base: uint = weight_offset + (oc * 3 + kh) * 3 * cin;
+                        for (let kw: uint = 0; kw < 3; kw = kw + 1) {
+                            let tx: uint = lx + kw;
+                            let tile_base: uint = (ty * 12 + tx) * 48;
+                            let w_tap_base: uint = w_row_base + kw * cin;
+                            for (let ic: uint = 0; ic < cin; ic = ic + 1) {
+                                acc = acc + tile[tile_base + ic] * weights[w_tap_base + ic];
+                            }
+                        }
+                    }
+                    let result: scalar = acc;
+                    if (acc < 0.0) {
+                        result = acc * 0.1;
+                    }
+                    output_buf[out_pixel_base + oc] = result;
+                }
+            }
+        }
+    }
+}
