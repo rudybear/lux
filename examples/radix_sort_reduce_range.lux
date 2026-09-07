@@ -1,0 +1,91 @@
+// Radix Sort — Range Reduction (16-bit key quantization prep)
+// Computes the global min/max of the pre-quantization sortable-uint32 depth
+// keys written by the splat preprocess stage, excluding culled/invisible
+// splats (which carry the sentinel key 0xFFFFFFFF -- see
+// luxc/expansion/splat_expander.py's `_cull_writes`). The result is used by
+// radix_sort_quantize.lux to compress each frame's actual visible depth
+// range into a 16-bit key, cutting the subsequent radix sort from 4 passes
+// (32-bit keys) to 2 passes (16-bit keys) -- see bench/lux_perf_ablation.md
+// in mobiledlss, "Key width / passes".
+//
+// Host contract:
+//   - `key_range[0]`/`key_range[1]` must be cleared to (0xFFFFFFFF, 0)
+//     immediately before this dispatch each frame (e.g. vkCmdFillBuffer /
+//     MTLBlitCommandEncoder fillBuffer -- both sentinel values happen to be
+//     byte-uniform, so a plain byte fill works on both backends).
+//   - Dispatched with the SAME per-workgroup tiling as
+//     radix_sort_histogram.lux (3840 elements/workgroup, 256 threads,
+//     15 items/thread) so `num_workgroups.x` matches `sortNumWg_` host-side.
+//
+// Reduction strategy: each thread writes its own per-thread min/max into a
+// distinct slot of a 256-element shared array (the same "each thread owns
+// index `local_id`" idiom radix_sort_histogram.lux's clear step already
+// uses), then thread 0 does a single-threaded scan of those 256 slots and
+// one atomic_min/atomic_max into the global result per workgroup. A true
+// parallel tree reduction would be faster, but at 256 elements this
+// thread-0 scan is already negligible next to the tile loop above it, and
+// staying inside proven single-thread/full-array shared-memory patterns
+// avoids the sharper edges of this compiler's less-exercised shared-array
+// codegen paths.
+//
+// Compile: luxc radix_sort_reduce_range.lux --define workgroup_size=256
+
+compute {
+    storage_buffer keys: uint;
+    storage_buffer key_range: uint;
+
+    push params {
+        num_elements: uint,
+    }
+
+    shared s_min: uint[256];
+    shared s_max: uint[256];
+
+    fn main() {
+        let local_id: uint = local_invocation_id.x;
+        let group_id: uint = workgroup_id.x;
+
+        let tile_start: uint = group_id * 3840;
+        let local_min: uint = 4294967295;
+        let local_max: uint = 0;
+
+        for (let i: uint = 0; i < 15; i = i + 1) {
+            let idx: uint = tile_start + local_id + i * 256;
+            if (idx < num_elements) {
+                let key: uint = keys[idx];
+                // Exclude the culled/invisible sentinel -- including it
+                // would pin the global max to 4294967295 and collapse the
+                // real depth range to a single low-precision bucket.
+                if (key < 4294967295) {
+                    if (key < local_min) {
+                        local_min = key;
+                    }
+                    if (key > local_max) {
+                        local_max = key;
+                    }
+                }
+            }
+        }
+
+        s_min[local_id] = local_min;
+        s_max[local_id] = local_max;
+
+        barrier();
+
+        if (local_id == 0) {
+            let final_min: uint = 4294967295;
+            let final_max: uint = 0;
+            for (let j: uint = 0; j < 256; j = j + 1) {
+                if (s_min[j] < final_min) {
+                    final_min = s_min[j];
+                }
+                if (s_max[j] > final_max) {
+                    final_max = s_max[j];
+                }
+            }
+            // One atomic per WORKGROUP into the global result.
+            let go_min: uint = atomic_min(key_range[0], final_min);
+            let go_max: uint = atomic_max(key_range[1], final_max);
+        }
+    }
+}

@@ -15,14 +15,38 @@ from luxc.parser.ast_nodes import (
 )
 
 # Calls that have side effects and must be preserved even if result is unused
+#
+# Bug fix (bench/lux_perf_ablation.md in mobiledlss, "Key width / passes"):
+# this set previously listed the atomic/barrier/image builtins under their
+# GLSL camelCase spelling ("atomicAdd", "memoryBarrier", "imageStore", ...),
+# but the actual registered builtin names (luxc/builtins/functions.py) are
+# snake_case ("atomic_add", "barrier", "image_store", ...). Since
+# `_has_side_effects` below matches by exact string equality against
+# `CallExpr.func.name`, every one of those entries silently failed to
+# match ANY real call in practice -- meaning `atomic_min`/`atomic_max`/etc.
+# calls whose result `let` goes unused (a normal, common pattern -- see
+# radix_sort_histogram.lux's `let old: uint = atomic_add(...)`) were
+# treated as pure and DEAD-CODE-ELIMINATED ENTIRELY, silently dropping the
+# atomic memory write. This was masked for the shipped
+# shaders/radix_sort/*.comp.spv because those checked-in binaries predate
+# this DCE pass (or a prior version of it) and were never recompiled since
+# -- confirmed empirically: recompiling radix_sort_histogram.lux fresh
+# with the current compiler produces a .spv with ZERO `OpAtomicIAdd`
+# instructions, vs. the checked-in binary, which has one. Any NEWLY
+# compiled shader using an atomic with an unused result (e.g.
+# radix_sort_reduce_range.lux's per-workgroup atomic_min/atomic_max
+# reduction) hit this live. Fixed by matching the real snake_case names;
+# `barrier`/`sample*`/`trace_ray` were already correct (no case mismatch)
+# and are unaffected.
 _SIDE_EFFECT_CALLS = frozenset({
     "sample", "sample_lod", "sample_bindless", "sample_bindless_lod",
     "sample_compare", "sample_array", "sample_grad",
-    "trace_ray", "barrier", "memoryBarrier", "memoryBarrierShared",
-    "atomicAdd", "atomicMin", "atomicMax", "atomicAnd", "atomicOr", "atomicXor",
-    "atomicExchange", "atomicCompareExchange",
-    "emit_vertex", "end_primitive", "emit_mesh_tasks",
-    "debug_printf", "imageStore",
+    "trace_ray", "barrier",
+    "atomic_add", "atomic_min", "atomic_max", "atomic_and", "atomic_or",
+    "atomic_xor", "atomic_exchange", "atomic_compare_exchange",
+    "atomic_load", "atomic_store",
+    "emit_mesh_tasks",
+    "image_store",
 })
 
 

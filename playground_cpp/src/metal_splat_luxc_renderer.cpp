@@ -251,6 +251,13 @@ void MetalSplatLuxcRenderer::createSortPipelines(MetalContext& ctx) {
     if (!sortPrefixSumPipeline_) throw std::runtime_error("luxc splat: failed to create sort-prefix-sum pipeline");
     sortScatterPipeline_ = ctx.device->newComputePipelineState(sortScatterShader_.function, &error);
     if (!sortScatterPipeline_) throw std::runtime_error("luxc splat: failed to create sort-scatter pipeline");
+
+    transpiler_.transpileInto(sortReduceRangeShader_, "shaders/radix_sort/reduce_range.comp.spv", SpvExecModel::GLCompute);
+    transpiler_.transpileInto(sortQuantizeShader_, "shaders/radix_sort/quantize.comp.spv", SpvExecModel::GLCompute);
+    sortReduceRangePipeline_ = ctx.device->newComputePipelineState(sortReduceRangeShader_.function, &error);
+    if (!sortReduceRangePipeline_) throw std::runtime_error("luxc splat: failed to create sort-reduce-range pipeline");
+    sortQuantizePipeline_ = ctx.device->newComputePipelineState(sortQuantizeShader_.function, &error);
+    if (!sortQuantizePipeline_) throw std::runtime_error("luxc splat: failed to create sort-quantize pipeline");
 }
 
 // --------------------------------------------------------------------------
@@ -373,6 +380,9 @@ void MetalSplatLuxcRenderer::createBuffers(MetalContext& ctx, const GaussianSpla
     uint32_t numPartitions = (totalHistEntries + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
     uint32_t partitionSumsSize = std::max(numPartitions * 4u, 4u);
     partitionSumsBuffer_ = ctx.newBuffer(partitionSumsSize, MTL::ResourceStorageModeShared);
+
+    // 16-bit key quantization range (2 uints: min, max).
+    keyRangeBuffer_ = ctx.newBuffer(2 * sizeof(uint32_t), MTL::ResourceStorageModeShared);
 
     std::cout << "[metal-luxc] GPU radix sort: " << numSplats_ << " splats, "
               << sortNumWg_ << " workgroups, " << totalHistEntries << " histogram entries, "
@@ -720,8 +730,8 @@ void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* 
     }
 
     auto t0 = std::chrono::steady_clock::now();
-    // Single command buffer for the *entire* frame (preprocess + all 4 radix-sort
-    // passes + render) -- `cmdBuf` is the caller's own (render() below passes a
+    // Single command buffer for the *entire* frame (preprocess + all radix-sort
+    // range-reduction/quantization/passes + render) -- `cmdBuf` is the caller's own (render() below passes a
     // freshly-begun one it will commit+wait on itself right after this call
     // returns; metal_live_reconstruct.* passes its own per-frame buffer and
     // keeps encoding into it afterwards). Previously each of the ~22 individual
@@ -813,12 +823,14 @@ void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* 
         }
     }
 
-    // --- GPU radix sort (4 passes, 8 bits/pass = 32-bit keys) ---
+    // --- GPU radix sort (range reduction + quantization, then 2 passes,
+    // 8 bits/pass = 16-bit keys -- perf; bench/lux_perf_ablation.md's "Key
+    // width / passes"; previously 4 passes over the full 32-bit key) ---
     // Skipped on frames the schedule above decides don't need a fresh
     // order -- sortedIndicesBuffer_/sortKeysBuffer_ simply keep whatever
     // the last real sort left in them (GPU-only buffers, never implicitly
     // cleared; always land back in buffer A after an even pass count, and
-    // this always runs 0 or 4 passes, never a partial/odd count, so that
+    // this always runs 0 or 2 passes, never a partial/odd count, so that
     // invariant holds across skipped frames too). Splat VISIBILITY is
     // unaffected either way (a per-splat decision made in
     // preprocess/fragment, not by sort position) -- only back-to-front
@@ -830,10 +842,51 @@ void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* 
         uint32_t numWg = sortNumWg_;
         uint32_t totalHistogram = 256 * numWg;
         uint32_t numParts = (totalHistogram + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
+        uint32_t numQuantizeWg = (numElements + 255) / 256;  // 1:1 dispatch, workgroup_size=256
 
         struct SortPush { uint32_t numElements; uint32_t bitOffset; };
 
-        for (uint32_t pass = 0; pass < 4; ++pass) {
+        // --- Range reduction + quantization (buffer A, before the
+        // ping-pong pass loop). No explicit barriers needed between these
+        // compute-encoder-per-dispatch blocks -- Metal's default hazard
+        // tracking (MTLResourceHazardTrackingModeTracked, the default for
+        // these MTL::ResourceStorageModeShared buffers) already serializes
+        // dependent encoders within one command buffer, matching how the
+        // existing pass loop below relies on it between histogram/prefix_
+        // sum/scatter.
+        {
+            // Clear key_range to (min=UINT_MAX, max=0) -- both sentinel
+            // values are byte-uniform, so a single-byte fillBuffer value
+            // (0xFF / 0x00) is exact, matching Vulkan's vkCmdFillBuffer
+            // 32-bit-word fill of the same two values.
+            auto* clearBlit = cmdBuf->blitCommandEncoder();
+            clearBlit->fillBuffer(keyRangeBuffer_, NS::Range(0, sizeof(uint32_t)), 0xFF);
+            clearBlit->fillBuffer(keyRangeBuffer_, NS::Range(sizeof(uint32_t), sizeof(uint32_t)), 0x00);
+            clearBlit->endEncoding();
+
+            {
+                auto* enc = cmdBuf->computeCommandEncoder();
+                enc->setComputePipelineState(sortReduceRangePipeline_);
+                trySetBuffer(enc, sortReduceRangeShader_, sortKeysBuffer_, 0);
+                trySetBuffer(enc, sortReduceRangeShader_, keyRangeBuffer_, 1);
+                SortPush rp = {numElements, 0};
+                enc->setBytes(&rp, sizeof(rp), sortReduceRangeShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numWg, 1, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmdBuf->computeCommandEncoder();
+                enc->setComputePipelineState(sortQuantizePipeline_);
+                trySetBuffer(enc, sortQuantizeShader_, sortKeysBuffer_, 0);
+                trySetBuffer(enc, sortQuantizeShader_, keyRangeBuffer_, 1);
+                SortPush qp = {numElements, 0};
+                enc->setBytes(&qp, sizeof(qp), sortQuantizeShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numQuantizeWg, 1, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+            }
+        }
+
+        for (uint32_t pass = 0; pass < 2; ++pass) {
             uint32_t bitOffset = pass * 8;
             uint32_t ping = pass % 2;  // 0 = A->B, 1 = B->A
             MTL::Buffer* keysIn = ping == 0 ? sortKeysBuffer_ : sortKeysBBuffer_;
@@ -898,7 +951,7 @@ void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* 
                 enc->endEncoding();
             }
         }
-        // After 4 (even) passes, sorted result is back in buffer A
+        // After 2 (even) passes, sorted result is back in buffer A
         // (sortKeysBuffer_ / sortedIndicesBuffer_), matching Vulkan.
     }
     lastSortMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
@@ -1159,8 +1212,40 @@ void MetalSplatLuxcRenderer::renderProfiled(MetalContext& ctx, double* preproces
         uint32_t numWg = sortNumWg_;
         uint32_t totalHistogram = 256 * numWg;
         uint32_t numParts = (totalHistogram + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
+        uint32_t numQuantizeWg = (numElements + 255) / 256;
         struct SortPush { uint32_t numElements; uint32_t bitOffset; };
-        for (uint32_t pass = 0; pass < 4; ++pass) {
+
+        // --- Range reduction + quantization (see render()'s identical,
+        // more heavily commented block) ---
+        {
+            auto* clearBlit = cmdBuf2->blitCommandEncoder();
+            clearBlit->fillBuffer(keyRangeBuffer_, NS::Range(0, sizeof(uint32_t)), 0xFF);
+            clearBlit->fillBuffer(keyRangeBuffer_, NS::Range(sizeof(uint32_t), sizeof(uint32_t)), 0x00);
+            clearBlit->endEncoding();
+
+            {
+                auto* enc = cmdBuf2->computeCommandEncoder();
+                enc->setComputePipelineState(sortReduceRangePipeline_);
+                trySetBuffer(enc, sortReduceRangeShader_, sortKeysBuffer_, 0);
+                trySetBuffer(enc, sortReduceRangeShader_, keyRangeBuffer_, 1);
+                SortPush rp = {numElements, 0};
+                enc->setBytes(&rp, sizeof(rp), sortReduceRangeShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numWg, 1, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmdBuf2->computeCommandEncoder();
+                enc->setComputePipelineState(sortQuantizePipeline_);
+                trySetBuffer(enc, sortQuantizeShader_, sortKeysBuffer_, 0);
+                trySetBuffer(enc, sortQuantizeShader_, keyRangeBuffer_, 1);
+                SortPush qp = {numElements, 0};
+                enc->setBytes(&qp, sizeof(qp), sortQuantizeShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numQuantizeWg, 1, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+            }
+        }
+
+        for (uint32_t pass = 0; pass < 2; ++pass) {
             uint32_t bitOffset = pass * 8;
             uint32_t ping = pass % 2;
             MTL::Buffer* keysIn = ping == 0 ? sortKeysBuffer_ : sortKeysBBuffer_;

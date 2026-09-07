@@ -392,25 +392,46 @@ private:
     VkBuffer histogramBuffer_ = VK_NULL_HANDLE;      VmaAllocation histogramAlloc_ = VK_NULL_HANDLE;
     VkBuffer partitionSumsBuffer_ = VK_NULL_HANDLE;  VmaAllocation partitionSumsAlloc_ = VK_NULL_HANDLE;
 
-    // Sort pipelines (3 compute stages)
+    // 16-bit key quantization (perf; bench/lux_perf_ablation.md's "Key
+    // width / passes" -- radix_sort_reduce_range.lux / radix_sort_quantize.lux):
+    // key_range[0]/[1] = this frame's global min/max of the pre-quantization
+    // sortable-uint32 depth keys (visible splats only), reduced by
+    // sortReduceRangePipeline_, then consumed by sortQuantizePipeline_ to
+    // remap sortKeysBuffer_ in place to a 16-bit-precision key -- letting
+    // the main pass loop below run 2 passes of 8 bits instead of 4.
+    VkBuffer keyRangeBuffer_ = VK_NULL_HANDLE;  VmaAllocation keyRangeAlloc_ = VK_NULL_HANDLE;
+
+    // Sort pipelines (3 core compute stages + 2 range-quantization stages)
     VkPipeline sortHistogramPipeline_ = VK_NULL_HANDLE;
     VkPipeline sortPrefixSumPipeline_ = VK_NULL_HANDLE;
     VkPipeline sortScatterPipeline_ = VK_NULL_HANDLE;
+    VkPipeline sortReduceRangePipeline_ = VK_NULL_HANDLE;
+    VkPipeline sortQuantizePipeline_ = VK_NULL_HANDLE;
 
     // Sort pipeline layouts
     VkPipelineLayout sortHistogramLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout sortPrefixSumLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout sortScatterLayout_ = VK_NULL_HANDLE;
+    // Shared by sortReduceRangePipeline_/sortQuantizePipeline_ (both use
+    // the same 2-binding (keys, key_range) descriptor set layout and
+    // 8-byte SortPush).
+    VkPipelineLayout sortRangeLayout_ = VK_NULL_HANDLE;
 
     // Sort descriptor set layouts
     VkDescriptorSetLayout sortHistogramSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout sortPrefixSumSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout sortScatterSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout sortRangeSetLayout_ = VK_NULL_HANDLE;
 
     // Sort descriptor sets: [0]=A->B, [1]=B->A for histogram and scatter; single for prefix_sum
     VkDescriptorSet sortHistogramDescSets_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDescriptorSet sortPrefixSumDescSet_ = VK_NULL_HANDLE;
     VkDescriptorSet sortScatterDescSets_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    // Bound to (sortKeysBuffer_, keyRangeBuffer_) -- both reduceRange
+    // (reads/atomics keys, writes key_range) and quantize (reads
+    // key_range, rewrites keys in place) always run against buffer A
+    // (sortKeysBuffer_), BEFORE the ping-pong pass loop starts.
+    VkDescriptorSet sortRangeDescSet_ = VK_NULL_HANDLE;
 
     // Precomputed sort workgroup count
     uint32_t sortNumWg_ = 0;

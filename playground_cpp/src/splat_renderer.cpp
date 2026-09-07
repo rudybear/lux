@@ -808,15 +808,19 @@ void SplatRenderer::createPipelines(VulkanContext& ctx, const std::string& shade
 
     // --- Descriptor pool ---
     // Need descriptors for: compute + render + sort (2*2 histogram + 1*2 prefix + 2*5 scatter = 16)
+    // + 1 range-quantization set (2 bindings; see createSortPipelines()'s
+    // sortRangeDescSet_, shared by the reduce-range and quantize stages)
     // + 1 morph-apply set (13 bindings, see _build_morph_apply_stage) for dynamic splats.
     static constexpr uint32_t kMorphBindingCount = 13;
+    static constexpr uint32_t kSortRangeBindingCount = 2;
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = numComputeBindings + numRenderBindings + 16 + kMorphBindingCount + 4; // + morph + margin
+    poolSize.descriptorCount = numComputeBindings + numRenderBindings + 16 + kSortRangeBindingCount
+                                + kMorphBindingCount + 4; // + morph + margin
 
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 2 + 5 + 1;  // compute, render + 2 histogram + 1 prefix_sum + 2 scatter + morph
+    poolInfo.maxSets = 2 + 5 + 1 + 1;  // compute, render + 2 histogram + 1 prefix_sum + 2 scatter + range + morph
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
 
@@ -904,39 +908,48 @@ void SplatRenderer::createSortPipelines(VkDevice device) {
     sortPrefixSumSetLayout_ = createSortSetLayout(device, 2);
     // scatter.comp: binding 0-4 = keys_in, keys_out, vals_in, vals_out, histograms
     sortScatterSetLayout_ = createSortSetLayout(device, 5);
+    // reduce_range.comp / quantize.comp: binding 0 = keys, binding 1 = key_range
+    // (same 2-SSBO shape for both -- shared layout + descriptor set, see
+    // sortRangeDescSet_'s header comment).
+    sortRangeSetLayout_ = createSortSetLayout(device, 2);
 
     // Pipeline layouts
     sortHistogramLayout_ = createSortPipelineLayout(device, sortHistogramSetLayout_);
     sortPrefixSumLayout_ = createSortPipelineLayout(device, sortPrefixSumSetLayout_);
     sortScatterLayout_ = createSortPipelineLayout(device, sortScatterSetLayout_);
+    sortRangeLayout_ = createSortPipelineLayout(device, sortRangeSetLayout_);
 
     // Compute pipelines (load pre-compiled SPIR-V from shaders/radix_sort/)
     std::string sortDir = "shaders/radix_sort/";
     sortHistogramPipeline_ = createSortComputePipeline(device, sortHistogramLayout_, sortDir + "histogram.comp.spv");
     sortPrefixSumPipeline_ = createSortComputePipeline(device, sortPrefixSumLayout_, sortDir + "prefix_sum.comp.spv");
     sortScatterPipeline_ = createSortComputePipeline(device, sortScatterLayout_, sortDir + "scatter.comp.spv");
+    sortReduceRangePipeline_ = createSortComputePipeline(device, sortRangeLayout_, sortDir + "reduce_range.comp.spv");
+    sortQuantizePipeline_ = createSortComputePipeline(device, sortRangeLayout_, sortDir + "quantize.comp.spv");
 
     // Allocate sort descriptor sets from the shared pool
-    VkDescriptorSetLayout sortLayouts[5] = {
+    VkDescriptorSetLayout sortLayouts[6] = {
         sortHistogramSetLayout_,   // A->B
         sortHistogramSetLayout_,   // B->A
         sortPrefixSumSetLayout_,   // single
         sortScatterSetLayout_,     // A->B
         sortScatterSetLayout_,     // B->A
+        sortRangeSetLayout_,       // reduce-range + quantize (shared)
     };
     VkDescriptorSetAllocateInfo sortAllocInfo = {};
     sortAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     sortAllocInfo.descriptorPool = descriptorPool_;
-    sortAllocInfo.descriptorSetCount = 5;
+    sortAllocInfo.descriptorSetCount = 6;
     sortAllocInfo.pSetLayouts = sortLayouts;
 
-    VkDescriptorSet sortSets[5];
+    VkDescriptorSet sortSets[6];
     vkAllocateDescriptorSets(device, &sortAllocInfo, sortSets);
     sortHistogramDescSets_[0] = sortSets[0];
     sortHistogramDescSets_[1] = sortSets[1];
     sortPrefixSumDescSet_ = sortSets[2];
     sortScatterDescSets_[0] = sortSets[3];
     sortScatterDescSets_[1] = sortSets[4];
+    sortRangeDescSet_ = sortSets[5];
 
     std::cout << "[info] GPU radix sort pipelines created" << std::endl;
 }
@@ -1106,6 +1119,14 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     createVmaBuffer(ctx.allocator, partitionSumsSize, ssbo,
                     VMA_MEMORY_USAGE_GPU_ONLY, partitionSumsBuffer_, partitionSumsAlloc_);
 
+    // 16-bit key quantization range (2 uints: min, max; see keyRangeBuffer_'s
+    // header comment in splat_renderer.h). Needs VK_BUFFER_USAGE_TRANSFER_DST_BIT
+    // (not in the plain `ssbo` flags above) because it's cleared every
+    // sorted frame via vkCmdFillBuffer.
+    createVmaBuffer(ctx.allocator, 2 * sizeof(uint32_t),
+                    ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VMA_MEMORY_USAGE_GPU_ONLY, keyRangeBuffer_, keyRangeAlloc_);
+
     std::cout << "[info] GPU radix sort: " << numSplats_ << " splats, "
               << sortNumWg_ << " workgroups, " << totalHistEntries << " histogram entries, "
               << numPartitions << " partitions" << std::endl;
@@ -1245,6 +1266,11 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     writeSSBO(sortScatterDescSets_[1], 2, sortValsBBuffer_, sortBufSize);
     writeSSBO(sortScatterDescSets_[1], 3, sortedIndicesBuffer_, sortBufSize);
     writeSSBO(sortScatterDescSets_[1], 4, histogramBuffer_, histBufSize);
+
+    // Range-quantization set: binding 0 = keys (buffer A, read/atomics by
+    // reduce-range, read/write in place by quantize), binding 1 = key_range.
+    writeSSBO(sortRangeDescSet_, 0, sortKeysBuffer_, sortBufSize);
+    writeSSBO(sortRangeDescSet_, 1, keyRangeBuffer_, 2 * sizeof(uint32_t));
 }
 
 // --------------------------------------------------------------------------
@@ -2047,7 +2073,8 @@ void SplatRenderer::render(VulkanContext& ctx) {
     //
     // This preprocess compute dispatch writes projected_mv (among other
     // projected_* buffers) which the vertex shader reads much later in this
-    // same command buffer, after the 4-pass GPU radix sort. In-buffer
+    // same command buffer, after the GPU radix sort (range reduction +
+    // quantization + 2 passes, see below). In-buffer
     // pipeline barriers (including, empirically, one broadened to
     // VK_PIPELINE_STAGE_ALL_COMMANDS_BIT / VK_ACCESS_MEMORY_WRITE_BIT right
     // before the render pass) were NOT sufficient to make this reliable on
@@ -2126,7 +2153,9 @@ void SplatRenderer::render(VulkanContext& ctx) {
         }
     }
 
-    // --- GPU Radix Sort (4 passes, 8 bits per pass = 32-bit keys) ---
+    // --- GPU Radix Sort (16-bit keys: reduce-range + quantize, then 2
+    // passes of 8 bits -- perf; bench/lux_perf_ablation.md's "Key width /
+    // passes"; previously 4 passes over the full 32-bit key) ---
     // Skipped entirely on frames the schedule above decides don't need a
     // fresh order -- sortedIndicesBuffer_/sortKeysBuffer_ simply keep
     // whatever the last real sort left in them (GPU_ONLY memory, never
@@ -2139,6 +2168,7 @@ void SplatRenderer::render(VulkanContext& ctx) {
         uint32_t numWg = sortNumWg_;
         uint32_t totalHistogram = 256 * numWg;
         uint32_t numParts = (totalHistogram + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
+        uint32_t numQuantizeWg = (numElements + 255) / 256;  // 1:1 dispatch, workgroup_size=256
 
         VkMemoryBarrier sortBarrier = {};
         sortBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -2150,7 +2180,52 @@ void SplatRenderer::render(VulkanContext& ctx) {
             uint32_t bitOffset;
         };
 
-        for (uint32_t pass = 0; pass < 4; ++pass) {
+        // --- Range reduction + quantization (runs against buffer A,
+        // sortKeysBuffer_, BEFORE the ping-pong pass loop) ---
+        {
+            // Clear key_range to (min=UINT_MAX, max=0). Both sentinel
+            // values are byte-uniform (0xFFFFFFFF = all-0xFF bytes, 0 =
+            // all-0x00 bytes) -- kept that way deliberately so the exact
+            // same fill values port unchanged to Metal's byte-granularity
+            // MTLBlitCommandEncoder::fillBuffer (see
+            // metal_splat_luxc_renderer.cpp's mirrored comment).
+            vkCmdFillBuffer(cmd, keyRangeBuffer_, 0, sizeof(uint32_t), 0xFFFFFFFFu);
+            vkCmdFillBuffer(cmd, keyRangeBuffer_, sizeof(uint32_t), sizeof(uint32_t), 0u);
+
+            VkMemoryBarrier fillBarrier = {};
+            fillBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            fillBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            fillBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &fillBarrier, 0, nullptr, 0, nullptr);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortReduceRangePipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortRangeLayout_,
+                                    0, 1, &sortRangeDescSet_, 0, nullptr);
+            SortPush reducePush = {numElements, 0};
+            vkCmdPushConstants(cmd, sortRangeLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(reducePush), &reducePush);
+            vkCmdDispatch(cmd, numWg, 1, 1);
+
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &sortBarrier, 0, nullptr, 0, nullptr);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortQuantizePipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortRangeLayout_,
+                                    0, 1, &sortRangeDescSet_, 0, nullptr);
+            SortPush quantPush = {numElements, 0};
+            vkCmdPushConstants(cmd, sortRangeLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(quantPush), &quantPush);
+            vkCmdDispatch(cmd, numQuantizeWg, 1, 1);
+
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &sortBarrier, 0, nullptr, 0, nullptr);
+        }
+
+        for (uint32_t pass = 0; pass < 2; ++pass) {
             uint32_t bitOffset = pass * 8;
             uint32_t ping = pass % 2;  // 0 = A->B, 1 = B->A
 
@@ -2217,7 +2292,7 @@ void SplatRenderer::render(VulkanContext& ctx) {
         }
     }
 
-    // After 4 passes (even count), sorted results are in buffer A
+    // After 2 passes (even count), sorted results are in buffer A
     // (sortKeysBuffer_, sortedIndicesBuffer_) which is what render reads.
 
     if (gpuTimingEnabled_) {
@@ -2690,9 +2765,12 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     if (sortHistogramPipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(ctx.device, sortHistogramPipeline_, nullptr);
     if (sortPrefixSumPipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(ctx.device, sortPrefixSumPipeline_, nullptr);
     if (sortScatterPipeline_ != VK_NULL_HANDLE)   vkDestroyPipeline(ctx.device, sortScatterPipeline_, nullptr);
+    if (sortReduceRangePipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(ctx.device, sortReduceRangePipeline_, nullptr);
+    if (sortQuantizePipeline_ != VK_NULL_HANDLE)    vkDestroyPipeline(ctx.device, sortQuantizePipeline_, nullptr);
     if (sortHistogramLayout_ != VK_NULL_HANDLE)   vkDestroyPipelineLayout(ctx.device, sortHistogramLayout_, nullptr);
     if (sortPrefixSumLayout_ != VK_NULL_HANDLE)   vkDestroyPipelineLayout(ctx.device, sortPrefixSumLayout_, nullptr);
     if (sortScatterLayout_ != VK_NULL_HANDLE)     vkDestroyPipelineLayout(ctx.device, sortScatterLayout_, nullptr);
+    if (sortRangeLayout_ != VK_NULL_HANDLE)       vkDestroyPipelineLayout(ctx.device, sortRangeLayout_, nullptr);
 
     // Descriptor layouts and pool
     if (computeSetLayout_ != VK_NULL_HANDLE)       vkDestroyDescriptorSetLayout(ctx.device, computeSetLayout_, nullptr);
@@ -2700,6 +2778,7 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     if (sortHistogramSetLayout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(ctx.device, sortHistogramSetLayout_, nullptr);
     if (sortPrefixSumSetLayout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(ctx.device, sortPrefixSumSetLayout_, nullptr);
     if (sortScatterSetLayout_ != VK_NULL_HANDLE)   vkDestroyDescriptorSetLayout(ctx.device, sortScatterSetLayout_, nullptr);
+    if (sortRangeSetLayout_ != VK_NULL_HANDLE)     vkDestroyDescriptorSetLayout(ctx.device, sortRangeSetLayout_, nullptr);
     if (descriptorPool_ != VK_NULL_HANDLE)         vkDestroyDescriptorPool(ctx.device, descriptorPool_, nullptr);
 
     // Buffers (VMA)
@@ -2729,6 +2808,7 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     destroyVmaBuffer(ctx.allocator, sortValsBBuffer_, sortValsBAlloc_);
     destroyVmaBuffer(ctx.allocator, histogramBuffer_, histogramAlloc_);
     destroyVmaBuffer(ctx.allocator, partitionSumsBuffer_, partitionSumsAlloc_);
+    destroyVmaBuffer(ctx.allocator, keyRangeBuffer_, keyRangeAlloc_);
 
     for (size_t i = 0; i < shBuffers_.size(); ++i) {
         destroyVmaBuffer(ctx.allocator, shBuffers_[i], shAllocs_[i]);

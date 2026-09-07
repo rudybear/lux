@@ -399,6 +399,15 @@ private:
     MTL::ComputePipelineState* sortPrefixSumPipeline_ = nullptr;
     MTL::ComputePipelineState* sortScatterPipeline_ = nullptr;
 
+    // 16-bit key quantization (perf; bench/lux_perf_ablation.md's "Key
+    // width / passes" -- see splat_renderer.h's identical Vulkan comment
+    // on keyRangeBuffer_). Runs before the ping-pong pass loop, cutting it
+    // from 4 passes (32-bit keys) to 2 (16-bit keys).
+    TranspiledShader sortReduceRangeShader_;
+    TranspiledShader sortQuantizeShader_;
+    MTL::ComputePipelineState* sortReduceRangePipeline_ = nullptr;
+    MTL::ComputePipelineState* sortQuantizePipeline_ = nullptr;
+
     // Splat input buffers (identical layout/prep to MetalSplatRenderer's).
     MTL::Buffer* posBuffer_ = nullptr;
     MTL::Buffer* rotBuffer_ = nullptr;
@@ -439,6 +448,9 @@ private:
     MTL::Buffer* histogramBuffer_ = nullptr;
     MTL::Buffer* partitionSumsBuffer_ = nullptr;
     uint32_t sortNumWg_ = 0;
+    // 16-bit key quantization range (2 uints: min, max); see
+    // splat_renderer.h's identical Vulkan keyRangeBuffer_ comment.
+    MTL::Buffer* keyRangeBuffer_ = nullptr;
 
     MTL::Buffer* prevPosBuffer_ = nullptr;
     // prev_camera_mats[0]=proj_matrix_unjittered, [1]=prev_view_proj_unjittered

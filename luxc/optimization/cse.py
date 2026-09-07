@@ -26,6 +26,18 @@ from luxc.parser.ast_nodes import (
 # Calls with side effects that must never be CSE'd
 # ---------------------------------------------------------------------------
 
+# Bug fix (bench/lux_perf_ablation.md in mobiledlss, "Key width / passes"):
+# same naming-mismatch bug as dead_code.py's _SIDE_EFFECT_CALLS -- see that
+# file's comment for the full story (confirmed via a fresh recompile of
+# radix_sort_histogram.lux losing its OpAtomicIAdd entirely). This set is
+# matched by exact string equality against `CallExpr.func.name`, and the
+# real registered builtin names (luxc/builtins/functions.py) are
+# snake_case ("atomic_add", not "atomicAdd"), so the atomic/image entries
+# below never matched a real call -- meaning two textually-identical
+# atomic_* calls (e.g. two `atomic_add(counter, 1)` sites) could have been
+# silently merged into one, executing the memory side effect only once.
+# Fixed to match the real names; `sample*`/`trace_ray`/`barrier` were
+# already correct.
 _NO_CSE_CALLS = frozenset({
     # Texture sampling (derivative side effects)
     "sample", "sample_lod", "sample_bindless", "sample_bindless_lod",
@@ -33,16 +45,15 @@ _NO_CSE_CALLS = frozenset({
     # Ray tracing
     "trace_ray",
     # Barriers / synchronisation
-    "barrier", "memoryBarrier", "memoryBarrierBuffer",
-    "memoryBarrierShared", "memoryBarrierImage",
-    "groupMemoryBarrier",
+    "barrier",
     # Atomics
-    "atomicAdd", "atomicMin", "atomicMax", "atomicAnd", "atomicOr",
-    "atomicXor", "atomicExchange", "atomicCompareExchange",
+    "atomic_add", "atomic_min", "atomic_max", "atomic_and", "atomic_or",
+    "atomic_xor", "atomic_exchange", "atomic_compare_exchange",
+    "atomic_load", "atomic_store",
     # Geometry / mesh output
-    "emit_vertex", "end_primitive", "emit_mesh_tasks",
-    # Debug
-    "debug_printf",
+    "emit_mesh_tasks",
+    # Images
+    "image_store",
 })
 
 

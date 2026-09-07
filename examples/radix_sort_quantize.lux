@@ -1,0 +1,60 @@
+// Radix Sort — Key Quantization (16-bit key quantization, step 2 of 2)
+// Rewrites `keys` IN PLACE: each full-range sortable-uint32 depth key
+// (written by the splat preprocess stage, see
+// luxc/expansion/splat_expander.py) is remapped into a 16-bit value
+// (0..65535, stored in a uint32 -- upper 16 bits always 0) using the
+// current frame's [key_range[0], key_range[1]] visible-depth range computed
+// by radix_sort_reduce_range.lux. This lets the subsequent radix sort run
+// only 2 passes of 8 bits (bit_offset 0, 8) instead of 4 passes over the
+// full 32-bit key -- see bench/lux_perf_ablation.md in mobiledlss,
+// "Key width / passes".
+//
+// Culled/invisible splats (sentinel key 0xFFFFFFFF) map to the top bucket
+// (65535) -- consistent with the pre-quantization convention that larger
+// keys sort later/farther; harmless either way since those splats render
+// as zero-size/zero-opacity quads.
+//
+// Quantization is monotonic (order-preserving) and only loses precision
+// WITHIN a 65536th of the frame's actual min-max depth spread, so distinct
+// depths only collide (tie) when they were already closer together than
+// that -- ties break by the radix sort's existing stable scatter (index
+// order), same as any other tied key today.
+//
+// Compile: luxc radix_sort_quantize.lux --define workgroup_size=256
+
+compute {
+    storage_buffer keys: uint;
+    storage_buffer key_range: uint;
+
+    push params {
+        num_elements: uint,
+    }
+
+    fn main() {
+        let gid: uint = global_invocation_id.x;
+        if (gid < num_elements) {
+            let key: uint = keys[gid];
+
+            if (key >= 4294967295) {
+                keys[gid] = 65535;
+            } else {
+                let lo: uint = key_range[0];
+                let hi: uint = key_range[1];
+                let span: uint = hi - lo;
+
+                let quant: uint = 0;
+                if (span > 0) {
+                    let rel: scalar = key - lo;
+                    let denom: scalar = span;
+                    let scaled: scalar = (rel / denom) * 65535.0;
+                    quant = scaled;
+                    if (quant > 65535) {
+                        quant = 65535;
+                    }
+                }
+
+                keys[gid] = quant;
+            }
+        }
+    }
+}
