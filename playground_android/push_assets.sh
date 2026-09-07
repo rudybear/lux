@@ -61,6 +61,9 @@ push_one "$MOBILEDLSS_ROOT/demo/ios_assets/bg_sphere.npy" "assets/bg_sphere.npy"
 echo "=== pushing Stage 4 TFLite net (unet_ps2_mem.tflite, fp16) ==="
 push_one "$MOBILEDLSS_ROOT/demo/ios_assets/exported/unet_ps2_mem.tflite" "assets/unet_ps2_mem.tflite"
 
+echo "=== pushing task-4 pooled-input TFLite net (unet_ps2_mem_pooled.tflite, fp16 -- mobiledlss/train/export.py::export_tflite_pooled_input, takes InputAssembly's tensor directly, no adapter) ==="
+push_one "$MOBILEDLSS_ROOT/demo/ios_assets/exported/unet_ps2_mem_pooled.tflite" "assets/unet_ps2_mem_pooled.tflite"
+
 echo "=== pushing Stage 5 memory-head weights (memory_head.npz, from expY_mem3_juggle_p0.8_ps2.pt) ==="
 push_one "$MOBILEDLSS_ROOT/demo/ios_assets/exported/memory_head.npz" "assets/memory_head.npz"
 

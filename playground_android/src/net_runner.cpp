@@ -2,6 +2,7 @@
 
 #include <tensorflow/lite/c/c_api.h>
 #include <tensorflow/lite/delegates/gpu/delegate.h>
+#include <tensorflow/lite/delegates/xnnpack/xnnpack_delegate.h>
 
 #include <android/log.h>
 #include <algorithm>
@@ -18,27 +19,20 @@ namespace {
 inline double msSince(std::chrono::high_resolution_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
 }
-
-// Stage 3's net-res channel layout (InputAssembly / NetInputAssembly.h):
-// color(3) depthN(1) mvN(2) disocc(1) fg(1) jitter(2) texfeat(8) hidden(*).
-constexpr int kColorOff = 0, kDepthOff = 3, kMvOff = 4, kDisoccOff = 6, kFgOff = 7,
-              kJitterOff = 8, kTexOff = 10;
-constexpr float kMvScale = 1.0f / 16.0f;
 }  // namespace
 
 struct NetRunner::Impl {
     TfLiteModel* model = nullptr;
     TfLiteInterpreterOptions* options = nullptr;
     TfLiteDelegate* gpuDelegate = nullptr;
+    TfLiteDelegate* xnnpackDelegate = nullptr;  // only set when explicitly force-created (see init())
     TfLiteInterpreter* interpreter = nullptr;
 
-    // Input tensor indices, resolved once by name at init time (onnx2tf +
-    // flatc preserved export.py's _input_names order/names exactly -- see
-    // the export_and_validate_tflite.py validation this was checked
-    // against -- but resolving by name is one extra safety net against a
-    // future re-export reordering them).
-    int idxColor = -1, idxDepth = -1, idxMv = -1, idxDisocc = -1, idxFg = -1,
-        idxJitter = -1, idxHidden = -1, idxTex = -1;
+    // Single input tensor index, resolved by name ("net_input" --
+    // export_tflite_pooled_input's input_names=["net_input"]) with
+    // positional fallback to 0 (a single-input graph has nowhere else it
+    // could be).
+    int idxInput = 0;
     TfLiteTensor* outputTensor = nullptr;
 };
 
@@ -46,6 +40,7 @@ NetRunner::~NetRunner() {
     if (!impl_) return;
     if (impl_->interpreter) TfLiteInterpreterDelete(impl_->interpreter);
     if (impl_->gpuDelegate) TfLiteGpuDelegateV2Delete(impl_->gpuDelegate);
+    if (impl_->xnnpackDelegate) TfLiteXNNPackDelegateDelete(impl_->xnnpackDelegate);
     if (impl_->options) TfLiteInterpreterOptionsDelete(impl_->options);
     if (impl_->model) TfLiteModelDelete(impl_->model);
     delete impl_;
@@ -59,8 +54,10 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
     paramStride_ = paramStride;
     hiddenChannels_ = hiddenChannels;
     texChannels_ = texChannels;
-    proxyW_ = netW * paramStride;
-    proxyH_ = netH * paramStride;
+    // build_input's parts concat order: color(3) depthN(1) mvN(2) disocc(1)
+    // fg(1) jitter(2) [=10, _NON_HIDDEN_IN_CHANNELS] + texture_feat(tex) +
+    // hidden(hidden) -- matches export_tflite_pooled_input's in_ch exactly.
+    inputChannels_ = 10u + hiddenChannels_ + texChannels_;
 
     impl_->model = TfLiteModelCreateFromFile(modelPath.c_str());
     if (!impl_->model) throw std::runtime_error("NetRunner: TfLiteModelCreateFromFile failed: " + modelPath);
@@ -77,21 +74,64 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
     }
     TfLiteInterpreterOptionsSetNumThreads(impl_->options, numThreads);
 
+    // Task 3 follow-up: XNNPACK is applied automatically by
+    // TfLiteInterpreterCreate whenever no other delegate is registered (its
+    // the CPU path's default backend since ~TF 2.3) -- that implicit
+    // instance runs fp32 compute even though the model's WEIGHTS are
+    // fp16-quantized on disk (dequantized to fp32 at load time). This
+    // block, gated by gpu_net_config.txt's xnnpack_fp16=1 (default 0, i.e.
+    // unchanged behaviour), instead creates an EXPLICIT XNNPack delegate
+    // with TFLITE_XNNPACK_DELEGATE_FLAG_FORCE_FP16 set, which runs the
+    // arithmetic itself in fp16 on CPUs with native fp16 vector support
+    // (the Tensor G4's cores are ARMv9/ARMv8.2+, which have it) -- measure
+    // via the NET timing infer= line with/without this flag. Needs
+    // third_party/tflite/include/.../delegates/xnnpack/xnnpack_delegate.h
+    // (fetched from the exact tensorflow v2.16.1 tag to match this repo's
+    // prebuilt libtensorflowlite_jni.so, which already exports these
+    // symbols -- confirmed via `llvm-nm -D`ing it -- even though no header
+    // for them shipped in the original third_party/tflite/include drop).
+    bool xnnpackForceFp16 = false;
+    FILE* xnnCfg = fopen("gpu_net_config.txt", "r");
+    if (xnnCfg) {
+        char line[128];
+        while (fgets(line, sizeof(line), xnnCfg)) {
+            std::string s(line);
+            auto eq = s.find('=');
+            if (eq == std::string::npos) continue;
+            std::string key = s.substr(0, eq);
+            std::string val = s.substr(eq + 1);
+            while (!val.empty() && (val.back() == '\n' || val.back() == '\r' || val.back() == ' ')) val.pop_back();
+            if (key == "xnnpack_fp16") xnnpackForceFp16 = (val == "1");
+        }
+        fclose(xnnCfg);
+    }
+    if (xnnpackForceFp16) {
+        TfLiteXNNPackDelegateOptions xnnOpts = TfLiteXNNPackDelegateOptionsDefault();
+        xnnOpts.num_threads = numThreads;
+        xnnOpts.flags |= TFLITE_XNNPACK_DELEGATE_FLAG_FORCE_FP16;
+        impl_->xnnpackDelegate = TfLiteXNNPackDelegateCreate(&xnnOpts);
+        if (impl_->xnnpackDelegate) {
+            TfLiteInterpreterOptionsAddDelegate(impl_->options, impl_->xnnpackDelegate);
+            LOGI("NetRunner: explicit XNNPack delegate created with FORCE_FP16 (gpu_net_config.txt xnnpack_fp16=1)");
+        } else {
+            LOGE("NetRunner: TfLiteXNNPackDelegateCreate(FORCE_FP16) failed; falling back to the implicit fp32 XNNPack path");
+        }
+    }
+
     // GPU delegate is OFF by default: on this exact device/model
-    // (Pixel 9 Pro XL, Mali-G715, TFLite GPU delegate 2.16.1,
-    // unet_ps2_mem.tflite's onnx2tf-converted graph) it silently produces
-    // WRONG results -- max|diff| vs. torch jumped from 1.17e-2 (CPU/
-    // XNNPACK, matching the desktop tf.lite.Interpreter validation exactly)
-    // to 26.7 (GPU delegate) on the identical frame-30 input, isolated by
-    // A/B toggling this flag with everything else held fixed (same
-    // interpreter, same input buffers, same model file). Not root-caused
-    // to a specific op -- a known category of issue for TFLite's GPU
-    // delegate on less-common op patterns (onnx2tf's conversion of the
-    // packed multi-output slice, transposes, etc. -- see export.py's
-    // `_export_tflite_onnx2tf` docstring for the conversion bugs already
-    // known in this exact graph). CPU/XNNPACK is the only currently-
-    // correct backend for this model on this device; re-enable via the
-    // `force_gpu_net` marker file only for further debugging.
+    // (Pixel 9 Pro XL, Mali-G715, TFLite GPU delegate 2.16.1) it produces
+    // WRONG results regardless of precision config or CL/GL backend --
+    // task 3's GPU-delegate correctness bisect (docs/rendering-engines.md)
+    // found MAX_PRECISION+fp32 still outputs all-zero on the full 72-node
+    // graph, OpenCL is entirely unloadable on this device ("undefined
+    // symbol: clGetCommandBufferInfoKHR"), and isolated single-op probes
+    // for the 3 likely-suspect ops (nearest-upsample, LeakyReLU, 4D jitter
+    // broadcast) all show CPU/GPU matching exactly -- not root-caused to a
+    // specific op, but conclusively not fixable by a delegate-options
+    // change alone. CPU/XNNPACK is the only currently-correct backend for
+    // this model on this device; re-enable via the `force_gpu_net` marker
+    // file only for further debugging (gpu_probe.{h,cpp}'s isolated probes
+    // are the better tool for that now, not this whole-model toggle).
     FILE* marker = fopen("force_gpu_net", "r");
     bool forceGpu = (marker != nullptr);
     if (marker) fclose(marker);
@@ -104,10 +144,6 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
     // TfLiteGpuDelegateOptionsV2Default() exactly; min -> this file's
     // prior hardcoded MIN_LATENCY override, kept only for A/B comparison)
     // and backend=auto|cl|gl (-> experimental_flags CL_ONLY/GL_ONLY).
-    // Defaults (no file, or missing keys): precision=max, backend=auto --
-    // i.e. plain TfLiteGpuDelegateOptionsV2Default(), the first thing the
-    // task brief asks to try, since the previous MIN_LATENCY override was
-    // never itself verified as the cause of the 26.7 max-diff result.
     std::string precisionCfg = "max", backendCfg = "auto";
     FILE* cfgFile = fopen("gpu_net_config.txt", "r");
     if (cfgFile) {
@@ -150,7 +186,8 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
     } else if (forceGpu) {
         LOGE("TfLiteGpuDelegateV2Create failed even with force_gpu_net set; using CPU (XNNPACK)");
     } else {
-        LOGI("NetRunner: GPU delegate disabled by default (see init()'s comment); using CPU (XNNPACK)");
+        LOGI("NetRunner: GPU delegate disabled by default (see init()'s comment); using CPU (XNNPACK%s)",
+             xnnpackForceFp16 ? ", explicit FORCE_FP16" : "");
     }
 
     impl_->interpreter = TfLiteInterpreterCreate(impl_->model, impl_->options);
@@ -167,7 +204,7 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
             impl_->gpuDelegate = nullptr;
             TfLiteInterpreterOptionsDelete(impl_->options);
             impl_->options = TfLiteInterpreterOptionsCreate();
-            TfLiteInterpreterOptionsSetNumThreads(impl_->options, 4);
+            TfLiteInterpreterOptionsSetNumThreads(impl_->options, numThreads);
             impl_->interpreter = TfLiteInterpreterCreate(impl_->model, impl_->options);
             if (!impl_->interpreter || TfLiteInterpreterAllocateTensors(impl_->interpreter) != kTfLiteOk) {
                 throw std::runtime_error("NetRunner: AllocateTensors failed (CPU fallback too)");
@@ -179,29 +216,17 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
     gpuDelegateActive_ = (impl_->gpuDelegate != nullptr);
 
     int32_t nIn = TfLiteInterpreterGetInputTensorCount(impl_->interpreter);
-    LOGI("NetRunner: model=%s inputs=%d gpu_delegate=%d cpu_threads=%d", modelPath.c_str(), nIn, gpuDelegateActive_,
-         numThreads);
+    LOGI("NetRunner: model=%s inputs=%d gpu_delegate=%d cpu_threads=%d xnnpack_force_fp16=%d",
+         modelPath.c_str(), nIn, gpuDelegateActive_, numThreads, xnnpackForceFp16 && impl_->xnnpackDelegate != nullptr);
+    impl_->idxInput = 0;
     for (int32_t i = 0; i < nIn; i++) {
         TfLiteTensor* t = TfLiteInterpreterGetInputTensor(impl_->interpreter, i);
         std::string name = TfLiteTensorName(t) ? TfLiteTensorName(t) : "";
         LOGI("  IN[%d] name=%s dims=%d", i, name.c_str(), TfLiteTensorNumDims(t));
-        if (name == "proxy_color") impl_->idxColor = i;
-        else if (name == "proxy_depth") impl_->idxDepth = i;
-        else if (name == "proxy_mv") impl_->idxMv = i;
-        else if (name == "proxy_disocc") impl_->idxDisocc = i;
-        else if (name == "proxy_fg") impl_->idxFg = i;
-        else if (name == "jitter_proxy") impl_->idxJitter = i;
-        else if (name == "hidden_in") impl_->idxHidden = i;
-        else if (name == "texture_feat") impl_->idxTex = i;
+        if (name == "net_input") impl_->idxInput = i;
     }
-    if (impl_->idxColor < 0 || impl_->idxDepth < 0 || impl_->idxMv < 0 || impl_->idxDisocc < 0 ||
-        impl_->idxFg < 0 || impl_->idxJitter < 0 || impl_->idxHidden < 0 || impl_->idxTex < 0) {
-        // Name-based resolution failed (e.g. a re-export without flatc on
-        // PATH, per export.py's _export_tflite_onnx2tf docstring) -- fall
-        // back to export.py's fixed _input_names positional order.
-        LOGE("NetRunner: input tensor name lookup incomplete; falling back to positional order");
-        impl_->idxColor = 0; impl_->idxDepth = 1; impl_->idxMv = 2; impl_->idxDisocc = 3;
-        impl_->idxFg = 4; impl_->idxJitter = 5; impl_->idxHidden = 6; impl_->idxTex = 7;
+    if (nIn != 1) {
+        LOGE("NetRunner: expected a single-input pooled model, got %d inputs -- using index 0 regardless", nIn);
     }
 
     impl_->outputTensor = const_cast<TfLiteTensor*>(TfLiteInterpreterGetOutputTensor(impl_->interpreter, 0));
@@ -209,72 +234,38 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
     outputChannels_ = static_cast<uint32_t>(TfLiteTensorDim(impl_->outputTensor, outDims - 1));
     LOGI("NetRunner: output channels=%u (expect sp*sp*K*K + sp*sp*3 + hidden)", outputChannels_);
 
-    const size_t proxyN = static_cast<size_t>(proxyW_) * proxyH_;
-    bufColor_.resize(proxyN * 3);
-    bufDepth_.resize(proxyN);
-    bufMv_.resize(proxyN * 2);
-    bufDisocc_.resize(proxyN);
-    bufFg_.resize(proxyN);
-    bufJitter_.resize(2);
-    bufHidden_.resize(static_cast<size_t>(netW_) * netH_ * hiddenChannels_);
-    bufTex_.resize(proxyN * texChannels_);
     bufOutput_.resize(static_cast<size_t>(netW_) * netH_ * outputChannels_);
+    // bufPooled_ is only actually allocated/used in run() when hiddenInNetRes
+    // != nullptr (see its call site) -- reserve now so that first real (post
+    // -warmup) frame doesn't pay a vector-growth cost mid-measurement.
+    bufPooled_.resize(static_cast<size_t>(netW_) * netH_ * inputChannels_);
 }
 
 const float* NetRunner::run(const float* netTensor26ch, const float* hiddenInNetRes, RunTimingsMs& timings) {
     auto tAdapter = std::chrono::high_resolution_clock::now();
-    const uint32_t ch = 18u + hiddenChannels_;
-    const uint32_t ps = paramStride_;
-
-    // --- Exact net-res -> proxy-res reconstruction (see net_runner.h's
-    // header comment for why nearest-upsample + inverse post-pool transform
-    // is mathematically exact here, not an approximation). ---
-    for (uint32_t gy = 0; gy < netH_; gy++) {
-        for (uint32_t gx = 0; gx < netW_; gx++) {
-            const float* px = netTensor26ch + (static_cast<size_t>(gy) * netW_ + gx) * ch;
-            float depthN = px[kDepthOff];
-            float depthRaw = (depthN < 0.999999f) ? depthN / (1.0f - depthN) : 1.0e6f;
-            for (uint32_t dy = 0; dy < ps; dy++) {
-                for (uint32_t dx = 0; dx < ps; dx++) {
-                    uint32_t py = gy * ps + dy, pxi = gx * ps + dx;
-                    size_t pidx = static_cast<size_t>(py) * proxyW_ + pxi;
-                    bufColor_[pidx * 3 + 0] = px[kColorOff + 0];
-                    bufColor_[pidx * 3 + 1] = px[kColorOff + 1];
-                    bufColor_[pidx * 3 + 2] = px[kColorOff + 2];
-                    bufDepth_[pidx] = depthRaw;
-                    bufMv_[pidx * 2 + 0] = px[kMvOff + 0] / kMvScale;
-                    bufMv_[pidx * 2 + 1] = px[kMvOff + 1] / kMvScale;
-                    bufDisocc_[pidx] = px[kDisoccOff];
-                    bufFg_[pidx] = px[kFgOff];
-                    for (uint32_t c = 0; c < texChannels_; c++) {
-                        bufTex_[pidx * texChannels_ + c] = px[kTexOff + c];
-                    }
-                }
-            }
-        }
-    }
-    bufJitter_[0] = netTensor26ch[kJitterOff + 0];
-    bufJitter_[1] = netTensor26ch[kJitterOff + 1];
+    const float* toUpload = netTensor26ch;
     if (hiddenInNetRes != nullptr) {
-        std::memcpy(bufHidden_.data(), hiddenInNetRes, bufHidden_.size() * sizeof(float));
-    } else {
-        std::fill(bufHidden_.begin(), bufHidden_.end(), 0.0f);
+        // InputAssembly's own tensor always has zero in its trailing
+        // hiddenChannels_ (its run() is always called with hiddenIn=nullptr
+        // in this app -- see net_runner.h's class comment): copy the whole
+        // tensor once, then overwrite just that trailing slice per pixel
+        // with the real recurrent state. Far cheaper than the old adapter
+        // (touches inputChannels_ floats/pixel at NET res, not a proxy-res
+        // reconstruction of every channel).
+        std::memcpy(bufPooled_.data(), netTensor26ch, bufPooled_.size() * sizeof(float));
+        const size_t n = static_cast<size_t>(netW_) * netH_;
+        for (size_t p = 0; p < n; p++) {
+            std::memcpy(&bufPooled_[p * inputChannels_ + (inputChannels_ - hiddenChannels_)],
+                        &hiddenInNetRes[p * hiddenChannels_], hiddenChannels_ * sizeof(float));
+        }
+        toUpload = bufPooled_.data();
     }
     timings.adapterMs = msSince(tAdapter);
 
     auto tUpload = std::chrono::high_resolution_clock::now();
-    auto upload = [&](int idx, const std::vector<float>& buf) {
-        TfLiteTensor* t = TfLiteInterpreterGetInputTensor(impl_->interpreter, idx);
-        TfLiteTensorCopyFromBuffer(t, buf.data(), buf.size() * sizeof(float));
-    };
-    upload(impl_->idxColor, bufColor_);
-    upload(impl_->idxDepth, bufDepth_);
-    upload(impl_->idxMv, bufMv_);
-    upload(impl_->idxDisocc, bufDisocc_);
-    upload(impl_->idxFg, bufFg_);
-    upload(impl_->idxJitter, bufJitter_);
-    upload(impl_->idxHidden, bufHidden_);
-    upload(impl_->idxTex, bufTex_);
+    TfLiteTensor* inputTensor = TfLiteInterpreterGetInputTensor(impl_->interpreter, impl_->idxInput);
+    TfLiteTensorCopyFromBuffer(inputTensor, toUpload,
+                                static_cast<size_t>(netW_) * netH_ * inputChannels_ * sizeof(float));
     timings.uploadMs = msSince(tUpload);
 
     auto tInfer = std::chrono::high_resolution_clock::now();

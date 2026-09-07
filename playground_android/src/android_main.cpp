@@ -424,7 +424,10 @@ void initRenderer(AppState* state) {
         // Stage 4: TFLite net (best-effort -- GPU delegate availability
         // varies by driver; log and continue the rest of the demo on failure).
         try {
-            state->netRunner.init(base + "/assets/unet_ps2_mem.tflite",
+            // Task 4 follow-up: pooled-input model (mobiledlss/train/
+            // export.py::export_tflite_pooled_input) -- see net_runner.h's
+            // class comment for why (eliminates the ~53ms CPU "adapter").
+            state->netRunner.init(base + "/assets/unet_ps2_mem_pooled.tflite",
                                    state->inputAssembly.getNetW(), state->inputAssembly.getNetH(),
                                    AppState::kParamStride, AppState::kHiddenChannels, AppState::kTexChannels);
             state->netRunnerReady = true;
