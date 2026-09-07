@@ -802,7 +802,7 @@ void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* 
     // re-sorts (needsSort stays true unconditionally below), so behavior is
     // unchanged unless a caller opts in.
     bool needsSort = true;
-    if (sortEveryNFrames_ > 1 || sortViewThresholdDeg_ > 0.0f) {
+    if (sortEveryNFrames_ > 1 || sortViewThresholdDeg_ > 0.0f || sortTranslateThreshold_ > 0.0f) {
         glm::vec3 viewDir = glm::normalize(
             -glm::vec3(viewMatrix_[0][2], viewMatrix_[1][2], viewMatrix_[2][2]));
         bool viewChanged = true;
@@ -811,12 +811,24 @@ void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* 
             float angleDeg = glm::degrees(std::acos(cosAngle));
             viewChanged = angleDeg >= sortViewThresholdDeg_;
         }
+        bool translated = true;
+        if (hasLastSortedView_ && sortTranslateThreshold_ > 0.0f) {
+            translated = glm::length(camPos_ - lastSortedCamPos_) >= sortTranslateThreshold_;
+        }
+        // Any change at all (not thresholded) -- see setSortSchedule()'s
+        // header comment: this is what makes the schedule safe for
+        // dynamic/morphing scenes.
+        bool morphChanged = hasLastSortedView_ && (currentMorphTime_ != lastSortedMorphTime_);
         bool budgetElapsed = framesSinceSort_ >= sortEveryNFrames_;
         needsSort = !hasLastSortedView_ || budgetElapsed ||
-            (sortViewThresholdDeg_ > 0.0f && viewChanged);
+            (sortViewThresholdDeg_ > 0.0f && viewChanged) ||
+            (sortTranslateThreshold_ > 0.0f && translated) ||
+            morphChanged;
         if (needsSort) {
             framesSinceSort_ = 0;
             lastSortedViewDir_ = viewDir;
+            lastSortedCamPos_ = camPos_;
+            lastSortedMorphTime_ = currentMorphTime_;
             hasLastSortedView_ = true;
         } else {
             framesSinceSort_++;
@@ -1183,7 +1195,7 @@ void MetalSplatLuxcRenderer::renderProfiled(MetalContext& ctx, double* preproces
 
     // --- Sort scheduling decision (identical to render()'s) ---
     bool needsSort = true;
-    if (sortEveryNFrames_ > 1 || sortViewThresholdDeg_ > 0.0f) {
+    if (sortEveryNFrames_ > 1 || sortViewThresholdDeg_ > 0.0f || sortTranslateThreshold_ > 0.0f) {
         glm::vec3 viewDir = glm::normalize(
             -glm::vec3(viewMatrix_[0][2], viewMatrix_[1][2], viewMatrix_[2][2]));
         bool viewChanged = true;
@@ -1192,12 +1204,24 @@ void MetalSplatLuxcRenderer::renderProfiled(MetalContext& ctx, double* preproces
             float angleDeg = glm::degrees(std::acos(cosAngle));
             viewChanged = angleDeg >= sortViewThresholdDeg_;
         }
+        bool translated = true;
+        if (hasLastSortedView_ && sortTranslateThreshold_ > 0.0f) {
+            translated = glm::length(camPos_ - lastSortedCamPos_) >= sortTranslateThreshold_;
+        }
+        // Any change at all (not thresholded) -- see setSortSchedule()'s
+        // header comment: this is what makes the schedule safe for
+        // dynamic/morphing scenes.
+        bool morphChanged = hasLastSortedView_ && (currentMorphTime_ != lastSortedMorphTime_);
         bool budgetElapsed = framesSinceSort_ >= sortEveryNFrames_;
         needsSort = !hasLastSortedView_ || budgetElapsed ||
-            (sortViewThresholdDeg_ > 0.0f && viewChanged);
+            (sortViewThresholdDeg_ > 0.0f && viewChanged) ||
+            (sortTranslateThreshold_ > 0.0f && translated) ||
+            morphChanged;
         if (needsSort) {
             framesSinceSort_ = 0;
             lastSortedViewDir_ = viewDir;
+            lastSortedCamPos_ = camPos_;
+            lastSortedMorphTime_ = currentMorphTime_;
             hasLastSortedView_ = true;
         } else {
             framesSinceSort_++;

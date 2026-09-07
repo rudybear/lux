@@ -2130,9 +2130,10 @@ void SplatRenderer::render(VulkanContext& ctx) {
         firstMvFrame_ = false;
     }
 
-    // --- Sort scheduling decision (see setSortSchedule()'s header comment) ---
+    // --- Sort scheduling decision (see setSortSchedule()'s header comment;
+    // motion-aware: rotation OR translation OR ANY morph-time delta) ---
     bool needsSort = true;
-    if (sortEveryNFrames_ > 1 || sortViewThresholdDeg_ > 0.0f) {
+    if (sortEveryNFrames_ > 1 || sortViewThresholdDeg_ > 0.0f || sortTranslateThreshold_ > 0.0f) {
         glm::vec3 viewDir = glm::normalize(
             -glm::vec3(viewMatrix_[0][2], viewMatrix_[1][2], viewMatrix_[2][2]));
         bool viewChanged = true;
@@ -2141,12 +2142,26 @@ void SplatRenderer::render(VulkanContext& ctx) {
             float angleDeg = glm::degrees(std::acos(cosAngle));
             viewChanged = angleDeg >= sortViewThresholdDeg_;
         }
+        bool translated = true;
+        if (hasLastSortedView_ && sortTranslateThreshold_ > 0.0f) {
+            translated = glm::length(camPos_ - lastSortedCamPos_) >= sortTranslateThreshold_;
+        }
+        // Any change at all (not thresholded) -- a dynamic/morphing scene
+        // changes this every animating frame, which is exactly what makes
+        // this schedule degenerate to "sort every frame" for dynamic
+        // scenes (safe) while still allowing static-camera-on-static-scene
+        // holds to skip (currentMorphTime_ pinned, so this never fires).
+        bool morphChanged = hasLastSortedView_ && (currentMorphTime_ != lastSortedMorphTime_);
         bool budgetElapsed = framesSinceSort_ >= sortEveryNFrames_;
         needsSort = !hasLastSortedView_ || budgetElapsed ||
-            (sortViewThresholdDeg_ > 0.0f && viewChanged);
+            (sortViewThresholdDeg_ > 0.0f && viewChanged) ||
+            (sortTranslateThreshold_ > 0.0f && translated) ||
+            morphChanged;
         if (needsSort) {
             framesSinceSort_ = 0;
             lastSortedViewDir_ = viewDir;
+            lastSortedCamPos_ = camPos_;
+            lastSortedMorphTime_ = currentMorphTime_;
             hasLastSortedView_ = true;
         } else {
             framesSinceSort_++;

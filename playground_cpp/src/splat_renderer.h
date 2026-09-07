@@ -189,14 +189,34 @@ public:
     // whatever sortedIndicesBuffer_ last held -- correctness of WHICH
     // splats are visible is unaffected, since that's decided per-splat in
     // preprocess/fragment, not by sort position) for amortized sort cost:
-    // a fresh sort runs when EITHER `framesSinceSort_ >= everyNFrames` OR
-    // the camera's view direction has rotated more than
-    // `viewChangeThresholdDeg` since the last real sort (whichever comes
-    // first), so a fast-panning camera still re-sorts promptly even under
-    // a large everyNFrames budget.
-    void setSortSchedule(uint32_t everyNFrames, float viewChangeThresholdDeg) {
+    // a fresh sort runs when ANY of the following hold (whichever comes
+    // first): `framesSinceSort_ >= everyNFrames`; the camera's view
+    // direction has rotated more than `viewChangeThresholdDeg` since the
+    // last real sort; the camera has translated more than
+    // `translateThreshold` world units since the last real sort; or (see
+    // bench/lux_perf_ablation.md in mobiledlss, "Motion-aware schedule")
+    // `currentMorphTime_` has changed AT ALL since the last real sort.
+    //
+    // That last condition is what makes this safe for DYNAMIC scenes: the
+    // original camera-only version of this schedule only watched rotation,
+    // so actor motion (which reorders splats in depth just as much as a
+    // camera move can, but leaves the view direction untouched) could go
+    // un-resorted for `everyNFrames` frames -- measured to collapse PSNR
+    // by ~15dB on 3 of 4 frames in the live demo chain. Since
+    // `currentMorphTime_` changes every frame a dynamic scene is actually
+    // animating, this condition makes the schedule degenerate to "sort
+    // every frame" automatically for dynamic scenes (matching the safe
+    // every-frame default they must otherwise be forced into), while
+    // static-camera holds on a STATIC scene (no morph target,
+    // `currentMorphTime_` pinned at 0) can still skip via the existing
+    // rotation/translation/frame-budget checks. `translateThreshold`
+    // defaults to 0 (disabled) for source compatibility with the
+    // 2-argument call sites that predate it.
+    void setSortSchedule(uint32_t everyNFrames, float viewChangeThresholdDeg,
+                         float translateThreshold = 0.0f) {
         sortEveryNFrames_ = std::max<uint32_t>(1, everyNFrames);
         sortViewThresholdDeg_ = viewChangeThresholdDeg;
+        sortTranslateThreshold_ = translateThreshold;
     }
 
     void blitToSwapchain(VulkanContext& ctx, VkCommandBuffer cmd,
@@ -448,8 +468,11 @@ private:
     // Sort scheduling state (see setSortSchedule() above).
     uint32_t sortEveryNFrames_ = 1;       // 1 = always sort (default, exactness-preserving)
     float sortViewThresholdDeg_ = 0.0f;   // 0 = never trigger early on view change alone
+    float sortTranslateThreshold_ = 0.0f; // 0 = never trigger early on camera translation alone
     uint32_t framesSinceSort_ = 0;
     glm::vec3 lastSortedViewDir_{0.0f, 0.0f, -1.0f};
+    glm::vec3 lastSortedCamPos_{0.0f};
+    float lastSortedMorphTime_ = 0.0f;
     bool hasLastSortedView_ = false;
 
     // Previous-frame camera history for motion vectors (docs/lux-4d-spec.md

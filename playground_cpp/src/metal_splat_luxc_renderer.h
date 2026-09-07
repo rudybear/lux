@@ -308,9 +308,24 @@ public:
     // unaffected. Opt in via setSortSchedule() for a continuous multi-frame
     // caller (interactive/live rendering, or --bench below) willing to
     // trade briefly-stale blend order for amortized sort cost.
-    void setSortSchedule(uint32_t everyNFrames, float viewChangeThresholdDeg) {
+    //
+    // Motion-aware extension (perf; bench/lux_perf_ablation.md in
+    // mobiledlss, "Motion-aware schedule" -- see splat_renderer.h's
+    // identical Vulkan setSortSchedule() comment for the full rationale):
+    // a fresh sort now also runs when the camera has translated more than
+    // `translateThreshold` world units, OR when `currentMorphTime_` has
+    // changed AT ALL since the last real sort -- the latter makes this
+    // schedule safe for dynamic/morphing scenes (which reorder splats via
+    // actor motion the original rotation-only check couldn't see) by
+    // degenerating to "sort every frame" automatically whenever the scene
+    // is actually animating, while still letting static-camera holds on a
+    // static scene skip via the existing checks. `translateThreshold`
+    // defaults to 0 (disabled) for source compatibility.
+    void setSortSchedule(uint32_t everyNFrames, float viewChangeThresholdDeg,
+                         float translateThreshold = 0.0f) {
         sortEveryNFrames_ = std::max<uint32_t>(1, everyNFrames);
         sortViewThresholdDeg_ = viewChangeThresholdDeg;
+        sortTranslateThreshold_ = translateThreshold;
     }
 
     // Real GPU-side timing of the most recent render() call, from
@@ -514,8 +529,11 @@ private:
     // splat_renderer.h's identical Vulkan fields exactly.
     uint32_t sortEveryNFrames_ = 1;
     float sortViewThresholdDeg_ = 0.0f;
+    float sortTranslateThreshold_ = 0.0f;
     uint32_t framesSinceSort_ = 0;
     glm::vec3 lastSortedViewDir_{0.0f, 0.0f, -1.0f};
+    glm::vec3 lastSortedCamPos_{0.0f};
+    float lastSortedMorphTime_ = 0.0f;
     bool hasLastSortedView_ = false;
 
     // Morph-reset scope (bench/lux_perf_ablation.md "Root cause #1", ported

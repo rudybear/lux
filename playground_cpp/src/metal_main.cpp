@@ -232,6 +232,13 @@ struct CLIOptions {
     bool benchSortSchedule = false;
     uint32_t benchSortEveryNFrames = 4;
     float benchSortViewThresholdDeg = 2.0f;
+    // Motion-aware extension (perf; bench/lux_perf_ablation.md in
+    // mobiledlss, "Motion-aware schedule"): world-unit camera-translation
+    // threshold, on top of the rotation/frame-budget ones above. 0
+    // (default) disables the translation check specifically; the schedule
+    // is always safe for dynamic scenes regardless via the unconditional
+    // morph-time-changed check in setSortSchedule() itself.
+    float benchSortTranslateThreshold = 0.0f;
 
     // Colour attachment format experiment (--splat-backend luxc only; see
     // MetalSplatLuxcRenderer::setColorFormat8BitExperiment()'s comment).
@@ -308,7 +315,7 @@ static void printUsage(const char* program) {
               << "  --bench <N>            Steady-state GPU-timing bench: N frames, orbiting camera,\n"
               << "                         real MTLCommandBuffer GPU timestamps (splat + --splat-backend luxc only)\n"
               << "  --bench-orbit-deg <D>  Camera yaw degrees advanced per bench frame (default 0.5)\n"
-              << "  --bench-sort-schedule <everyN> <deg>  Opt into sort scheduling during --bench\n"
+              << "  --bench-sort-schedule <everyN> <deg> [translate]  Opt into sort scheduling during --bench\n"
               << "  --live-bench <N>       Headless bench of the live-inference chain (proxy render +\n"
               << "                         net input assembly + MPSGraph UNet + reconstruct-with-memory) --\n"
               << "                         the same chain playground_ios/Source/SplatView.mm runs, driven\n"
@@ -403,6 +410,14 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.benchSortSchedule = true;
             opts.benchSortEveryNFrames = static_cast<uint32_t>(std::stoi(argv[++i]));
             opts.benchSortViewThresholdDeg = std::stof(argv[++i]);
+            // Optional 3rd arg: translation threshold (world units). Only
+            // consumed if present and not itself the next flag.
+            if (i + 1 < argc) {
+                std::string maybeTranslate = argv[i + 1];
+                if (!maybeTranslate.empty() && maybeTranslate.substr(0, 2) != "--") {
+                    opts.benchSortTranslateThreshold = std::stof(argv[++i]);
+                }
+            }
         } else if (arg == "--sort" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "view_depth") opts.sortByViewDepth = true;
@@ -628,9 +643,12 @@ static void computeMedianP90(std::vector<double> v, double& median, double& p90)
 static void runSplatBench(MetalSplatLuxcRenderer& splatR, MetalContext& ctx,
                            MetalSceneManager& scene, const CLIOptions& opts) {
     if (opts.benchSortSchedule) {
-        splatR.setSortSchedule(opts.benchSortEveryNFrames, opts.benchSortViewThresholdDeg);
+        splatR.setSortSchedule(opts.benchSortEveryNFrames, opts.benchSortViewThresholdDeg,
+                                opts.benchSortTranslateThreshold);
         std::cout << "[bench] sort schedule: every " << opts.benchSortEveryNFrames
                   << " frames OR " << opts.benchSortViewThresholdDeg << " deg view change"
+                  << " OR " << opts.benchSortTranslateThreshold << " world-unit translate"
+                  << " OR any morph-time change"
                   << std::endl;
     } else {
         std::cout << "[bench] sort schedule: every frame (default, exactness-preserving)"
@@ -742,17 +760,25 @@ static int runLiveBenchMetal(const CLIOptions& opts) {
     params.unetWeightsBinPath = opts.liveAssetsDir + "/exported/unet_weights.fp16.bin";
     params.unetLayersTxtPath = opts.liveAssetsDir + "/exported/unet_weights.layers.txt";
     params.memoryHeadNpzPath = opts.liveAssetsDir + "/exported/memory_head.npz";
-    // NOT the amortized (4, 2.0f) sort schedule bench/lux_perf_ablation.md
-    // validated for a camera-orbit-only STATIC scene: --live-psnr measured
-    // it badly breaking reconstruction quality on THIS dynamic (actor-
-    // motion) scene -- periodic ~15dB collapses on 3 of every 4 frames
-    // (17.8dB vs a stable ~33dB with every-frame sort). The schedule's
-    // view-change threshold only re-sorts on CAMERA rotation, with no
-    // signal for the scene content itself moving -- exactly what reorders
-    // back-to-front blend order here even with zero camera motion. Left at
-    // the exactness-preserving default (see MetalLiveReconstruct::
-    // InitParams's own comment) so these numbers reflect the actually
-    // shippable (quality-correct) configuration, not a broken-but-fast one.
+    // (4, 2.0f) -- perf; bench/lux_perf_ablation.md's "Motion-aware
+    // schedule" (see runLivePsnrMetal's identical comment and
+    // MetalSplatLuxcRenderer::setSortSchedule()'s header for the full
+    // story): the un-fixed version of this schedule badly broke
+    // reconstruction quality on THIS dynamic (actor-motion) scene
+    // (periodic ~15dB collapses), because it only watched camera
+    // rotation, with no signal for the scene content itself moving.
+    // setSortSchedule() now also re-sorts on any currentMorphTime_ change,
+    // which fires every frame this continuously-animating scene actually
+    // renders -- so numerically this measures IDENTICALLY to the
+    // un-scheduled every-frame-sort default (verified via --live-psnr:
+    // frame-by-frame PSNR bit-for-bit unchanged) since this benchmark's
+    // scene never holds still long enough for the schedule to skip a
+    // sort. The schedule now being safe to opt into here at all -- rather
+    // than left at the exactness-preserving default out of necessity -- is
+    // itself the fix; a scene with actual static-camera-and-content holds
+    // would see the amortized win this schedule was designed for.
+    params.sortEveryNFrames = 4;
+    params.sortViewThresholdDeg = 2.0f;
 
     auto tInit0 = std::chrono::steady_clock::now();
     live.init(ctx, scene.getSplatData(), params);
@@ -942,19 +968,22 @@ static int runLivePsnrMetal(const CLIOptions& opts) {
     params.unetWeightsBinPath = opts.liveAssetsDir + "/exported/unet_weights.fp16.bin";
     params.unetLayersTxtPath = opts.liveAssetsDir + "/exported/unet_weights.layers.txt";
     params.memoryHeadNpzPath = opts.liveAssetsDir + "/exported/memory_head.npz";
-    // NOT (4, 2.0f) here, unlike --live-bench: measured via THIS flag
-    // (--live-psnr) to badly break reconstruction quality on this DYNAMIC
-    // (actor-motion) scene -- periodic ~15dB collapses on 3 of every 4
-    // frames (17.8dB vs a stable ~33dB with every-frame sort), not the
-    // "ZERO measured pixel difference" bench/lux_perf_ablation.md's
-    // ablation found for a camera-orbit-only STATIC scene. The schedule's
-    // view-change threshold only re-sorts on CAMERA rotation; it has no
-    // signal for the SCENE CONTENT itself moving (splats translating
-    // relative to each other frame to frame), which is exactly what
-    // reorders back-to-front blend order here even with zero camera
-    // motion. Left at the exactness-preserving default (see
-    // MetalLiveReconstruct::InitParams's own comment) until the schedule
-    // itself gets a content-motion-aware trigger.
+    // (4, 2.0f) -- perf; bench/lux_perf_ablation.md's "Motion-aware
+    // schedule": this used to badly break reconstruction quality on this
+    // DYNAMIC (actor-motion) scene -- periodic ~15dB collapses on 3 of
+    // every 4 frames (17.8dB vs a stable ~33dB with every-frame sort) --
+    // because the schedule's view-change threshold only re-sorted on
+    // CAMERA rotation, with no signal for the scene content itself moving
+    // (exactly what reorders back-to-front blend order here even with
+    // zero camera motion). setSortSchedule() now ALSO re-sorts on any
+    // currentMorphTime_ change (see its header comment), which fires
+    // every frame this scene actually animates -- degenerating this
+    // config back to "sort every frame" for this dynamic scene (safe,
+    // matching the un-scheduled baseline's PSNR) while still allowing a
+    // static-camera hold on a static scene to skip via the
+    // rotation/frame-budget checks.
+    params.sortEveryNFrames = 4;
+    params.sortViewThresholdDeg = 2.0f;
     live.init(ctx, sceneProxy.getSplatData(), params);
 
     // Target mode: same luxc pipeline, full (unpruned) scene, full target
