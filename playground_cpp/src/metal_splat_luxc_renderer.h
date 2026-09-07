@@ -396,6 +396,13 @@ private:
     double lastSortMs_ = 0.0;
     double lastRenderMs_ = 0.0;
 
+    // Morph-reset scope (bench/lux_perf_ablation.md "Root cause #1", ported
+    // from splat_renderer.h/.cpp's dispatchMorph() -- see setMorphTime()'s
+    // updated comment for the full rationale). -1 = no segment applied yet
+    // (skip the reset entirely on the very first call: posBuffer_/
+    // rotBuffer_/shBuffer_ already hold base values from createBuffers()).
+    int lastAppliedSegment_ = -1;
+
     // Helpers
     void createRenderTargets(MetalContext& ctx);
     void createPipelines(MetalContext& ctx);

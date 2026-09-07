@@ -523,23 +523,49 @@ void MetalSplatLuxcRenderer::setMorphTime(float seconds, MTL::CommandBuffer* sha
     uint32_t threadGroupSize = static_cast<uint32_t>(morphPipeline_->maxTotalThreadsPerThreadgroup());
     if (threadGroupSize > 256) threadGroupSize = 256;
 
-    if (morphTotalEntries_ > 0) {
-        MorphPush resetPush = {0, morphTotalEntries_, 0.0f, 0.0f};
-        enc->setBytes(&resetPush, sizeof(resetPush), morphShader_.pushConstantBufferIndex);
-        uint32_t groups = (morphTotalEntries_ + threadGroupSize - 1) / threadGroupSize;
-        enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(threadGroupSize, 1, 1));
+    // Morph-reset scope fix (bench/lux_perf_ablation.md "Root cause #1",
+    // ported from splat_renderer.cpp's dispatchMorph() -- see that
+    // function's header comment for the full correctness argument). The
+    // "apply" dispatch below is non-incremental (splat_pos[idx] =
+    // splat_base_pos[idx] + weight_lo*delta_lo + weight_hi*delta_hi,
+    // always read from the immutable base buffers), so any index the
+    // CURRENT apply touches is fully overwritten regardless of what an
+    // earlier call left there. A "reset" is only needed for indices left
+    // stale by the *immediately preceding* setMorphTime() call's segment
+    // (by induction, residue never accumulates past one step back -- every
+    // prior call already cleaned up its own predecessor's residue the same
+    // way) -- so only that one segment (segmentCounts_[lastAppliedSegment_],
+    // tracked below) needs resetting, not the whole concatenated
+    // morphTotalEntries_ array (was ~38x more reset work than apply work
+    // on the juggle scene, ~13ms of an ~18ms Mali preprocess window; same
+    // shader/buffer layout here, so the same win applies to Apple Silicon).
+    // -1 (no prior segment, e.g. the very first call) or an unchanged
+    // segment both skip the reset dispatch entirely.
+    bool hasActive = (state.weightLow != 0.0f || state.weightHigh != 0.0f) &&
+                      state.highTargetIndex >= 0 &&
+                      static_cast<size_t>(state.highTargetIndex) < segmentCounts_.size() &&
+                      segmentCounts_[state.highTargetIndex] > 0;
+    int curSeg = hasActive ? state.highTargetIndex : -1;
+
+    if (lastAppliedSegment_ >= 0 && lastAppliedSegment_ != curSeg) {
+        uint32_t seg = static_cast<uint32_t>(lastAppliedSegment_);
+        if (segmentCounts_[seg] > 0) {
+            MorphPush resetPush = {segmentOffsets_[seg], segmentCounts_[seg], 0.0f, 0.0f};
+            enc->setBytes(&resetPush, sizeof(resetPush), morphShader_.pushConstantBufferIndex);
+            uint32_t groups = (segmentCounts_[seg] + threadGroupSize - 1) / threadGroupSize;
+            enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(threadGroupSize, 1, 1));
+        }
     }
 
-    if ((state.weightLow != 0.0f || state.weightHigh != 0.0f) &&
-        state.highTargetIndex >= 0 &&
-        static_cast<size_t>(state.highTargetIndex) < segmentCounts_.size() &&
-        segmentCounts_[state.highTargetIndex] > 0) {
-        uint32_t seg = static_cast<uint32_t>(state.highTargetIndex);
+    if (hasActive) {
+        uint32_t seg = static_cast<uint32_t>(curSeg);
         MorphPush applyPush = {segmentOffsets_[seg], segmentCounts_[seg], state.weightLow, state.weightHigh};
         enc->setBytes(&applyPush, sizeof(applyPush), morphShader_.pushConstantBufferIndex);
         uint32_t groups = (segmentCounts_[seg] + threadGroupSize - 1) / threadGroupSize;
         enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(threadGroupSize, 1, 1));
     }
+
+    lastAppliedSegment_ = curSeg;
 
     enc->endEncoding();
 
