@@ -762,11 +762,53 @@ def _build_preprocess_body(config: dict) -> list:
     body.append(_let("conic_z", "scalar",
         _binop("*", _ref("cov2d_00f"), _ref("inv_det"))))
 
+    # --- Read opacity (sigmoid activation) ---
+    # Hoisted here (was originally after NDC projection/frustum culling,
+    # right before SH evaluation) so the opacity-tight quad-extent below can
+    # use it -- `opacity` only depends on `gid` (splat_opacity[gid]), so it
+    # has no dependency on anything computed in between and this reordering
+    # changes no other value.
+    # let raw_opacity = splat_opacity[gid];
+    # let opacity = 1.0 / (1.0 + exp(-raw_opacity));
+    body.append(_let("raw_opacity", "scalar",
+        _idx("splat_opacity", _ref("gid"))))
+    body.append(_let("raw_sigmoid", "scalar",
+        _binop("/", _lit("1.0"),
+               _binop("+", _lit("1.0"),
+                      _call("exp", [_neg(_ref("raw_opacity"))])))))
+    # No opacity compensation (see the dilation comment above) -- opacity is
+    # just the activated raw value.
+    body.append(_let("opacity", "scalar", _ref("raw_sigmoid")))
+
+    # --- Cull low-opacity splats early (before radius/SH eval) ---
+    # Splats with opacity < alpha_min (default 1/255, matching 3DGS/gsplat)
+    # are invisible. Also guarantees opacity > alpha_min below (ln(opacity/
+    # alpha_min) > 0), so the opacity-tight radius sqrt() argument is real.
+    body.append(_if(
+        _binop("<", _ref("opacity"), _lit(config["alpha_min"])),
+        _cull_writes(config) + [ReturnStmt(None)],
+    ))
+
     # --- Compute screen-space radius from eigenvalues ---
     # mid = 0.5 * (cov2d_00f + cov2d_11f)
     # half_diff = sqrt(max((mid*mid - det), 0.0))
     # lambda_max = mid + half_diff
-    # radius = ceil(3.0 * sqrt(lambda_max))
+    #
+    # Opacity-tight extent (perf; SPECIFICATION.md 12.8 / docs/rendering-
+    # engines.md's mobile-DLSS Android timing breakdown): rather than a
+    # fixed 3-sigma quad, size it to exactly where this splat's peak-alpha
+    # falls to alpha_min --
+    #   opacity * exp(-0.5*t^2) = alpha_min  =>  t = sqrt(2*ln(opacity/alpha_min))
+    # -- clamped to <=3 (never LARGER than the reference 3-sigma quad, only
+    # smaller for low-opacity splats). This is exact w.r.t. the fragment
+    # shader's own `alpha < alpha_min` discard (same section below /
+    # splat_expander.py's fragment-stage alpha_min cutoff): every fragment
+    # this shrinks the quad past would have been discarded anyway, so pixel
+    # output is bit-identical -- only wasted rasterizer/blend work on
+    # already-invisible fragments is removed. Background/low-opacity
+    # splats (common after area-based pruning, which systematically keeps
+    # few large-footprint splats -- see the Stage 1 timing breakdown's
+    # overdraw analysis) benefit most.
     body.append(_let("mid", "scalar",
         _binop("*", _lit("0.5"),
                _binop("+", _ref("cov2d_00f"), _ref("cov2d_11f")))))
@@ -777,8 +819,13 @@ def _build_preprocess_body(config: dict) -> list:
         ])])))
     body.append(_let("lambda_max", "scalar",
         _binop("+", _ref("mid"), _ref("half_diff"))))
+    body.append(_let("sigma_t_raw", "scalar",
+        _call("sqrt", [_binop("*", _lit("2.0"),
+                               _call("log", [_binop("/", _ref("opacity"), _lit(config["alpha_min"]))]))])))
+    body.append(_let("sigma_t", "scalar",
+        _call("min", [_ref("sigma_t_raw"), _lit("3.0")])))
     body.append(_let("raw_radius", "scalar",
-        _call("ceil", [_binop("*", _lit("3.0"),
+        _call("ceil", [_binop("*", _ref("sigma_t"),
                                _call("sqrt", [_ref("lambda_max")]))])))
     # Clamp radius to screen size (prevents excessively large quads)
     body.append(_let("radius", "scalar",
@@ -820,26 +867,8 @@ def _build_preprocess_body(config: dict) -> list:
         _cull_writes(config) + [ReturnStmt(None)],
     ))
 
-    # --- Read opacity (sigmoid activation) ---
-    # let raw_opacity = splat_opacity[gid];
-    # let opacity = 1.0 / (1.0 + exp(-raw_opacity));
-    body.append(_let("raw_opacity", "scalar",
-        _idx("splat_opacity", _ref("gid"))))
-    body.append(_let("raw_sigmoid", "scalar",
-        _binop("/", _lit("1.0"),
-               _binop("+", _lit("1.0"),
-                      _call("exp", [_neg(_ref("raw_opacity"))])))))
-    # No opacity compensation (see the dilation comment above) -- opacity is
-    # just the activated raw value.
-    body.append(_let("opacity", "scalar", _ref("raw_sigmoid")))
-
-    # --- Cull low-opacity splats early (before SH eval) ---
-    # Splats with opacity < alpha_min (default 1/255, matching 3DGS/gsplat)
-    # are invisible.
-    body.append(_if(
-        _binop("<", _ref("opacity"), _lit(config["alpha_min"])),
-        _cull_writes(config) + [ReturnStmt(None)],
-    ))
+    # (opacity already read + culled above, before the radius computation --
+    # see the "opacity-tight extent" comment.)
 
     # --- Evaluate spherical harmonics for view-dependent color ---
     body.extend(_build_sh_evaluation(sh_degree))

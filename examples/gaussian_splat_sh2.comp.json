@@ -262,6 +262,7 @@
     "motion": "none",
     "motion_vectors": false,
     "expected_depth": false,
+    "foreground_coverage": false,
     "workgroup_size": [
       256,
       1,
@@ -291,8 +292,8 @@
     ]
   },
   "performance_hints": {
-    "instruction_count": 697,
-    "alu_ops": 199,
+    "instruction_count": 702,
+    "alu_ops": 201,
     "texture_samples": 0,
     "branches": 5,
     "function_calls": 0,
