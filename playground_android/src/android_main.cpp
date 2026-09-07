@@ -47,6 +47,7 @@
 #include "input_assembly.h"
 #include "net_runner.h"
 #include "reconstruct_pass.h"
+#include "gpu_probe.h"
 
 #define LOG_TAG "lux_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -364,6 +365,11 @@ void initRenderer(AppState* state) {
         LOGI("chdir to %s", base.c_str());
     }
     mkdir((base + "/dump").c_str(), 0755);  // Stage 2 validation dump target (dumpProxyDebugFrame)
+
+    // Task 3 (docs/rendering-engines.md, GPU-delegate correctness bisect):
+    // runs before anything else (no Vulkan/scene dependency at all) and is
+    // a no-op if files/probes doesn't exist -- see gpu_probe.h.
+    runGpuProbes(base + "/probes");
 
     try {
         AndroidVulkan::init(state->ctx, state->app->window, false);
@@ -817,6 +823,15 @@ void blitImageToSwapchain(VkCommandBuffer cmd, VkImage srcImage, uint32_t srcW, 
                          0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
+// Task 2 (Reconstruction-mode time budget): everything runReconstructionModeFrame
+// does beyond the net run itself (which fills its own NetRunner::RunTimingsMs).
+struct ReconModeFrameTimingsMs {
+    NetRunner::RunTimingsMs net;
+    double dumpWriteMs = 0.0;   // proxy_color/mv_proxy/jitter/packed_params/disocc/k_params/cam_to_world npy writes
+    ReconstructTimingsMs reconstruct;  // runReconstructDump's own breakdown (setup/read/upload/dispatch/download/write/teardown)
+    double outputReadMs = 0.0;  // reading out_f0.npy back off disk
+};
+
 // Stage 6: runs the Reconstruction mode's full net + reconstruct-with-
 // memory pass for exactly ONE frame (fresh 1-frame dump dir each call --
 // see DemoMode's header comment) and returns its [kHeight,kWidth,3]
@@ -824,12 +839,15 @@ void blitImageToSwapchain(VkCommandBuffer cmd, VkImage srcImage, uint32_t srcW, 
 // PSNR comparison uses). Reuses the SAME NetRunner hidden-state feedback
 // (state->hiddenState) the Stage 5 warmup/capture window already
 // established -- calling this repeatedly (every displayed frame while in
-// Reconstruction mode) keeps that recurrence live and running.
+// Reconstruction mode) keeps that recurrence live and running. `outTimings`
+// (optional) receives task 2's breakdown of everything below.
 std::vector<float> runReconstructionModeFrame(AppState* state, VulkanContext& ctx, SplatRenderer* splatR,
-                                               const OrbitFrame& frame, float jitterTargetX, float jitterTargetY) {
+                                               const OrbitFrame& frame, float jitterTargetX, float jitterTargetY,
+                                               ReconModeFrameTimingsMs* outTimings = nullptr) {
     NetRunner::RunTimingsMs t{};
     const float* hiddenPtr = state->hiddenState.empty() ? nullptr : state->hiddenState.data();
     const float* out = state->netRunner.run(state->inputAssembly.getOutputHostPtr(), hiddenPtr, t);
+    if (outTimings != nullptr) outTimings->net = t;
     uint32_t netW = state->inputAssembly.getNetW(), netH = state->inputAssembly.getNetH();
     uint32_t outCh = state->netRunner.getOutputChannels();
     uint32_t hiddenCh = AppState::kHiddenChannels;
@@ -852,6 +870,7 @@ std::vector<float> runReconstructionModeFrame(AppState* state, VulkanContext& ct
     writeMetaJson(dumpDir + "/meta.json", 2, 4, AppState::kParamStride, hiddenCh, kProxyWidth, paddedProxyH,
                   targetW, targetH, netW, netH, /*numFrames=*/1, AppState::kTexChannels, 16, 512, 256);
 
+    auto tDumpWrite = std::chrono::high_resolution_clock::now();
     auto colorProxy = readColorRgb(ctx, splatR);
     auto colorPadded = padRowsReplicate(colorProxy, kProxyHeight, kProxyWidth, 3, paddedProxyH);
     DlssIO::writeNpyFloat32(dumpDir + "/proxy_color_f0.npy", colorPadded, {paddedProxyH, kProxyWidth, 3});
@@ -885,14 +904,18 @@ std::vector<float> runReconstructionModeFrame(AppState* state, VulkanContext& ct
     camToWorld[8] = reconTargetFrame.rAxis.z; camToWorld[9] = reconTargetFrame.uAxis.z; camToWorld[10] = reconTargetFrame.fAxis.z; camToWorld[11] = reconTargetFrame.eye.z;
     camToWorld[15] = 1.0f;
     DlssIO::writeNpyFloat32(dumpDir + "/cam_to_world_f0.npy", camToWorld, {4, 4});
+    if (outTimings != nullptr) outTimings->dumpWriteMs = msSince(tDumpWrite);
 
     std::string outDir = basePath(state) + "/live_recon_out_1f";
-    int rc = runReconstructDump(ctx, dumpDir, outDir, basePath(state) + "/examples/reconstruct_mem_ps2");
+    int rc = runReconstructDump(ctx, dumpDir, outDir, basePath(state) + "/examples/reconstruct_mem_ps2",
+                                 outTimings != nullptr ? &outTimings->reconstruct : nullptr);
     if (rc != 0) {
         LOGE("Reconstruction mode: runReconstructDump failed (rc=%d)", rc);
         return std::vector<float>(static_cast<size_t>(kWidth) * kHeight * 3, 0.0f);
     }
+    auto tOutputRead = std::chrono::high_resolution_clock::now();
     DlssIO::NpyArray outArr = DlssIO::readNpyFloat32(outDir + "/out_f0.npy");  // [targetH,targetW,3]
+    if (outTimings != nullptr) outTimings->outputReadMs = msSince(tOutputRead);
     std::vector<float> cropped(static_cast<size_t>(kWidth) * kHeight * 3);
     for (uint32_t y = 0; y < kHeight; y++) {
         memcpy(&cropped[static_cast<size_t>(y) * kWidth * 3], &outArr.data[static_cast<size_t>(y) * targetW * 3],
@@ -986,6 +1009,13 @@ void renderFrame(AppState* state) {
     splatR->render(ctx);
     double renderMs = msSince(tRender);
 
+    // Task 2 (Reconstruction-mode time budget, docs/rendering-engines.md):
+    // filled in by the input_assembly.run() call just below when isProxy
+    // (always true in Reconstruction mode), left zero otherwise. Declared
+    // here (not inside the `if (isProxy)` block) so it's still in scope for
+    // the RECON_TIMING log after the Stage 6 dispatch below.
+    InputAssembly::Timings iaTimings;
+
     // --- Stage 3: input assembly, proxy-mode frames only (Target mode has
     // no jitter/history contract to feed the network -- it exists purely
     // as this demo's ground-truth comparison target, per DemoMode's
@@ -1000,7 +1030,7 @@ void renderFrame(AppState* state) {
                                   frame.rAxis.x, frame.rAxis.y, frame.rAxis.z,
                                   frame.uAxis.x, frame.uAxis.y, frame.uAxis.z,
                                   frame.fAxis.x, frame.fAxis.y, frame.fAxis.z,
-                                  frame.fx, frame.fy, cx, cy, jitterPxX, jitterPxY);
+                                  frame.fx, frame.fy, cx, cy, jitterPxX, jitterPxY, &iaTimings);
     }
 
     // --- Stage 5: net inference with recurrent hidden feedback + live
@@ -1219,9 +1249,32 @@ void renderFrame(AppState* state) {
         stage6Ms = msSince(tS6);
     } else if (state->mode == DemoMode::Reconstruction) {
         auto tS6 = std::chrono::high_resolution_clock::now();
-        auto reconColor = runReconstructionModeFrame(state, ctx, splatR, frame, jitterTargetX, jitterTargetY);
+        ReconModeFrameTimingsMs reconT;
+        auto reconColor = runReconstructionModeFrame(state, ctx, splatR, frame, jitterTargetX, jitterTargetY, &reconT);
         uploadRgbToDisplayImage(ctx, state->displayImage, reconColor, kWidth, kHeight);
         stage6Ms = msSince(tS6);
+        // Task 2 (docs/rendering-engines.md, Reconstruction-mode time
+        // budget): proxy render is `renderMs` (above); input assembly is
+        // `iaTimings` (readback = 3x vkCmdCopyImageToBuffer, compute = the
+        // 2 GLSL dispatches); net is `reconT.net` (adapter=CPU repack,
+        // upload/infer/download=TFLite); the rest is runReconstructionModeFrame's
+        // own file-based round trip through reconstruct_pass.cpp's
+        // runReconstructDump (dumpWrite=write dump npys, reconstruct.*=its
+        // internal setup/read/upload/dispatch[cpu+gpu]/download/write/
+        // teardown breakdown, outputRead=read the final out_f0.npy back).
+        const ReconstructTimingsMs& rt = reconT.reconstruct;
+        double reconstructTotalMs = rt.setupMs + rt.fileReadMs + rt.uploadMs + rt.dispatchCpuMs +
+                                     rt.downloadMs + rt.fileWriteMs + rt.teardownMs;
+        LOGI("RECON_TIMING (ms) proxy_render=%.1f | ia_readback=%.1f ia_compute=%.1f | "
+             "net_adapter=%.1f net_upload=%.1f net_infer=%.1f net_download=%.1f | "
+             "dump_write=%.1f | recon_setup=%.1f recon_read=%.1f recon_upload=%.1f "
+             "recon_dispatch_cpu=%.1f recon_dispatch_gpu=%.1f recon_download=%.1f "
+             "recon_write=%.1f recon_teardown=%.1f recon_total=%.1f | output_read=%.1f | "
+             "stage6_total=%.1f",
+             renderMs, iaTimings.readbackMs, iaTimings.computeMs,
+             reconT.net.adapterMs, reconT.net.uploadMs, reconT.net.inferMs, reconT.net.downloadMs,
+             reconT.dumpWriteMs, rt.setupMs, rt.fileReadMs, rt.uploadMs, rt.dispatchCpuMs, rt.dispatchGpuMs,
+             rt.downloadMs, rt.fileWriteMs, rt.teardownMs, reconstructTotalMs, reconT.outputReadMs, stage6Ms);
     }
     if (stage6Ms > 0.0) {
         LOGI("Stage6 %s frame render: %.1fms", demoModeName(state->mode), stage6Ms);
@@ -1282,6 +1335,16 @@ void renderFrame(AppState* state) {
 
     double blitPresentMs = msSince(tBlit) - 0.0;  // encode+submit+present call (non-blocking; actual GPU blit cost is hidden behind next frame's wait-fence)
     double frameMs = msSince(tFrameStart);
+    if (state->mode == DemoMode::Reconstruction) {
+        // Companion to the RECON_TIMING line above (present cost is only
+        // known after vkQueuePresentKHR, later in renderFrame() than
+        // Stage 6) -- cpu_wait_fence is the PRIOR frame's blit+present
+        // finishing (this frame's own present cost is non-blocking and
+        // shows up as the NEXT frame's cpu_wait_fence instead, same as the
+        // Stage-1 TIMING block above).
+        LOGI("RECON_TIMING_PRESENT (ms) cpu_wait_fence=%.1f blit_present_submit=%.1f frame_total=%.1f",
+             waitFenceMs, blitPresentMs, frameMs);
+    }
 
     // --- Stage 1 timing breakdown accounting ---
     state->sumCpuWaitFenceMs += waitFenceMs;

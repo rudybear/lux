@@ -4,9 +4,16 @@
 #include "dlss_io.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+
+namespace {
+inline double msSince(std::chrono::high_resolution_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+}
+}  // namespace
 
 namespace {
 
@@ -323,11 +330,14 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage depthIma
                          float rX, float rY, float rZ, float uX, float uY, float uZ,
                          float fX, float fY, float fZ,
                          float fx, float fy, float cx, float cy,
-                         float jitterProxyX, float jitterProxyY) {
+                         float jitterProxyX, float jitterProxyY, Timings* outTimings) {
+    auto tReadback = std::chrono::high_resolution_clock::now();
     copyImageToBuffer(ctx, colorImage, impl_->bColorRaw, proxyW, proxyH);
     copyImageToBuffer(ctx, depthImage, impl_->bDepthRaw, proxyW, proxyH);
     copyImageToBuffer(ctx, motionImage, impl_->bMotionRaw, proxyW, proxyH);
+    double readbackMs = msSince(tReadback);
 
+    auto tCompute = std::chrono::high_resolution_clock::now();
     int curIdx = impl_->depthPingIndex;
     int prevIdx = 1 - curIdx;
 
@@ -364,10 +374,16 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage depthIma
 
     uint32_t ngx = (netW_ + 15) / 16, ngy = (netH_ + 15) / 16;
     dispatchOne(ctx, impl_->assemblePipe, impl_->assemblePL, impl_->assembleSet, &push, sizeof(push), ngx, ngy);
+    double computeMs = msSince(tCompute);
 
     wasFirstFrame_ = firstFrame_;
     impl_->depthPingIndex = prevIdx;
     firstFrame_ = false;
+
+    if (outTimings != nullptr) {
+        outTimings->readbackMs = readbackMs;
+        outTimings->computeMs = computeMs;
+    }
 }
 
 const float* InputAssembly::getOutputHostPtr() const {

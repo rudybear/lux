@@ -64,6 +64,18 @@ public:
     // is kept only as the pre-foreground-coverage fallback value.
     enum FgSource : uint32_t { kFgSourceConstantZero = 0, kFgSourceExpectedDepthG = 1 };
 
+    // Task 2 (Reconstruction-mode time budget) timing breakdown for one
+    // run() call -- CPU wall-clock only (these are all synchronous
+    // beginSingleTimeCommands()/endSingleTimeCommands() round trips, i.e.
+    // full queue drains, so CPU wall time here already includes GPU
+    // execution + submit/wait overhead; readbackMs's 3 vkCmdCopyImageToBuffer
+    // calls have no compute work at all, so they isolate pure copy+drain
+    // cost).
+    struct Timings {
+        double readbackMs = 0.0;  // 3x copyImageToBuffer (color/depth/motion -> storage buffers)
+        double computeMs = 0.0;   // unpremul_depth + assemble compute dispatches
+    };
+
     // Runs both passes for one frame: (1) un-premultiply this frame's proxy
     // depth into the ping-pong buffer, (2) assemble the packed fp32 NHWC
     // tensor into getOutputHostPtr(). `colorImage`/`depthImage`/`motionImage`
@@ -73,14 +85,15 @@ public:
     // recurrent state). eye/rAxis/uAxis/fAxis are world-space camera
     // position/right/up(down)/forward axes (see android_main.cpp's
     // buildCvViewRowMajor -- its r/u/f ARE these axes directly, no camera-
-    // to-world matrix construction needed).
+    // to-world matrix construction needed). `outTimings` (optional) receives
+    // this call's breakdown for task 2's profiling.
     void run(VulkanContext& ctx, VkImage colorImage, VkImage depthImage, VkImage motionImage,
              uint32_t proxyW, uint32_t proxyH, const float* hiddenIn,
              float eyeX, float eyeY, float eyeZ,
              float rX, float rY, float rZ, float uX, float uY, float uZ,
              float fX, float fY, float fZ,
              float fx, float fy, float cx, float cy,
-             float jitterProxyX, float jitterProxyY);
+             float jitterProxyX, float jitterProxyY, Timings* outTimings = nullptr);
 
     // Host-visible pointer to this frame's packed NHWC fp32 output
     // (netW*netH*getChannels() floats) -- valid immediately after run()

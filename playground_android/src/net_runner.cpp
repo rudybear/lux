@@ -66,7 +66,16 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
     if (!impl_->model) throw std::runtime_error("NetRunner: TfLiteModelCreateFromFile failed: " + modelPath);
 
     impl_->options = TfLiteInterpreterOptionsCreate();
-    TfLiteInterpreterOptionsSetNumThreads(impl_->options, 4);
+    // Task 3 CPU-config sweep: cpu_threads.txt (cwd-relative), a bare
+    // integer, overrides the thread count (default 4) without a rebuild.
+    int numThreads = 4;
+    FILE* threadsFile = fopen("cpu_threads.txt", "r");
+    if (threadsFile) {
+        int v = 0;
+        if (fscanf(threadsFile, "%d", &v) == 1 && v > 0) numThreads = v;
+        fclose(threadsFile);
+    }
+    TfLiteInterpreterOptionsSetNumThreads(impl_->options, numThreads);
 
     // GPU delegate is OFF by default: on this exact device/model
     // (Pixel 9 Pro XL, Mali-G715, TFLite GPU delegate 2.16.1,
@@ -86,11 +95,56 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
     FILE* marker = fopen("force_gpu_net", "r");
     bool forceGpu = (marker != nullptr);
     if (marker) fclose(marker);
+
+    // Task 3 (docs/rendering-engines.md, GPU-delegate correctness bisect):
+    // runtime-configurable via gpu_net_config.txt (cwd-relative, same as
+    // force_gpu_net) instead of a rebuild per experiment -- one
+    // "key=value" per line, keys: precision=max|min (max ->
+    // is_precision_loss_allowed=0 + priority1=MAX_PRECISION, matching
+    // TfLiteGpuDelegateOptionsV2Default() exactly; min -> this file's
+    // prior hardcoded MIN_LATENCY override, kept only for A/B comparison)
+    // and backend=auto|cl|gl (-> experimental_flags CL_ONLY/GL_ONLY).
+    // Defaults (no file, or missing keys): precision=max, backend=auto --
+    // i.e. plain TfLiteGpuDelegateOptionsV2Default(), the first thing the
+    // task brief asks to try, since the previous MIN_LATENCY override was
+    // never itself verified as the cause of the 26.7 max-diff result.
+    std::string precisionCfg = "max", backendCfg = "auto";
+    FILE* cfgFile = fopen("gpu_net_config.txt", "r");
+    if (cfgFile) {
+        char line[128];
+        while (fgets(line, sizeof(line), cfgFile)) {
+            std::string s(line);
+            auto eq = s.find('=');
+            if (eq == std::string::npos) continue;
+            std::string key = s.substr(0, eq);
+            std::string val = s.substr(eq + 1);
+            while (!val.empty() && (val.back() == '\n' || val.back() == '\r' || val.back() == ' ')) val.pop_back();
+            if (key == "precision") precisionCfg = val;
+            else if (key == "backend") backendCfg = val;
+        }
+        fclose(cfgFile);
+    }
+
     TfLiteGpuDelegateOptionsV2 gpuOpts = TfLiteGpuDelegateOptionsV2Default();
     gpuOpts.inference_preference = TFLITE_GPU_INFERENCE_PREFERENCE_SUSTAINED_SPEED;
-    gpuOpts.inference_priority1 = TFLITE_GPU_INFERENCE_PRIORITY_MIN_LATENCY;
+    if (precisionCfg == "min") {
+        gpuOpts.inference_priority1 = TFLITE_GPU_INFERENCE_PRIORITY_MIN_LATENCY;
+    } else {
+        gpuOpts.is_precision_loss_allowed = 0;
+        gpuOpts.inference_priority1 = TFLITE_GPU_INFERENCE_PRIORITY_MAX_PRECISION;
+    }
+    if (backendCfg == "cl") {
+        gpuOpts.experimental_flags |= TFLITE_GPU_EXPERIMENTAL_FLAGS_CL_ONLY;
+    } else if (backendCfg == "gl") {
+        gpuOpts.experimental_flags |= TFLITE_GPU_EXPERIMENTAL_FLAGS_GL_ONLY;
+    }
     impl_->gpuDelegate = forceGpu ? TfLiteGpuDelegateV2Create(&gpuOpts) : nullptr;
-    if (forceGpu) LOGI("NetRunner: force_gpu_net marker present, enabling (KNOWN-INCORRECT) GPU delegate");
+    if (forceGpu) {
+        LOGI("NetRunner: force_gpu_net marker present, enabling GPU delegate (precision=%s backend=%s, "
+             "is_precision_loss_allowed=%d priority1=%d experimental_flags=%lld)",
+             precisionCfg.c_str(), backendCfg.c_str(), gpuOpts.is_precision_loss_allowed,
+             gpuOpts.inference_priority1, static_cast<long long>(gpuOpts.experimental_flags));
+    }
     if (impl_->gpuDelegate) {
         TfLiteInterpreterOptionsAddDelegate(impl_->options, impl_->gpuDelegate);
     } else if (forceGpu) {
@@ -125,7 +179,8 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
     gpuDelegateActive_ = (impl_->gpuDelegate != nullptr);
 
     int32_t nIn = TfLiteInterpreterGetInputTensorCount(impl_->interpreter);
-    LOGI("NetRunner: model=%s inputs=%d gpu_delegate=%d", modelPath.c_str(), nIn, gpuDelegateActive_);
+    LOGI("NetRunner: model=%s inputs=%d gpu_delegate=%d cpu_threads=%d", modelPath.c_str(), nIn, gpuDelegateActive_,
+         numThreads);
     for (int32_t i = 0; i < nIn; i++) {
         TfLiteTensor* t = TfLiteInterpreterGetInputTensor(impl_->interpreter, i);
         std::string name = TfLiteTensorName(t) ? TfLiteTensorName(t) : "";

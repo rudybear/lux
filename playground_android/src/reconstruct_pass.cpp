@@ -12,10 +12,59 @@
 #include <vector>
 #include <cstring>
 #include <array>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
 namespace {
+
+inline double msSince(std::chrono::high_resolution_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+}
+
+// Task 2: a tiny 2-slot GPU timestamp-query bracket, written via its own
+// single-time command buffers immediately before the first and immediately
+// after the last dispatch of one frame's compute chain -- see
+// ReconstructTimingsMs::dispatchGpuMs's comment for what this does and
+// doesn't capture. `beginSingleTimeCommands()`/`endSingleTimeCommands()`
+// already fully drain the queue (per dispatchOne's own comment), so the
+// result is available to vkGetQueryPoolResults immediately after the second
+// call returns -- no extra sync needed.
+struct GpuTimestampBracket {
+    VkQueryPool pool = VK_NULL_HANDLE;
+    double periodNs = 1.0;
+
+    void init(VulkanContext& ctx) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(ctx.physicalDevice, &props);
+        periodNs = props.limits.timestampPeriod > 0.0 ? props.limits.timestampPeriod : 1.0;
+        VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = 2;
+        vkCreateQueryPool(ctx.device, &qpci, nullptr, &pool);
+    }
+    void destroy(VkDevice device) {
+        if (pool != VK_NULL_HANDLE) vkDestroyQueryPool(device, pool, nullptr);
+    }
+    void writeStart(VulkanContext& ctx) {
+        VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+        vkCmdResetQueryPool(cmd, pool, 0, 2);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
+        ctx.endSingleTimeCommands(cmd);
+    }
+    void writeEnd(VulkanContext& ctx) {
+        VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, 1);
+        ctx.endSingleTimeCommands(cmd);
+    }
+    double readDeltaMs(VkDevice device) {
+        uint64_t ts[2] = {0, 0};
+        VkResult qr = vkGetQueryPoolResults(device, pool, 0, 2, sizeof(ts), ts, sizeof(uint64_t),
+                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (qr != VK_SUCCESS) return 0.0;
+        return static_cast<double>(ts[1] - ts[0]) * periodNs * 1e-6;
+    }
+};
 
 // --- Small local helpers (same conventions as splat_renderer.cpp) ---------
 
@@ -238,7 +287,8 @@ static_assert(sizeof(MemoryPush) == 16, "MemoryPush must match reconstruct_expan
 // reconstruct_pass.h's header comment.
 
 int runReconstructDump(VulkanContext& ctx, const std::string& dumpDir, const std::string& outDirIn,
-                        const std::string& pipelineBase) {
+                        const std::string& pipelineBase, ReconstructTimingsMs* outTimings) {
+    auto tSetup = std::chrono::high_resolution_clock::now();
     std::string outDir = outDirIn.empty() ? dumpDir : outDirIn;
     fs::create_directories(outDir);
 
@@ -420,8 +470,13 @@ int runReconstructDump(VulkanContext& ctx, const std::string& dumpDir, const std
     BlendPush blendPush = {static_cast<uint32_t>(meta.target_w), static_cast<uint32_t>(meta.target_h), 0, 0};
     uint32_t totalTargetThreads = static_cast<uint32_t>(targetScalarN);
 
+    GpuTimestampBracket gpuBracket;
+    if (outTimings != nullptr) gpuBracket.init(ctx);
+    if (outTimings != nullptr) outTimings->setupMs += msSince(tSetup);
+
     for (int t = 0; t < meta.num_frames; ++t) {
         std::string suf = "_f" + std::to_string(t) + ".npy";
+        auto tRead = std::chrono::high_resolution_clock::now();
         auto proxyColor = DlssIO::readNpyFloat32(dumpDir + "/proxy_color" + suf);
         auto mvProxy = DlssIO::readNpyFloat32(dumpDir + "/mv_proxy" + suf);
         auto jitter = DlssIO::readNpyFloat32(dumpDir + "/jitter" + suf);
@@ -439,23 +494,33 @@ int runReconstructDump(VulkanContext& ctx, const std::string& dumpDir, const std
             return 1;
         }
 
+        std::vector<float> kParams, camToWorld;
+        if (hasMemory) {
+            kParams = DlssIO::readNpyFloat32(dumpDir + "/k_params" + suf).data;
+            camToWorld = DlssIO::readNpyFloat32(dumpDir + "/cam_to_world" + suf).data;
+            if (kParams.size() != 4 || camToWorld.size() != 16) {
+                std::cerr << "[error] frame " << t << ": k_params/cam_to_world size mismatch" << std::endl;
+                return 1;
+            }
+        }
+        if (outTimings != nullptr) outTimings->fileReadMs += msSince(tRead);
+
+        auto tUpload = std::chrono::high_resolution_clock::now();
         uploadFloats(ctx.allocator, aProxyColor, proxyColor.data);
         uploadFloats(ctx.allocator, aMvProxy, mvProxy.data);
         uploadFloats(ctx.allocator, aPacked, packed.data);
         uploadFloats(ctx.allocator, aDisocc, disocc.data);
+        if (outTimings != nullptr) outTimings->uploadMs += msSince(tUpload);
+
+        auto tDispatch = std::chrono::high_resolution_clock::now();
+        if (outTimings != nullptr) gpuBracket.writeStart(ctx);
 
         if (hasMemory) {
-            auto kParams = DlssIO::readNpyFloat32(dumpDir + "/k_params" + suf);
-            auto camToWorld = DlssIO::readNpyFloat32(dumpDir + "/cam_to_world" + suf);
-            if (kParams.data.size() != 4 || camToWorld.data.size() != 16) {
-                std::cerr << "[error] frame " << t << ": k_params/cam_to_world size mismatch" << std::endl;
-                return 1;
-            }
             BguvPush bguvPush{};
             bguvPush.width = static_cast<uint32_t>(meta.target_w);
             bguvPush.height = static_cast<uint32_t>(meta.target_h);
-            std::copy(kParams.data.begin(), kParams.data.end(), bguvPush.k_params);
-            glm::mat4 camToWorldGlm = rowMajorToGlm4x4(camToWorld.data);
+            std::copy(kParams.begin(), kParams.end(), bguvPush.k_params);
+            glm::mat4 camToWorldGlm = rowMajorToGlm4x4(camToWorld);
             std::memcpy(bguvPush.cam_to_world, &camToWorldGlm[0][0], 64);
             std::copy(bgSphere.begin(), bgSphere.end(), bguvPush.bg_sphere);
 
@@ -476,17 +541,29 @@ int runReconstructDump(VulkanContext& ctx, const std::string& dumpDir, const std
 
         dispatchOne(ctx, blendPipe, blendPL, blendSet, &blendPush, sizeof(blendPush), totalTargetThreads);
 
+        if (outTimings != nullptr) {
+            gpuBracket.writeEnd(ctx);
+            outTimings->dispatchGpuMs += gpuBracket.readDeltaMs(ctx.device);
+            outTimings->dispatchCpuMs += msSince(tDispatch);
+        }
+
+        auto tDownload = std::chrono::high_resolution_clock::now();
         auto outColor = downloadFloats(ctx.allocator, aOutColor, targetColorN);
         auto hidden = downloadFloats(ctx.allocator, aHidden, hiddenN);
+        std::vector<float> bguvOut;
+        if (hasMemory) bguvOut = downloadFloats(ctx.allocator, aBguvTarget, targetScalarN * 2);
+        if (outTimings != nullptr) outTimings->downloadMs += msSince(tDownload);
+
+        auto tWrite = std::chrono::high_resolution_clock::now();
         DlssIO::writeNpyFloat32(outDir + "/out_f" + std::to_string(t) + ".npy", outColor,
                                  {meta.target_h, meta.target_w, 3});
         DlssIO::writeNpyFloat32(outDir + "/hidden_f" + std::to_string(t) + ".npy", hidden,
                                  {meta.target_h, meta.target_w, HIDDEN});
         if (hasMemory) {
-            auto bguvOut = downloadFloats(ctx.allocator, aBguvTarget, targetScalarN * 2);
             DlssIO::writeNpyFloat32(outDir + "/bguv_target_f" + std::to_string(t) + ".npy", bguvOut,
                                      {meta.target_h, meta.target_w, 2});
         }
+        if (outTimings != nullptr) outTimings->fileWriteMs += msSince(tWrite);
 
         // Carry `out` forward as next frame's `prev_color` (host-side copy
         // -- all buffers are host-visible/coherent VMA_MEMORY_USAGE_CPU_TO_GPU,
@@ -498,6 +575,8 @@ int runReconstructDump(VulkanContext& ctx, const std::string& dumpDir, const std
         std::cout << "[reconstruct] frame " << t << " done" << std::endl;
     }
 
+    auto tTeardown = std::chrono::high_resolution_clock::now();
+    gpuBracket.destroy(ctx.device);
     vkDestroyPipeline(ctx.device, warpPipe, nullptr);
     vkDestroyPipeline(ctx.device, applyPipe, nullptr);
     vkDestroyPipeline(ctx.device, blendPipe, nullptr);
@@ -534,6 +613,7 @@ int runReconstructDump(VulkanContext& ctx, const std::string& dumpDir, const std
     vmaDestroyBuffer(ctx.allocator, bHidden, aHidden);
     vmaDestroyBuffer(ctx.allocator, bDisocc, aDisocc);
     vmaDestroyBuffer(ctx.allocator, bOutColor, aOutColor);
+    if (outTimings != nullptr) outTimings->teardownMs += msSince(tTeardown);
 
     std::cout << "[reconstruct] done: " << meta.num_frames << " frames written to " << outDir << std::endl;
     return 0;
@@ -679,4 +759,295 @@ int runDumpBgFeatures(VulkanContext& ctx, const std::string& dumpDir, const std:
 
     std::cout << "[dump-bg-features] done: " << meta.num_frames << " frames written to " << outDir << std::endl;
     return 0;
+}
+
+// --- ReconstructLive (task 4) --------------------------------------------
+// Same pipelines/buffers/descriptor sets as runReconstructDump's per-call
+// body, but created once in init() and reused by every run() call instead
+// of being recreated (and torn down) every time -- see reconstruct_pass.h's
+// class comment for the measured savings.
+
+struct ReconstructLive::Impl {
+    Meta meta;
+    bool hasMemory = false;
+    int totalCh = 0, NBLEND = 0, SP = 0;
+    size_t proxyColorN = 0, mvProxyN = 0, targetColorN = 0, targetScalarN = 0, hiddenN = 0, packedN = 0, blendN = 0;
+
+    VkDescriptorSetLayout warpLayout = VK_NULL_HANDLE, applyLayout = VK_NULL_HANDLE, blendLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout bguvLayout = VK_NULL_HANDLE, memoryLayout = VK_NULL_HANDLE;
+    VkPipelineLayout warpPL = VK_NULL_HANDLE, applyPL = VK_NULL_HANDLE, blendPL = VK_NULL_HANDLE;
+    VkPipelineLayout bguvPL = VK_NULL_HANDLE, memoryPL = VK_NULL_HANDLE;
+    VkPipeline warpPipe = VK_NULL_HANDLE, applyPipe = VK_NULL_HANDLE, blendPipe = VK_NULL_HANDLE;
+    VkPipeline bguvPipe = VK_NULL_HANDLE, memoryPipe = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet warpSet = VK_NULL_HANDLE, applySet = VK_NULL_HANDLE, blendSet = VK_NULL_HANDLE;
+    VkDescriptorSet bguvSet = VK_NULL_HANDLE, memorySet = VK_NULL_HANDLE;
+
+    VkBuffer bProxyColor = VK_NULL_HANDLE, bMvProxy = VK_NULL_HANDLE, bWarped = VK_NULL_HANDLE, bPrevColor = VK_NULL_HANDLE;
+    VkBuffer bPacked = VK_NULL_HANDLE, bSpatial = VK_NULL_HANDLE, bBlend = VK_NULL_HANDLE, bHidden = VK_NULL_HANDLE;
+    VkBuffer bDisocc = VK_NULL_HANDLE, bOutColor = VK_NULL_HANDLE;
+    VmaAllocation aProxyColor{}, aMvProxy{}, aWarped{}, aPrevColor{};
+    VmaAllocation aPacked{}, aSpatial{}, aBlend{}, aHidden{}, aDisocc{}, aOutColor{};
+
+    VkBuffer bBgTexture = VK_NULL_HANDLE, bFc1W = VK_NULL_HANDLE, bFc1B = VK_NULL_HANDLE;
+    VkBuffer bFc2W = VK_NULL_HANDLE, bFc2B = VK_NULL_HANDLE, bBguvTarget = VK_NULL_HANDLE;
+    VkBuffer bBgFeaturesDummy = VK_NULL_HANDLE, bMemoryColor = VK_NULL_HANDLE;
+    VmaAllocation aBgTexture{}, aFc1W{}, aFc1B{}, aFc2W{}, aFc2B{}, aBguvTarget{}, aBgFeaturesDummy{}, aMemoryColor{};
+    std::array<float, 4> bgSphere{};
+
+    GpuTimestampBracket gpuBracket;
+    std::vector<float> outColorHost, hiddenHost, bguvHost;
+    VulkanContext* ctx = nullptr;
+};
+
+ReconstructLive::~ReconstructLive() {
+    if (!impl_) return;
+    VkDevice device = impl_->ctx ? impl_->ctx->device : VK_NULL_HANDLE;
+    if (device) {
+        vkDeviceWaitIdle(device);
+        impl_->gpuBracket.destroy(device);
+        vkDestroyPipeline(device, impl_->warpPipe, nullptr);
+        vkDestroyPipeline(device, impl_->applyPipe, nullptr);
+        vkDestroyPipeline(device, impl_->blendPipe, nullptr);
+        vkDestroyPipelineLayout(device, impl_->warpPL, nullptr);
+        vkDestroyPipelineLayout(device, impl_->applyPL, nullptr);
+        vkDestroyPipelineLayout(device, impl_->blendPL, nullptr);
+        vkDestroyDescriptorSetLayout(device, impl_->warpLayout, nullptr);
+        vkDestroyDescriptorSetLayout(device, impl_->applyLayout, nullptr);
+        vkDestroyDescriptorSetLayout(device, impl_->blendLayout, nullptr);
+        if (impl_->hasMemory) {
+            vkDestroyPipeline(device, impl_->bguvPipe, nullptr);
+            vkDestroyPipeline(device, impl_->memoryPipe, nullptr);
+            vkDestroyPipelineLayout(device, impl_->bguvPL, nullptr);
+            vkDestroyPipelineLayout(device, impl_->memoryPL, nullptr);
+            vkDestroyDescriptorSetLayout(device, impl_->bguvLayout, nullptr);
+            vkDestroyDescriptorSetLayout(device, impl_->memoryLayout, nullptr);
+            auto& alloc = impl_->ctx->allocator;
+            vmaDestroyBuffer(alloc, impl_->bBgTexture, impl_->aBgTexture);
+            vmaDestroyBuffer(alloc, impl_->bFc1W, impl_->aFc1W);
+            vmaDestroyBuffer(alloc, impl_->bFc1B, impl_->aFc1B);
+            vmaDestroyBuffer(alloc, impl_->bFc2W, impl_->aFc2W);
+            vmaDestroyBuffer(alloc, impl_->bFc2B, impl_->aFc2B);
+            vmaDestroyBuffer(alloc, impl_->bBguvTarget, impl_->aBguvTarget);
+            vmaDestroyBuffer(alloc, impl_->bBgFeaturesDummy, impl_->aBgFeaturesDummy);
+            vmaDestroyBuffer(alloc, impl_->bMemoryColor, impl_->aMemoryColor);
+        }
+        vkDestroyDescriptorPool(device, impl_->pool, nullptr);
+        auto& alloc = impl_->ctx->allocator;
+        vmaDestroyBuffer(alloc, impl_->bProxyColor, impl_->aProxyColor);
+        vmaDestroyBuffer(alloc, impl_->bMvProxy, impl_->aMvProxy);
+        vmaDestroyBuffer(alloc, impl_->bWarped, impl_->aWarped);
+        vmaDestroyBuffer(alloc, impl_->bPrevColor, impl_->aPrevColor);
+        vmaDestroyBuffer(alloc, impl_->bPacked, impl_->aPacked);
+        vmaDestroyBuffer(alloc, impl_->bSpatial, impl_->aSpatial);
+        vmaDestroyBuffer(alloc, impl_->bBlend, impl_->aBlend);
+        vmaDestroyBuffer(alloc, impl_->bHidden, impl_->aHidden);
+        vmaDestroyBuffer(alloc, impl_->bDisocc, impl_->aDisocc);
+        vmaDestroyBuffer(alloc, impl_->bOutColor, impl_->aOutColor);
+    }
+    delete impl_;
+}
+
+void ReconstructLive::init(VulkanContext& ctx, const std::string& pipelineBase,
+                            int s, int k, int paramStride, int hidden,
+                            int proxyW, int proxyH, int targetW, int targetH, int netW, int netH,
+                            int memoryChannels, int memoryHidden, int texW, int texH,
+                            const std::string& textureNpyPath, const std::string& bgSphereNpyPath,
+                            const std::string& memoryHeadNpzPath) {
+    impl_ = new Impl();
+    impl_->ctx = &ctx;
+    Impl& I = *impl_;
+    I.meta.s = s; I.meta.k = k; I.meta.param_stride = paramStride; I.meta.hidden = hidden;
+    I.meta.proxy_w = proxyW; I.meta.proxy_h = proxyH; I.meta.target_w = targetW; I.meta.target_h = targetH;
+    I.meta.net_w = netW; I.meta.net_h = netH; I.meta.num_frames = 1;
+    I.meta.memory_channels = memoryChannels; I.meta.memory_hidden = memoryHidden;
+    I.meta.tex_w = texW; I.meta.tex_h = texH;
+    I.hasMemory = memoryChannels > 0;
+    const int S = s, K = k, PS = paramStride, HIDDEN = hidden;
+    I.SP = S * PS;
+    I.NBLEND = I.hasMemory ? 3 : 1;
+    I.totalCh = I.SP * I.SP * K * K + I.SP * I.SP * I.NBLEND + HIDDEN;
+    const int MC = memoryChannels, MH = memoryHidden, TEXW = texW, TEXH = texH;
+
+    I.warpLayout = makeSetLayout(ctx.device, 3);
+    I.applyLayout = makeSetLayout(ctx.device, 5);
+    I.blendLayout = makeSetLayout(ctx.device, I.hasMemory ? 6 : 5);
+    I.warpPL = makePipelineLayout(ctx.device, I.warpLayout, 16);
+    I.applyPL = makePipelineLayout(ctx.device, I.applyLayout, 32);
+    I.blendPL = makePipelineLayout(ctx.device, I.blendLayout, 16);
+    I.warpPipe = makeComputePipeline(ctx.device, I.warpPL, pipelineBase + ".warp.comp.spv");
+    I.applyPipe = makeComputePipeline(ctx.device, I.applyPL, pipelineBase + ".apply.comp.spv");
+    I.blendPipe = makeComputePipeline(ctx.device, I.blendPL, pipelineBase + ".blend.comp.spv");
+    if (I.hasMemory) {
+        I.bguvLayout = makeSetLayout(ctx.device, 1);
+        I.memoryLayout = makeSetLayout(ctx.device, 8);
+        I.bguvPL = makePipelineLayout(ctx.device, I.bguvLayout, sizeof(BguvPush));
+        I.memoryPL = makePipelineLayout(ctx.device, I.memoryLayout, sizeof(MemoryPush));
+        I.bguvPipe = makeComputePipeline(ctx.device, I.bguvPL, pipelineBase + ".bguv.comp.spv");
+        I.memoryPipe = makeComputePipeline(ctx.device, I.memoryPL, pipelineBase + ".memory.comp.spv");
+    }
+
+    uint32_t totalDescriptors = 3 + 5 + (I.hasMemory ? 6u : 5u) + (I.hasMemory ? (1u + 8u) : 0u);
+    uint32_t totalSets = I.hasMemory ? 5 : 3;
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, totalDescriptors};
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = totalSets;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &I.pool);
+
+    std::vector<VkDescriptorSetLayout> layouts = {I.warpLayout, I.applyLayout, I.blendLayout};
+    if (I.hasMemory) { layouts.push_back(I.bguvLayout); layouts.push_back(I.memoryLayout); }
+    std::vector<VkDescriptorSet> sets(layouts.size());
+    VkDescriptorSetAllocateInfo dsAlloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsAlloc.descriptorPool = I.pool;
+    dsAlloc.descriptorSetCount = static_cast<uint32_t>(layouts.size());
+    dsAlloc.pSetLayouts = layouts.data();
+    vkAllocateDescriptorSets(ctx.device, &dsAlloc, sets.data());
+    I.warpSet = sets[0]; I.applySet = sets[1]; I.blendSet = sets[2];
+    if (I.hasMemory) { I.bguvSet = sets[3]; I.memorySet = sets[4]; }
+
+    I.proxyColorN = static_cast<size_t>(proxyW) * proxyH * 3;
+    I.mvProxyN = static_cast<size_t>(proxyW) * proxyH * 2;
+    I.targetColorN = static_cast<size_t>(targetW) * targetH * 3;
+    I.targetScalarN = static_cast<size_t>(targetW) * targetH;
+    I.hiddenN = I.targetScalarN * HIDDEN;
+    I.packedN = static_cast<size_t>(netW) * netH * I.totalCh;
+    I.blendN = I.targetScalarN * I.NBLEND;
+
+    I.bProxyColor = createHostVisibleBuffer(ctx.allocator, I.proxyColorN * 4, I.aProxyColor);
+    I.bMvProxy = createHostVisibleBuffer(ctx.allocator, I.mvProxyN * 4, I.aMvProxy);
+    I.bWarped = createHostVisibleBuffer(ctx.allocator, I.targetColorN * 4, I.aWarped);
+    I.bPrevColor = createHostVisibleBuffer(ctx.allocator, I.targetColorN * 4, I.aPrevColor);
+    I.bPacked = createHostVisibleBuffer(ctx.allocator, I.packedN * 4, I.aPacked);
+    I.bSpatial = createHostVisibleBuffer(ctx.allocator, I.targetColorN * 4, I.aSpatial);
+    I.bBlend = createHostVisibleBuffer(ctx.allocator, I.blendN * 4, I.aBlend);
+    I.bHidden = createHostVisibleBuffer(ctx.allocator, I.hiddenN * 4, I.aHidden);
+    I.bDisocc = createHostVisibleBuffer(ctx.allocator, I.targetScalarN * 4, I.aDisocc);
+    I.bOutColor = createHostVisibleBuffer(ctx.allocator, I.targetColorN * 4, I.aOutColor);
+    zeroBuffer(ctx.allocator, I.aPrevColor, I.targetColorN);
+
+    if (I.hasMemory) {
+        auto tex = DlssIO::readNpyFloat32(textureNpyPath);
+        auto sph = DlssIO::readNpyFloat32(bgSphereNpyPath);
+        std::copy(sph.data.begin(), sph.data.end(), I.bgSphere.begin());
+        auto fc1w = DlssIO::readNpzMemberFloat32(memoryHeadNpzPath, "fc1_w");
+        auto fc1b = DlssIO::readNpzMemberFloat32(memoryHeadNpzPath, "fc1_b");
+        auto fc2w = DlssIO::readNpzMemberFloat32(memoryHeadNpzPath, "fc2_w");
+        auto fc2b = DlssIO::readNpzMemberFloat32(memoryHeadNpzPath, "fc2_b");
+        I.bBgTexture = createHostVisibleBuffer(ctx.allocator, tex.data.size() * 4, I.aBgTexture);
+        uploadFloats(ctx.allocator, I.aBgTexture, tex.data);
+        I.bFc1W = createHostVisibleBuffer(ctx.allocator, fc1w.data.size() * 4, I.aFc1W);
+        uploadFloats(ctx.allocator, I.aFc1W, fc1w.data);
+        I.bFc1B = createHostVisibleBuffer(ctx.allocator, fc1b.data.size() * 4, I.aFc1B);
+        uploadFloats(ctx.allocator, I.aFc1B, fc1b.data);
+        I.bFc2W = createHostVisibleBuffer(ctx.allocator, fc2w.data.size() * 4, I.aFc2W);
+        uploadFloats(ctx.allocator, I.aFc2W, fc2w.data);
+        I.bFc2B = createHostVisibleBuffer(ctx.allocator, fc2b.data.size() * 4, I.aFc2B);
+        uploadFloats(ctx.allocator, I.aFc2B, fc2b.data);
+        I.bBguvTarget = createHostVisibleBuffer(ctx.allocator, I.targetScalarN * 2 * 4, I.aBguvTarget);
+        I.bBgFeaturesDummy = createHostVisibleBuffer(ctx.allocator, I.targetScalarN * static_cast<size_t>(MC) * 4,
+                                                       I.aBgFeaturesDummy);
+        I.bMemoryColor = createHostVisibleBuffer(ctx.allocator, I.targetColorN * 4, I.aMemoryColor);
+    }
+
+    writeDescriptorSet(ctx.device, I.warpSet, {I.bPrevColor, I.bMvProxy, I.bWarped});
+    writeDescriptorSet(ctx.device, I.applySet, {I.bPacked, I.bProxyColor, I.bSpatial, I.bBlend, I.bHidden});
+    if (I.hasMemory) {
+        writeDescriptorSet(ctx.device, I.blendSet, {I.bSpatial, I.bWarped, I.bBlend, I.bDisocc, I.bMemoryColor, I.bOutColor});
+        writeDescriptorSet(ctx.device, I.bguvSet, {I.bBguvTarget});
+        writeDescriptorSet(ctx.device, I.memorySet,
+                            {I.bBguvTarget, I.bBgTexture, I.bFc1W, I.bFc1B, I.bFc2W, I.bFc2B, I.bBgFeaturesDummy, I.bMemoryColor});
+    } else {
+        writeDescriptorSet(ctx.device, I.blendSet, {I.bSpatial, I.bWarped, I.bBlend, I.bDisocc, I.bOutColor});
+    }
+
+    I.gpuBracket.init(ctx);
+    I.outColorHost.resize(I.targetColorN);
+    I.hiddenHost.resize(I.hiddenN);
+    if (I.hasMemory) I.bguvHost.resize(I.targetScalarN * 2);
+
+    (void)TEXW; (void)TEXH; (void)MC; (void)MH;
+}
+
+void ReconstructLive::reset(VulkanContext& ctx) {
+    if (!impl_) return;
+    zeroBuffer(ctx.allocator, impl_->aPrevColor, impl_->targetColorN);
+}
+
+ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const FrameInputs& in,
+                                                     ReconstructTimingsMs* outTimings) {
+    Impl& I = *impl_;
+    auto tUpload = std::chrono::high_resolution_clock::now();
+    uploadFloats(ctx.allocator, I.aProxyColor, std::vector<float>(in.proxyColor, in.proxyColor + I.proxyColorN));
+    uploadFloats(ctx.allocator, I.aMvProxy, std::vector<float>(in.mvProxy, in.mvProxy + I.mvProxyN));
+    uploadFloats(ctx.allocator, I.aPacked, std::vector<float>(in.packed, in.packed + I.packedN));
+    uploadFloats(ctx.allocator, I.aDisocc, std::vector<float>(in.disocc, in.disocc + I.targetScalarN));
+    if (outTimings != nullptr) outTimings->uploadMs += msSince(tUpload);
+
+    auto tDispatch = std::chrono::high_resolution_clock::now();
+    if (outTimings != nullptr) I.gpuBracket.writeStart(ctx);
+
+    if (I.hasMemory) {
+        BguvPush bguvPush{};
+        bguvPush.width = static_cast<uint32_t>(I.meta.target_w);
+        bguvPush.height = static_cast<uint32_t>(I.meta.target_h);
+        std::copy(in.kParams, in.kParams + 4, bguvPush.k_params);
+        std::vector<float> camToWorldVec(in.camToWorld, in.camToWorld + 16);
+        glm::mat4 camToWorldGlm = rowMajorToGlm4x4(camToWorldVec);
+        std::memcpy(bguvPush.cam_to_world, &camToWorldGlm[0][0], 64);
+        std::copy(I.bgSphere.begin(), I.bgSphere.end(), bguvPush.bg_sphere);
+        dispatchOne(ctx, I.bguvPipe, I.bguvPL, I.bguvSet, &bguvPush, sizeof(bguvPush),
+                    static_cast<uint32_t>(I.targetScalarN));
+
+        MemoryPush memPush = {static_cast<uint32_t>(I.meta.target_w), static_cast<uint32_t>(I.meta.target_h),
+                               static_cast<uint32_t>(I.meta.tex_w), static_cast<uint32_t>(I.meta.tex_h)};
+        dispatchOne(ctx, I.memoryPipe, I.memoryPL, I.memorySet, &memPush, sizeof(memPush),
+                    static_cast<uint32_t>(I.targetScalarN));
+    }
+
+    struct WarpPush { uint32_t target_w, target_h, proxy_w, proxy_h; };
+    WarpPush warpPush = {static_cast<uint32_t>(I.meta.target_w), static_cast<uint32_t>(I.meta.target_h),
+                          static_cast<uint32_t>(I.meta.proxy_w), static_cast<uint32_t>(I.meta.proxy_h)};
+    dispatchOne(ctx, I.warpPipe, I.warpPL, I.warpSet, &warpPush, sizeof(warpPush),
+                static_cast<uint32_t>(I.targetScalarN));
+
+    struct ApplyPush {
+        uint32_t target_w, target_h, proxy_w, proxy_h, net_w, net_h;
+        float jitter_x, jitter_y;
+    };
+    ApplyPush applyPush = {static_cast<uint32_t>(I.meta.target_w), static_cast<uint32_t>(I.meta.target_h),
+                            static_cast<uint32_t>(I.meta.proxy_w), static_cast<uint32_t>(I.meta.proxy_h),
+                            static_cast<uint32_t>(I.meta.net_w), static_cast<uint32_t>(I.meta.net_h),
+                            in.jitterX, in.jitterY};
+    dispatchOne(ctx, I.applyPipe, I.applyPL, I.applySet, &applyPush, sizeof(applyPush),
+                static_cast<uint32_t>(I.targetScalarN));
+
+    struct BlendPush { uint32_t target_w, target_h, _pad0, _pad1; };
+    BlendPush blendPush = {static_cast<uint32_t>(I.meta.target_w), static_cast<uint32_t>(I.meta.target_h), 0, 0};
+    dispatchOne(ctx, I.blendPipe, I.blendPL, I.blendSet, &blendPush, sizeof(blendPush),
+                static_cast<uint32_t>(I.targetScalarN));
+
+    if (outTimings != nullptr) {
+        I.gpuBracket.writeEnd(ctx);
+        outTimings->dispatchGpuMs += I.gpuBracket.readDeltaMs(ctx.device);
+        outTimings->dispatchCpuMs += msSince(tDispatch);
+    }
+
+    auto tDownload = std::chrono::high_resolution_clock::now();
+    I.outColorHost = downloadFloats(ctx.allocator, I.aOutColor, I.targetColorN);
+    I.hiddenHost = downloadFloats(ctx.allocator, I.aHidden, I.hiddenN);
+    if (I.hasMemory) I.bguvHost = downloadFloats(ctx.allocator, I.aBguvTarget, I.targetScalarN * 2);
+    if (outTimings != nullptr) outTimings->downloadMs += msSince(tDownload);
+
+    // Carry forward as next call's prev_color -- see class comment re: this
+    // now being genuine cross-frame continuity, unlike runReconstructDump's
+    // per-call-fresh-zeroed buffer.
+    copyBufferHost(ctx.allocator, I.aPrevColor, I.aOutColor, I.targetColorN);
+
+    FrameOutputs out;
+    out.outColor = I.outColorHost.data();
+    out.hidden = I.hiddenHost.data();
+    out.bguvTarget = I.hasMemory ? I.bguvHost.data() : nullptr;
+    return out;
 }
