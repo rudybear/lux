@@ -227,6 +227,39 @@ void dispatchOne(VulkanContext& ctx, VkPipeline pipeline, VkPipelineLayout layou
     ctx.endSingleTimeCommands(cmd);
 }
 
+// Task B (docs/rendering-engines.md, "reconstruct-pass queue waits"):
+// records one dispatch into an ALREADY-open command buffer -- no begin/end/
+// submit of its own -- followed by a compute-to-compute pipeline barrier,
+// instead of dispatchOne's fully-synchronous single-dispatch submission.
+// Used ONLY by ReconstructLive::run() below: the live, on-device
+// Reconstruction-mode path, which only ever runs against the Mali-G715's
+// conformant Vulkan driver on Android, not dispatchOne's MoltenVK-flaky
+// desktop/offline validation path above (runReconstructDump), which keeps
+// the old per-dispatch vkQueueWaitIdle unchanged.
+void recordDispatchBarriered(VkCommandBuffer cmd, VkPipeline pipeline, VkPipelineLayout layout,
+                              VkDescriptorSet set, const void* pushData, uint32_t pushSize,
+                              uint32_t totalThreads, bool barrierAfter) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, pushData);
+    uint32_t groups = (totalThreads + 255) / 256;
+    vkCmdDispatch(cmd, groups, 1, 1);
+    if (!barrierAfter) return;
+    // One VkMemoryBarrier (all buffers), not a per-buffer scoped barrier:
+    // ReconstructLive::init()'s descriptor sets chain bguv -> memory -> warp
+    // -> apply -> blend, each stage consuming a mix of earlier stages'
+    // outputs plus its own dedicated inputs (see the writeDescriptorSet
+    // calls there), so naming every producer/consumer buffer pair by hand
+    // would not be meaningfully tighter than one global barrier at this
+    // buffer count/size, and a global barrier is trivially provable correct
+    // (every write before this point is visible to every read after it).
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
 // numpy's row-major (flat[i*4+j] == M[row i, col j]) -> GLM's column-major
 // storage (mat[col][row]) -- same convention as DlssIO::cvViewToGl's own
 // row-major-input handling. SPIR-V push-constant mat4 fields are
@@ -816,6 +849,17 @@ struct ReconstructLive::Impl {
     GpuTimestampBracket gpuBracket;
     std::vector<float> outColorHost, hiddenHost, bguvHost;
     VulkanContext* ctx = nullptr;
+
+    // Task B: one persistent command buffer + one fence for the whole
+    // 5-dispatch reconstruct chain, allocated/created once in init() and
+    // re-recorded every run() call (vkBeginCommandBuffer implicitly resets
+    // it -- ctx.commandPool is created with
+    // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT on both the Android
+    // and desktop VulkanContext, see android_vulkan_context.cpp/
+    // vulkan_context.cpp) instead of dispatchOne's per-call
+    // allocate+free+fully-synchronous-submit.
+    VkCommandBuffer reconCmd = VK_NULL_HANDLE;
+    VkFence reconFence = VK_NULL_HANDLE;
 };
 
 ReconstructLive::~ReconstructLive() {
@@ -823,6 +867,10 @@ ReconstructLive::~ReconstructLive() {
     VkDevice device = impl_->ctx ? impl_->ctx->device : VK_NULL_HANDLE;
     if (device) {
         vkDeviceWaitIdle(device);
+        if (impl_->reconFence != VK_NULL_HANDLE) vkDestroyFence(device, impl_->reconFence, nullptr);
+        if (impl_->reconCmd != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device, impl_->ctx->commandPool, 1, &impl_->reconCmd);
+        }
         impl_->gpuBracket.destroy(device);
         vkDestroyPipeline(device, impl_->warpPipe, nullptr);
         vkDestroyPipeline(device, impl_->applyPipe, nullptr);
@@ -985,6 +1033,16 @@ void ReconstructLive::init(VulkanContext& ctx, const std::string& pipelineBase,
     I.hiddenHost.resize(I.hiddenN);
     if (I.hasMemory) I.bguvHost.resize(I.targetScalarN * 2);
 
+    // Task B: persistent command buffer + fence for the batched dispatch
+    // chain in run() (see the Impl field comment above).
+    VkCommandBufferAllocateInfo cbAlloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbAlloc.commandPool = ctx.commandPool;
+    cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbAlloc.commandBufferCount = 1;
+    vkAllocateCommandBuffers(ctx.device, &cbAlloc, &I.reconCmd);
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    vkCreateFence(ctx.device, &fenceInfo, nullptr, &I.reconFence);
+
     (void)TEXW; (void)TEXH; (void)MC; (void)MH;
 }
 
@@ -1008,7 +1066,30 @@ ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const Fra
     if (outTimings != nullptr) outTimings->uploadMs += msSince(tUpload);
 
     auto tDispatch = std::chrono::high_resolution_clock::now();
-    if (outTimings != nullptr) I.gpuBracket.writeStart(ctx);
+
+    // Task B (docs/rendering-engines.md, "reconstruct-pass queue waits"):
+    // one command buffer for the whole bguv->memory->warp->apply->blend
+    // chain, pipeline barriers between dispatches (recordDispatchBarriered,
+    // above), one fence submit+wait for the frame -- replaces what was up
+    // to 5 fully-synchronous dispatchOne submissions (5 vkQueueWaitIdle
+    // round trips) plus 2 more from GpuTimestampBracket's own
+    // writeStart()/writeEnd() single-time commands whenever timing was
+    // requested (7 total CPU-GPU stalls/frame). The timestamp queries are
+    // folded into this same command buffer instead. Same dispatches, same
+    // descriptor sets, same push constants, same buffers, same ordering
+    // (each barrier makes every earlier write visible to every later
+    // read/write before the next dispatch starts) -- only the submission
+    // granularity changed, so output is bit-identical to the old
+    // per-dispatch-drain path (verified: see the task's PSNR/diff report).
+    vkResetCommandBuffer(I.reconCmd, 0);
+    VkCommandBufferBeginInfo cmdBeginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    cmdBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(I.reconCmd, &cmdBeginInfo);
+
+    if (outTimings != nullptr) {
+        vkCmdResetQueryPool(I.reconCmd, I.gpuBracket.pool, 0, 2);
+        vkCmdWriteTimestamp(I.reconCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, I.gpuBracket.pool, 0);
+    }
 
     if (I.hasMemory) {
         BguvPush bguvPush{};
@@ -1019,20 +1100,20 @@ ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const Fra
         glm::mat4 camToWorldGlm = rowMajorToGlm4x4(camToWorldVec);
         std::memcpy(bguvPush.cam_to_world, &camToWorldGlm[0][0], 64);
         std::copy(I.bgSphere.begin(), I.bgSphere.end(), bguvPush.bg_sphere);
-        dispatchOne(ctx, I.bguvPipe, I.bguvPL, I.bguvSet, &bguvPush, sizeof(bguvPush),
-                    static_cast<uint32_t>(I.targetScalarN));
+        recordDispatchBarriered(I.reconCmd, I.bguvPipe, I.bguvPL, I.bguvSet, &bguvPush, sizeof(bguvPush),
+                                 static_cast<uint32_t>(I.targetScalarN), /*barrierAfter=*/true);
 
         MemoryPush memPush = {static_cast<uint32_t>(I.meta.target_w), static_cast<uint32_t>(I.meta.target_h),
                                static_cast<uint32_t>(I.meta.tex_w), static_cast<uint32_t>(I.meta.tex_h)};
-        dispatchOne(ctx, I.memoryPipe, I.memoryPL, I.memorySet, &memPush, sizeof(memPush),
-                    static_cast<uint32_t>(I.targetScalarN));
+        recordDispatchBarriered(I.reconCmd, I.memoryPipe, I.memoryPL, I.memorySet, &memPush, sizeof(memPush),
+                                 static_cast<uint32_t>(I.targetScalarN), /*barrierAfter=*/true);
     }
 
     struct WarpPush { uint32_t target_w, target_h, proxy_w, proxy_h; };
     WarpPush warpPush = {static_cast<uint32_t>(I.meta.target_w), static_cast<uint32_t>(I.meta.target_h),
                           static_cast<uint32_t>(I.meta.proxy_w), static_cast<uint32_t>(I.meta.proxy_h)};
-    dispatchOne(ctx, I.warpPipe, I.warpPL, I.warpSet, &warpPush, sizeof(warpPush),
-                static_cast<uint32_t>(I.targetScalarN));
+    recordDispatchBarriered(I.reconCmd, I.warpPipe, I.warpPL, I.warpSet, &warpPush, sizeof(warpPush),
+                             static_cast<uint32_t>(I.targetScalarN), /*barrierAfter=*/true);
 
     struct ApplyPush {
         uint32_t target_w, target_h, proxy_w, proxy_h, net_w, net_h;
@@ -1042,16 +1123,34 @@ ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const Fra
                             static_cast<uint32_t>(I.meta.proxy_w), static_cast<uint32_t>(I.meta.proxy_h),
                             static_cast<uint32_t>(I.meta.net_w), static_cast<uint32_t>(I.meta.net_h),
                             in.jitterX, in.jitterY};
-    dispatchOne(ctx, I.applyPipe, I.applyPL, I.applySet, &applyPush, sizeof(applyPush),
-                static_cast<uint32_t>(I.targetScalarN));
+    recordDispatchBarriered(I.reconCmd, I.applyPipe, I.applyPL, I.applySet, &applyPush, sizeof(applyPush),
+                             static_cast<uint32_t>(I.targetScalarN), /*barrierAfter=*/true);
 
     struct BlendPush { uint32_t target_w, target_h, _pad0, _pad1; };
     BlendPush blendPush = {static_cast<uint32_t>(I.meta.target_w), static_cast<uint32_t>(I.meta.target_h), 0, 0};
-    dispatchOne(ctx, I.blendPipe, I.blendPL, I.blendSet, &blendPush, sizeof(blendPush),
-                static_cast<uint32_t>(I.targetScalarN));
+    // No barrier after the last dispatch: the fence wait below already
+    // guarantees all of this command buffer's work (including blend's
+    // writes to I.bOutColor) is complete -- and, since these are the same
+    // HOST_COHERENT VMA buffers downloadFloats()/copyBufferHost() already
+    // read right after the old per-dispatch vkQueueWaitIdle without an
+    // extra barrier, complete-and-host-visible -- before the CPU download
+    // below runs.
+    recordDispatchBarriered(I.reconCmd, I.blendPipe, I.blendPL, I.blendSet, &blendPush, sizeof(blendPush),
+                             static_cast<uint32_t>(I.targetScalarN), /*barrierAfter=*/false);
 
     if (outTimings != nullptr) {
-        I.gpuBracket.writeEnd(ctx);
+        vkCmdWriteTimestamp(I.reconCmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, I.gpuBracket.pool, 1);
+    }
+    vkEndCommandBuffer(I.reconCmd);
+
+    vkResetFences(ctx.device, 1, &I.reconFence);
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &I.reconCmd;
+    vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, I.reconFence);
+    vkWaitForFences(ctx.device, 1, &I.reconFence, VK_TRUE, UINT64_MAX);
+
+    if (outTimings != nullptr) {
         outTimings->dispatchGpuMs += I.gpuBracket.readDeltaMs(ctx.device);
         outTimings->dispatchCpuMs += msSince(tDispatch);
     }
