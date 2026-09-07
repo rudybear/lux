@@ -180,6 +180,13 @@ struct GaussianSplatData {
     std::vector<float> rotations;    // xyzw quaternion per splat
     std::vector<float> scales;       // log-space xyz per splat
     std::vector<float> opacities;    // logit-space per splat
+    // Per-gaussian foreground/actor coverage flag, 0.0/1.0, length == num_splats.
+    // Sourced from the custom `_FOREGROUND` vertex attribute (SCALAR, UNSIGNED_BYTE
+    // normalized, 255 = foreground) when the primitive has one; else falls back to
+    // "gaussian has any morph-target delta" (dynamics.targets[*].indices union);
+    // else all-zero. See docs/lux-4d-spec.md and splat_expander.py's
+    // `foreground_coverage` config flag (packs this into out_depth's .g channel).
+    std::vector<float> foreground;
     std::vector<std::vector<float>> sh_coefficients; // per-degree SH coefficients
     uint32_t sh_degree = 0;
     uint32_t num_splats = 0;

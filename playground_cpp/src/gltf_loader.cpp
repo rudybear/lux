@@ -841,6 +841,7 @@ GltfScene loadGltf(const std::string& path) {
             std::vector<float> primRotations;
             std::vector<float> primScales;
             std::vector<float> primOpacities;
+            std::vector<float> primForeground;  // _FOREGROUND attribute, if present
             std::vector<std::vector<float>> primSHCoeffs; // per-degree
             uint32_t primSHDegree = 0;
             uint32_t primNumSplats = 0;
@@ -873,6 +874,15 @@ GltfScene loadGltf(const std::string& path) {
                     primScales = readFloatAccessor(attr.data);
                 } else if (isSplatAttr(attrName, "OPACITY")) {
                     primOpacities = readFloatAccessor(attr.data);
+                } else if (attrName == "_FOREGROUND" && !std::getenv("LUX_DEBUG_IGNORE_FOREGROUND_ATTR")) {
+                    // Custom mobiledlss attribute: SCALAR UNSIGNED_BYTE normalized
+                    // (255 = foreground). cgltf_accessor_unpack_floats already
+                    // applies the normalized-int -> [0,1] float conversion.
+                    // LUX_DEBUG_IGNORE_FOREGROUND_ATTR=1 forces the morph-delta
+                    // fallback below even when the attribute is present, for
+                    // validating the two sources agree (see mobiledlss's
+                    // juggle_p0.8_stride{2,4}.glb: both give 65,641/119,826).
+                    primForeground = readFloatAccessor(attr.data);
                 } else if (attrName.rfind("_SH_", 0) == 0) {
                     // Internal format: _SH_0, _SH_1, ... _SH_N (packed float array)
                     int degree = std::stoi(attrName.substr(4));
@@ -1142,6 +1152,15 @@ GltfScene loadGltf(const std::string& path) {
                 primScales.begin(), primScales.end());
             scene.splat_data.opacities.insert(scene.splat_data.opacities.end(),
                 primOpacities.begin(), primOpacities.end());
+            // Only append when this primitive actually had a _FOREGROUND attribute
+            // and every primitive seen so far also had one; otherwise leave
+            // scene-level `foreground` short so the post-loop fallback (below)
+            // detects the mismatch and rebuilds it from morph-target deltas.
+            if (!primForeground.empty() &&
+                scene.splat_data.foreground.size() == scene.splat_data.num_splats) {
+                scene.splat_data.foreground.insert(scene.splat_data.foreground.end(),
+                    primForeground.begin(), primForeground.end());
+            }
 
             // Append SH coefficients with zero-padding for missing higher degrees
             // Ensure scene-level sh_coefficients has enough degree slots
@@ -1231,6 +1250,44 @@ GltfScene loadGltf(const std::string& path) {
         if (scene.splat_data.khr_format) {
             std::cout << "[info] KHR_gaussian_splatting kernel=" << scene.splat_data.kernel
                       << " colorSpace=" << scene.splat_data.color_space << std::endl;
+        }
+
+        // --- Foreground/actor coverage flag ---
+        // Preferred source: the custom `_FOREGROUND` vertex attribute, appended
+        // above per-primitive. If any primitive lacked it (size mismatch against
+        // the final splat count), rebuild it from scratch using the fallback:
+        // a gaussian is foreground iff it has any morph-target delta (i.e. is
+        // in the union of dynamics.targets[*].indices). Static (non-dynamic)
+        // scenes with no attribute get an all-zero flag.
+        if (scene.splat_data.foreground.size() != scene.splat_data.num_splats) {
+            if (!scene.splat_data.foreground.empty()) {
+                std::cout << "[warn] _FOREGROUND attribute present on only some splat "
+                             "primitives; falling back to morph-delta-derived foreground "
+                             "flag for all " << scene.splat_data.num_splats << " splats"
+                          << std::endl;
+            }
+            scene.splat_data.foreground.assign(scene.splat_data.num_splats, 0.0f);
+            if (scene.splat_data.dynamics.has_motion) {
+                size_t marked = 0;
+                for (auto& target : scene.splat_data.dynamics.targets) {
+                    for (uint32_t idx : target.indices) {
+                        if (idx < scene.splat_data.foreground.size() &&
+                            scene.splat_data.foreground[idx] == 0.0f) {
+                            scene.splat_data.foreground[idx] = 1.0f;
+                            marked++;
+                        }
+                    }
+                }
+                std::cout << "[info] Foreground coverage: derived from morph-target "
+                             "deltas (" << marked << "/" << scene.splat_data.num_splats
+                          << " splats)" << std::endl;
+            }
+        } else if (!scene.splat_data.foreground.empty()) {
+            size_t fgCount = 0;
+            for (float f : scene.splat_data.foreground) if (f > 0.5f) fgCount++;
+            std::cout << "[info] Foreground coverage: from _FOREGROUND attribute ("
+                      << fgCount << "/" << scene.splat_data.num_splats << " splats)"
+                      << std::endl;
         }
     }
 
