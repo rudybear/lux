@@ -279,6 +279,16 @@ struct AppState {
     // frame once the Stage 5 net-warmup window starts; empty == zero.
     std::vector<float> hiddenState;
 
+    // Task 4 (docs/rendering-engines.md, remove the readback stalls/copies
+    // where cheap): persistent reconstruct pass for Reconstruction mode's
+    // live per-displayed-frame path -- lazily init()ed on first use inside
+    // runReconstructionModeFrame (needs netW/netH, only known once
+    // inputAssembly has run at least once). Stage 5's window-capture path
+    // and any offline dump tooling still go through the file-based
+    // runReconstructDump (unchanged) -- this is ONLY for the live display.
+    ReconstructLive reconstructLive;
+    bool reconstructLiveReady = false;
+
     // Stage 5 (docs/rendering-engines.md): live reconstruct-with-memory
     // validation against the REAL juggle scene (not the synthetic clip
     // Stage 5's runReconstructDump() startup pass above already validated
@@ -856,31 +866,30 @@ std::vector<float> runReconstructionModeFrame(AppState* state, VulkanContext& ct
         memcpy(&state->hiddenState[p * hiddenCh], &out[p * outCh + (outCh - hiddenCh)], hiddenCh * sizeof(float));
     }
 
-    std::string dumpDir = basePath(state) + "/live_recon_dump_1f";
-    static bool staticsCopied = false;
-    if (!staticsCopied) {
-        mkdir(dumpDir.c_str(), 0755);
-        copyFile(basePath(state) + "/assets/bg_sphere.npy", dumpDir + "/bg_sphere.npy");
-        copyFile(basePath(state) + "/assets/texture.npy", dumpDir + "/texture.npy");
-        copyFile(basePath(state) + "/assets/memory_head.npz", dumpDir + "/memory_head.npz");
-        staticsCopied = true;
-    }
+    // Task 4: ReconstructLive replaces the old file-based round trip
+    // (write 7 dump npys, runReconstructDump recreates its whole pipeline
+    // and reloads scene-memory weights from scratch, read 1 npy back) with
+    // a persistent GPU object fed directly from in-memory pointers -- see
+    // reconstruct_pass.h's ReconstructLive class comment. Lazily init()ed
+    // here on first call since it needs netW/netH.
     uint32_t paddedProxyH = netH * AppState::kParamStride;
     uint32_t targetW = kWidth, targetH = paddedProxyH * 2;
-    writeMetaJson(dumpDir + "/meta.json", 2, 4, AppState::kParamStride, hiddenCh, kProxyWidth, paddedProxyH,
-                  targetW, targetH, netW, netH, /*numFrames=*/1, AppState::kTexChannels, 16, 512, 256);
+    if (!state->reconstructLiveReady) {
+        state->reconstructLive.init(ctx, basePath(state) + "/examples/reconstruct_mem_ps2",
+                                     /*s=*/2, /*k=*/4, AppState::kParamStride, hiddenCh,
+                                     kProxyWidth, paddedProxyH, targetW, targetH, netW, netH,
+                                     AppState::kTexChannels, /*memoryHidden=*/16, /*texW=*/512, /*texH=*/256,
+                                     basePath(state) + "/assets/texture.npy",
+                                     basePath(state) + "/assets/bg_sphere.npy",
+                                     basePath(state) + "/assets/memory_head.npz");
+        state->reconstructLiveReady = true;
+    }
 
     auto tDumpWrite = std::chrono::high_resolution_clock::now();
     auto colorProxy = readColorRgb(ctx, splatR);
     auto colorPadded = padRowsReplicate(colorProxy, kProxyHeight, kProxyWidth, 3, paddedProxyH);
-    DlssIO::writeNpyFloat32(dumpDir + "/proxy_color_f0.npy", colorPadded, {paddedProxyH, kProxyWidth, 3});
     auto mvProxy = readMvProxy(ctx, splatR);
     auto mvPadded = padRowsReplicate(mvProxy, kProxyHeight, kProxyWidth, 2, paddedProxyH);
-    DlssIO::writeNpyFloat32(dumpDir + "/mv_proxy_f0.npy", mvPadded, {paddedProxyH, kProxyWidth, 2});
-    std::vector<float> jitterArr = {jitterTargetX, jitterTargetY};
-    DlssIO::writeNpyFloat32(dumpDir + "/jitter_f0.npy", jitterArr, {2});
-    std::vector<float> packed(out, out + static_cast<size_t>(netW) * netH * outCh);
-    DlssIO::writeNpyFloat32(dumpDir + "/packed_params_f0.npy", packed, {netH, netW, outCh});
 
     const float* netTensor = state->inputAssembly.getOutputHostPtr();
     uint32_t ch26 = state->inputAssembly.getChannels();
@@ -893,32 +902,31 @@ std::vector<float> runReconstructionModeFrame(AppState* state, VulkanContext& ct
             disoccTarget[static_cast<size_t>(y) * targetW + x] = netTensor[(static_cast<size_t>(gy) * netW + gx) * ch26 + 6];
         }
     }
-    DlssIO::writeNpyFloat32(dumpDir + "/disocc_f0.npy", disoccTarget, {targetH, targetW});
 
     OrbitFrame reconTargetFrame = computeOrbitFrame(static_cast<float>(state->frameCounter), targetW, targetH);
     std::vector<float> kParams = {reconTargetFrame.fx, reconTargetFrame.fy, targetW * 0.5f, targetH * 0.5f};
-    DlssIO::writeNpyFloat32(dumpDir + "/k_params_f0.npy", kParams, {4});
     std::vector<float> camToWorld(16, 0.0f);
     camToWorld[0] = reconTargetFrame.rAxis.x; camToWorld[1] = reconTargetFrame.uAxis.x; camToWorld[2] = reconTargetFrame.fAxis.x; camToWorld[3] = reconTargetFrame.eye.x;
     camToWorld[4] = reconTargetFrame.rAxis.y; camToWorld[5] = reconTargetFrame.uAxis.y; camToWorld[6] = reconTargetFrame.fAxis.y; camToWorld[7] = reconTargetFrame.eye.y;
     camToWorld[8] = reconTargetFrame.rAxis.z; camToWorld[9] = reconTargetFrame.uAxis.z; camToWorld[10] = reconTargetFrame.fAxis.z; camToWorld[11] = reconTargetFrame.eye.z;
     camToWorld[15] = 1.0f;
-    DlssIO::writeNpyFloat32(dumpDir + "/cam_to_world_f0.npy", camToWorld, {4, 4});
-    if (outTimings != nullptr) outTimings->dumpWriteMs = msSince(tDumpWrite);
+    if (outTimings != nullptr) outTimings->dumpWriteMs = msSince(tDumpWrite);  // now just readback+prep, no files
 
-    std::string outDir = basePath(state) + "/live_recon_out_1f";
-    int rc = runReconstructDump(ctx, dumpDir, outDir, basePath(state) + "/examples/reconstruct_mem_ps2",
-                                 outTimings != nullptr ? &outTimings->reconstruct : nullptr);
-    if (rc != 0) {
-        LOGE("Reconstruction mode: runReconstructDump failed (rc=%d)", rc);
-        return std::vector<float>(static_cast<size_t>(kWidth) * kHeight * 3, 0.0f);
-    }
-    auto tOutputRead = std::chrono::high_resolution_clock::now();
-    DlssIO::NpyArray outArr = DlssIO::readNpyFloat32(outDir + "/out_f0.npy");  // [targetH,targetW,3]
-    if (outTimings != nullptr) outTimings->outputReadMs = msSince(tOutputRead);
+    ReconstructLive::FrameInputs in;
+    in.proxyColor = colorPadded.data();
+    in.mvProxy = mvPadded.data();
+    in.jitterX = jitterTargetX;
+    in.jitterY = jitterTargetY;
+    in.packed = out;  // state->netRunner.run()'s own [netH,netW,outCh] output buffer, valid until its next call
+    in.disocc = disoccTarget.data();
+    in.kParams = kParams.data();
+    in.camToWorld = camToWorld.data();
+    ReconstructLive::FrameOutputs recOut =
+        state->reconstructLive.run(ctx, in, outTimings != nullptr ? &outTimings->reconstruct : nullptr);
+
     std::vector<float> cropped(static_cast<size_t>(kWidth) * kHeight * 3);
     for (uint32_t y = 0; y < kHeight; y++) {
-        memcpy(&cropped[static_cast<size_t>(y) * kWidth * 3], &outArr.data[static_cast<size_t>(y) * targetW * 3],
+        memcpy(&cropped[static_cast<size_t>(y) * kWidth * 3], &recOut.outColor[static_cast<size_t>(y) * targetW * 3],
                static_cast<size_t>(kWidth) * 3 * sizeof(float));
     }
     return cropped;
