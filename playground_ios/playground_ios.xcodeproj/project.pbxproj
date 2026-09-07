@@ -10,10 +10,7 @@
 		08BA9FA7E54B4A71824375EF /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = E0802142ACB140038F13B697 /* main.mm */; };
 		0978CD32677F430C97AF6855 /* AppDelegate.mm in Sources */ = {isa = PBXBuildFile; fileRef = 58E8E8E1EF324B57A789E95E /* AppDelegate.mm */; };
 		610929FFD4AC4CE2867ABFB6 /* SplatView.mm in Sources */ = {isa = PBXBuildFile; fileRef = 65F5609D4C194BD6A4535C10 /* SplatView.mm */; };
-		4F6514F822D942F2AB0E7CA1 /* ReconstructPass.mm in Sources */ = {isa = PBXBuildFile; fileRef = D359D56C7188455F81C563DD /* ReconstructPass.mm */; };
-		2E332088F74A4635AF1AF15E /* MPSGraphUNet.mm in Sources */ = {isa = PBXBuildFile; fileRef = 04F93970F50041ACB8101C41 /* MPSGraphUNet.mm */; };
 		9CAF47923B284476B9E30DCC /* ios_metal_bridge_stub.mm in Sources */ = {isa = PBXBuildFile; fileRef = D5F97D10263C4B5785D36D1C /* ios_metal_bridge_stub.mm */; };
-		79F3D01F1C604665AC76FAFB /* NetInputAssembly.mm in Sources */ = {isa = PBXBuildFile; fileRef = 67F50891484A4DF5A0970801 /* NetInputAssembly.mm */; };
 		DF63C967A26D4946A51FB775 /* metal_context.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 07E03D36384745818C75A799 /* metal_context.cpp */; settings = {COMPILER_FLAGS = "-DNS_PRIVATE_IMPLEMENTATION -DCA_PRIVATE_IMPLEMENTATION -DMTL_PRIVATE_IMPLEMENTATION"; }; };
 		F1E497534FF9459591D4052B /* metal_scene.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 306C4BC2551A458D93DCB8C1 /* metal_scene.cpp */; };
 		D12A5C5F6DEC41619E0B590D /* metal_scene_manager.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D8C67E462510421F87CDC06D /* metal_scene_manager.cpp */; };
@@ -26,6 +23,11 @@
 		F50732F6B7AC4C67A7A35169 /* reflected_pipeline.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 561003A468254CF2B1244E8F /* reflected_pipeline.cpp */; };
 		E75552357DDD4023AE4F22A8 /* metal_shader_transpiler.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 0CC11AEE99BE401DA560FC5F /* metal_shader_transpiler.cpp */; };
 		A8093538955E47EEB9CFAE97 /* metal_splat_luxc_renderer.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 24EF83A640F04A9299061481 /* metal_splat_luxc_renderer.cpp */; };
+		9C2638C4FEC717249A0D3ED3 /* orbit_camera.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 147293AD9E070A3973ABC732 /* orbit_camera.cpp */; };
+		7159B46FABA14FA1180A72AA /* net_input_assembly.mm in Sources */ = {isa = PBXBuildFile; fileRef = 117485AD60861188D71DF5CD /* net_input_assembly.mm */; };
+		542E9D180707DAFA96079C82 /* mps_graph_unet.mm in Sources */ = {isa = PBXBuildFile; fileRef = 40B2FDE513BB34471461663D /* mps_graph_unet.mm */; };
+		C48763807E638EA81504D03F /* live_reconstruct_pass.mm in Sources */ = {isa = PBXBuildFile; fileRef = 5F1ECA9697714C4E587C8F18 /* live_reconstruct_pass.mm */; };
+		0E8E5DA30FF9F7570C28BA7C /* metal_live_reconstruct.cpp in Sources */ = {isa = PBXBuildFile; fileRef = B90F4C3A5E3ED77053A348AC /* metal_live_reconstruct.cpp */; };
 		C1CEA2AC4D5142B1AE0664D7 /* spirv_cross.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D7469EAC727E4B2CB3ED5F72 /* spirv_cross.cpp */; };
 		1FC6C231D40D43C8B648F3F3 /* spirv_parser.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 5C18C7494571423384888A6B /* spirv_parser.cpp */; };
 		E401CA4CC2A64D73A9B466BB /* spirv_cross_parsed_ir.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EE8761A440A54B159B0D3F83 /* spirv_cross_parsed_ir.cpp */; };
@@ -55,13 +57,7 @@
 		58E8E8E1EF324B57A789E95E /* AppDelegate.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = AppDelegate.mm; sourceTree = "<group>"; };
 		0676F38E92224273BC027CDF /* SplatView.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SplatView.h; sourceTree = "<group>"; };
 		65F5609D4C194BD6A4535C10 /* SplatView.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = SplatView.mm; sourceTree = "<group>"; };
-		048FA9C778924FBAA44003F8 /* ReconstructPass.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ReconstructPass.h; sourceTree = "<group>"; };
-		D359D56C7188455F81C563DD /* ReconstructPass.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = ReconstructPass.mm; sourceTree = "<group>"; };
-		B8FE90719FC9489CA2571A26 /* MPSGraphUNet.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MPSGraphUNet.h; sourceTree = "<group>"; };
-		04F93970F50041ACB8101C41 /* MPSGraphUNet.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = MPSGraphUNet.mm; sourceTree = "<group>"; };
 		D5F97D10263C4B5785D36D1C /* ios_metal_bridge_stub.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = ios_metal_bridge_stub.mm; sourceTree = "<group>"; };
-		D3AEF019DD4C40FCBBA1CA43 /* NetInputAssembly.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NetInputAssembly.h; sourceTree = "<group>"; };
-		67F50891484A4DF5A0970801 /* NetInputAssembly.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NetInputAssembly.mm; sourceTree = "<group>"; };
 		0BFEFD6DF61D4AB2BD89C528 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		07E03D36384745818C75A799 /* metal_context.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = metal_context.cpp; path = ../playground_cpp/src/metal_context.cpp; sourceTree = "<group>"; };
 		306C4BC2551A458D93DCB8C1 /* metal_scene.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = metal_scene.cpp; path = ../playground_cpp/src/metal_scene.cpp; sourceTree = "<group>"; };
@@ -75,6 +71,16 @@
 		561003A468254CF2B1244E8F /* reflected_pipeline.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = reflected_pipeline.cpp; path = ../playground_cpp/src/reflected_pipeline.cpp; sourceTree = "<group>"; };
 		0CC11AEE99BE401DA560FC5F /* metal_shader_transpiler.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = metal_shader_transpiler.cpp; path = ../playground_cpp/src/metal_shader_transpiler.cpp; sourceTree = "<group>"; };
 		24EF83A640F04A9299061481 /* metal_splat_luxc_renderer.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = metal_splat_luxc_renderer.cpp; path = ../playground_cpp/src/metal_splat_luxc_renderer.cpp; sourceTree = "<group>"; };
+		AFD06A1BD2B7A8AECDFD8AD5 /* orbit_camera.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = orbit_camera.h; path = ../playground_cpp/src/orbit_camera.h; sourceTree = "<group>"; };
+		147293AD9E070A3973ABC732 /* orbit_camera.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = orbit_camera.cpp; path = ../playground_cpp/src/orbit_camera.cpp; sourceTree = "<group>"; };
+		F20A8D28850BE3E4BF19946C /* net_input_assembly.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = net_input_assembly.h; path = ../playground_cpp/src/net_input_assembly.h; sourceTree = "<group>"; };
+		117485AD60861188D71DF5CD /* net_input_assembly.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; name = net_input_assembly.mm; path = ../playground_cpp/src/net_input_assembly.mm; sourceTree = "<group>"; };
+		61CD775E7CD0A84BABAED476 /* mps_graph_unet.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = mps_graph_unet.h; path = ../playground_cpp/src/mps_graph_unet.h; sourceTree = "<group>"; };
+		40B2FDE513BB34471461663D /* mps_graph_unet.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; name = mps_graph_unet.mm; path = ../playground_cpp/src/mps_graph_unet.mm; sourceTree = "<group>"; };
+		EF0326039336141531876695 /* live_reconstruct_pass.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = live_reconstruct_pass.h; path = ../playground_cpp/src/live_reconstruct_pass.h; sourceTree = "<group>"; };
+		5F1ECA9697714C4E587C8F18 /* live_reconstruct_pass.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; name = live_reconstruct_pass.mm; path = ../playground_cpp/src/live_reconstruct_pass.mm; sourceTree = "<group>"; };
+		B7DA4BE78C3D176A96775108 /* metal_live_reconstruct.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = metal_live_reconstruct.h; path = ../playground_cpp/src/metal_live_reconstruct.h; sourceTree = "<group>"; };
+		B90F4C3A5E3ED77053A348AC /* metal_live_reconstruct.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = metal_live_reconstruct.cpp; path = ../playground_cpp/src/metal_live_reconstruct.cpp; sourceTree = "<group>"; };
 		D7469EAC727E4B2CB3ED5F72 /* spirv_cross.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = spirv_cross.cpp; path = ../playground_cpp/build-metal/_deps/spirv-cross-src/spirv_cross.cpp; sourceTree = "<group>"; };
 		5C18C7494571423384888A6B /* spirv_parser.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = spirv_parser.cpp; path = ../playground_cpp/build-metal/_deps/spirv-cross-src/spirv_parser.cpp; sourceTree = "<group>"; };
 		EE8761A440A54B159B0D3F83 /* spirv_cross_parsed_ir.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = spirv_cross_parsed_ir.cpp; path = ../playground_cpp/build-metal/_deps/spirv-cross-src/spirv_cross_parsed_ir.cpp; sourceTree = "<group>"; };
@@ -143,13 +149,7 @@
 				58E8E8E1EF324B57A789E95E /* AppDelegate.mm */,
 				0676F38E92224273BC027CDF /* SplatView.h */,
 				65F5609D4C194BD6A4535C10 /* SplatView.mm */,
-				048FA9C778924FBAA44003F8 /* ReconstructPass.h */,
-				D359D56C7188455F81C563DD /* ReconstructPass.mm */,
-				B8FE90719FC9489CA2571A26 /* MPSGraphUNet.h */,
-				04F93970F50041ACB8101C41 /* MPSGraphUNet.mm */,
 				D5F97D10263C4B5785D36D1C /* ios_metal_bridge_stub.mm */,
-				D3AEF019DD4C40FCBBA1CA43 /* NetInputAssembly.h */,
-				67F50891484A4DF5A0970801 /* NetInputAssembly.mm */,
 				0BFEFD6DF61D4AB2BD89C528 /* Info.plist */,
 			);
 			path = Source;
@@ -170,6 +170,16 @@
 				561003A468254CF2B1244E8F /* reflected_pipeline.cpp */,
 				0CC11AEE99BE401DA560FC5F /* metal_shader_transpiler.cpp */,
 				24EF83A640F04A9299061481 /* metal_splat_luxc_renderer.cpp */,
+				AFD06A1BD2B7A8AECDFD8AD5 /* orbit_camera.h */,
+				147293AD9E070A3973ABC732 /* orbit_camera.cpp */,
+				F20A8D28850BE3E4BF19946C /* net_input_assembly.h */,
+				117485AD60861188D71DF5CD /* net_input_assembly.mm */,
+				61CD775E7CD0A84BABAED476 /* mps_graph_unet.h */,
+				40B2FDE513BB34471461663D /* mps_graph_unet.mm */,
+				EF0326039336141531876695 /* live_reconstruct_pass.h */,
+				5F1ECA9697714C4E587C8F18 /* live_reconstruct_pass.mm */,
+				B7DA4BE78C3D176A96775108 /* metal_live_reconstruct.h */,
+				B90F4C3A5E3ED77053A348AC /* metal_live_reconstruct.cpp */,
 				D7469EAC727E4B2CB3ED5F72 /* spirv_cross.cpp */,
 				5C18C7494571423384888A6B /* spirv_parser.cpp */,
 				EE8761A440A54B159B0D3F83 /* spirv_cross_parsed_ir.cpp */,
@@ -282,10 +292,7 @@
 				08BA9FA7E54B4A71824375EF /* main.mm in Sources */,
 				0978CD32677F430C97AF6855 /* AppDelegate.mm in Sources */,
 				610929FFD4AC4CE2867ABFB6 /* SplatView.mm in Sources */,
-				4F6514F822D942F2AB0E7CA1 /* ReconstructPass.mm in Sources */,
-				2E332088F74A4635AF1AF15E /* MPSGraphUNet.mm in Sources */,
 				9CAF47923B284476B9E30DCC /* ios_metal_bridge_stub.mm in Sources */,
-				79F3D01F1C604665AC76FAFB /* NetInputAssembly.mm in Sources */,
 				DF63C967A26D4946A51FB775 /* metal_context.cpp in Sources */,
 				F1E497534FF9459591D4052B /* metal_scene.cpp in Sources */,
 				D12A5C5F6DEC41619E0B590D /* metal_scene_manager.cpp in Sources */,
@@ -298,6 +305,11 @@
 				F50732F6B7AC4C67A7A35169 /* reflected_pipeline.cpp in Sources */,
 				E75552357DDD4023AE4F22A8 /* metal_shader_transpiler.cpp in Sources */,
 				A8093538955E47EEB9CFAE97 /* metal_splat_luxc_renderer.cpp in Sources */,
+				9C2638C4FEC717249A0D3ED3 /* orbit_camera.cpp in Sources */,
+				7159B46FABA14FA1180A72AA /* net_input_assembly.mm in Sources */,
+				542E9D180707DAFA96079C82 /* mps_graph_unet.mm in Sources */,
+				C48763807E638EA81504D03F /* live_reconstruct_pass.mm in Sources */,
+				0E8E5DA30FF9F7570C28BA7C /* metal_live_reconstruct.cpp in Sources */,
 				C1CEA2AC4D5142B1AE0664D7 /* spirv_cross.cpp in Sources */,
 				1FC6C231D40D43C8B648F3F3 /* spirv_parser.cpp in Sources */,
 				E401CA4CC2A64D73A9B466BB /* spirv_cross_parsed_ir.cpp in Sources */,

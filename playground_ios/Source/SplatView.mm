@@ -31,9 +31,7 @@
 #include "metal_splat_luxc_renderer.h"
 #include "dlss_io.h"
 #include "metal_screenshot.h"
-#include "NetInputAssembly.h"
-#include "MPSGraphUNet.h"
-#include "ReconstructPass.h"
+#include "metal_live_reconstruct.h"
 
 #include <glm/glm.hpp>
 #include <array>
@@ -97,7 +95,7 @@ static NSString *const kSceneAssetName = @"juggle_p0.8_stride4";
 // mobiledlss/datagen/make_clips.py::render_clip always renders `target_*`
 // from the unpruned scene and `proxy_*` from the pruned one -- this matches
 // that convention. Target-mode display/PSNR-reference only; the proxy/
-// reconstruction pipeline (_splatRProxy) keeps using kSceneAssetName above.
+// reconstruction pipeline (_live's proxy renderer) keeps using kSceneAssetName above.
 static NSString *const kSceneAssetNameFullTarget = @"juggle_full_stride4";
 
 // Builds the OpenCV-convention world->camera viewmat + GL view/proj matrices
@@ -214,7 +212,7 @@ static int intFromEnvironment(NSString *key, int def) {
 // offline Python PSNR pass), this computes PSNR ON-DEVICE every captured
 // frame by *also* running the Target full-res pass and a Bicubic reference
 // upscale alongside the normal Reconstruction chain, without ever touching
-// _netInput/_reconstruct's history/reset state -- LUX_START_MODE stays
+// _live's history/reset state -- LUX_START_MODE stays
 // Reconstruction the whole time, so the recurrence really is continuous.
 static int psnrFramesFromEnvironment() {
     int n = intFromEnvironment(@"LUX_PSNR_FRAMES", 0);
@@ -338,27 +336,43 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     // the Vulkan/gsplat-verified convention). Replaced with a second
     // ProxyRenderer (luxc, GPU radix sort, `sort: view_depth` baked into
     // the compiled examples/gaussian_splat_dlss pipeline -- same shaderBase
-    // as _splatRProxy, at 960x540) rendered offscreen and un-premultiply-
+    // as _live's proxy renderer, at 960x540) rendered offscreen and un-premultiply-
     // copied into the drawable, exactly like the Proxy/Bicubic display path.
     std::unique_ptr<ProxyRenderer> _splatRTarget;   // target-res (960x540), offscreen (luxc path)
-    std::unique_ptr<ProxyRenderer> _splatRProxy;    // proxy-res, offscreen DLSS attachments (B1, luxc path)
-    NetInputAssembly _netInput;                     // B2: 26-ch net input assembly compute pass
-    MPSGraphUNet _unet;                             // B3: MPSGraph ParamPredUNet port
-    MTL::Buffer *_unetOutputBuffer;                 // fp16 NHWC, netW*netH*312
+    // Reconstruction's whole chain (proxy render -> net input assembly ->
+    // MPSGraph UNet -> reconstruct-with-memory) -- shared with metal_main.cpp's
+    // `--live-bench`/`--live-psnr` (playground_cpp/src/metal_live_reconstruct.h).
+    // SplatView now only owns the display link, the layer, the mode switch,
+    // HUD and dumps -- the chain itself, its history/hidden ping-pong, and the
+    // single-command-buffer-per-frame fusion all live in this class.
+    MetalLiveReconstruct _live;
     MTL::ComputePipelineState *_upscalePipeline;    // proxy -> drawable upscale (Proxy/Bicubic modes)
-    ReconstructPass _reconstruct;                   // B4: reconstruct-with-memory
-    MTL::Texture *_reconOutputTex;                  // RGBA16Float, target res -- Reconstruction mode's own output
     DisplayMode _displayMode;
     BOOL _reconDumped;
 
-    // Per-stage wall-clock ms (each stage's Metal call already commits+waits
-    // internally, so CPU-side deltas here are GPU-inclusive) -- logged every
-    // ~0.5s alongside FPS. Requested by the coordinator ahead of the full
-    // GPUStartTime/GPUEndTime instrumentation.
-    double _msTarget, _msProxy, _msInput, _msNet, _msRecon, _msDisplay;
+    // Per-stage wall-clock ms (CPU-inclusive of any real GPU wait that stage
+    // pays) -- logged every ~0.5s alongside FPS. _msRecon now covers the
+    // WHOLE fused chain (proxy+input+net+reconstruct), one command buffer,
+    // one wait -- not a per-stage breakdown any more (see _gpuMsRecon /
+    // _cmdBufCountRecon below for the real GPU-side numbers the coordinator
+    // asked for; per-stage CPU breakdown is still available via the
+    // `--live-bench` stage-split diagnostic path on the Mac CLI).
+    double _msTarget, _msProxy, _msRecon, _msDisplay;
     double _msMorph;       // setMorphTime/seedPreviousMorphTime GPU round-trip(s), whichever renderer runs this frame
     double _msFrameWall;   // tick-to-tick wall clock (CADisplayLink callback interval)
     CFTimeInterval _lastTickTime;
+
+    // Goal 1 (GPU vs CPU split): real MTLCommandBuffer GPUStartTime/GPUEndTime
+    // for every command buffer this frame submits, plus how many command
+    // buffers / waitUntilCompleted calls the frame paid -- logged alongside
+    // the CPU ms above. _gpuMsRecon uses MetalLiveReconstruct::
+    // gpuMsAcrossPossibleSplit() (MPSGraph's UNet may internally
+    // commitAndContinue and split the fused command buffer -- see that
+    // method's own comment for why a naive single-buffer GPUEndTime-
+    // GPUStartTime under-reports the real cost when that happens).
+    double _gpuMsTarget, _gpuMsProxy, _gpuMsRecon, _gpuMsDisplay;
+    int _cmdBufCountThisFrame;
+    int _waitCountThisFrame;
     DisplayMode _lastDisplayMode;  // for detecting a mode-switch INTO Reconstruction (history reset)
     int _frame;
     int _loopFrames;
@@ -422,7 +436,7 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
         // All display paths write RGBA16Float into the drawable: the
         // upscale_proxy compute kernel (Proxy/Bicubic/Target) and the
-        // straight blit from _reconOutputTex (Reconstruction, itself
+        // straight blit from _live.getReconOutputTexture() (Reconstruction, itself
         // RGBA16Float -- blitCommandEncoder requires matching formats).
         // BGRA8Unorm (the CAMetalLayer default) would silently reinterpret
         // half-float bytes as 8-bit UNORM and come out as garbage --
@@ -543,64 +557,49 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         // other caller (headless CLI, tests).
         _splatRTarget->setSortSchedule(4, 2.0f);
 
-        // B1: a second renderer instance dedicated to the proxy-res (480x270)
-        // DLSS-attachment pass -- ProxyRenderer::init() fixes its offscreen
-        // colorTarget_/motionTarget_/expectedDepthTarget_ at the given
-        // width/height, so this can't share _splatRTarget's instance. luxc
-        // needs the compiled pipeline base (examples/gaussian_splat_dlss.*.spv,
-        // bundled as a folder reference) -- the same pipeline
-        // gaussian_splat_dlss.lux compiles to for the Vulkan/hand-Metal
-        // parity comparison in commit 08cfe8e.
-        _splatRProxy = std::make_unique<ProxyRenderer>();
-        _splatRProxy->init(_ctx, _scene.getSplatData(), "examples/gaussian_splat_dlss", kProxyW, kProxyH);
-        // Perf: same sort-scheduling amortization as _splatRTarget above --
-        // see that call site's comment.
-        _splatRProxy->setSortSchedule(4, 2.0f);
-
-        // B2: net input assembly (bg-sphere UV + texture sample + disocclusion
-        // + box-pool). texture.npy/bg_sphere.npy exported by
-        // demo/ios_assets/export_ios_weights.py (mobiledlss repo).
+        // Reconstruction's whole chain (proxy render -> net input assembly ->
+        // MPSGraph UNet -> reconstruct-with-memory), one shared class --
+        // playground_cpp/src/metal_live_reconstruct.h, also used headless by
+        // metal_main.cpp's `--live-bench`/`--live-psnr` on the Mac. Asset
+        // paths come from the app bundle (same NSBundle resources the old
+        // per-component init calls read individually).
         NSString *texPath = [[NSBundle mainBundle] pathForResource:@"texture" ofType:@"npy"];
         NSString *spherePath = [[NSBundle mainBundle] pathForResource:@"bg_sphere" ofType:@"npy"];
-        if (!texPath || !spherePath) {
-            *errorOut = "bundle resource not found: texture.npy / bg_sphere.npy";
-            return NO;
-        }
-        // lux 6ed0334 merged the DLSS aux attachments (out_motion/out_depth ->
-        // one packed out_aux, foreground_coverage -> its own out_fg) -- no more
-        // depthAlphaOffset param, see NetInputAssembly.h/.mm.
-        _netInput.init(_ctx, std::string(texPath.UTF8String), std::string(spherePath.UTF8String),
-                        kProxyW, kProxyH, /*paramStride=*/2, /*hiddenChannels=*/8);
-        // lux's foreground_coverage output has landed (examples/gaussian_splat_dlss.lux's
-        // `foreground_coverage: true`, compiled fresh from a clean HEAD worktree into
-        // playground_ios/CompiledShaders/ -- see the Xcode project's examples/shaders
-        // folder references) -- switch off the const-0 interim now that a real per-pixel
-        // actor mask is available (NetInputAssembly.mm un-premultiplies it by the fg
-        // attachment's own alpha, matching metal_main.cpp's --output-aux _fg.npy
-        // convention -- lux 6ed0334 moved fg to its own out_fg attachment).
-        if (_splatRProxy->hasForegroundCoverage()) {
-            _netInput.setFgSource(NetInputAssembly::kFgSourceFgTexture);
-            NSLog(@"[SplatView] fg source: separate fg attachment (real foreground_coverage)");
-        } else {
-            NSLog(@"[SplatView] WARNING: compiled pipeline has no foreground_coverage -- fg stays const 0");
-        }
-
-        // B3: MPSGraph ParamPredUNet port, running at NetInputAssembly's own
-        // (already-padded, multiple-of-8) net resolution.
         NSString *unetBinPath = [[NSBundle mainBundle] pathForResource:@"unet_weights.fp16" ofType:@"bin"];
         NSString *unetLayersPath = [[NSBundle mainBundle] pathForResource:@"unet_weights.layers" ofType:@"txt"];
-        if (!unetBinPath || !unetLayersPath) {
-            *errorOut = "bundle resource not found: unet_weights.fp16.bin / unet_weights.layers.txt";
+        NSString *memHeadPath = [[NSBundle mainBundle] pathForResource:@"memory_head" ofType:@"npz"];
+        if (!texPath || !spherePath || !unetBinPath || !unetLayersPath || !memHeadPath) {
+            *errorOut = "bundle resource not found: texture.npy / bg_sphere.npy / "
+                        "unet_weights.fp16.bin / unet_weights.layers.txt / memory_head.npz";
             return NO;
         }
-        _unet.init(_ctx, std::string(unetBinPath.UTF8String), std::string(unetLayersPath.UTF8String),
-                   _netInput.getNetW(), _netInput.getNetH());
-        _unetOutputBuffer = _ctx.newBuffer(
-            static_cast<size_t>(_netInput.getNetW()) * _netInput.getNetH() * _unet.getOutChannels() * sizeof(uint16_t),
-            MTL::ResourceStorageModeShared);
-        NSLog(@"[SplatView] MPSGraphUNet ready: in=%u out=%u net=%ux%u K=%u hidden=%u",
-              _unet.getInChannels(), _unet.getOutChannels(), _unet.getNetW(), _unet.getNetH(),
-              _unet.getK(), _unet.getHiddenChannels());
+
+        MetalLiveReconstruct::InitParams liveParams;
+        liveParams.shaderBase = "examples/gaussian_splat_dlss";
+        liveParams.proxyW = kProxyW;
+        liveParams.proxyH = kProxyH;
+        liveParams.targetW = kTargetW;
+        liveParams.targetH = kTargetH;
+        liveParams.paramStride = 2;
+        liveParams.hiddenChannels = 8;
+        liveParams.textureNpyPath = std::string(texPath.UTF8String);
+        liveParams.bgSphereNpyPath = std::string(spherePath.UTF8String);
+        liveParams.unetWeightsBinPath = std::string(unetBinPath.UTF8String);
+        liveParams.unetLayersTxtPath = std::string(unetLayersPath.UTF8String);
+        liveParams.memoryHeadNpzPath = std::string(memHeadPath.UTF8String);
+        // NOT (4, 2.0f): playground_cpp's `--live-psnr` measured that
+        // amortized schedule badly breaking reconstruction quality on this
+        // DYNAMIC (actor-motion) scene -- periodic ~15dB PSNR collapses on 3
+        // of every 4 frames (its view-change threshold only re-sorts on
+        // CAMERA rotation, with no signal for the scene content itself
+        // moving). Left at the exactness-preserving default (every-frame
+        // sort) so Reconstruction mode's actual quality matches the
+        // validated ~33dB, not the broken-but-faster path -- see
+        // playground_cpp/src/metal_main.cpp's runLiveBenchMetal/
+        // runLivePsnrMetal for the measurement and metal_live_reconstruct.h's
+        // InitParams comment.
+        _live.init(_ctx, _scene.getSplatData(), liveParams);
+        NSLog(@"[SplatView] MetalLiveReconstruct ready: netRes=%ux%u", _live.getNetW(), _live.getNetH());
 
         {
             NS::Error *error = nullptr;
@@ -623,40 +622,17 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
             }
         }
 
-        // B4: reconstruct-with-memory. nBlend isn't stored directly in the
-        // manifest -- derive it from out_channels = sp*sp*K*K + nBlend*sp*sp + hidden.
-        {
-            uint32_t sp = _unet.getUpscale() * _unet.getParamStride();
-            uint32_t kk = _unet.getK() * _unet.getK();
-            uint32_t nBlend = (_unet.getOutChannels() - sp * sp * kk - _unet.getHiddenChannels()) / (sp * sp);
-            NSString *memHeadPath = [[NSBundle mainBundle] pathForResource:@"memory_head" ofType:@"npz"];
-            if (!memHeadPath) {
-                *errorOut = "bundle resource not found: memory_head.npz";
-                return NO;
-            }
-            _reconstruct.init(_ctx, std::string(texPath.UTF8String), std::string(spherePath.UTF8String),
-                               std::string(memHeadPath.UTF8String), kTargetW, kTargetH, kProxyW, kProxyH,
-                               _netInput.getNetW(), _netInput.getNetH(), _unet.getK(), _unet.getHiddenChannels(),
-                               nBlend, kTargetW / kProxyW, _unet.getParamStride());
-            NSLog(@"[SplatView] ReconstructPass ready: nBlend=%u sp=%u", nBlend, sp);
-
-            auto *reconDesc = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA16Float, kTargetW, kTargetH, false);
-            reconDesc->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
-            reconDesc->setStorageMode(MTL::StorageModePrivate);
-            _reconOutputTex = _ctx.newTexture(reconDesc);
-
-            if (_psnrFrames > 0) {
-                // LUX_PSNR_FRAMES: scratch target-res texture the Bicubic
-                // reference (upscale_proxy, bilinear=1) writes into every
-                // captured frame -- same kernel/convention as the Bicubic
-                // display mode, just offscreen so it doesn't fight
-                // Reconstruction for the drawable.
-                auto *bicubicDesc =
-                    MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA16Float, kTargetW, kTargetH, false);
-                bicubicDesc->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
-                bicubicDesc->setStorageMode(MTL::StorageModePrivate);
-                _psnrBicubicTex = _ctx.newTexture(bicubicDesc);
-            }
+        if (_psnrFrames > 0) {
+            // LUX_PSNR_FRAMES: scratch target-res texture the Bicubic
+            // reference (upscale_proxy, bilinear=1) writes into every
+            // captured frame -- same kernel/convention as the Bicubic
+            // display mode, just offscreen so it doesn't fight
+            // Reconstruction for the drawable.
+            auto *bicubicDesc =
+                MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA16Float, kTargetW, kTargetH, false);
+            bicubicDesc->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
+            bicubicDesc->setStorageMode(MTL::StorageModePrivate);
+            _psnrBicubicTex = _ctx.newTexture(bicubicDesc);
         }
 
         if (_splatRTarget->hasMotion()) {
@@ -710,26 +686,29 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
 
     // Per coordinator: each mode should only pay for the stages it actually
     // displays -- Target = full-res luxc pass only; Proxy/Bicubic = proxy
-    // pass only (no net input/net/reconstruct); Reconstruction = the full
-    // proxy+input+net+recon chain. Re-entering Reconstruction after frames
-    // were skipped resets the recurrent history (depth/hidden/prevColor) --
-    // see NetInputAssembly::reset()/ReconstructPass::reset() -- since it
+    // pass only (no live-inference chain); Reconstruction = the full fused
+    // chain (MetalLiveReconstruct::encodeFrame). Re-entering Reconstruction
+    // after frames were skipped resets the recurrent history (depth/hidden/
+    // prevColor) -- see MetalLiveReconstruct::resetHistory() -- since it
     // would otherwise be stale by however many frames/orbit-degrees were
     // skipped, not just one frame old.
     BOOL enteringRecon = (_displayMode == DisplayModeReconstruction && _lastDisplayMode != DisplayModeReconstruction);
     if (enteringRecon) {
-        _netInput.reset();
-        _reconstruct.reset();
+        _live.resetHistory();
         NSLog(@"[SplatView] entering Reconstruction mode -- history reset");
     }
     _lastDisplayMode = _displayMode;
 
     _msTarget = 0.0;
     _msProxy = 0.0;
-    _msInput = 0.0;
-    _msNet = 0.0;
     _msRecon = 0.0;
     _msMorph = 0.0;
+    _gpuMsTarget = 0.0;
+    _gpuMsProxy = 0.0;
+    _gpuMsRecon = 0.0;
+    _gpuMsDisplay = 0.0;
+    _cmdBufCountThisFrame = 0;
+    _waitCountThisFrame = 0;
 
     // mobiledlss/train/data.py convention: jitter_proxy = jitter_target / S.
     // Computed unconditionally (cheap, CPU-only) since Proxy/Bicubic/
@@ -771,6 +750,12 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
             pool->release();
         }
         _msTarget = (CACurrentMediaTime() - m1) * 1000.0;
+        // render() is one fused command buffer, one internal wait -- see
+        // getLastGpuTotalMs()'s own comment for why this is a real GPU
+        // timestamp, not a CPU encode-time estimate.
+        _gpuMsTarget = _splatRTarget->getLastGpuTotalMs();
+        _cmdBufCountThisFrame += 1;
+        _waitCountThisFrame += 1;
 
         if (_frame < 16 && !_seqDumped[_frame]) {
             _seqDumped[_frame] = YES;
@@ -779,7 +764,7 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
 
     } else if (_displayMode == DisplayModeProxy || _displayMode == DisplayModeBicubic) {
         // --- Proxy/Bicubic: proxy-res render + upscale display only. No
-        // net input/net/reconstruct, and (like Target above) no
+        // live-inference chain, and (like Target above) no
         // seedPreviousMorphTime -- MV isn't consumed by a plain colour
         // upscale.
         glm::vec3 peyeCur, prCur, puCur, pfCur;
@@ -787,33 +772,41 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         float pfxCur, pfyCur;
         computeOrbitCamera(_frame, kProxyW, kProxyH, ProxyRenderer::kMetalYConvention,
                             peyeCur, prCur, puCur, pfCur, pviewCur, pprojCur, pfxCur, pfyCur);
-        _splatRProxy->updateCameraExplicit(peyeCur, pviewCur, pprojCur, pfxCur, pfyCur);
-        _splatRProxy->setJitter(jxProxy, jyProxy);
+        _live.proxyRenderer().updateCameraExplicit(peyeCur, pviewCur, pprojCur, pfxCur, pfyCur);
+        _live.proxyRenderer().setJitter(jxProxy, jyProxy);
 
         CFTimeInterval m0 = CACurrentMediaTime();
-        if (_splatRProxy->hasMotion()) {
-            _splatRProxy->setMorphTime(tCur);
+        if (_live.proxyRenderer().hasMotion()) {
+            _live.proxyRenderer().setMorphTime(tCur);
         }
         CFTimeInterval m1 = CACurrentMediaTime();
         _msMorph = (m1 - m0) * 1000.0;
 
         @autoreleasepool {
             NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
-            _splatRProxy->render(_ctx);
+            _live.proxyRenderer().render(_ctx);
             pool->release();
         }
         _msProxy = (CACurrentMediaTime() - m1) * 1000.0;
+        _gpuMsProxy = _live.proxyRenderer().getLastGpuTotalMs();
+        _cmdBufCountThisFrame += 1;
+        _waitCountThisFrame += 1;
 
     } else {
-        // --- Reconstruction: proxy render (with real previous-camera/morph
-        // for correct MV) + net input assembly (B2) + net (B3) + reconstruct
-        // (B4). This is the one mode that still pays for the full 3x
-        // blocking morph evaluation (setMorphTime(tCur) +
-        // seedPreviousMorphTime(tPrev)'s own internal 2 calls) inside
-        // MetalSplatLuxcRenderer, since real per-frame MV is load-bearing
-        // here (disocclusion + warp) -- reducing that further needs a change
-        // inside metal_splat_luxc_renderer.cpp itself (shared playground_cpp
-        // file, out of this pass's scope).
+        // --- Reconstruction: the whole chain (proxy render with real
+        // previous-camera/morph for correct MV, net input assembly, MPSGraph
+        // UNet, reconstruct-with-memory), fused into ONE command buffer via
+        // MetalLiveReconstruct::encodeFrame() -- no host wait between
+        // stages (Metal's automatic within-command-buffer encoder-ordering
+        // hazard tracking is what makes this safe, same guarantee
+        // metal_splat_luxc_renderer.cpp's own render() already relies on).
+        // Morph is folded into the SAME shared command buffer too
+        // (setMorphTime(t, cmdBuf)'s shared-cmdBuf overload, invoked inside
+        // encodeFrame()) -- down from what used to be up to 6 separate
+        // command-buffer round trips (morph, proxy render, hidden-warp+
+        // net-input, UNet, reconstruct, display) to 1-2 (the chain, plus a
+        // possible MPSGraph-internal split -- see MetalLiveReconstruct::
+        // gpuMsAcrossPossibleSplit()'s comment) + the display blit below.
         glm::vec3 peyeCur, peyePrev, prCur, puCur, pfCur, prPrev, puPrev, pfPrev;
         glm::mat4 pviewCur, pviewPrev, pprojCur, pprojPrev;
         float pfxCur, pfyCur, pfxPrev, pfyPrev;
@@ -821,94 +814,73 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
                             peyeCur, prCur, puCur, pfCur, pviewCur, pprojCur, pfxCur, pfyCur);
         computeOrbitCamera(prevFrame, kProxyW, kProxyH, ProxyRenderer::kMetalYConvention,
                             peyePrev, prPrev, puPrev, pfPrev, pviewPrev, pprojPrev, pfxPrev, pfyPrev);
-
-        _splatRProxy->updateCameraExplicit(peyeCur, pviewCur, pprojCur, pfxCur, pfyCur);
-        _splatRProxy->setPreviousCameraExplicit(pviewPrev, pprojPrev);
-        _splatRProxy->setJitter(jxProxy, jyProxy);
-
-        CFTimeInterval m0 = CACurrentMediaTime();
-        if (_splatRProxy->hasMotion()) {
-            _splatRProxy->setMorphTime(tCur);
-            _splatRProxy->seedPreviousMorphTime(tPrev);
-        }
-        CFTimeInterval m1 = CACurrentMediaTime();
-        _msMorph = (m1 - m0) * 1000.0;
-
-        @autoreleasepool {
-            NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
-            _splatRProxy->render(_ctx);
-            pool->release();
-        }
-        CFTimeInterval tp1 = CACurrentMediaTime();
-        _msProxy = (tp1 - m1) * 1000.0;
-
-        // B4 step 0 (must run BEFORE B2/B3 this frame): warp+downsample last
-        // frame's raw hidden state into this frame's net-res hidden_in.
-        // lux 6ed0334: getMotionTexture()/getExpectedDepthTexture() are gone,
-        // replaced by one packed getAuxTexture() (mv.x*a, mv.y*a, depth*a, a)
-        // -- both prepareHiddenInput (mv only) and netInput.run (mv + depth,
-        // via the separate unpremul pass inside NetInputAssembly::run) now
-        // read from it.
-        BOOL isFirstReconFrame = _netInput.isNextFrameFirst();
-        _reconstruct.prepareHiddenInput(_ctx, _splatRProxy->getAuxTexture(), isFirstReconFrame,
-                                         _reconstruct.getHiddenInputBuffer());
-
-        // B2: assemble the 26-ch net input from this frame's proxy DLSS
-        // attachments (hidden_in from B4's recurrence above). fg comes from
-        // its own getFgTexture() (nullptr when !hasForegroundCoverage() --
-        // NetInputAssembly::run() falls back to a dummy binding for that case).
-        _netInput.run(_ctx, _splatRProxy->getOutputTexture(), _splatRProxy->getAuxTexture(),
-                      _splatRProxy->hasForegroundCoverage() ? _splatRProxy->getFgTexture() : nullptr,
-                      _reconstruct.getHiddenInputBuffer(),
-                      peyeCur, prCur, puCur, pfCur, pfxCur, pfyCur,
-                      0.5f * kProxyW, 0.5f * kProxyH, jxProxy, jyProxy);
-        CFTimeInterval tp2 = CACurrentMediaTime();
-        _msInput = (tp2 - tp1) * 1000.0;
-
-        // B3: run the network on this frame's assembled input, own command
-        // buffer (single-command-buffer fusion is a later optimization pass).
-        {
-            auto *unetCmdBuf = _ctx.beginCommandBuffer();
-            _unet.encode(_ctx, unetCmdBuf, _netInput.getOutputBuffer(), _unetOutputBuffer);
-        }
-        CFTimeInterval tp3 = CACurrentMediaTime();
-        _msNet = (tp3 - tp2) * 1000.0;
-
-        // B4: reconstruct-with-memory.
         glm::vec3 teyeCur, trCur, tuCur, tfCur;
         glm::mat4 tviewCur, tprojCur;
         float tfxCur, tfyCur;
         computeOrbitCamera(_frame, kTargetW, kTargetH, ProxyRenderer::kMetalYConvention,
                             teyeCur, trCur, tuCur, tfCur, tviewCur, tprojCur, tfxCur, tfyCur);
-        MTL::Texture *curDepth = _netInput.getDepthWrittenThisFrame();
-        MTL::Texture *prevDepth = _netInput.getDepthFromPreviousFrame();
-        BOOL wasFirst = _netInput.wasFirstFrame();
 
-        if (_frame == kProxyDumpFrame && !_proxyDumped) {
-            // Everything reconstruct.run() is about to consume this frame,
-            // captured BEFORE the call (prevColor_/prevHidden_ read side,
-            // before pingIndex_ flips) -- for reproducing this exact step in
-            // PyTorch. proxy_f10_{color,mv,depth}.npy (dumpProxyFrame),
-            // netinput_f10.npy's trailing hiddenChannels columns (this
-            // frame's hidden_in), and unet_output_f10.npy (packed
-            // kernel/blend/hidden_raw) are the other half of "everything
-            // reconstruct consumes" -- already dumped by the calls below.
-            [self dumpReconInputsWithPrevDepth:prevDepth jitterTargetX:jxTarget jitterTargetY:jyTarget];
+        MetalLiveReconstruct::FrameInputs frameInputs;
+        frameInputs.proxyCur = {peyeCur, prCur, puCur, pfCur, pviewCur, pprojCur, pfxCur, pfyCur};
+        frameInputs.proxyPrev = {peyePrev, prPrev, puPrev, pfPrev, pviewPrev, pprojPrev, pfxPrev, pfyPrev};
+        frameInputs.targetCur = {teyeCur, trCur, tuCur, tfCur, tviewCur, tprojCur, tfxCur, tfyCur};
+        frameInputs.morphTimeCur = tCur;
+        frameInputs.morphTimePrev = tPrev;
+        frameInputs.jitterProxyX = jxProxy;
+        frameInputs.jitterProxyY = jyProxy;
+        frameInputs.jitterTargetX = jxTarget;
+        frameInputs.jitterTargetY = jyTarget;
+
+        // Frame-10 "everything reconstruct.run() consumes this frame" dump
+        // (dumpReconInputsWithPrevColor:prevHidden:prevDepth:...): the
+        // prevColor_/prevHidden_ HISTORY side must be captured HERE, before
+        // -encodeFrame: runs -- LiveReconstructPass's own ping-pong flips at
+        // the end of its internal run() call, buried inside the now-
+        // monolithic encodeFrame(), so this is the last point at which
+        // getPrevColorTexture()/getPrevHiddenBuffer() still reflect frame
+        // (kProxyDumpFrame-1)'s history rather than this frame's own output.
+        // The prevDepth side is the OPPOSITE: NetInputAssembly::
+        // getDepthFromPreviousFrame() only becomes valid for THIS frame
+        // once this frame's own net-input-assembly step (also buried inside
+        // encodeFrame()) has actually run -- see the capture below, after
+        // the call.
+        MTL::Texture *dumpPrevColorTex = nullptr;
+        MTL::Buffer *dumpPrevHiddenBuf = nullptr;
+        BOOL wantReconInputsDump = (_frame == kProxyDumpFrame && !_proxyDumped);
+        if (wantReconInputsDump) {
+            dumpPrevColorTex = _live.reconstruct().getPrevColorTexture();
+            dumpPrevHiddenBuf = _live.reconstruct().getPrevHiddenBuffer();
         }
 
-        _reconstruct.run(_ctx, _splatRProxy->getOutputTexture(), _splatRProxy->getAuxTexture(), curDepth,
-                          prevDepth, wasFirst, _unetOutputBuffer, _reconOutputTex, teyeCur, trCur, tuCur, tfCur,
-                          tfxCur, tfyCur, 0.5f * kTargetW, 0.5f * kTargetH, jxTarget, jyTarget);
-        CFTimeInterval tp4 = CACurrentMediaTime();
-        _msRecon = (tp4 - tp3) * 1000.0;
+        CFTimeInterval c0 = CACurrentMediaTime();
+        MTL::CommandBuffer *cmdBuf = _ctx.beginCommandBuffer();
+        MTL::CommandBuffer *cur = _live.encodeFrame(_ctx, cmdBuf, frameInputs);
+        cur->commit();
+        cur->waitUntilCompleted();
+        _msRecon = (CACurrentMediaTime() - c0) * 1000.0;
+        _gpuMsRecon = MetalLiveReconstruct::gpuMsAcrossPossibleSplit(cmdBuf, cur);
+        _cmdBufCountThisFrame += (cur != cmdBuf) ? 2 : 1;
+        _waitCountThisFrame += 1;
+        cur->release();  // balances MPSGraphUNet::encode()'s extra retain (see its own doc comment).
+
+        if (wantReconInputsDump) {
+            // proxy_f10_{color,mv,depth}.npy (dumpProxyFrame), netinput_f10.npy's
+            // trailing hiddenChannels columns (this frame's hidden_in), and
+            // unet_output_f10.npy (packed kernel/blend/hidden_raw) are the
+            // other half of "everything reconstruct consumes" -- dumped by
+            // the calls below, after this block.
+            [self dumpReconInputsWithPrevColor:dumpPrevColorTex prevHidden:dumpPrevHiddenBuf
+                                      prevDepth:_live.netInput().getDepthFromPreviousFrame()
+                                  jitterTargetX:jxTarget jitterTargetY:jyTarget];
+        }
 
         // LUX_PSNR_FRAMES: continuous rollout PSNR capture -- runs entirely
         // inside the normal Reconstruction branch (no display-mode switch,
-        // no _netInput.reset()/_reconstruct.reset()), so the recurrent
-        // history stays exactly as continuous as it is in every other mode.
-        // The extra Target full-res render + Bicubic upscale below are the
-        // ONLY things this feature adds to the frame; both are read back to
-        // CPU purely for the PSNR/RMS math, never fed back into the chain.
+        // no _live.resetHistory()), so the recurrent history stays exactly
+        // as continuous as it is in every other mode. The extra Target
+        // full-res render + Bicubic upscale below are the ONLY things this
+        // feature adds to the frame; both are read back to CPU purely for
+        // the PSNR/RMS math, never fed back into the chain.
         if (_psnrFrames > 0 && _frame >= _psnrStartFrame && _frame < _psnrStartFrame + _psnrFrames) {
             [self capturePsnrFrame:_frame eyeCur:teyeCur rCur:trCur uCur:tuCur fCur:tfCur viewCur:tviewCur
                             projCur:tprojCur fxCur:tfxCur fyCur:tfyCur tCur:tCur];
@@ -916,7 +888,7 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
 
         if (_frame < 16 && !_seqDumped[_frame]) {
             _seqDumped[_frame] = YES;
-            [self dumpSeqFrame:_reconOutputTex tag:@"reconseq" frame:_frame];
+            [self dumpSeqFrame:_live.getReconOutputTexture() tag:@"reconseq" frame:_frame];
         }
 
         if (_frame == kProxyDumpFrame && !_proxyDumped) {
@@ -928,9 +900,9 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
             [self dumpProxyFrame];
             [self dumpNetInput];
             [self dumpUnetOutput];
-            // ReconstructPass has already run every frame from 0 (real history
-            // in prevColor_/prevHidden_ by now), so frame 10's own reconstruction
-            // is directly comparable to a from-scratch PyTorch replay of frames 0..10.
+            // The reconstruct pass has already run every frame from 0 (real
+            // history by now), so frame 10's own reconstruction is directly
+            // comparable to a from-scratch PyTorch replay of frames 0..10.
             _reconDumped = YES;
             [self dumpReconOutput];
         } else if (_frame == kProxyDumpFrame + 1 && !_proxyDumped2) {
@@ -950,7 +922,13 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     // Reconstruction, a straight blit) into the drawable. Target now goes
     // through this same path as Proxy/Bicubic (scale=1, i.e. an
     // un-premultiply "copy") since MetalSplatLuxcRenderer has no
-    // renderToDrawable of its own (headless-only backend).
+    // renderToDrawable of its own (headless-only backend). Kept as its own
+    // command buffer rather than fused into the Reconstruction chain's
+    // buffer above: nextDrawable() should be acquired as late as possible
+    // (a well-known Metal latency pitfall -- holding a drawable across a
+    // heavy compute chain risks the compositor stalling), and this is the
+    // ONLY host wait Proxy/Bicubic/Target modes pay per frame (Reconstruction
+    // pays this plus its own chain wait above).
     {
         CFTimeInterval td0 = CACurrentMediaTime();
         @autoreleasepool {
@@ -959,17 +937,17 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
             if (drawable) {
                 auto *cmdBuf = _ctx.beginCommandBuffer();
                 if (_displayMode == DisplayModeReconstruction) {
-                    // _reconOutputTex is already target-res RGBA16Float --
-                    // straight blit into the (same-format) drawable.
+                    // _live.getReconOutputTexture() is already target-res
+                    // RGBA16Float -- straight blit into the (same-format) drawable.
                     auto *blit = cmdBuf->blitCommandEncoder();
-                    blit->copyFromTexture(_reconOutputTex, 0, 0, MTL::Origin(0, 0, 0),
+                    blit->copyFromTexture(_live.getReconOutputTexture(), 0, 0, MTL::Origin(0, 0, 0),
                                            MTL::Size(kTargetW, kTargetH, 1), drawable->texture(), 0, 0,
                                            MTL::Origin(0, 0, 0));
                     blit->endEncoding();
                 } else {
                     MTL::Texture *srcTex = (_displayMode == DisplayModeTarget)
                                                 ? _splatRTarget->getOutputTexture()
-                                                : _splatRProxy->getOutputTexture();
+                                                : _live.proxyRenderer().getOutputTexture();
                     float scaleXY = (_displayMode == DisplayModeTarget)
                                         ? 1.0f
                                         : static_cast<float>(kTargetW) / static_cast<float>(kProxyW);
@@ -993,6 +971,9 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
                 cmdBuf->presentDrawable(drawable);
                 cmdBuf->commit();
                 cmdBuf->waitUntilCompleted();
+                _gpuMsDisplay = (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
+                _cmdBufCountThisFrame += 1;
+                _waitCountThisFrame += 1;
                 if (_wantScreenshot) {
                     _wantScreenshot = NO;
                     [self saveScreenshotFromTexture:drawable->texture()];
@@ -1032,22 +1013,31 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     // CADisplayLink period) minus everything this method itself timed --
     // display-link scheduling slack, UIKit/dispatch overhead, and any
     // remaining un-timed CPU work in this method.
-    double summedStages = _msMorph + _msTarget + _msProxy + _msInput + _msNet + _msRecon + _msDisplay;
+    double summedStages = _msMorph + _msTarget + _msProxy + _msRecon + _msDisplay;
     double msOther = _msFrameWall - summedStages;
+    double gpuMsTotal = _gpuMsTarget + _gpuMsProxy + _gpuMsRecon + _gpuMsDisplay;
     if (elapsed >= 0.5) {
         self.fps = self.fpsFrameCount / elapsed;
         self.fpsFrameCount = 0;
         self.fpsWindowStart = now;
         self.hudLabel.text = [NSString stringWithFormat:
-            @"%s | %u splats | frame %d/%d | %.1f fps (frame=%.1fms)\n"
-            @"morph=%.1fms target=%.1fms proxy=%.1fms input=%.1fms net=%.1fms recon=%.1fms disp=%.1fms other=%.1fms",
+            @"%s | %u splats | frame %d/%d | %.1f fps (cpu=%.1fms gpu=%.1fms)\n"
+            @"morph=%.1fms target=%.1fms proxy=%.1fms recon=%.1fms disp=%.1fms other=%.1fms\n"
+            @"cmdbufs=%d waits=%d",
             kDisplayModeNames[_displayMode], _scene.getSplatData().num_splats, _frame, _loopFrames, self.fps,
-            _msFrameWall, _msMorph, _msTarget, _msProxy, _msInput, _msNet, _msRecon, _msDisplay, msOther];
-        NSLog(@"[SplatView] mode=%s fps=%.1f frame=%d/%d | wall=%.2fms morph=%.2fms target=%.2fms proxy=%.2fms "
-              @"input=%.2fms net=%.2fms recon=%.2fms display=%.2fms other=%.2fms summed=%.2fms",
+            _msFrameWall, gpuMsTotal, _msMorph, _msTarget, _msProxy, _msRecon, _msDisplay, msOther,
+            _cmdBufCountThisFrame, _waitCountThisFrame];
+        // Goal 1/3: real per-frame GPU ms (MTLCommandBuffer GPUStartTime/
+        // GPUEndTime, every command buffer the frame submits) logged next to
+        // the CPU wall ms, plus command-buffer/waitUntilCompleted counts --
+        // fps is already logged per-mode via kDisplayModeNames[_displayMode].
+        NSLog(@"[SplatView] mode=%s fps=%.1f frame=%d/%d | cpu_ms=%.2f gpu_ms=%.2f cmdbufs=%d waits=%d | "
+              @"morph=%.2fms target=%.2fms(gpu=%.2f) proxy=%.2fms(gpu=%.2f) recon=%.2fms(gpu=%.2f) "
+              @"display=%.2fms(gpu=%.2f) other=%.2fms summed=%.2fms",
               kDisplayModeNames[_displayMode], self.fps, _frame, _loopFrames,
-              _msFrameWall, _msMorph, _msTarget, _msProxy, _msInput, _msNet, _msRecon, _msDisplay, msOther,
-              summedStages);
+              _msFrameWall, gpuMsTotal, _cmdBufCountThisFrame, _waitCountThisFrame,
+              _msMorph, _msTarget, _gpuMsTarget, _msProxy, _gpuMsProxy, _msRecon, _gpuMsRecon,
+              _msDisplay, _gpuMsDisplay, msOther, summedStages);
     }
 }
 
@@ -1059,7 +1049,7 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
 
 // B1 validation dump: replicates metal_main.cpp's `--output-aux` aux-dump
 // logic exactly (same DlssIO/MetalScreenshot calls, same un-premultiply
-// convention) against _splatRProxy's own colour/motion/expected-depth
+// convention) against _live.proxyRenderer()'s own colour/motion/expected-depth
 // targets, writing <Documents>/proxy_f10_{color,depth,mv}.npy +
 // _color.png so it can be pulled with `devicectl device copy from` and
 // compared against `lux-playground-metal --output-aux` run on the Mac with
@@ -1078,10 +1068,10 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     std::string p = std::string(prefix.UTF8String);
     uint32_t w = kProxyW, h = kProxyH;
     try {
-        MetalScreenshot::saveTextureToPNG(_ctx, _splatRProxy->getOutputTexture(), w, h, p + "_color.png");
+        MetalScreenshot::saveTextureToPNG(_ctx, _live.proxyRenderer().getOutputTexture(), w, h, p + "_color.png");
 
         {
-            auto raw = MetalScreenshot::readTextureRaw(_ctx, _splatRProxy->getOutputTexture(), w, h, 8);
+            auto raw = MetalScreenshot::readTextureRaw(_ctx, _live.proxyRenderer().getOutputTexture(), w, h, 8);
             std::vector<uint8_t> unusedRgba8;
             auto colorF32 = DlssIO::convertRgba16fColorAttachment(raw, w, h, unusedRgba8);
             DlssIO::writeNpyFloat32(p + "_color.npy", colorF32, {h, w, 4});
@@ -1094,20 +1084,20 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         // rendering-engines.md). readTextureAsFloats() is precision-agnostic
         // (RGBA32Float today; an `aux_precision: half` RGBA16Float variant is
         // expected soon -- see its own comment).
-        if (_splatRProxy->hasExpectedDepth() || _splatRProxy->hasMotionVectors()) {
+        if (_live.proxyRenderer().hasExpectedDepth() || _live.proxyRenderer().hasMotionVectors()) {
             constexpr uint32_t C = ProxyRenderer::kAuxChannels;  // 4
-            std::vector<float> chans = readTextureAsFloats(_ctx, _splatRProxy->getAuxTexture(), w, h, C);
+            std::vector<float> chans = readTextureAsFloats(_ctx, _live.proxyRenderer().getAuxTexture(), w, h, C);
             std::vector<float> auxAlpha(static_cast<size_t>(w) * h);
             for (size_t i = 0; i < auxAlpha.size(); ++i) auxAlpha[i] = chans[i * C + 3];
 
-            if (_splatRProxy->hasExpectedDepth()) {
+            if (_live.proxyRenderer().hasExpectedDepth()) {
                 std::vector<float> depthPremul(static_cast<size_t>(w) * h);
                 for (size_t i = 0; i < depthPremul.size(); ++i) depthPremul[i] = chans[i * C + 2];
                 auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, auxAlpha, w, h, 1);
                 DlssIO::writeNpyFloat32(p + "_depth.npy", depth, {h, w});
             }
 
-            if (_splatRProxy->hasMotionVectors()) {
+            if (_live.proxyRenderer().hasMotionVectors()) {
                 std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
                 for (size_t i = 0; i < auxAlpha.size(); ++i) {
                     mvPremul[i * 2 + 0] = chans[i * C + 0];
@@ -1122,10 +1112,10 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         // un-premultiply, independent of the aux texture above. RGBA16Float
         // today (kept safe per getFgTexture()'s own comment: fg is [0,1]-
         // bounded like alpha itself), but read format-agnostically anyway.
-        if (_splatRProxy->hasForegroundCoverage()) {
-            const uint32_t C = _splatRProxy->getFgChannels();  // always 4 -- lux 5d5630c made this a
+        if (_live.proxyRenderer().hasForegroundCoverage()) {
+            const uint32_t C = _live.proxyRenderer().getFgChannels();  // always 4 -- lux 5d5630c made this a
                                                                 // runtime accessor (was kFgChannels)
-            std::vector<float> chans = readTextureAsFloats(_ctx, _splatRProxy->getFgTexture(), w, h, C);
+            std::vector<float> chans = readTextureAsFloats(_ctx, _live.proxyRenderer().getFgTexture(), w, h, C);
             std::vector<float> fgPremul(static_cast<size_t>(w) * h);
             std::vector<float> fgAlpha(static_cast<size_t>(w) * h);
             for (size_t i = 0; i < fgPremul.size(); ++i) {
@@ -1145,7 +1135,7 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     }
 }
 
-// B2 validation dump: reads _netInput's packed fp16 NHWC output buffer back
+// B2 validation dump: reads _live.netInput()'s packed fp16 NHWC output buffer back
 // to CPU, converts to float32 (DlssIO::halfToFloat -- already linked, no new
 // fp16 dependency), and writes <Documents>/netinput_f10.npy
 // [netH, netW, 18+hiddenChannels] for comparison against
@@ -1157,8 +1147,8 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *outPath = [docPaths.firstObject stringByAppendingPathComponent:@"netinput_f10.npy"];
     try {
-        uint32_t netW = _netInput.getNetW(), netH = _netInput.getNetH(), ch = _netInput.getChannels();
-        MTL::Buffer *buf = _netInput.getOutputBuffer();
+        uint32_t netW = _live.netInput().getNetW(), netH = _live.netInput().getNetH(), ch = _live.netInput().getChannels();
+        MTL::Buffer *buf = _live.netInput().getOutputBuffer();
         const uint16_t *halfData = static_cast<const uint16_t *>(buf->contents());
         size_t count = static_cast<size_t>(netW) * netH * ch;
         std::vector<float> f32(count);
@@ -1182,8 +1172,8 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *outPath = [docPaths.firstObject stringByAppendingPathComponent:@"unet_output_f10.npy"];
     try {
-        uint32_t netW = _unet.getNetW(), netH = _unet.getNetH(), ch = _unet.getOutChannels();
-        const uint16_t *halfData = static_cast<const uint16_t *>(_unetOutputBuffer->contents());
+        uint32_t netW = _live.unet().getNetW(), netH = _live.unet().getNetH(), ch = _live.unet().getOutChannels();
+        const uint16_t *halfData = static_cast<const uint16_t *>(_live.getUnetOutputBuffer()->contents());
         size_t count = static_cast<size_t>(netW) * netH * ch;
         std::vector<float> f32(count);
         for (size_t i = 0; i < count; i++) f32[i] = DlssIO::halfToFloat(halfData[i]);
@@ -1207,8 +1197,8 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     NSString *prefix = [docPaths.firstObject stringByAppendingPathComponent:@"recon_f10"];
     std::string p = std::string(prefix.UTF8String);
     try {
-        MetalScreenshot::saveTextureToPNG(_ctx, _reconOutputTex, kTargetW, kTargetH, p + ".png");
-        auto raw = MetalScreenshot::readTextureRaw(_ctx, _reconOutputTex, kTargetW, kTargetH, 8);
+        MetalScreenshot::saveTextureToPNG(_ctx, _live.getReconOutputTexture(), kTargetW, kTargetH, p + ".png");
+        auto raw = MetalScreenshot::readTextureRaw(_ctx, _live.getReconOutputTexture(), kTargetW, kTargetH, 8);
         std::vector<uint8_t> unusedRgba8;
         auto colorF32 = DlssIO::convertRgba16fColorAttachment(raw, kTargetW, kTargetH, unusedRgba8);
         DlssIO::writeNpyFloat32(p + ".npy", colorF32, {kTargetH, kTargetW, 4});
@@ -1221,13 +1211,22 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     }
 }
 
-// Frame-10 "everything reconstruct.run() consumes this frame" dump, taken
-// right BEFORE the call (so prevColor_/prevHidden_/prevDepth are the
-// history side, not yet overwritten by this frame's own output) --
-// completing what dumpProxyFrame/dumpNetInput/dumpUnetOutput already cover
-// (proxy colour/mv/depth, hidden_in, packed kernel/blend/hidden_raw logits)
-// so the whole reconstruct step can be reproduced bit-for-bit in PyTorch.
-- (void)dumpReconInputsWithPrevDepth:(MTL::Texture *)prevDepthTex jitterTargetX:(float)jx jitterTargetY:(float)jy {
+// Frame-10 "everything reconstruct.run() consumes this frame" dump.
+// prevColorTex/prevHiddenBuf must be captured by the CALLER before
+// -encodeFrame: runs for this frame (they're the history side --
+// prevColor_[pingIndex_]/prevHidden_[pingIndex_], not yet overwritten by
+// this frame's own output at that point); prevDepthTex must be captured
+// AFTER -encodeFrame: returns (see MetalLiveReconstruct::netInput()'s
+// getDepthFromPreviousFrame() comment -- it only reflects THIS frame's
+// real "N-1" depth once this frame's own net-input-assembly step, buried
+// inside the now-monolithic encodeFrame() call, has actually run; calling
+// it any earlier would silently read frame N-2's depth instead). Together
+// these complete what dumpProxyFrame/dumpNetInput/dumpUnetOutput already
+// cover (proxy colour/mv/depth, hidden_in, packed kernel/blend/hidden_raw
+// logits) so the whole reconstruct step can be reproduced bit-for-bit in
+// PyTorch.
+- (void)dumpReconInputsWithPrevColor:(MTL::Texture *)prevColorTex prevHidden:(MTL::Buffer *)prevHiddenBuf
+                           prevDepth:(MTL::Texture *)prevDepthTex jitterTargetX:(float)jx jitterTargetY:(float)jy {
     NSArray<NSString *> *docPaths =
         NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *prefix = [docPaths.firstObject stringByAppendingPathComponent:@"recon_in_f10"];
@@ -1237,15 +1236,15 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         // already-straight non-premultiplied RGB per ReconstructPass's own output
         // convention -- same read path as dumpReconOutput).
         {
-            auto raw = MetalScreenshot::readTextureRaw(_ctx, _reconstruct.getPrevColorTexture(), kTargetW, kTargetH, 8);
+            auto raw = MetalScreenshot::readTextureRaw(_ctx, prevColorTex, kTargetW, kTargetH, 8);
             std::vector<uint8_t> unusedRgba8;
             auto colorF32 = DlssIO::convertRgba16fColorAttachment(raw, kTargetW, kTargetH, unusedRgba8);
             DlssIO::writeNpyFloat32(p + "_prevcolor.npy", colorF32, {kTargetH, kTargetW, 4});
         }
         // prev hidden (target res, NHWC fp16 -> f32).
         {
-            uint32_t hiddenChannels = _unet.getHiddenChannels();
-            const uint16_t *halfData = static_cast<const uint16_t *>(_reconstruct.getPrevHiddenBuffer()->contents());
+            uint32_t hiddenChannels = _live.unet().getHiddenChannels();
+            const uint16_t *halfData = static_cast<const uint16_t *>(prevHiddenBuf->contents());
             size_t count = static_cast<size_t>(kTargetW) * kTargetH * hiddenChannels;
             std::vector<float> f32(count);
             for (size_t i = 0; i < count; i++) f32[i] = DlssIO::halfToFloat(halfData[i]);
@@ -1274,7 +1273,7 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
 // 16-frame orbit PSNR test (task spec): dumps frame `frame`'s straight
 // (un-premultiplied) RGB colour from `tex` (any target-res RGBA16Float
 // texture -- works for both _splatRTarget's premultiplied render output and
-// _reconOutputTex's already-straight one, since convertRgba16fColorAttachment
+// _live.getReconOutputTexture()'s already-straight one, since convertRgba16fColorAttachment
 // does the alpha division itself) as <Documents>/seq_<tag>_f<frame>.npy.
 // Run once with LUX_START_MODE=Target and once with LUX_START_MODE=
 // Reconstruction (separate app launches -- Target's full-res pass and the
@@ -1305,10 +1304,10 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
 // _psnrBicubicTex), then reads all three target-res textures back to CPU
 // (readTextureRaw + convertRgba16fColorAttachment -- same un-premultiply
 // convention as dumpSeqFrame, works for both _splatRTarget's premultiplied
-// output and _reconOutputTex's already-straight one) and logs/records PSNR
+// output and _live.getReconOutputTexture()'s already-straight one) and logs/records PSNR
 // + the mean blend alpha/w_m + hidden-state RMS for this frame. Called from
-// -tick: strictly AFTER _reconstruct.run() for this frame, so
-// _reconstruct.getBlendDebugBuffer()/getPrevHiddenBuffer() both read what
+// -tick: strictly AFTER _live.reconstruct().run() for this frame, so
+// _live.reconstruct().getBlendDebugBuffer()/getPrevHiddenBuffer() both read what
 // run() just wrote (see ReconstructPass.h's getPrevHiddenBuffer() doc for
 // the before-vs-after pingIndex_ distinction).
 - (void)capturePsnrFrame:(int)frame eyeCur:(glm::vec3)eyeCur rCur:(glm::vec3)rCur uCur:(glm::vec3)uCur
@@ -1333,7 +1332,7 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
             auto *cmdBuf = _ctx.beginCommandBuffer();
             auto *enc = cmdBuf->computeCommandEncoder();
             enc->setComputePipelineState(_upscalePipeline);
-            enc->setTexture(_splatRProxy->getOutputTexture(), 0);
+            enc->setTexture(_live.proxyRenderer().getOutputTexture(), 0);
             enc->setTexture(_psnrBicubicTex, 1);
             uint32_t bilinear = 1;
             std::array<float, 2> scale = {static_cast<float>(kTargetW) / static_cast<float>(kProxyW),
@@ -1355,7 +1354,7 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         std::vector<uint8_t> unusedRgba8;
         auto targetRaw = MetalScreenshot::readTextureRaw(_ctx, _splatRTarget->getOutputTexture(), kTargetW, kTargetH, 8);
         auto targetF32 = DlssIO::convertRgba16fColorAttachment(targetRaw, kTargetW, kTargetH, unusedRgba8);
-        auto reconRaw = MetalScreenshot::readTextureRaw(_ctx, _reconOutputTex, kTargetW, kTargetH, 8);
+        auto reconRaw = MetalScreenshot::readTextureRaw(_ctx, _live.getReconOutputTexture(), kTargetW, kTargetH, 8);
         auto reconF32 = DlssIO::convertRgba16fColorAttachment(reconRaw, kTargetW, kTargetH, unusedRgba8);
         auto bicubicRaw = MetalScreenshot::readTextureRaw(_ctx, _psnrBicubicTex, kTargetW, kTargetH, 8);
         auto bicubicF32 = DlssIO::convertRgba16fColorAttachment(bicubicRaw, kTargetW, kTargetH, unusedRgba8);
@@ -1366,7 +1365,7 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         // --- Mean blend alpha (wS) / w_m (wM), post-disocclusion-renorm. ---
         double sumAlpha = 0.0, sumWm = 0.0;
         {
-            const uint16_t *half = static_cast<const uint16_t *>(_reconstruct.getBlendDebugBuffer()->contents());
+            const uint16_t *half = static_cast<const uint16_t *>(_live.reconstruct().getBlendDebugBuffer()->contents());
             size_t n = static_cast<size_t>(kTargetW) * kTargetH;
             for (size_t i = 0; i < n; i++) {
                 sumAlpha += DlssIO::halfToFloat(half[i * 2 + 0]);
@@ -1380,8 +1379,8 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         // this frame's run()). ---
         float hiddenRms;
         {
-            uint32_t hiddenChannels = _unet.getHiddenChannels();
-            const uint16_t *half = static_cast<const uint16_t *>(_reconstruct.getPrevHiddenBuffer()->contents());
+            uint32_t hiddenChannels = _live.unet().getHiddenChannels();
+            const uint16_t *half = static_cast<const uint16_t *>(_live.reconstruct().getPrevHiddenBuffer()->contents());
             size_t n = static_cast<size_t>(kTargetW) * kTargetH * hiddenChannels;
             double sumSq = 0.0;
             for (size_t i = 0; i < n; i++) {
