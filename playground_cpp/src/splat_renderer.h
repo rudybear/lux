@@ -216,6 +216,16 @@ private:
     VkBuffer projColorBuffer_ = VK_NULL_HANDLE;   VmaAllocation projColorAlloc_ = VK_NULL_HANDLE;
     VkBuffer projMvBuffer_ = VK_NULL_HANDLE;      VmaAllocation projMvAlloc_ = VK_NULL_HANDLE;
     VkBuffer projDepthBuffer_ = VK_NULL_HANDLE;   VmaAllocation projDepthAlloc_ = VK_NULL_HANDLE;
+    // Per-frame camera data for the (jitter-free) motion-vector projection:
+    // [0]=proj_matrix_unjittered, [1]=prev_view_proj_unjittered (2x mat4 =
+    // 128 bytes) -- a tiny storage buffer instead of push constants (see
+    // splat_expander.py's "Why not push constants" comment: pushing these
+    // as push-constant fields put the compute stage's push-constant block
+    // at 304 bytes, over Mali-G715's 256-byte maxPushConstantsSize, which
+    // silently corrupted every motion vector on Android). Written via
+    // vkCmdUpdateBuffer each render() call, matching the old memcpy-into-
+    // push-constants call site exactly.
+    VkBuffer prevCameraBuffer_ = VK_NULL_HANDLE;  VmaAllocation prevCameraAlloc_ = VK_NULL_HANDLE;
 
     // Sort buffers (buffer A = primary, written by compute shader)
     VkBuffer sortKeysBuffer_ = VK_NULL_HANDLE;      VmaAllocation sortKeysAlloc_ = VK_NULL_HANDLE;
@@ -294,7 +304,7 @@ private:
     void createFramebuffer(VkDevice device);
     void createFramebufferLoad(VkDevice device);
     void createFramebufferLoadDepth(VkDevice device);
-    void createPipelines(VkDevice device, const std::string& shaderBase);
+    void createPipelines(VulkanContext& ctx, const std::string& shaderBase);
     void createSortPipelines(VkDevice device);
     void createBuffers(VulkanContext& ctx, const GaussianSplatData& data);
 

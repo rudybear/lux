@@ -284,6 +284,7 @@ void MetalSplatLuxcRenderer::createBuffers(MetalContext& ctx, const GaussianSpla
         projMvBuffer_ = ctx.newBuffer(numSplats_ * 2 * sizeof(float), MTL::ResourceStorageModeShared);
         prevPosBuffer_ = ctx.newBuffer(hostPositions_.data(), hostPositions_.size() * sizeof(float),
                                         MTL::ResourceStorageModeShared);
+        prevCameraBuffer_ = ctx.newBuffer(2 * sizeof(glm::mat4), MTL::ResourceStorageModeShared);
     } else {
         // Dummy 1-element buffers -- the compute stage only declares these
         // storage buffers when motion_vectors/expected_depth are enabled
@@ -291,6 +292,7 @@ void MetalSplatLuxcRenderer::createBuffers(MetalContext& ctx, const GaussianSpla
         // but keep pointers non-null for uniform code below.
         projMvBuffer_ = ctx.newBuffer(8, MTL::ResourceStorageModeShared);
         prevPosBuffer_ = ctx.newBuffer(16, MTL::ResourceStorageModeShared);
+        prevCameraBuffer_ = ctx.newBuffer(16, MTL::ResourceStorageModeShared);
     }
     if (hasExpectedDepth_) {
         projDepthBuffer_ = ctx.newBuffer(numSplats_ * sizeof(float), MTL::ResourceStorageModeShared);
@@ -570,6 +572,14 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
     }
 
     // --- Preprocess compute: projection, covariance, SH, sort-key gen ---
+    // proj_matrix_unjittered/prev_view_proj_unjittered do NOT live in this
+    // push-constant struct (unlike the pre-fix version) -- they're written
+    // into prevCameraBuffer_ below instead, matching splat_renderer.cpp's
+    // Vulkan path exactly (see that file's ComputePush comment / the
+    // guardrail check in its createPipelines for why: a 304-byte compute
+    // push-constant block was fine on MoltenVK's reported 4096-byte budget,
+    // never an issue here, but silently corrupted every motion vector on
+    // Android's Mali-G715, which only supports 256).
     struct ComputePush {
         float view[16];
         float proj[16];
@@ -581,8 +591,6 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
         float focalY;
         int32_t shDegree;
         float _pad1[2];
-        float projUnjittered[16];
-        float prevViewProjUnjittered[16];
     } push = {};
     std::memcpy(push.view, &viewMatrix_[0][0], 64);
     std::memcpy(push.proj, &projMatrix_[0][0], 64);
@@ -594,9 +602,16 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
     push.focalY = focalY_;
     push.shDegree = static_cast<int32_t>(shDegree_);
     if (hasMotionVectors_) {
-        glm::mat4 prevViewProj = prevProjMatrixUnjittered_ * prevViewMatrix_;
-        std::memcpy(push.projUnjittered, &projMatrixUnjittered_[0][0], 64);
-        std::memcpy(push.prevViewProjUnjittered, &prevViewProj[0][0], 64);
+        // prev_camera_mats[0]=proj_matrix_unjittered, [1]=prev_view_proj_unjittered.
+        // Direct memcpy into the shared-storage buffer's contents (like
+        // prevPosBuffer_'s firstMvFrame_ seed above) -- no explicit barrier
+        // needed, Metal auto-tracks buffer hazards within a command buffer
+        // in submission order, and this write happens on the CPU well
+        // before the compute encoder below is even created.
+        glm::mat4 prevCameraMats[2];
+        prevCameraMats[0] = projMatrixUnjittered_;
+        prevCameraMats[1] = prevProjMatrixUnjittered_ * prevViewMatrix_;
+        std::memcpy(prevCameraBuffer_->contents(), prevCameraMats, sizeof(prevCameraMats));
     }
 
     auto t0 = std::chrono::steady_clock::now();
@@ -629,6 +644,7 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
         if (hasMotionVectors_) {
             trySetBuffer(enc, compShader_, prevPosBuffer_, nextBinding++);
             trySetBuffer(enc, compShader_, projMvBuffer_, nextBinding++);
+            trySetBuffer(enc, compShader_, prevCameraBuffer_, nextBinding++);
         }
         if (hasExpectedDepth_) {
             trySetBuffer(enc, compShader_, projDepthBuffer_, nextBinding++);

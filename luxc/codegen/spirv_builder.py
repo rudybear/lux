@@ -936,6 +936,18 @@ class SpvGenerator:
             # Decorations
             self.decorations.append(f"OpDecorate {struct_id} Block")
             self.decorations.append(f"OpMemberDecorate {struct_id} 0 Offset 0")
+            # Matrix-typed storage buffers (e.g. a small per-frame camera
+            # array, `StorageBufferDecl(name, "mat4")`) need explicit
+            # layout decorations on the wrapping struct's member, same as
+            # matrix fields in uniform/push-constant blocks just above --
+            # SPIR-V requires MatrixStride wherever a matrix type appears
+            # (directly or via an array) inside a Block-decorated struct.
+            # Missing this passes codegen but fails spirv-val with
+            # "Structure id N decorated as Block must be explicitly laid
+            # out with MatrixStride decorations."
+            if sb.element_type in ("mat2", "mat3", "mat4"):
+                self.decorations.append(f"OpMemberDecorate {struct_id} 0 ColMajor")
+                self.decorations.append(f"OpMemberDecorate {struct_id} 0 MatrixStride 16")
             if self.stage.stage_type != "compute":
                 self.decorations.append(f"OpMemberDecorate {struct_id} 0 NonWritable")
                 self.decorations.append(f"OpDecorate {var_id} NonWritable")

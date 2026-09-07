@@ -235,6 +235,15 @@ private:
     uint32_t sortNumWg_ = 0;
 
     MTL::Buffer* prevPosBuffer_ = nullptr;
+    // prev_camera_mats[0]=proj_matrix_unjittered, [1]=prev_view_proj_unjittered
+    // (128 bytes) -- moved out of push constants into a storage buffer;
+    // see splat_renderer.h's identical field and splat_expander.py's "Why
+    // not push constants" comment (Mali-G715's 256-byte
+    // maxPushConstantsSize vs. the 304-byte block these two mat4 fields
+    // used to make; MoltenVK on Apple Silicon reports 4096, so this bug
+    // never manifested on the Metal backend, but the fix is shared since
+    // both backends transpile/consume the same compiled shader).
+    MTL::Buffer* prevCameraBuffer_ = nullptr;
 
     // Camera state (identical to MetalSplatRenderer).
     glm::mat4 viewMatrix_{1.0f};

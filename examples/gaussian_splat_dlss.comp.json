@@ -129,6 +129,15 @@
       {
         "binding": 13,
         "type": "storage_buffer",
+        "name": "prev_camera_mats",
+        "element_type": "mat4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 14,
+        "type": "storage_buffer",
         "name": "projected_depth",
         "element_type": "scalar",
         "stage_flags": [
@@ -188,21 +197,9 @@
           "type": "int",
           "offset": 164,
           "size": 4
-        },
-        {
-          "name": "proj_matrix_unjittered",
-          "type": "mat4",
-          "offset": 176,
-          "size": 64
-        },
-        {
-          "name": "prev_view_proj_unjittered",
-          "type": "mat4",
-          "offset": 240,
-          "size": 64
         }
       ],
-      "size": 304,
+      "size": 176,
       "stage_flags": [
         "compute"
       ]
@@ -253,7 +250,7 @@
     ]
   },
   "performance_hints": {
-    "instruction_count": 646,
+    "instruction_count": 651,
     "alu_ops": 173,
     "texture_samples": 0,
     "branches": 5,

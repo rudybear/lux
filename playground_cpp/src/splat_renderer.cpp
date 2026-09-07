@@ -524,16 +524,18 @@ void SplatRenderer::createFramebufferLoadDepth(VkDevice device) {
 // Pipeline creation
 // --------------------------------------------------------------------------
 
-void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBase) {
+void SplatRenderer::createPipelines(VulkanContext& ctx, const std::string& shaderBase) {
+    VkDevice device = ctx.device;
     // --- Descriptor set layouts ---
 
     // Compute: 4 input + N SH coefficients + 6 output SSBOs
     // Output order: proj_center, proj_conic, proj_color, sort_keys, sorted_indices, visible_count
-    // + (motion_vectors) splat_prev_pos, projected_mv + (expected_depth) projected_depth,
-    // appended in that order (matches splat_expander._build_preprocess_stage exactly).
+    // + (motion_vectors) splat_prev_pos, projected_mv, prev_camera_mats
+    // + (expected_depth) projected_depth, appended in that order (matches
+    // splat_expander._build_preprocess_stage exactly).
     uint32_t numShCoeffs = numShCoeffsForDegree(shaderShDegree_);
     uint32_t numComputeBindings = 4 + numShCoeffs + 6
-        + (hasMotionVectors_ ? 2 : 0) + (hasExpectedDepth_ ? 1 : 0);
+        + (hasMotionVectors_ ? 3 : 0) + (hasExpectedDepth_ ? 1 : 0);
     std::vector<VkDescriptorSetLayoutBinding> computeBindings(numComputeBindings);
     for (uint32_t i = 0; i < numComputeBindings; ++i) {
         computeBindings[i] = {};
@@ -569,12 +571,26 @@ void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBa
 
     // --- Pipeline layouts ---
 
-    // Compute push constants: view(64) + proj(64) + camPos(12) + pad(4) + focal(8) + screen(8) + numSplats(4) + pad(12) = 176 bytes
-    // + (motion_vectors) proj_matrix_unjittered(64) + prev_view_proj_unjittered(64) = 304 bytes
+    // Compute push constants: view(64) + proj(64) + camPos(12) + pad(4) + focal(8) + screen(8) + numSplats(4) + pad(12) = 176 bytes.
+    // proj_matrix_unjittered/prev_view_proj_unjittered (motion_vectors) are
+    // NOT pushed here -- they live in prevCameraBuffer_ (a tiny storage
+    // buffer, see splat_renderer.h) instead. They used to be pushed as two
+    // extra mat4 push-constant fields, putting this block at 304 bytes;
+    // that's within what desktop/iOS GPUs report (MoltenVK: 4096 on Apple
+    // Silicon, checked via `vulkaninfo`) but OVER the 256-byte
+    // maxPushConstantsSize Mali-G715 actually reports, which is a Vulkan
+    // spec violation (VUID-VkPushConstantRange-size-00298) -- Mali's driver
+    // accepted the oversized range without validation layers active, then
+    // silently served undefined/recycled data for the out-of-range tail
+    // (bytes 256-303, i.e. most of prev_view_proj_unjittered) at dispatch
+    // time, corrupting every motion vector on Android by 3-6 orders of
+    // magnitude while leaving color/depth (which only need bytes 0-175/
+    // 0-239) correct -- see docs/rendering-engines.md's Android
+    // live-rendering demo MV investigation and the startup check below.
     VkPushConstantRange computePush = {};
     computePush.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     computePush.offset = 0;
-    computePush.size = hasMotionVectors_ ? 304 : 176;
+    computePush.size = 176;
 
     VkPipelineLayoutCreateInfo computePipeLayoutInfo = {};
     computePipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -597,6 +613,32 @@ void SplatRenderer::createPipelines(VkDevice device, const std::string& shaderBa
     renderPipeLayoutInfo.pushConstantRangeCount = 1;
     renderPipeLayoutInfo.pPushConstantRanges = &renderPush;
     vkCreatePipelineLayout(device, &renderPipeLayoutInfo, nullptr, &renderLayout_);
+
+    // --- Guardrail against this exact class of bug recurring (any future
+    // push-constant field added to any of this renderer's shaders) ---
+    // Vulkan allows vkCreatePipelineLayout to silently accept a push-
+    // constant range larger than the device supports (no validation layers
+    // required to catch it), so check explicitly and fail loudly instead
+    // of quietly corrupting whatever field lands past the limit.
+    {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(ctx.physicalDevice, &props);
+        uint32_t maxPc = props.limits.maxPushConstantsSize;
+        if (computePush.size > maxPc || renderPush.size > maxPc) {
+            throw std::runtime_error(
+                "SplatRenderer::createPipelines: a push-constant range exceeds this "
+                "device's maxPushConstantsSize (" + std::to_string(maxPc) + " bytes on \"" +
+                std::string(props.deviceName) + "\") -- compute push=" +
+                std::to_string(computePush.size) + "B, render push=" +
+                std::to_string(renderPush.size) + "B. This is a Vulkan spec violation "
+                "(VUID-VkPushConstantRange-size-00298) some drivers accept without "
+                "validation layers active, then serve undefined data for the "
+                "out-of-range bytes at dispatch time -- see the Android MV corruption "
+                "this exact bug caused (docs/rendering-engines.md). Move the offending "
+                "field(s) into a storage buffer (see prev_camera_mats in "
+                "luxc/expansion/splat_expander.py) instead of adding push-constant bytes.");
+        }
+    }
 
     // --- Load compute shader ---
     auto compCode = SpvLoader::loadSPIRV(shaderBase + ".comp.spv");
@@ -935,6 +977,11 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
         createVmaBuffer(ctx.allocator, numSplats_ * 2 * sizeof(float), ssbo,
                         VMA_MEMORY_USAGE_GPU_ONLY, projMvBuffer_, projMvAlloc_);
         createPrevPosBuffer(ctx, data);
+        // 2x mat4 = 128 bytes; needs TRANSFER_DST for the per-frame
+        // vkCmdUpdateBuffer write in render() (see splat_renderer.h).
+        createVmaBuffer(ctx.allocator, 2 * sizeof(glm::mat4),
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VMA_MEMORY_USAGE_GPU_ONLY, prevCameraBuffer_, prevCameraAlloc_);
     }
     if (hasExpectedDepth_) {
         createVmaBuffer(ctx.allocator, numSplats_ * sizeof(float), ssbo,
@@ -1045,12 +1092,13 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
 
     // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
     // Appended after visible_count, matching splat_expander._build_preprocess_stage's
-    // storage_buffers order exactly: [motion_vectors: splat_prev_pos, projected_mv]
-    // then [expected_depth: projected_depth].
+    // storage_buffers order exactly: [motion_vectors: splat_prev_pos, projected_mv,
+    // prev_camera_mats] then [expected_depth: projected_depth].
     uint32_t computeNextBinding = outputBase + 6;
     if (hasMotionVectors_) {
         writeSSBO(computeDescSet_, computeNextBinding++, prevPosBuffer_, numSplats_ * 4 * sizeof(float));
         writeSSBO(computeDescSet_, computeNextBinding++, projMvBuffer_, numSplats_ * 2 * sizeof(float));
+        writeSSBO(computeDescSet_, computeNextBinding++, prevCameraBuffer_, 2 * sizeof(glm::mat4));
     }
     if (hasExpectedDepth_) {
         writeSSBO(computeDescSet_, computeNextBinding++, projDepthBuffer_, numSplats_ * sizeof(float));
@@ -1388,7 +1436,7 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
     createFramebuffer(ctx.device);
     createFramebufferLoad(ctx.device);
     createFramebufferLoadDepth(ctx.device);
-    createPipelines(ctx.device, shaderBase);
+    createPipelines(ctx, shaderBase);
     createSortPipelines(ctx.device);
     createBuffers(ctx, data);
     createMorphPipeline(ctx.device, shaderBase);
@@ -1778,10 +1826,12 @@ void SplatRenderer::render(VulkanContext& ctx) {
         float focalX;         // offset 156
         float focalY;         // offset 160
         int32_t shDegree;     // offset 164
-        float _pad1[2];       // offset 168 (pad to 176)
-        // --- DLSS input-contract outputs: only pushed when hasMotionVectors_ ---
-        float projUnjittered[16];         // offset 176
-        float prevViewProjUnjittered[16]; // offset 240 (total 304)
+        float _pad1[2];       // offset 168 (pad to 176, portable across
+                               // every backend's maxPushConstantsSize --
+                               // see the guardrail check in createPipelines
+                               // and prevCameraBuffer_'s comment in the
+                               // header for why proj_matrix_unjittered/
+                               // prev_view_proj_unjittered do NOT live here)
     } push = {};
 
     std::memcpy(push.view, &viewMatrix_[0][0], 64);
@@ -1795,17 +1845,32 @@ void SplatRenderer::render(VulkanContext& ctx) {
     push.focalX = focalX_;
     push.focalY = focalY_;
     push.shDegree = static_cast<int32_t>(shDegree_);
+
+    // prev_camera_mats[0]=proj_matrix_unjittered, [1]=prev_view_proj_unjittered
+    // (splat_expander.py) -- written via vkCmdUpdateBuffer (a small inline
+    // transfer recorded directly in this command buffer, <=65536 bytes per
+    // Vulkan's limit; ours is 128) followed by a barrier gating the
+    // preprocess dispatch below on that transfer completing, exactly
+    // mirroring how this data used to reach the shader via push constants.
     if (hasMotionVectors_) {
-        glm::mat4 prevViewProj = prevProjMatrixUnjittered_ * prevViewMatrix_;
-        std::memcpy(push.projUnjittered, &projMatrixUnjittered_[0][0], 64);
-        std::memcpy(push.prevViewProjUnjittered, &prevViewProj[0][0], 64);
+        glm::mat4 prevCameraMats[2];
+        prevCameraMats[0] = projMatrixUnjittered_;
+        prevCameraMats[1] = prevProjMatrixUnjittered_ * prevViewMatrix_;
+        vkCmdUpdateBuffer(cmd, prevCameraBuffer_, 0, sizeof(prevCameraMats), prevCameraMats);
+
+        VkMemoryBarrier updateBarrier = {};
+        updateBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        updateBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        updateBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &updateBarrier, 0, nullptr, 0, nullptr);
     }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computeLayout_,
                             0, 1, &computeDescSet_, 0, nullptr);
     vkCmdPushConstants(cmd, computeLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, hasMotionVectors_ ? sizeof(push) : 176, &push);
+                       0, sizeof(push), &push);
 
     uint32_t groupCount = (numSplats_ + 255) / 256;
     vkCmdDispatch(cmd, groupCount, 1, 1);
@@ -2441,6 +2506,7 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     destroyVmaBuffer(ctx.allocator, projConicBuffer_, projConicAlloc_);
     destroyVmaBuffer(ctx.allocator, projColorBuffer_, projColorAlloc_);
     destroyVmaBuffer(ctx.allocator, projMvBuffer_, projMvAlloc_);
+    destroyVmaBuffer(ctx.allocator, prevCameraBuffer_, prevCameraAlloc_);
     destroyVmaBuffer(ctx.allocator, projDepthBuffer_, projDepthAlloc_);
     if (prevPosOwned_) {
         destroyVmaBuffer(ctx.allocator, prevPosBuffer_, prevPosAlloc_);

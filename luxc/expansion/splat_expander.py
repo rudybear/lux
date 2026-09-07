@@ -397,10 +397,39 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
         stage.storage_buffers.append(StorageBufferDecl("splat_prev_pos", "vec4"))
         # Backward motion vector in pixels: uv_curr - uv_prev.
         stage.storage_buffers.append(StorageBufferDecl("projected_mv", "vec2"))
+        # Per-frame camera data needed only for the (jitter-free) motion-
+        # vector projection: element [0] = proj_matrix_unjittered, element
+        # [1] = prev_view_proj_unjittered (the previous frame's combined
+        # unjittered view-projection, pre-multiplied host-side). A 2-element
+        # storage buffer rather than push-constant fields -- see the "Why
+        # not push constants" note below.
+        stage.storage_buffers.append(StorageBufferDecl("prev_camera_mats", "mat4"))
     if config.get("expected_depth"):
         stage.storage_buffers.append(StorageBufferDecl("projected_depth", "scalar"))
 
     # --- Push constants ---
+    #
+    # Why not push constants for proj_matrix_unjittered/prev_view_proj_unjittered
+    # (docs/rendering-engines.md "Android live-rendering demo" MV
+    # investigation): the base 176-byte block below plus those two mat4
+    # fields (128 more bytes) totalled 304 bytes -- within the 4096-byte
+    # budget desktop/iOS GPUs report (MoltenVK on Apple Silicon), but OVER
+    # the 256-byte maxPushConstantsSize a real Android GPU (Mali-G715)
+    # actually reports. vkCreatePipelineLayout with size > the device's
+    # maxPushConstantsSize is a spec violation (VUID-VkPushConstantRange-
+    # size-00298); Mali's driver accepted it anyway (no validation layers
+    # on-device) and silently served undefined/recycled bytes for the
+    # out-of-range tail -- which happened to be most of
+    # prev_view_proj_unjittered -- corrupting every motion vector by 3-6
+    # orders of magnitude while leaving everything reading only the
+    # in-range bytes (color, depth) correct. Moving both fields into the
+    # prev_camera_mats storage buffer above keeps this block at a portable
+    # 176 bytes on every backend, well under Mali's 256 (this base block was
+    # already over the Vulkan spec's guaranteed *minimum* of 128 before this
+    # change and isn't addressed here -- 256+ has not been observed to be an
+    # issue on any target device so far). See splat_renderer.cpp's startup
+    # maxPushConstantsSize check for a guardrail against this class of bug
+    # recurring.
     pc_fields = [
         BlockField("view_matrix", "mat4"),
         BlockField("proj_matrix", "mat4"),
@@ -411,13 +440,6 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
         BlockField("focal_y", "scalar"),
         BlockField("sh_degree", "int"),
     ]
-    if config.get("motion_vectors"):
-        # `proj_matrix` above may carry a sub-pixel jitter offset (--jitter);
-        # motion vectors must be computed WITHOUT jitter, so the host also
-        # supplies the unjittered current projection and the previous
-        # frame's combined (unjittered) view-projection matrix.
-        pc_fields.append(BlockField("proj_matrix_unjittered", "mat4"))
-        pc_fields.append(BlockField("prev_view_proj_unjittered", "mat4"))
     stage.push_constants.append(PushBlock("push", pc_fields))
 
     # --- Main function body ---
@@ -806,7 +828,7 @@ def _build_preprocess_body(config: dict) -> list:
         # leak into the motion vector); reuses the already-computed
         # view-space position.
         body.append(_let("clip_u", "vec4",
-            _binop("*", _push_field("proj_matrix_unjittered"),
+            _binop("*", _idx("prev_camera_mats", _uint_lit(0)),
                    _ctor("vec4", [_ref("view_pos"), _lit("1.0")]))))
         body.append(_let("ndc_u_x", "scalar",
             _binop("/", _swizzle(_ref("clip_u"), "x"), _swizzle(_ref("clip_u"), "w"))))
@@ -818,7 +840,7 @@ def _build_preprocess_body(config: dict) -> list:
         body.append(_let("prev_world_pos", "vec3",
             _swizzle(_idx("splat_prev_pos", _ref("gid")), "xyz")))
         body.append(_let("prev_clip", "vec4",
-            _binop("*", _push_field("prev_view_proj_unjittered"),
+            _binop("*", _idx("prev_camera_mats", _uint_lit(1)),
                    _ctor("vec4", [_ref("prev_world_pos"), _lit("1.0")]))))
         body.append(_let("prev_ndc_x", "scalar",
             _binop("/", _swizzle(_ref("prev_clip"), "x"), _swizzle(_ref("prev_clip"), "w"))))
