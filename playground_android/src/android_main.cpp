@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -344,6 +345,21 @@ struct AppState {
     static constexpr int kReconWindowFrames = 16;
     bool stage5Done = false;
 
+    // Bug B investigation (docs/rendering-engines.md task 3): the reported
+    // apparent PSNR decay after >~16 continuous frames doesn't reproduce
+    // offline (flat 36dB over 96 frames), so it needs a longer on-device,
+    // NO-RESET rollout than the default 16-frame window to bisect -- same
+    // mechanism as kReconWindowFrames above (this literally overrides that
+    // window's length at runtime), just longer and gated by a marker file
+    // (same convention as full_scene_target.txt/gpu_net_config.txt) so the
+    // default 16-frame Stage 5 validation this window was originally built
+    // for is completely unaffected unless someone deliberately asks for
+    // more. "psnr_rollout_frames.txt" (cwd-relative, i.e. under
+    // internalDataPath like the other markers) holding a decimal integer
+    // (e.g. "96") overrides reconWindowFrames; absent/unparseable keeps the
+    // original 16-frame default.
+    int reconWindowFrames = kReconWindowFrames;
+
     DemoMode mode = DemoMode::Proxy;
     // Stage 6: tap-to-cycle (see onInputEvent()) sets this from the input
     // thread/callback; renderFrame() consumes+clears it at the top of the
@@ -477,6 +493,25 @@ void initRenderer(AppState* state) {
                      fullGltfScene.splat_data.num_splats);
             } else {
                 LOGE("juggle_full_stride4.glb has no splat data; keeping the pruned scene for Target");
+            }
+        }
+
+        // Bug B investigation (task 3, see AppState::reconWindowFrames'
+        // comment): optional marker overriding the Stage 5 capture window's
+        // length for a longer no-history-reset rollout.
+        if (FILE* rolloutMarker = fopen("psnr_rollout_frames.txt", "r")) {
+            char buf[32] = {};
+            size_t n = fread(buf, 1, sizeof(buf) - 1, rolloutMarker);
+            fclose(rolloutMarker);
+            buf[n] = '\0';
+            int requested = atoi(buf);
+            if (requested > 0) {
+                state->reconWindowFrames = requested;
+                LOGI("psnr_rollout_frames.txt marker present: reconWindowFrames overridden %d -> %d",
+                     AppState::kReconWindowFrames, requested);
+            } else {
+                LOGE("psnr_rollout_frames.txt present but unparseable ('%s'); keeping default %d frames",
+                     buf, AppState::kReconWindowFrames);
             }
         }
 
@@ -1183,7 +1218,7 @@ void renderFrame(AppState* state) {
     // on-demand at the SAME orbit frame index, whatever `state->mode`
     // currently is).
     if (isProxy && state->netRunnerReady && state->frameCounter >= AppState::kNetWarmupStart &&
-        state->frameCounter < AppState::kReconWindowStart + AppState::kReconWindowFrames) {
+        state->frameCounter < AppState::kReconWindowStart + state->reconWindowFrames) {
         NetRunner::RunTimingsMs t{};
         const float* hiddenPtr = state->hiddenState.empty() ? nullptr : state->hiddenState.data();
         const float* out = state->netRunner.run(state->inputAssembly.getOutputHostPtr(), hiddenPtr, t);
@@ -1198,9 +1233,25 @@ void renderFrame(AppState* state) {
             memcpy(&state->hiddenState[p * hiddenCh], &out[p * outCh + (outCh - hiddenCh)], hiddenCh * sizeof(float));
         }
 
+        // Bug B investigation (task 3): per-frame hidden-state RMS, logged
+        // for EVERY continuous rollout frame (not just the captured window)
+        // so a bisect can see exactly where in the warmup+capture range any
+        // blow-up/collapse starts, independent of the once-at-the-end batch
+        // PSNR computation below.
+        {
+            double sumSq = 0.0;
+            size_t hn = state->hiddenState.size();
+            for (size_t i = 0; i < hn; i++) {
+                double v = state->hiddenState[i];
+                sumSq += v * v;
+            }
+            double hiddenRms = hn > 0 ? std::sqrt(sumSq / static_cast<double>(hn)) : 0.0;
+            LOGI("PSNR_ROLLOUT_HIDDEN frame=%d hidden_rms=%.6f", state->frameCounter, hiddenRms);
+        }
+
         int t0 = AppState::kReconWindowStart;
         int idx = state->frameCounter - t0;
-        if (idx >= 0 && idx < AppState::kReconWindowFrames) {
+        if (idx >= 0 && idx < state->reconWindowFrames) {
             std::string dumpDir = basePath(state) + "/live_recon_dump";
             if (idx == 0) {
                 mkdir(dumpDir.c_str(), 0755);
@@ -1212,7 +1263,7 @@ void renderFrame(AppState* state) {
                 // internally (see padRowsReplicate's comment).
                 writeMetaJson(dumpDir + "/meta.json", /*s=*/2, /*k=*/4, AppState::kParamStride, hiddenCh,
                               kProxyWidth, netH * AppState::kParamStride, kWidth, netH * AppState::kParamStride * 2,
-                              netW, netH, AppState::kReconWindowFrames, AppState::kTexChannels,
+                              netW, netH, state->reconWindowFrames, AppState::kTexChannels,
                               /*memHidden=*/16, /*texW=*/512, /*texH=*/256);
             }
             std::string suf = "_f" + std::to_string(idx) + ".npy";
@@ -1285,9 +1336,9 @@ void renderFrame(AppState* state) {
             auto targetColor = readColorRgb(ctx, targetR);  // [540,960,3]
             DlssIO::writeNpyFloat32(dumpDir + "/target_color" + suf, targetColor, {kHeight, kWidth, 3});
 
-            LOGI("Stage5 capture frame %d/%d (app frame %d)", idx + 1, AppState::kReconWindowFrames, state->frameCounter);
+            LOGI("Stage5 capture frame %d/%d (app frame %d)", idx + 1, state->reconWindowFrames, state->frameCounter);
 
-            if (idx == AppState::kReconWindowFrames - 1 && !state->stage5Done) {
+            if (idx == state->reconWindowFrames - 1 && !state->stage5Done) {
                 state->stage5Done = true;
                 std::string outDir = basePath(state) + "/live_recon_out";
                 auto tRecon = std::chrono::high_resolution_clock::now();
