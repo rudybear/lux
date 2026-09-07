@@ -44,6 +44,7 @@
 #include "dlss_io.h"
 #include "android_vulkan_context.h"
 #include "input_assembly.h"
+#include "net_runner.h"
 
 #define LOG_TAG "lux_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -191,6 +192,14 @@ struct AppState {
     InputAssembly inputAssembly;
     static constexpr uint32_t kParamStride = 2;
     static constexpr uint32_t kHiddenChannels = 8;
+    static constexpr uint32_t kTexChannels = 8;
+
+    // Stage 4: TFLite C API + GPU delegate net inference (docs/rendering-
+    // engines.md). Runs once on the frame-30 dump for validation (see
+    // dumpProxyDebugFrame's call site) -- not yet driven every frame
+    // (Stage 5 wires the recurrent hidden state + per-frame invocation).
+    NetRunner netRunner;
+    bool netRunnerReady = false;
 
     DemoMode mode = DemoMode::Proxy;
     // Auto-cycle Proxy/Target every kModeSwitchFrames frames so a single run
@@ -292,6 +301,20 @@ void initRenderer(AppState* state) {
                                    base + "/shaders_ia");
         LOGI("InputAssembly initialized: net=%ux%u channels=%u",
              state->inputAssembly.getNetW(), state->inputAssembly.getNetH(), state->inputAssembly.getChannels());
+
+        // Stage 4: TFLite net (best-effort -- GPU delegate availability
+        // varies by driver; log and continue the rest of the demo on failure).
+        try {
+            state->netRunner.init(base + "/assets/unet_ps2_mem.tflite",
+                                   state->inputAssembly.getNetW(), state->inputAssembly.getNetH(),
+                                   AppState::kParamStride, AppState::kHiddenChannels, AppState::kTexChannels);
+            state->netRunnerReady = true;
+            LOGI("NetRunner initialized: gpu_delegate=%d output_channels=%u",
+                 state->netRunner.isGpuDelegateActive(), state->netRunner.getOutputChannels());
+        } catch (const std::exception& e) {
+            LOGE("NetRunner init failed (continuing without Stage 4): %s", e.what());
+            state->netRunnerReady = false;
+        }
 
         // NOTE: deliberately NOT using scene.getAutoTarget()/getAutoEye()
         // here -- SceneManager::computeAutoCamera frames the WHOLE scene's
@@ -585,6 +608,23 @@ void renderFrame(AppState* state) {
         LOGI("DUMP input_tensor: %s/dump/android_input_tensor.npy (net=%ux%u ch=%u)",
              basePath(state).c_str(), state->inputAssembly.getNetW(), state->inputAssembly.getNetH(),
              state->inputAssembly.getChannels());
+
+        // Stage 4: run the TFLite net on this same dumped tensor (zero
+        // hidden-in, matching Stage 3/4's validation config) and dump its
+        // packed output for comparison against torch_packed_output_f30.npy.
+        if (state->netRunnerReady) {
+            NetRunner::RunTimingsMs t{};
+            const float* out = state->netRunner.run(state->inputAssembly.getOutputHostPtr(), nullptr, t);
+            uint32_t netW = state->inputAssembly.getNetW(), netH = state->inputAssembly.getNetH();
+            uint32_t outCh = state->netRunner.getOutputChannels();
+            std::vector<float> outCopy(out, out + static_cast<size_t>(netW) * netH * outCh);
+            DlssIO::writeNpyFloat32(basePath(state) + "/dump/android_net_output.npy", outCopy, {netH, netW, outCh});
+            LOGI("NET timing (ms): adapter=%.3f upload=%.3f infer=%.3f download=%.3f total=%.3f "
+                 "gpu_delegate=%d out_ch=%u",
+                 t.adapterMs, t.uploadMs, t.inferMs, t.downloadMs,
+                 t.adapterMs + t.uploadMs + t.inferMs + t.downloadMs,
+                 state->netRunner.isGpuDelegateActive(), outCh);
+        }
     } else if (!isProxy && state->frameCounter == kDumpFrameTarget) {
         dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", "target", state->frameCounter, morphT, jitterPxX, jitterPxY);
     }

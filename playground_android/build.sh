@@ -72,6 +72,13 @@ else
     echo "warning: libc++_shared.so not found at $CXX_SHARED" >&2
 fi
 
+# Stage 4: TFLite C API + GPU delegate .so's (vendored under third_party/tflite/
+# -- see CMakeLists.txt's comment). Kept under their AAR-native filenames
+# (their real embedded SONAME) so the dynamic linker's DT_NEEDED lookup
+# resolves against the file actually present in the APK.
+cp "$SRC_DIR/third_party/tflite/lib/$ABI/libtensorflowlite_jni.so" "$APK_STAGE/lib/$ABI/libtensorflowlite_jni.so"
+cp "$SRC_DIR/third_party/tflite/lib/$ABI/libtensorflowlite_gpu_jni.so" "$APK_STAGE/lib/$ABI/libtensorflowlite_gpu_jni.so"
+
 echo "=== [4/7] aapt2 compile+link (no gradle) ==="
 mkdir -p "$BUILD_DIR/aapt2_compiled"
 "$BUILD_TOOLS/aapt2" link \

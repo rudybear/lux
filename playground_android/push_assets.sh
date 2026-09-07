@@ -58,5 +58,8 @@ echo "=== pushing Stage 3 scene-memory assets (texture.npy, bg_sphere.npy) ==="
 push_one "$MOBILEDLSS_ROOT/demo/ios_assets/exported/texture.npy" "assets/texture.npy"
 push_one "$MOBILEDLSS_ROOT/demo/ios_assets/bg_sphere.npy" "assets/bg_sphere.npy"
 
+echo "=== pushing Stage 4 TFLite net (unet_ps2_mem.tflite, fp16) ==="
+push_one "$MOBILEDLSS_ROOT/demo/ios_assets/exported/unet_ps2_mem.tflite" "assets/unet_ps2_mem.tflite"
+
 echo "done. Remote layout (internal files dir):"
 "$ADB" shell run-as "$PKG" find files -type f

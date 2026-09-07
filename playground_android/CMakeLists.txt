@@ -53,12 +53,43 @@ add_library(vk-bootstrap STATIC
 target_include_directories(vk-bootstrap PUBLIC "${FRESH_VULKAN_INCLUDE}" "${DEPS_DIR}/vk-bootstrap-src/src")
 target_link_libraries(vk-bootstrap PUBLIC Vulkan::Vulkan)
 
+# ---------------------------------------------------------------------------
+# Stage 4: TensorFlow Lite C API + GPU delegate (mobile-DLSS Android live
+# demo). No Maven/Gradle available in this NDK-only CMake build, so the
+# arm64-v8a .so's are vendored directly under third_party/tflite/ (extracted
+# from the official org.tensorflow:tensorflow-lite / tensorflow-lite-gpu
+# 2.16.1 AARs -- 2.17.0's "tensorflow-lite" Maven artifact is a bodyless POM
+# now, superseded upstream by the LiteRT AARs, but 2.16.1 still ships a real
+# one). Headers are vendored from the matching tensorflow v2.16.1 tag (the
+# AAR ships no headers, only .so's + Java).
+#
+# The AAR's jni/arm64-v8a/libtensorflowlite_jni.so is Java/JNI-oriented by
+# name, but `nm -D` on it confirms it exports the full versioned
+# (VERS_1.0) plain-C ABI (TfLiteInterpreterCreate, TfLiteModelCreate, ...) --
+# i.e. it doubles as the "libtensorflowlite_c.so" the task brief names, so
+# no separate C-only artifact is needed. Same story for
+# libtensorflowlite_gpu_jni.so and TfLiteGpuDelegateV2Create/Delete. Both
+# ship their real SONAME baked in as their JNI filename (confirmed via
+# `readelf -d`), so they're deliberately kept under their AAR-native
+# filenames here and in the APK (see build.sh) rather than renamed --
+# renaming the file without also using `patchelf`/relinking to fix the
+# SONAME would leave the dynamic linker looking for a DT_NEEDED name that
+# doesn't match the on-disk file inside the APK's lib/arm64-v8a/.
+set(TFLITE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tflite")
+add_library(tflite_c SHARED IMPORTED)
+set_target_properties(tflite_c PROPERTIES
+    IMPORTED_LOCATION "${TFLITE_DIR}/lib/arm64-v8a/libtensorflowlite_jni.so")
+add_library(tflite_gpu_delegate SHARED IMPORTED)
+set_target_properties(tflite_gpu_delegate PROPERTIES
+    IMPORTED_LOCATION "${TFLITE_DIR}/lib/arm64-v8a/libtensorflowlite_gpu_jni.so")
+
 add_library(lux_android SHARED
     # --- Android glue / this directory ---
     "${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c"
     src/android_main.cpp
     src/android_vulkan_context.cpp
     src/input_assembly.cpp
+    src/net_runner.cpp
 
     # --- Reused-by-reference lux Vulkan splat pipeline (playground_cpp/src) ---
     "${PGCPP}/src/splat_renderer.cpp"
@@ -79,6 +110,7 @@ target_include_directories(lux_android PRIVATE
     "${PGCPP}/deps"
     "${DEPS_DIR}/glm-src"
     "${DEPS_DIR}/vulkanmemoryallocator-src/include"
+    "${TFLITE_DIR}/include"
 )
 
 target_compile_definitions(lux_android PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
@@ -90,6 +122,8 @@ target_link_libraries(lux_android PRIVATE
     Vulkan::Vulkan
     android
     log
+    tflite_c
+    tflite_gpu_delegate
 )
 
 set_target_properties(lux_android PROPERTIES
