@@ -32,6 +32,24 @@ bool readGsBoolFlag(const std::string& content, const std::string& key) {
     return content.compare(keyPos, needleTrue.size(), needleTrue) == 0;
 }
 
+// Same substring-scan approach, for a `"key": "value"` string field (used
+// for "aux_precision": "half"/"float" -- bench/lux_perf_ablation.md task 2
+// follow-up).
+std::string readGsStringFlag(const std::string& content, const std::string& key,
+                              const std::string& fallback) {
+    auto gsPos = content.find("\"gaussian_splatting\"");
+    if (gsPos == std::string::npos) return fallback;
+    auto keyPos = content.find("\"" + key + "\"", gsPos);
+    if (keyPos == std::string::npos) return fallback;
+    auto colonPos = content.find(':', keyPos);
+    if (colonPos == std::string::npos) return fallback;
+    auto openQuote = content.find('"', colonPos);
+    if (openQuote == std::string::npos) return fallback;
+    auto closeQuote = content.find('"', openQuote + 1);
+    if (closeQuote == std::string::npos) return fallback;
+    return content.substr(openQuote + 1, closeQuote - openQuote - 1);
+}
+
 // SPIRV-Cross's MSL backend drops resource bindings that are declared but
 // never actually read/written in the shader body (e.g. splat_expander.py's
 // `visible_count` -- described as "atomic counter (incremented per visible
@@ -102,23 +120,21 @@ void MetalSplatLuxcRenderer::createRenderTargets(MetalContext& ctx) {
     // values with ZERO wasted lanes; see getAuxTexture()'s header comment
     // and luxc/expansion/splat_expander.py's out_aux comment. `.w` MUST
     // stay genuine alpha (required for correct hardware blend
-    // accumulation) and this texture MUST stay RGBA32Float, not
-    // RGBA16Float -- see getAuxTexture()'s comment for the measured
-    // precision failure that ruled the RGBA16Float variant out.
+    // accumulation). Format is a compile-time host hint (aux_precision:
+    // float/half) -- see getAuxFormat()'s comment.
     if (hasMotionVectors_ || hasExpectedDepth_) {
         auto* auxDesc = MTL::TextureDescriptor::texture2DDescriptor(
-            MTL::PixelFormatRGBA32Float, width_, height_, false);
+            getAuxFormat(), width_, height_, false);
         auxDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
         auxDesc->setStorageMode(MTL::StorageModePrivate);
         auxTarget_ = ctx.newTexture(auxDesc);
         auxTarget_->setLabel(NS::String::string("SplatAuxLuxc", NS::UTF8StringEncoding));
     }
-    // Second, smaller RGBA16Float `out_fg` attachment (fg*alpha, 0, 0,
-    // alpha) -- see getFgTexture()'s comment for why this can't share
-    // out_aux's lanes.
+    // Second, smaller `out_fg` attachment (fg*alpha, ..., alpha) -- see
+    // getFgTexture()'s comment for why this can't share out_aux's lanes.
     if (hasForegroundCoverage_) {
         auto* fgDesc = MTL::TextureDescriptor::texture2DDescriptor(
-            MTL::PixelFormatRGBA16Float, width_, height_, false);
+            getFgFormat(), width_, height_, false);
         fgDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
         fgDesc->setStorageMode(MTL::StorageModePrivate);
         fgTarget_ = ctx.newTexture(fgDesc);
@@ -137,6 +153,7 @@ void MetalSplatLuxcRenderer::createPipelines(MetalContext& ctx) {
     hasMotionVectors_ = readGsBoolFlag(compJson, "motion_vectors");
     hasExpectedDepth_ = readGsBoolFlag(compJson, "expected_depth");
     hasForegroundCoverage_ = readGsBoolFlag(compJson, "foreground_coverage");
+    auxPrecisionHalf_ = readGsStringFlag(compJson, "aux_precision", "float") == "half";
 
     transpiler_.transpileInto(compShader_, shaderBase_ + ".comp.spv", SpvExecModel::GLCompute);
     computePipeline_ = ctx.device->newComputePipelineState(compShader_.function, &error);
@@ -184,7 +201,7 @@ void MetalSplatLuxcRenderer::createPipelines(MetalContext& ctx) {
     uint32_t nextColorSlot = 1;
     if (hasMotionVectors_ || hasExpectedDepth_) {
         auto* auxAtt = pipeDesc->colorAttachments()->object(nextColorSlot++);
-        auxAtt->setPixelFormat(MTL::PixelFormatRGBA32Float);
+        auxAtt->setPixelFormat(getAuxFormat());
         auxAtt->setBlendingEnabled(true);
         auxAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
         auxAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
@@ -195,7 +212,7 @@ void MetalSplatLuxcRenderer::createPipelines(MetalContext& ctx) {
     }
     if (hasForegroundCoverage_) {
         auto* fgAtt = pipeDesc->colorAttachments()->object(nextColorSlot++);
-        fgAtt->setPixelFormat(MTL::PixelFormatRGBA16Float);
+        fgAtt->setPixelFormat(getFgFormat());
         fgAtt->setBlendingEnabled(true);
         fgAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
         fgAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);

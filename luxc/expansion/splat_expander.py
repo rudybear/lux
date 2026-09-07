@@ -143,11 +143,37 @@ def _get_splat_config(splat: SplatDecl) -> dict:
         "motion_vectors": False,
         "expected_depth": False,
         "foreground_coverage": False,
+        # Host-side format hint for out_aux/out_fg (bench/lux_perf_ablation.md
+        # task 2 follow-up), reflected into the compute stage's
+        # gaussian_splatting JSON section for the host to read (see
+        # splat_renderer.h's getAuxFormat()/getFgFormat() comments) --
+        # doesn't affect generated SPIR-V at all, both stay plain vec4
+        # fragment outputs; only which VkFormat/MTLPixelFormat the HOST
+        # creates the attachment as changes. "float" (default): out_aux
+        # RGBA32F, out_fg RGBA16F -- the precision-safe design from task 2,
+        # 24B/px for the production DLSS pipeline, verified bit-exact vs.
+        # the pre-task-2 baseline. "half": out_aux RGBA16F, out_fg RG16F --
+        # 12B/px, MEASURED (examples/gaussian_splat_dlss_half.lux,
+        # bench/lux_perf_ablation.md) to FAIL the parity gate on both
+        # Vulkan and Metal, on 3 of 3 metrics: MV median error 0.012-0.016px
+        # (gate <=0.01px), depth relative median error ~5.4e-3 (gate
+        # <=1e-3), and fg has a full 0-to-1 flip on ~1% of pixels (RG16F's
+        # 2 channels apparently don't carry a real stored alpha component
+        # for the fixed-function blend to read, unlike out_aux's RGBA16F,
+        # which still has a real `.w` -- see splat_renderer.h's
+        # getFgFormat() comment). Kept as a real, working, opt-in-only
+        # option (not a repeat of the earlier `.w`-repurposing bug -- this
+        # keeps genuine alpha in every lane; the failure here is purely
+        # half-float accumulation/format precision) for whoever wants to
+        # trade correctness for the extra 2x bandwidth reduction on a less
+        # precision-sensitive downstream consumer, or revisit with a
+        # 4-channel out_fg even in the "half" case.
+        "aux_precision": "float",
     }
     for m in splat.members:
         if m.name == "sh_degree":
             config["sh_degree"] = int(m.value.value)
-        elif m.name in ("kernel", "color_space", "sort", "motion"):
+        elif m.name in ("kernel", "color_space", "sort", "motion", "aux_precision"):
             config[m.name] = m.value.name
         elif m.name == "alpha_cutoff":
             # Legacy name; kept as an alias of alpha_min for backward

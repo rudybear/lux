@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "source": "gaussian_splat_dlss.lux",
+  "source": "gaussian_splat_dlss_half.lux",
   "stage": "compute",
   "execution_model": "GLCompute",
   "features": {},
@@ -242,7 +242,7 @@
     ]
   },
   "gaussian_splatting": {
-    "splat_name": "DlssGaussianCloud",
+    "splat_name": "DlssGaussianCloudHalf",
     "sh_degree": 0,
     "kernel": "ellipse",
     "color_space": "linear",
@@ -254,7 +254,7 @@
     "motion_vectors": true,
     "expected_depth": true,
     "foreground_coverage": true,
-    "aux_precision": "float",
+    "aux_precision": "half",
     "workgroup_size": [
       256,
       1,

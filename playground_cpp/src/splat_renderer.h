@@ -80,6 +80,9 @@ public:
     // (implies hasExpectedDepth_ -- the flag adds a SECOND small attachment,
     // getFgImage() below, not a channel of getAuxImage()).
     bool hasForegroundCoverage() const { return hasForegroundCoverage_; }
+    // "aux_precision: half" was set on the compiled splat block -- see
+    // getAuxFormat()/getFgFormat().
+    bool auxPrecisionHalf() const { return auxPrecisionHalf_; }
 
     // Sub-pixel jitter in PIXELS, applied to the projection matrix used for
     // rasterization only -- motion vectors always use the unjittered
@@ -88,45 +91,64 @@ public:
     void setJitter(float jitterXPixels, float jitterYPixels);
 
     // Packed DLSS aux attachment (bench/lux_perf_ablation.md task 2):
-    // `out_aux` is ONE RGBA32F attachment carrying
+    // `out_aux` is ONE attachment carrying
     // (mv.x*alpha, mv.y*alpha, depth*alpha, alpha) -- replaces the earlier
     // TWO-attachment (out_motion RGBA32F, out_depth RGBA32F, each with an
     // always-0 `.z`) design with one attachment that packs 3 real values
-    // with ZERO wasted lanes (2->1 attachment, 32B/px->16B/px whenever
-    // foreground_coverage is off). `.w` MUST be the genuine per-fragment
-    // alpha, not a repurposed data channel -- see
+    // with ZERO wasted lanes. `.w` MUST be the genuine per-fragment alpha,
+    // not a repurposed data channel -- see
     // luxc/expansion/splat_expander.py's out_aux comment for why: Vulkan's
     // fixed-function SRC_ALPHA/ONE_MINUS_SRC_ALPHA blend factors read
     // "source alpha" from THIS attachment's own 4th component specifically,
     // so anything else there corrupts the blend accumulation itself (a
     // real, measured, 10-50x MV/depth error in an earlier version of this
     // design that tried to pack `fg` into `.w` instead and un-premultiply
-    // everything via out_color's alpha -- NOT merely a precision tradeoff).
-    // NOT RGBA16F: also measured on the juggle DLSS scene, downgrading this
-    // attachment to half-float still produces catastrophic error in
-    // heavily-overdrawn background regions (tens of pixels of MV error) --
-    // premultiplied mv/depth values (unlike color's own [0,1]-bounded
-    // channels) are NOT magnitude-bounded, so repeated half-float blend
-    // accumulation steps compound rounding error badly over many
-    // overlapping low-alpha splats. RGBA32F keeps the SAME full-precision
-    // accumulation the old two-attachment design had. Valid whenever
-    // hasMotionVectors() || hasExpectedDepth().
+    // everything via out_color's alpha -- NOT merely a precision tradeoff,
+    // a GPU-side correctness bug). Format is a compile-time host hint
+    // (`aux_precision: float|half` on the splat block, read from the
+    // reflection JSON, NOT baked into the shader -- same vec4 output
+    // either way): "float" (default) is VK_FORMAT_R32G32B32A32_SFLOAT,
+    // the SAME full-precision accumulation the old two-attachment design
+    // had -- 2->1 attachment, 32B/px->16B/px whenever foreground_coverage
+    // is off. "half" is VK_FORMAT_R16G16B16A16_SFLOAT, 8B/px -- MEASURED
+    // (with the `.w`-alpha bug already fixed, isolating pure half-float
+    // accumulation precision) to FAIL the parity gate: MV median error
+    // 0.012-0.016px (gate <=0.01px), depth relative median error ~5.4e-3
+    // (gate <=1e-3) -- premultiplied mv/depth values are not
+    // magnitude-bounded like color's own [0,1] channels, so half-float
+    // blend rounding over many overlapping splats still exceeds this
+    // task's tight gates. See bench/lux_perf_ablation.md for the full
+    // table. Kept opt-in only (examples/gaussian_splat_dlss_half.lux),
+    // default stays "float".
     VkImage getAuxImage() const { return auxImage_; }
-    VkFormat getAuxFormat() const { return VK_FORMAT_R32G32B32A32_SFLOAT; }
+    VkFormat getAuxFormat() const {
+        return auxPrecisionHalf_ ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    }
 
     // Second, smaller attachment for foreground_coverage (only allocated
     // when hasForegroundCoverage()): `out_fg` = (fg*alpha, 0, 0, alpha).
     // Can't share `out_aux` -- that attachment's 3 non-alpha lanes are
     // already spoken for by mv.xy/depth, and `.w` must stay genuine alpha
     // (see getAuxImage()'s comment) in EVERY blended attachment
-    // independently, not just one. RGBA16F, not RGBA32F: fg (like alpha
-    // itself) is bounded to [0,1] -- the same magnitude-boundedness that
-    // keeps out_color's own RGBA16F blend accumulation safe applies here
-    // too (measured: no precision regression vs. RGBA32F on the same
-    // scene), unlike out_aux's mv/depth values which are NOT
-    // magnitude-bounded.
+    // independently, not just one. "float" (default): RGBA16F, not
+    // RGBA32F -- fg (like alpha itself) is bounded to [0,1], the same
+    // magnitude-boundedness that keeps out_color's own RGBA16F blend
+    // accumulation safe applies here too (measured: no precision
+    // regression vs. RGBA32F), unlike out_aux's mv/depth values which are
+    // NOT magnitude-bounded. "half": RG16F (fg*alpha, alpha) -- 2 channels,
+    // not 4 -- MEASURED to FAIL the parity gate much more sharply than
+    // out_aux's own "half": a full 0-to-1 flip on ~1% of pixels (p99/max
+    // abs diff vs. the float variant both exactly 1.0), consistent with
+    // Vulkan/Metal's fixed-function blend treating a 2-component
+    // destination format's "source alpha" as a constant rather than
+    // reading this attachment's own `.w` -- i.e. a 2-channel format is not
+    // a safe way to carry a real per-fragment alpha for blending, not just
+    // a precision tradeoff. See bench/lux_perf_ablation.md for the full
+    // table. Kept opt-in only, default stays "float".
     VkImage getFgImage() const { return fgImage_; }
-    VkFormat getFgFormat() const { return VK_FORMAT_R16G16B16A16_SFLOAT; }
+    VkFormat getFgFormat() const {
+        return auxPrecisionHalf_ ? VK_FORMAT_R16G16_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+    }
 
     void render(VulkanContext& ctx);
 
@@ -228,6 +250,9 @@ private:
     bool hasMotionVectors_ = false;
     bool hasExpectedDepth_ = false;
     bool hasForegroundCoverage_ = false;
+    // "aux_precision: half" (bench/lux_perf_ablation.md task 2 follow-up)
+    // -- see getAuxFormat()/getFgFormat() for what this selects.
+    bool auxPrecisionHalf_ = false;
     // Packed RGBA32F attachment (mv.x*a, mv.y*a, depth*a, a) -- see
     // getAuxImage()'s comment (NOT RGBA16F -- measured precision failure).
     VkImage auxImage_ = VK_NULL_HANDLE;

@@ -69,6 +69,30 @@ static bool readShaderBoolFlag(const std::string& shaderBase, const std::string&
     return content.compare(keyPos, needleTrue.size(), needleTrue) == 0;
 }
 
+// Same substring-scan approach, for a `"key": "value"` string field (used
+// for "aux_precision": "half"/"float" -- bench/lux_perf_ablation.md task 2
+// follow-up). Returns `fallback` if the key or file isn't found.
+static std::string readShaderStringFlag(const std::string& shaderBase, const std::string& key,
+                                         const std::string& fallback) {
+    std::string jsonPath = shaderBase + ".comp.json";
+    if (!fs::exists(jsonPath)) return fallback;
+    std::ifstream f(jsonPath);
+    if (!f.is_open()) return fallback;
+    std::string content((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+    auto gsPos = content.find("\"gaussian_splatting\"");
+    if (gsPos == std::string::npos) return fallback;
+    auto keyPos = content.find("\"" + key + "\"", gsPos);
+    if (keyPos == std::string::npos) return fallback;
+    auto colonPos = content.find(':', keyPos);
+    if (colonPos == std::string::npos) return fallback;
+    auto openQuote = content.find('"', colonPos);
+    if (openQuote == std::string::npos) return fallback;
+    auto closeQuote = content.find('"', openQuote + 1);
+    if (closeQuote == std::string::npos) return fallback;
+    return content.substr(openQuote + 1, closeQuote - openQuote - 1);
+}
+
 // Applies a sub-pixel jitter (in pixels) to a projection matrix by directly
 // shifting the post-divide NDC x/y coordinates: for any projection matrix P,
 // adding `d * row3(P)` to `row_k(P)` adds exactly `d` to `clip[k]/clip.w`
@@ -230,12 +254,12 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
     // luxc/expansion/splat_expander.py's out_aux comment.
     if (hasMotionVectors_ || hasExpectedDepth_) {
         VkImageCreateInfo auxInfo = imageInfo;
-        auxInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        auxInfo.format = getAuxFormat();
         vmaCreateImage(ctx.allocator, &auxInfo, &allocInfo, &auxImage_, &auxAlloc_, nullptr);
 
         VkImageViewCreateInfo auxViewInfo = viewInfo;
         auxViewInfo.image = auxImage_;
-        auxViewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        auxViewInfo.format = getAuxFormat();
         vkCreateImageView(ctx.device, &auxViewInfo, nullptr, &auxView_);
     }
     // Second, smaller RGBA16F `out_fg` attachment (fg*a, 0, 0, a) -- see
@@ -243,12 +267,12 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
     // out_aux's lanes.
     if (hasForegroundCoverage_) {
         VkImageCreateInfo fgInfo = imageInfo;
-        fgInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        fgInfo.format = getFgFormat();
         vmaCreateImage(ctx.allocator, &fgInfo, &allocInfo, &fgImage_, &fgAlloc_, nullptr);
 
         VkImageViewCreateInfo fgViewInfo = viewInfo;
         fgViewInfo.image = fgImage_;
-        fgViewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        fgViewInfo.format = getFgFormat();
         vkCreateImageView(ctx.device, &fgViewInfo, nullptr, &fgView_);
     }
 }
@@ -281,13 +305,13 @@ void SplatRenderer::createRenderPass(VkDevice device) {
 
     if (hasMotionVectors_ || hasExpectedDepth_) {
         VkAttachmentDescription aux = colorAttach;
-        aux.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        aux.format = getAuxFormat();
         attachments.push_back(aux);
         colorRefs.push_back({static_cast<uint32_t>(attachments.size() - 1), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
     }
     if (hasForegroundCoverage_) {
         VkAttachmentDescription fg = colorAttach;
-        fg.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        fg.format = getFgFormat();
         attachments.push_back(fg);
         colorRefs.push_back({static_cast<uint32_t>(attachments.size() - 1), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
     }
@@ -1474,6 +1498,7 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
     hasMotionVectors_ = readShaderBoolFlag(shaderBase, "motion_vectors");
     hasExpectedDepth_ = readShaderBoolFlag(shaderBase, "expected_depth");
     hasForegroundCoverage_ = readShaderBoolFlag(shaderBase, "foreground_coverage");
+    auxPrecisionHalf_ = readShaderStringFlag(shaderBase, "aux_precision", "float") == "half";
     if (hasMotionVectors_ || hasExpectedDepth_) {
         std::cout << "[info] DLSS outputs enabled: motion_vectors=" << hasMotionVectors_
                   << " expected_depth=" << hasExpectedDepth_

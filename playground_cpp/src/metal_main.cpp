@@ -691,9 +691,18 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
         if constexpr (std::is_same_v<Renderer, MetalSplatLuxcRenderer>) {
             if (splatR->hasMotionVectors() || splatR->hasExpectedDepth()) {
                 constexpr uint32_t C = Renderer::kAuxChannels;
-                auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getAuxTexture(), w, h, C * 4);
+                bool half = splatR->auxPrecisionHalf();
+                auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getAuxTexture(), w, h, half ? C * 2 : C * 4);
                 std::vector<float> auxF32(static_cast<size_t>(w) * h * C);
-                std::memcpy(auxF32.data(), raw.data(), raw.size());
+                if (half) {
+                    for (size_t i = 0; i < auxF32.size(); ++i) {
+                        uint16_t h16;
+                        std::memcpy(&h16, raw.data() + i * 2, 2);
+                        auxF32[i] = DlssIO::halfToFloat(h16);
+                    }
+                } else {
+                    std::memcpy(auxF32.data(), raw.data(), raw.size());
+                }
                 std::vector<float> auxAlpha(static_cast<size_t>(w) * h);
                 for (size_t i = 0; i < auxAlpha.size(); ++i) {
                     auxAlpha[i] = auxF32[i * C + 3];
@@ -707,22 +716,24 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
                     DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_depth.npy", depth, {h, w});
                     DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png", depth, w, h, 1);
 
-                    // foreground_coverage: a SEPARATE out_fg texture
-                    // (RGBA16Float, fg*alpha at .x, alpha at .w).
+                    // foreground_coverage: a SEPARATE out_fg texture --
+                    // "float": RGBA16Float (fg*alpha at .x, alpha at .w,
+                    // 4 channels); "half": RG16Float (fg*alpha, alpha,
+                    // 2 channels). Always half-float storage either way.
                     if (splatR->hasForegroundCoverage()) {
-                        constexpr uint32_t FC = Renderer::kFgChannels;
+                        uint32_t FC = splatR->getFgChannels();
                         auto rawFg = MetalScreenshot::readTextureRaw(ctx, splatR->getFgTexture(), w, h, FC * 2);
                         std::vector<float> fgF32(static_cast<size_t>(w) * h * FC);
                         for (size_t i = 0; i < fgF32.size(); ++i) {
-                            uint16_t half;
-                            std::memcpy(&half, rawFg.data() + i * 2, 2);
-                            fgF32[i] = DlssIO::halfToFloat(half);
+                            uint16_t h16;
+                            std::memcpy(&h16, rawFg.data() + i * 2, 2);
+                            fgF32[i] = DlssIO::halfToFloat(h16);
                         }
                         std::vector<float> fgPremul(static_cast<size_t>(w) * h);
                         std::vector<float> fgAlpha(static_cast<size_t>(w) * h);
                         for (size_t i = 0; i < fgPremul.size(); ++i) {
                             fgPremul[i] = fgF32[i * FC + 0];
-                            fgAlpha[i] = fgF32[i * FC + 3];
+                            fgAlpha[i] = fgF32[i * FC + (FC - 1)];
                         }
                         auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, fgAlpha, w, h, 1);
                         DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_fg.npy", fg, {h, w});

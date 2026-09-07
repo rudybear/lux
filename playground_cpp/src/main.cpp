@@ -887,19 +887,25 @@ static int runHeadless(const CLIOptions& opts) {
                     // is the GENUINE per-fragment alpha (required for
                     // correct hardware blend accumulation, see
                     // getAuxFormat()'s comment), used here to un-premultiply
-                    // `.xyz`. NOT RGBA16F: measured on the juggle DLSS
-                    // scene, downgrading this attachment to half-float
-                    // produces catastrophic error (tens of pixels of MV
-                    // error) in background regions with heavy overdraw --
-                    // premultiplied mv/depth values (unlike color's own
-                    // [0,1]-bounded channels) are NOT magnitude-bounded, so
-                    // repeated half-float blend-accumulation steps compound
-                    // rounding error badly over many overlapping low-alpha
-                    // splats.
-                    auto rawAux = Screenshot::readImageRaw(ctx, splatR->getAuxImage(), w, h, 16,
+                    // `.xyz`. Format ("float" RGBA32F, default, vs. "half"
+                    // RGBA16F) is a compile-time host hint
+                    // (`aux_precision:`) read via auxPrecisionHalf() --
+                    // decode accordingly; both are still full vec4 reads
+                    // (4 channels), only the byte width differs.
+                    bool half = splatR->auxPrecisionHalf();
+                    uint32_t auxBytesPerPixel = half ? 8 : 16;
+                    auto rawAux = Screenshot::readImageRaw(ctx, splatR->getAuxImage(), w, h, auxBytesPerPixel,
                                                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
                     std::vector<float> auxF32(static_cast<size_t>(w) * h * 4);
-                    std::memcpy(auxF32.data(), rawAux.data(), rawAux.size());
+                    if (half) {
+                        for (size_t i = 0; i < auxF32.size(); ++i) {
+                            uint16_t h16;
+                            std::memcpy(&h16, rawAux.data() + i * 2, 2);
+                            auxF32[i] = DlssIO::halfToFloat(h16);
+                        }
+                    } else {
+                        std::memcpy(auxF32.data(), rawAux.data(), rawAux.size());
+                    }
                     std::vector<float> auxAlpha(static_cast<size_t>(w) * h);
                     for (size_t i = 0; i < auxAlpha.size(); ++i) {
                         auxAlpha[i] = auxF32[i * 4 + 3];
@@ -917,28 +923,32 @@ static int runHeadless(const CLIOptions& opts) {
                         DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png",
                                                            depth, w, h, 1);
 
-                        // foreground_coverage: a SECOND attachment out_fg
-                        // (fg*alpha, 0, 0, alpha) -- can't share out_aux's
-                        // lanes, see splat_renderer.h's getFgImage()
-                        // comment. RGBA16F (not RGBA32F): fg is bounded to
-                        // [0,1] like alpha itself, so it's safe in
-                        // half-float the same way out_color's own channels
-                        // are (measured: no precision regression vs.
-                        // RGBA32F on this scene).
+                        // foreground_coverage: a SECOND attachment out_fg --
+                        // can't share out_aux's lanes, see splat_renderer.h's
+                        // getFgImage() comment. "float": RGBA16F
+                        // (fg*alpha, 0, 0, alpha), 4 channels -- fg is
+                        // bounded to [0,1] like alpha itself, so it's safe
+                        // in half-float the same way out_color's own
+                        // channels are. "half": RG16F (fg*alpha, alpha),
+                        // only 2 channels -- see bench/lux_perf_ablation.md
+                        // for whether a 2-component format's blend still
+                        // reads a real per-fragment alpha.
                         if (splatR->hasForegroundCoverage()) {
-                            auto rawFg = Screenshot::readImageRaw(ctx, splatR->getFgImage(), w, h, 8,
+                            uint32_t fgChannels = half ? 2 : 4;
+                            uint32_t fgBytesPerPixel = fgChannels * 2;
+                            auto rawFg = Screenshot::readImageRaw(ctx, splatR->getFgImage(), w, h, fgBytesPerPixel,
                                                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                            std::vector<float> fgF32(static_cast<size_t>(w) * h * 4);
+                            std::vector<float> fgF32(static_cast<size_t>(w) * h * fgChannels);
                             for (size_t i = 0; i < fgF32.size(); ++i) {
-                                uint16_t half;
-                                std::memcpy(&half, rawFg.data() + i * 2, 2);
-                                fgF32[i] = DlssIO::halfToFloat(half);
+                                uint16_t h16;
+                                std::memcpy(&h16, rawFg.data() + i * 2, 2);
+                                fgF32[i] = DlssIO::halfToFloat(h16);
                             }
                             std::vector<float> fgPremul(static_cast<size_t>(w) * h);
                             std::vector<float> fgAlpha(static_cast<size_t>(w) * h);
                             for (size_t i = 0; i < fgPremul.size(); ++i) {
-                                fgPremul[i] = fgF32[i * 4 + 0];
-                                fgAlpha[i] = fgF32[i * 4 + 3];
+                                fgPremul[i] = fgF32[i * fgChannels + 0];
+                                fgAlpha[i] = fgF32[i * fgChannels + (fgChannels - 1)];
                             }
                             auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, fgAlpha, w, h, 1);
                             DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_fg.npy", fg, {h, w});

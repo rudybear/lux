@@ -1,0 +1,36 @@
+// aux_precision: half variant of gaussian_splat_dlss.lux (bench/
+// lux_perf_ablation.md task 2 follow-up): out_aux as RGBA16F
+// (mv.x*alpha, mv.y*alpha, depth*alpha, alpha) and out_fg as RG16F
+// (fg*alpha, alpha) instead of the default RGBA32F/RGBA16F -- 12B/px vs.
+// 24B/px for this pipeline. MEASURED (bench/lux_perf_ablation.md) to FAIL
+// the parity gate on both Vulkan and Metal: MV median error 0.012-0.016px
+// (gate <=0.01px), depth relative median error ~5.4e-3 (gate <=1e-3), and
+// fg has a full 0-to-1 flip on ~1% of pixels (RG16F's 2 channels don't
+// carry a real stored alpha component for the blend hardware to read).
+// Kept as a real, working, OPT-IN-ONLY example -- the default
+// (`gaussian_splat_dlss.lux`, no aux_precision member, i.e. "float") is
+// what's actually safe to use. See gaussian_splat_dlss.lux for the base
+// pipeline this mirrors, and splat_renderer.h's getAuxFormat()/
+// getFgFormat() comments for exactly what changes host-side (the compiled
+// shader itself is identical either way -- aux_precision is a host format
+// hint, not a codegen switch).
+//
+// Compile: python -m luxc examples/gaussian_splat_dlss_half.lux
+
+splat DlssGaussianCloudHalf {
+    sh_degree: 0,
+    kernel: ellipse,
+    color_space: linear,
+    sort: view_depth,
+    alpha_cutoff: 0.004,
+    motion: keyframes,
+    motion_vectors: true,
+    expected_depth: true,
+    foreground_coverage: true,
+    aux_precision: half,
+}
+
+pipeline DlssSplatViewerHalf {
+    mode: gaussian_splat,
+    splat: DlssGaussianCloudHalf,
+}

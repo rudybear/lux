@@ -668,6 +668,18 @@ flags and `motion: keyframes` all enabled together. See
 `tests/test_dlss_outputs.py`'s
 `TestExpectedDepth::test_overlapping_splats_depth_matches_over_compositing`.
 
+**`aux_precision: float | half`** (optional, default `float`): a host-side format
+hint for `out_aux`/`out_fg`, reflected into `gaussian_splatting.aux_precision` —
+does NOT change the compiled shader at all (identical `vec4` outputs either way),
+only which pixel format the host allocates the attachment as. `float` (default) is
+the precision-safe design above (RGBA32F `out_aux`, RGBA16F `out_fg`). `half`
+(RGBA16F `out_aux`, RG16F `out_fg`, `examples/gaussian_splat_dlss_half.lux`) was
+built and measured, and **fails** the DLSS-consumer parity gate on both Vulkan and
+Metal (MV/depth precision and, more sharply, `out_fg`'s 2-channel format not
+carrying a real alpha component for the blend hardware to read) — see
+`bench/lux_perf_ablation.md` for the numbers. Kept as a real, opt-in-only compiler
+option, not a default.
+
 Sub-pixel jitter (`--jitter jx jy` in the playgrounds), the previous-frame
 double buffering, and the `--output-aux`/`--camera-json` headless dump and
 camera-bridge flags are all host (playground) responsibilities, not
