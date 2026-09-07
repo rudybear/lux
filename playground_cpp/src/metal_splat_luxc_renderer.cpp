@@ -600,8 +600,18 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
     }
 
     auto t0 = std::chrono::steady_clock::now();
+    // Single command buffer for the *entire* frame (preprocess + all 4 radix-sort
+    // passes + render), committed and waited on exactly once at the very end of
+    // this function -- see the final `cmdBuf->commit()` below. Previously each of
+    // the ~22 individual dispatches (1 preprocess + 4 passes x 5 sub-dispatches +
+    // 1 render) used its own beginCommandBuffer()+commit()+waitUntilCompleted(),
+    // which is resolution-independent CPU<->GPU synchronization overhead (Metal
+    // already auto-tracks buffer/texture hazards *within* one command buffer
+    // across encoder boundaries in submission order, so no manual fences are
+    // needed to merge these safely). The inner `{ }` scopes below are kept only
+    // to let each stage redeclare its own `enc` without a name clash.
+    MTL::CommandBuffer* cmdBuf = ctx.beginCommandBuffer();
     {
-        auto* cmdBuf = ctx.beginCommandBuffer();
         auto* enc = cmdBuf->computeCommandEncoder();
         enc->setComputePipelineState(computePipeline_);
         trySetBuffer(enc, compShader_, posBuffer_, 0);
@@ -627,13 +637,23 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
         uint32_t groups = (numSplats_ + 255) / 256;
         enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(256, 1, 1));
         enc->endEncoding();
-        cmdBuf->commit();
-        cmdBuf->waitUntilCompleted();
     }
     lastPreprocessMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
     if (hasMotionVectors_) {
-        std::memcpy(prevPosBuffer_->contents(), posBuffer_->contents(), hostPositions_.size() * sizeof(float));
+        // GPU-side copy (was a CPU memcpy before the single-command-buffer
+        // refactor above): the preprocess compute encoder just encoded
+        // above reads the OLD prevPosBuffer_ to compute this frame's MV,
+        // but hasn't actually *run* yet (commit() is deferred to the very
+        // end of this function now) -- a CPU memcpy here would race ahead
+        // and clobber prevPosBuffer_ with this frame's positions before the
+        // GPU ever reads the old ones. A blit encoded into the same shared
+        // cmdBuf, right after the preprocess encoder, keeps the ordering
+        // correct (Metal executes a command buffer's encoders in
+        // submission order) with no CPU/GPU sync needed.
+        auto* posCopyBlit = cmdBuf->blitCommandEncoder();
+        posCopyBlit->copyFromBuffer(posBuffer_, 0, prevPosBuffer_, 0, hostPositions_.size() * sizeof(float));
+        posCopyBlit->endEncoding();
         prevViewMatrix_ = viewMatrix_;
         prevProjMatrixUnjittered_ = projMatrixUnjittered_;
         firstMvFrame_ = false;
@@ -660,7 +680,6 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
 
             // Histogram
             {
-                auto* cmdBuf = ctx.beginCommandBuffer();
                 auto* enc = cmdBuf->computeCommandEncoder();
                 enc->setComputePipelineState(sortHistogramPipeline_);
                 trySetBuffer(enc, sortHistogramShader_, keysIn, 0);
@@ -669,12 +688,9 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
                 enc->setBytes(&hp, sizeof(hp), sortHistogramShader_.pushConstantBufferIndex);
                 enc->dispatchThreadgroups(MTL::Size(numWg, 1, 1), MTL::Size(256, 1, 1));
                 enc->endEncoding();
-                cmdBuf->commit();
-                cmdBuf->waitUntilCompleted();
             }
             // Prefix sum (3 sub-passes)
             {
-                auto* cmdBuf = ctx.beginCommandBuffer();
                 auto* enc = cmdBuf->computeCommandEncoder();
                 enc->setComputePipelineState(sortPrefixSumPipeline_);
                 trySetBuffer(enc, sortPrefixSumShader_, histogramBuffer_, 0);
@@ -683,11 +699,8 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
                 enc->setBytes(&ps0, sizeof(ps0), sortPrefixSumShader_.pushConstantBufferIndex);
                 enc->dispatchThreadgroups(MTL::Size(numParts, 1, 1), MTL::Size(1024, 1, 1));
                 enc->endEncoding();
-                cmdBuf->commit();
-                cmdBuf->waitUntilCompleted();
             }
             {
-                auto* cmdBuf = ctx.beginCommandBuffer();
                 auto* enc = cmdBuf->computeCommandEncoder();
                 enc->setComputePipelineState(sortPrefixSumPipeline_);
                 trySetBuffer(enc, sortPrefixSumShader_, histogramBuffer_, 0);
@@ -696,11 +709,8 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
                 enc->setBytes(&ps1, sizeof(ps1), sortPrefixSumShader_.pushConstantBufferIndex);
                 enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
                 enc->endEncoding();
-                cmdBuf->commit();
-                cmdBuf->waitUntilCompleted();
             }
             {
-                auto* cmdBuf = ctx.beginCommandBuffer();
                 auto* enc = cmdBuf->computeCommandEncoder();
                 enc->setComputePipelineState(sortPrefixSumPipeline_);
                 trySetBuffer(enc, sortPrefixSumShader_, histogramBuffer_, 0);
@@ -709,12 +719,9 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
                 enc->setBytes(&ps2, sizeof(ps2), sortPrefixSumShader_.pushConstantBufferIndex);
                 enc->dispatchThreadgroups(MTL::Size(numParts, 1, 1), MTL::Size(1024, 1, 1));
                 enc->endEncoding();
-                cmdBuf->commit();
-                cmdBuf->waitUntilCompleted();
             }
             // Scatter
             {
-                auto* cmdBuf = ctx.beginCommandBuffer();
                 auto* enc = cmdBuf->computeCommandEncoder();
                 enc->setComputePipelineState(sortScatterPipeline_);
                 trySetBuffer(enc, sortScatterShader_, keysIn, 0);
@@ -726,8 +733,6 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
                 enc->setBytes(&sp, sizeof(sp), sortScatterShader_.pushConstantBufferIndex);
                 enc->dispatchThreadgroups(MTL::Size(numWg, 1, 1), MTL::Size(256, 1, 1));
                 enc->endEncoding();
-                cmdBuf->commit();
-                cmdBuf->waitUntilCompleted();
             }
         }
         // After 4 (even) passes, sorted result is back in buffer A
@@ -785,7 +790,6 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
     depthAtt->setStoreAction(MTL::StoreActionDontCare);
     depthAtt->setClearDepth(1.0);
 
-    auto* cmdBuf = ctx.beginCommandBuffer();
     auto* enc = cmdBuf->renderCommandEncoder(rpDesc);
     // Negative-height viewport flip (the standard MoltenVK/Vulkan-on-Metal
     // trick): Vulkan's NDC has +Y pointing down; Metal's native NDC has +Y
