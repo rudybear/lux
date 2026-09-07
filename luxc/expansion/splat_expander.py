@@ -143,31 +143,39 @@ def _get_splat_config(splat: SplatDecl) -> dict:
         "motion_vectors": False,
         "expected_depth": False,
         "foreground_coverage": False,
-        # Host-side format hint for out_aux/out_fg (bench/lux_perf_ablation.md
+        # Host-side format hint for out_aux (bench/lux_perf_ablation.md
         # task 2 follow-up), reflected into the compute stage's
         # gaussian_splatting JSON section for the host to read (see
-        # splat_renderer.h's getAuxFormat()/getFgFormat() comments) --
-        # doesn't affect generated SPIR-V at all, both stay plain vec4
-        # fragment outputs; only which VkFormat/MTLPixelFormat the HOST
-        # creates the attachment as changes. "float" (default): out_aux
-        # RGBA32F, out_fg RGBA16F -- the precision-safe design from task 2,
-        # 24B/px for the production DLSS pipeline, verified bit-exact vs.
-        # the pre-task-2 baseline. "half": out_aux RGBA16F, out_fg RG16F --
-        # 12B/px, MEASURED (examples/gaussian_splat_dlss_half.lux,
-        # bench/lux_perf_ablation.md) to FAIL the parity gate on both
-        # Vulkan and Metal, on 3 of 3 metrics: MV median error 0.012-0.016px
-        # (gate <=0.01px), depth relative median error ~5.4e-3 (gate
-        # <=1e-3), and fg has a full 0-to-1 flip on ~1% of pixels (RG16F's
-        # 2 channels apparently don't carry a real stored alpha component
-        # for the fixed-function blend to read, unlike out_aux's RGBA16F,
-        # which still has a real `.w` -- see splat_renderer.h's
-        # getFgFormat() comment). Kept as a real, working, opt-in-only
-        # option (not a repeat of the earlier `.w`-repurposing bug -- this
-        # keeps genuine alpha in every lane; the failure here is purely
-        # half-float accumulation/format precision) for whoever wants to
-        # trade correctness for the extra 2x bandwidth reduction on a less
-        # precision-sensitive downstream consumer, or revisit with a
-        # 4-channel out_fg even in the "half" case.
+        # splat_renderer.h's getAuxFormat() comment) -- doesn't affect
+        # generated SPIR-V at all, out_aux stays a plain vec4 fragment
+        # output; only which VkFormat/MTLPixelFormat the HOST creates the
+        # attachment as changes. "float" (default): out_aux RGBA32F -- the
+        # precision-safe design from task 2, verified bit-exact vs. the
+        # pre-task-2 baseline. "half": out_aux RGBA16F -- MEASURED
+        # (examples/gaussian_splat_dlss_half.lux, bench/lux_perf_ablation.md)
+        # to FAIL the parity gate on both Vulkan and Metal: MV median error
+        # 0.012-0.016px (gate <=0.01px), depth relative median error
+        # ~5.4e-3 (gate <=1e-3) -- premultiplied mv/depth values aren't
+        # magnitude-bounded like color's own [0,1] channels, so half-float
+        # blend accumulation over many overlapping splats still exceeds
+        # this task's tight gates. Kept as a real, working, opt-in-only
+        # option for whoever wants to trade correctness for the extra
+        # bandwidth reduction on a less precision-sensitive downstream
+        # consumer.
+        #
+        # NOTE: out_fg (only present when foreground_coverage is also on)
+        # is DELIBERATELY NOT covered by this option -- it stays RGBA16F
+        # in both "float" and "half". An earlier version of this option
+        # also shrank out_fg to RG16F under "half" (12B/px total vs. this
+        # version's 24B/px), which measurably broke the blend: Vulkan/
+        # Metal's fixed-function SRC_ALPHA/ONE_MINUS_SRC_ALPHA blend reads
+        # "source alpha" from EACH blended attachment's own 4th component,
+        # and RG16F has no 4th component for it to read there, so the
+        # blend silently used a constant alpha instead -- a full 0-to-1
+        # flip on ~1% of pixels, a real correctness bug, not a precision
+        # tradeoff (unlike out_aux's "half", which keeps a genuine `.w` in
+        # all 4 channels and only has ordinary half-float rounding error).
+        # See splat_renderer.h's getFgFormat() comment for the full story.
         "aux_precision": "float",
     }
     for m in splat.members:

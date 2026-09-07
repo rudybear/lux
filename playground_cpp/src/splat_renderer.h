@@ -81,7 +81,8 @@ public:
     // getFgImage() below, not a channel of getAuxImage()).
     bool hasForegroundCoverage() const { return hasForegroundCoverage_; }
     // "aux_precision: half" was set on the compiled splat block -- see
-    // getAuxFormat()/getFgFormat().
+    // getAuxFormat() (out_fg's format is independent of this flag -- see
+    // getFgFormat()).
     bool auxPrecisionHalf() const { return auxPrecisionHalf_; }
 
     // Sub-pixel jitter in PIXELS, applied to the projection matrix used for
@@ -130,25 +131,25 @@ public:
     // Can't share `out_aux` -- that attachment's 3 non-alpha lanes are
     // already spoken for by mv.xy/depth, and `.w` must stay genuine alpha
     // (see getAuxImage()'s comment) in EVERY blended attachment
-    // independently, not just one. "float" (default): RGBA16F, not
-    // RGBA32F -- fg (like alpha itself) is bounded to [0,1], the same
-    // magnitude-boundedness that keeps out_color's own RGBA16F blend
+    // independently, not just one. ALWAYS RGBA16F, regardless of
+    // aux_precision -- fg (like alpha itself) is bounded to [0,1], the
+    // same magnitude-boundedness that keeps out_color's own RGBA16F blend
     // accumulation safe applies here too (measured: no precision
     // regression vs. RGBA32F), unlike out_aux's mv/depth values which are
-    // NOT magnitude-bounded. "half": RG16F (fg*alpha, alpha) -- 2 channels,
-    // not 4 -- MEASURED to FAIL the parity gate much more sharply than
-    // out_aux's own "half": a full 0-to-1 flip on ~1% of pixels (p99/max
-    // abs diff vs. the float variant both exactly 1.0), consistent with
-    // Vulkan/Metal's fixed-function blend treating a 2-component
-    // destination format's "source alpha" as a constant rather than
-    // reading this attachment's own `.w` -- i.e. a 2-channel format is not
-    // a safe way to carry a real per-fragment alpha for blending, not just
-    // a precision tradeoff. See bench/lux_perf_ablation.md for the full
-    // table. Kept opt-in only, default stays "float".
+    // NOT magnitude-bounded. Do NOT drop this to RG16F under
+    // "aux_precision: half": that was tried and MEASURED to fail the
+    // parity gate hard (a full 0-to-1 flip on ~1% of pixels, p99/max abs
+    // diff both exactly 1.0) -- Vulkan/Metal's fixed-function
+    // SRC_ALPHA/ONE_MINUS_SRC_ALPHA blend reads "source alpha" from THIS
+    // attachment's own 4th component specifically, and a 2-channel format
+    // has no 4th component for it to read, so the blend silently treats
+    // source alpha as a constant instead -- a real correctness bug, not a
+    // precision tradeoff (see getAuxFormat()'s comment for why out_aux
+    // itself is still safe to shrink: it keeps its `.w` alpha lane in
+    // both "float" and "half"). "aux_precision: half" therefore only
+    // changes getAuxFormat(); out_fg's format is independent of it.
     VkImage getFgImage() const { return fgImage_; }
-    VkFormat getFgFormat() const {
-        return auxPrecisionHalf_ ? VK_FORMAT_R16G16_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
-    }
+    VkFormat getFgFormat() const { return VK_FORMAT_R16G16B16A16_SFLOAT; }
 
     void render(VulkanContext& ctx);
 

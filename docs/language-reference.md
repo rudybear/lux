@@ -669,16 +669,22 @@ flags and `motion: keyframes` all enabled together. See
 `TestExpectedDepth::test_overlapping_splats_depth_matches_over_compositing`.
 
 **`aux_precision: float | half`** (optional, default `float`): a host-side format
-hint for `out_aux`/`out_fg`, reflected into `gaussian_splatting.aux_precision` —
-does NOT change the compiled shader at all (identical `vec4` outputs either way),
-only which pixel format the host allocates the attachment as. `float` (default) is
-the precision-safe design above (RGBA32F `out_aux`, RGBA16F `out_fg`). `half`
-(RGBA16F `out_aux`, RG16F `out_fg`, `examples/gaussian_splat_dlss_half.lux`) was
-built and measured, and **fails** the DLSS-consumer parity gate on both Vulkan and
-Metal (MV/depth precision and, more sharply, `out_fg`'s 2-channel format not
-carrying a real alpha component for the blend hardware to read) — see
-`bench/lux_perf_ablation.md` for the numbers. Kept as a real, opt-in-only compiler
-option, not a default.
+hint for `out_aux` ONLY, reflected into `gaussian_splatting.aux_precision` — does
+NOT change the compiled shader at all (identical `vec4` output either way), only
+which pixel format the host allocates the `out_aux` attachment as. `float`
+(default) is the precision-safe design above (RGBA32F `out_aux`). `half`
+(RGBA16F `out_aux`, `examples/gaussian_splat_dlss_half.lux`) was built and
+measured, and **fails** the DLSS-consumer parity gate on both Vulkan and Metal
+(half-float MV/depth blend-accumulation rounding) — see `bench/lux_perf_ablation.md`
+for the numbers. Kept as a real, opt-in-only compiler option, not a default.
+`out_fg` (only present when `foreground_coverage` is also on) is DELIBERATELY
+NOT affected by `aux_precision` — it stays RGBA16F in both `float` and `half`.
+An earlier version of this option also shrank `out_fg` to RG16F under `half`,
+which was a real correctness bug, not a precision tradeoff: the fixed-function
+blend reads "source alpha" from each blended attachment's own 4th component,
+and a 2-channel format has none, so alpha silently came out wrong (a full
+0-to-1 flip on ~1% of pixels) — see `examples/gaussian_splat_dlss.lux`'s
+`out_aux`/`out_fg` comment and `splat_renderer.h`'s `getFgFormat()` comment.
 
 Sub-pixel jitter (`--jitter jx jy` in the playgrounds), the previous-frame
 double buffering, and the `--output-aux`/`--camera-json` headless dump and

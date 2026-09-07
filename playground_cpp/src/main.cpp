@@ -925,17 +925,18 @@ static int runHeadless(const CLIOptions& opts) {
 
                         // foreground_coverage: a SECOND attachment out_fg --
                         // can't share out_aux's lanes, see splat_renderer.h's
-                        // getFgImage() comment. "float": RGBA16F
-                        // (fg*alpha, 0, 0, alpha), 4 channels -- fg is
-                        // bounded to [0,1] like alpha itself, so it's safe
-                        // in half-float the same way out_color's own
-                        // channels are. "half": RG16F (fg*alpha, alpha),
-                        // only 2 channels -- see bench/lux_perf_ablation.md
-                        // for whether a 2-component format's blend still
-                        // reads a real per-fragment alpha.
+                        // getFgImage() comment. ALWAYS RGBA16F
+                        // (fg*alpha, 0, 0, alpha), 4 channels, regardless of
+                        // aux_precision -- fg is bounded to [0,1] like alpha
+                        // itself, so it's safe in half-float the same way
+                        // out_color's own channels are; a 2-channel RG16F
+                        // out_fg was tried and measured to break the
+                        // fixed-function blend's alpha read (see
+                        // splat_renderer.h's getFgFormat() comment), so
+                        // out_fg's format doesn't vary with aux_precision.
                         if (splatR->hasForegroundCoverage()) {
-                            uint32_t fgChannels = half ? 2 : 4;
-                            uint32_t fgBytesPerPixel = fgChannels * 2;
+                            constexpr uint32_t fgChannels = 4;
+                            constexpr uint32_t fgBytesPerPixel = fgChannels * 2;
                             auto rawFg = Screenshot::readImageRaw(ctx, splatR->getFgImage(), w, h, fgBytesPerPixel,
                                                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
                             std::vector<float> fgF32(static_cast<size_t>(w) * h * fgChannels);

@@ -166,7 +166,8 @@ public:
     // can't share getAuxTexture()'s lanes).
     bool hasForegroundCoverage() const { return hasForegroundCoverage_; }
     // "aux_precision: half" was set on the compiled splat block -- see
-    // getAuxFormat()/getFgFormat()/kFgChannels.
+    // getAuxFormat() (out_fg's format is independent of this flag -- see
+    // getFgFormat()).
     bool auxPrecisionHalf() const { return auxPrecisionHalf_; }
     void setJitter(float jitterXPixels, float jitterYPixels);
 
@@ -187,9 +188,11 @@ public:
     // NOT a valid precision tradeoff, a genuine correctness bug). Format
     // ("float", default, RGBA32Float vs "half", RGBA16Float) is a
     // compile-time host hint (`aux_precision:`) -- same vec4 shader output
-    // either way. Always 4 channels regardless of precision -- only
-    // getFgTexture()'s channel count varies. Valid whenever
-    // hasMotionVectors() || hasExpectedDepth(). "half" MEASURED (bench/
+    // either way, always 4 channels regardless of precision (unlike an
+    // earlier version of this option, which also shrank getFgTexture() to
+    // 2 channels under "half" -- see getFgTexture()'s comment for why that
+    // was reverted). Valid whenever hasMotionVectors() ||
+    // hasExpectedDepth(). "half" MEASURED (bench/
     // lux_perf_ablation.md): MV median error 0.012-0.016px (gate
     // <=0.01px) and depth relative median error ~5.4e-3 (gate <=1e-3),
     // both a real, milder-than-the-alpha-bug FAIL -- premultiplied mv/depth
@@ -204,28 +207,28 @@ public:
     }
 
     // Second, smaller texture for foreground_coverage (only allocated when
-    // hasForegroundCoverage()): (fg*alpha, 0, 0, alpha) ["float"] or
-    // (fg*alpha, alpha) ["half", only 2 channels]. Can't share
+    // hasForegroundCoverage()): (fg*alpha, 0, 0, alpha). Can't share
     // getAuxTexture()'s lanes -- those 3 non-alpha lanes are already
     // mv.xy/depth, and `.w` must independently stay genuine alpha in
     // EVERY blended texture, not just one (see getAuxTexture()'s comment).
-    // "float": RGBA16Float, 4 channels -- fg (like alpha itself) is
-    // bounded to [0,1], the same magnitude-boundedness that keeps color's
-    // own RGBA16Float blend accumulation safe applies here too. "half":
-    // RG16Float, 2 channels -- MEASURED to FAIL the parity gate (see
-    // bench/lux_perf_ablation.md): a full 0-to-1 flip on ~1% of pixels,
-    // consistent with a 2-component format not carrying a real stored
-    // alpha component for the fixed-function blend to read (the blend
-    // factor apparently falls back to a constant instead of this
-    // texture's own `.w`, breaking the decay term for some overlapping
-    // fragments) -- unlike getAuxFormat()'s "half" (RGBA16Float, still 4
-    // channels, still a real `.w`), which only has ordinary half-float
-    // rounding error, not this sharper failure mode. Kept opt-in only.
+    // ALWAYS RGBA16Float, 4 channels, regardless of aux_precision -- fg
+    // (like alpha itself) is bounded to [0,1], the same
+    // magnitude-boundedness that keeps color's own RGBA16Float blend
+    // accumulation safe applies here too. Do NOT drop this to RG16Float
+    // (2 channels) under "aux_precision: half": that was tried and
+    // MEASURED to FAIL the parity gate hard (see bench/lux_perf_ablation.md):
+    // a full 0-to-1 flip on ~1% of pixels, consistent with a 2-component
+    // format not carrying a real stored alpha component for the
+    // fixed-function blend to read (the blend factor falls back to a
+    // constant instead of reading this texture's own `.w`, breaking the
+    // decay term for overlapping fragments) -- a real correctness bug,
+    // not a precision tradeoff, unlike getAuxFormat()'s "half" (still 4
+    // channels, still a real `.w`, only ordinary half-float rounding
+    // error). "aux_precision: half" therefore only changes
+    // getAuxFormat(); out_fg's format/channel count is independent of it.
     MTL::Texture* getFgTexture() const { return fgTarget_; }
-    uint32_t getFgChannels() const { return auxPrecisionHalf_ ? 2 : 4; }
-    MTL::PixelFormat getFgFormat() const {
-        return auxPrecisionHalf_ ? MTL::PixelFormatRG16Float : MTL::PixelFormatRGBA16Float;
-    }
+    uint32_t getFgChannels() const { return 4; }
+    MTL::PixelFormat getFgFormat() const { return MTL::PixelFormatRGBA16Float; }
 
     // The luxc-compiled vertex shader (splat_expander.py's
     // _build_vertex_body) maps screen.y = (ndc.y*0.5+0.5)*H directly --

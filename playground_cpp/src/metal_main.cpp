@@ -716,10 +716,11 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
                     DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_depth.npy", depth, {h, w});
                     DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png", depth, w, h, 1);
 
-                    // foreground_coverage: a SEPARATE out_fg texture --
-                    // "float": RGBA16Float (fg*alpha at .x, alpha at .w,
-                    // 4 channels); "half": RG16Float (fg*alpha, alpha,
-                    // 2 channels). Always half-float storage either way.
+                    // foreground_coverage: a SEPARATE out_fg texture,
+                    // ALWAYS RGBA16Float (fg*alpha at .x, alpha at .w, 4
+                    // channels) regardless of aux_precision -- see
+                    // metal_splat_luxc_renderer.h's getFgFormat() comment
+                    // for why a 2-channel "half" out_fg is unsafe.
                     if (splatR->hasForegroundCoverage()) {
                         uint32_t FC = splatR->getFgChannels();
                         auto rawFg = MetalScreenshot::readTextureRaw(ctx, splatR->getFgTexture(), w, h, FC * 2);

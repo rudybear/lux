@@ -468,10 +468,12 @@ def generate_reflection(
             "motion_vectors": splat_config.get("motion_vectors", False),
             "expected_depth": splat_config.get("expected_depth", False),
             "foreground_coverage": splat_config.get("foreground_coverage", False),
-            # Host format hint for out_aux/out_fg (bench/lux_perf_ablation.md
-            # task 2 follow-up) -- "float" (out_aux RGBA32F, out_fg RGBA16F,
-            # precision-safe) or "half" (out_aux RGBA16F, out_fg RG16F,
-            # smaller but unproven -- see splat_expander.py's docstring).
+            # Host format hint for out_aux ONLY (bench/lux_perf_ablation.md
+            # task 2 follow-up) -- "float" (out_aux RGBA32F, precision-safe,
+            # default) or "half" (out_aux RGBA16F, smaller but measured to
+            # fail the parity gate -- see splat_expander.py's docstring).
+            # out_fg (when present) always stays RGBA16F, independent of
+            # this setting -- see splat_expander.py's docstring for why.
             "aux_precision": splat_config.get("aux_precision", "float"),
         }
         if stage.stage_type == "compute":
