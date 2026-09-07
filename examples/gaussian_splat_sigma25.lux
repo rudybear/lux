@@ -1,0 +1,20 @@
+// Colour-only splat pipeline, quad_sigma: 2.5 variant
+// (bench/lux_perf_ablation.md draw-stage ablation, task 3 — quad extent
+// sweep). Identical to gaussian_splat.lux except the opacity-tight quad
+// extent clamps at 2.5-sigma instead of the reference 3-sigma, which is
+// no longer bit-exact (see luxc/expansion/splat_expander.py's quad_sigma
+// comment) -- measure draw ms AND colour PSNR vs. the 3-sigma render.
+
+splat GaussianCloudSigma25 {
+    sh_degree: 0,
+    kernel: ellipse,
+    color_space: linear,
+    sort: camera_distance,
+    alpha_cutoff: 0.004,
+    quad_sigma: 2.5,
+}
+
+pipeline SplatViewerSigma25 {
+    mode: gaussian_splat,
+    splat: GaussianCloudSigma25,
+}

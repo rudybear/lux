@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "source": "gaussian_splat_dlss_relaxed.lux",
+  "stage": "fragment",
+  "execution_model": "Fragment",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [
+    {
+      "name": "frag_conic",
+      "type": "vec3",
+      "location": 0
+    },
+    {
+      "name": "frag_color",
+      "type": "vec4",
+      "location": 1
+    },
+    {
+      "name": "frag_center",
+      "type": "vec2",
+      "location": 2
+    },
+    {
+      "name": "frag_offset",
+      "type": "vec2",
+      "location": 3
+    },
+    {
+      "name": "frag_mv",
+      "type": "vec2",
+      "location": 4
+    },
+    {
+      "name": "frag_depth",
+      "type": "scalar",
+      "location": 5
+    },
+    {
+      "name": "frag_foreground",
+      "type": "scalar",
+      "location": 6
+    }
+  ],
+  "outputs": [
+    {
+      "name": "out_color",
+      "type": "vec4",
+      "location": 0
+    },
+    {
+      "name": "out_aux",
+      "type": "vec4",
+      "location": 1
+    },
+    {
+      "name": "out_fg",
+      "type": "vec4",
+      "location": 2
+    }
+  ],
+  "descriptor_sets": {},
+  "push_constants": [
+    {
+      "name": "push",
+      "fields": [
+        {
+          "name": "screen_size",
+          "type": "vec2",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "visible_count",
+          "type": "uint",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "alpha_min",
+          "type": "scalar",
+          "offset": 12,
+          "size": 4
+        }
+      ],
+      "size": 16,
+      "stage_flags": [
+        "fragment"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "gaussian_splatting": {
+    "splat_name": "DlssGaussianCloudRelaxed"
+  },
+  "performance_hints": {
+    "instruction_count": 144,
+    "alu_ops": 18,
+    "texture_samples": 0,
+    "branches": 2,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

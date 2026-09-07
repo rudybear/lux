@@ -1,0 +1,26 @@
+// Production DLSS splat pipeline, `precision: relaxed` variant
+// (bench/lux_perf_ablation.md draw-stage ablation, task 2).
+//
+// Identical to gaussian_splat_dlss.lux (motion_vectors/expected_depth/
+// foreground_coverage/aux_precision:half all unchanged) except adding
+// `precision: relaxed`, which only touches the fragment stage's Gaussian-
+// weight/alpha/color evaluation chain -- NOT the mv/depth/foreground math
+// or out_aux/out_fg (those stay exactly as measured/gated in task 2 above).
+
+splat DlssGaussianCloudRelaxed {
+    sh_degree: 0,
+    kernel: ellipse,
+    color_space: linear,
+    sort: view_depth,
+    alpha_cutoff: 0.004,
+    motion: keyframes,
+    motion_vectors: true,
+    expected_depth: true,
+    foreground_coverage: true,
+    precision: relaxed,
+}
+
+pipeline DlssSplatViewerRelaxed {
+    mode: gaussian_splat,
+    splat: DlssGaussianCloudRelaxed,
+}

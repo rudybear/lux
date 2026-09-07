@@ -190,12 +190,55 @@ def _get_splat_config(splat: SplatDecl) -> dict:
         # caller of the default pipeline. See splat_renderer.h's
         # getFgFormat() comment for the full story.
         "aux_precision": "half",
+        # bench/lux_perf_ablation.md draw-stage ablation (task 2, fragment
+        # precision experiment): "full" (default) is unchanged codegen --
+        # every fragment intermediate is plain fp32. "relaxed" emits SPIR-V
+        # `RelaxedPrecision` decorations (Arm's own guidance: Mali gets
+        # ~2x fp16 ALU throughput over fp32) on the Gaussian-evaluation/
+        # alpha/color intermediates in _build_fragment_body ONLY -- conic,
+        # the pixel offset, the exponent, the resulting weight/alpha, and
+        # the premultiplied color math. Deliberately does NOT touch
+        # anything in the vertex stage or anything position/depth-related
+        # anywhere (gl_Position math stays full precision; a position
+        # heuristic like `--auto-type`'s `_FP32_NAME_PATTERNS` for
+        # depth/position/matrix names exists for exactly this reason) --
+        # vertex/preprocess ALU is already <1ms and not worth the
+        # correctness risk of relaxing anything that feeds screen
+        # position. Not routed through the generic `--auto-type` CLI
+        # flag/analysis at all: that machinery's static IntervalAnalysis
+        # is deliberately conservative about unbounded storage-buffer/
+        # push-constant inputs (measured: 0/22 fragment variables judged
+        # "safe" on this exact shader, every one hitting "static range
+        # exceeds fp16" even though the actual runtime ranges are tightly
+        # bounded by this shader's own math -- conic*offset^2 stays O(1)
+        # near the visible region because larger conic values only occur
+        # for smaller splats with proportionally smaller quad radii, and
+        # alpha/opacity/gauss_weight are bounded to [0,1] by construction)
+        # -- this option instead hand-picks the known-safe variable set
+        # directly, the same kind of scene-specific engineering judgment
+        # `aux_precision` already uses. See splat_renderer.h and the
+        # ablation doc for the measured draw-ms/PSNR result.
+        "precision": "full",
+        # bench/lux_perf_ablation.md draw-stage ablation (task 3, quad
+        # extent sweep): clamp on the opacity-tight `sigma_t` above
+        # (default 3.0 = reference 3-sigma quad, exact/bit-identical vs.
+        # the fragment shader's own alpha_min discard -- see the comment
+        # above `sigma_t`). Values < 3.0 (e.g. 2.5, 2.0) shrink the quad
+        # further for EVERY splat (not just low-opacity ones), which is NO
+        # LONGER exact -- it clips real fragments with alpha still >=
+        # alpha_min in the t in (quad_sigma, 3] shell, trading a small,
+        # measured PSNR loss for less rasterizer/blend overdraw. See the
+        # ablation doc for the measured draw-ms/PSNR curve; keep 3.0
+        # (default) unless the measured PSNR loss is < 0.1 dB.
+        "quad_sigma": 3.0,
     }
     for m in splat.members:
         if m.name == "sh_degree":
             config["sh_degree"] = int(m.value.value)
-        elif m.name in ("kernel", "color_space", "sort", "motion", "aux_precision"):
+        elif m.name in ("kernel", "color_space", "sort", "motion", "aux_precision", "precision"):
             config[m.name] = m.value.name
+        elif m.name == "quad_sigma":
+            config["quad_sigma"] = float(m.value.value)
         elif m.name == "alpha_cutoff":
             # Legacy name; kept as an alias of alpha_min for backward
             # compatibility with existing .lux sources.
@@ -938,7 +981,7 @@ def _build_preprocess_body(config: dict) -> list:
         _call("sqrt", [_binop("*", _lit("2.0"),
                                _call("log", [_binop("/", _ref("opacity"), _lit(config["alpha_min"]))]))])))
     body.append(_let("sigma_t", "scalar",
-        _call("min", [_ref("sigma_t_raw"), _lit("3.0")])))
+        _call("min", [_ref("sigma_t_raw"), _lit(str(config["quad_sigma"]))])))
 
     # --- Oriented quad: covariance eigenvectors (see class docstring's
     # "Oriented quads" note). theta diagonalizes the symmetric 2x2
@@ -1753,6 +1796,29 @@ def _build_fragment_stage(config: dict) -> StageBlock:
     # --- Main function body ---
     body = _build_fragment_body(config)
     stage.functions.append(FunctionDef("main", [], None, body))
+
+    # "precision: relaxed" (see the config dict's comment above for why this
+    # bypasses the generic `--auto-type` analysis): hand-picked SPIR-V
+    # RelaxedPrecision hints on the Gaussian-evaluation/alpha/color chain
+    # only. RelaxedPrecision is a HINT, not a type change -- these stay
+    # ordinary fp32 SSA values in the SPIR-V; a driver that supports it
+    # (Mali) MAY compute them at fp16 internally, one that doesn't just
+    # ignores the decoration, so this is low-risk by construction. Every
+    # name here is a `let`-bound LOCAL from _build_fragment_body -- the
+    # actual STAGE OUTPUTS (out_color/out_aux/out_fg) are never in this
+    # set and stay full precision regardless (spirv_builder.py's codegen
+    # only ever consults this map for LetStmt-defined locals, so listing
+    # anything else here would just be a harmless no-op, not a risk).
+    if config.get("precision") == "relaxed":
+        relaxed_names = [
+            "conic", "d", "dx", "dy", "a", "b", "c",
+            "power", "gauss_weight", "opacity", "raw_alpha", "alpha",
+            "rgb", "final_rgb",
+        ]
+        if config.get("color_space") == "srgb":
+            relaxed_names += ["srgb_r", "srgb_g", "srgb_b"]
+        stage._precision_map_override = {name: "fp16" for name in relaxed_names}
+
     return stage
 
 

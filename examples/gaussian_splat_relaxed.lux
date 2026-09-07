@@ -1,0 +1,23 @@
+// Colour-only splat pipeline, `precision: relaxed` variant
+// (bench/lux_perf_ablation.md draw-stage ablation, task 2).
+//
+// Identical to gaussian_splat.lux except `precision: relaxed`, which emits
+// SPIR-V RelaxedPrecision hints on the fragment stage's Gaussian-weight/
+// alpha/color evaluation chain only (see luxc/expansion/splat_expander.py's
+// _build_fragment_stage for the exact variable list and reasoning). Values
+// stay ordinary fp32 in the SPIR-V -- this is a hint a driver (Mali) may
+// use to run those ops on fp16 ALUs, not a format/type change.
+
+splat GaussianCloudRelaxed {
+    sh_degree: 0,
+    kernel: ellipse,
+    color_space: linear,
+    sort: camera_distance,
+    alpha_cutoff: 0.004,
+    precision: relaxed,
+}
+
+pipeline SplatViewerRelaxed {
+    mode: gaussian_splat,
+    splat: GaussianCloudRelaxed,
+}

@@ -287,6 +287,20 @@ def compile_source(
                 if d.precision == Precision.FP16
             }
 
+        # A splat pipeline's own `precision: relaxed` option (independent
+        # of --auto-type -- see luxc/expansion/splat_expander.py's
+        # _build_fragment_stage for why: the generic auto-type static
+        # analysis is too conservative on this shader's unbounded
+        # storage-buffer inputs, so the splat expander hand-picks a
+        # known-safe set instead). Merge rather than replace so both
+        # sources can co-exist if a caller somehow uses both.
+        splat_precision_override = getattr(stage, '_precision_map_override', None)
+        if splat_precision_override:
+            if stage_precision_map is None:
+                stage_precision_map = dict(splat_precision_override)
+            else:
+                stage_precision_map = {**stage_precision_map, **splat_precision_override}
+
         asm_text = generate_spirv(module, stage, debug=debug, source_name=source_name or f"{stem}.lux",
                                   assert_kill=assert_kill, source_text=source if debug else "",
                                   rich_debug=rich_debug, precision_map=stage_precision_map,
