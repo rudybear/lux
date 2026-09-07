@@ -132,8 +132,11 @@ kernel void assemble_net_input(
 
     for (uint dy = 0; dy < u.paramStride; dy++) {
         for (uint dx = 0; dx < u.paramStride; dx++) {
-            uint px = gid.x * u.paramStride + dx;
-            uint py = gid.y * u.paramStride + dy;
+            // Replicate-pad (mobiledlss.train.export._PaddedExportModel): proxy rows/cols
+            // at or past the real proxy size reuse the last real row/col, exactly like
+            // F.pad(..., mode='replicate') applied before build_input's box-pool.
+            uint px = min(gid.x * u.paramStride + dx, u.proxyW - 1);
+            uint py = min(gid.y * u.paramStride + dy, u.proxyH - 1);
             uint2 pgid(px, py);
 
             float4 colorRaw = colorTex.read(pgid);
@@ -276,8 +279,15 @@ void NetInputAssembly::init(MetalContext& ctx, const std::string& textureNpyPath
     paramStride_ = paramStride;
     hiddenChannels_ = hiddenChannels;
     depthAlphaOffset_ = depthAlphaOffset;
-    netW_ = proxyW / paramStride;
-    netH_ = proxyH / paramStride;
+    // mobiledlss.train.export._PaddedExportModel: replicate-pad proxy h/w up to a
+    // multiple of 8*paramStride before box-pooling, so the network always runs at a
+    // multiple-of-8 resolution (e.g. 480x270, ps=2 -> pad proxy to 480x272 -> net 240x136).
+    auto roundUp = [](uint32_t x, uint32_t m) { return ((x + m - 1) / m) * m; };
+    uint32_t multiple = 8 * paramStride;
+    uint32_t paddedProxyW = roundUp(proxyW, multiple);
+    uint32_t paddedProxyH = roundUp(proxyH, multiple);
+    netW_ = paddedProxyW / paramStride;
+    netH_ = paddedProxyH / paramStride;
 
     unpremulPipeline_ = buildPipeline(ctx, kUnpremulDepthMSL, "unpremul_depth");
     assemblePipeline_ = buildPipeline(ctx, kAssembleMSL, "assemble_net_input");
@@ -384,6 +394,7 @@ void NetInputAssembly::run(MetalContext& ctx, MTL::Texture* currColorTex, MTL::T
     cmdBuf->commit();
     cmdBuf->waitUntilCompleted();
 
+    wasFirstFrame_ = firstFrame_;
     depthPingIndex_ = 1 - depthPingIndex_;
     firstFrame_ = false;
 }

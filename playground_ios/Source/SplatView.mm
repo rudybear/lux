@@ -26,6 +26,8 @@
 #include "dlss_io.h"
 #include "metal_screenshot.h"
 #include "NetInputAssembly.h"
+#include "MPSGraphUNet.h"
+#include "ReconstructPass.h"
 
 #include <glm/glm.hpp>
 #include <array>
@@ -138,6 +140,61 @@ static float haltonSeq(int index, int base) {
     return r;
 }
 
+// Display modes (B5, pulled forward per coordinator priority change): tap
+// cycles through these. Target is the only one that pays for the full-res
+// (960x540) splat pass -- Proxy/Bicubic/Reconstruction all display a cheap
+// upscale of the *proxy* pass's own colour output instead, per the
+// coordinator's explicit "Reconstruction mode must not render the full-res
+// pass" instruction. The proxy+net(+reconstruct, once B4 lands) pipeline
+// itself always runs every frame regardless of display mode, so the
+// recurrent hidden state stays continuous across mode switches.
+typedef NS_ENUM(NSInteger, DisplayMode) {
+    DisplayModeProxy = 0,
+    DisplayModeBicubic,
+    DisplayModeReconstruction,
+    DisplayModeTarget,
+    DisplayModeCount,
+};
+static const char *kDisplayModeNames[DisplayModeCount] = {"Proxy", "Bilinear", "Reconstruction", "Target"};
+
+// Nearest/bilinear 2x upscale of the proxy colour texture straight into the
+// drawable -- un-premultiplies alpha (the proxy render is premultiplied),
+// forces alpha=1 (opaque display). "Bicubic" mode currently uses this same
+// kernel's bilinear path as a placeholder (TODO: real bicubic) -- labelled
+// "Bilinear" in the HUD/log rather than falsely claiming bicubic.
+static const char *kUpscaleMSL = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void upscale_proxy(texture2d<float, access::read> src [[texture(0)]],
+                           texture2d<float, access::write> dst [[texture(1)]],
+                           constant uint& bilinear [[buffer(0)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+    uint srcW = src.get_width(), srcH = src.get_height();
+    float4 rgba;
+    if (bilinear == 0) {
+        uint sx = min(gid.x / 2, srcW - 1);
+        uint sy = min(gid.y / 2, srcH - 1);
+        rgba = src.read(uint2(sx, sy));
+    } else {
+        float fx = (float(gid.x) + 0.5) / 2.0 - 0.5;
+        float fy = (float(gid.y) + 0.5) / 2.0 - 0.5;
+        int x0 = int(floor(fx)); int y0 = int(floor(fy));
+        float tx = fx - float(x0); float ty = fy - float(y0);
+        int x0c = clamp(x0, 0, int(srcW) - 1); int x1c = clamp(x0 + 1, 0, int(srcW) - 1);
+        int y0c = clamp(y0, 0, int(srcH) - 1); int y1c = clamp(y0 + 1, 0, int(srcH) - 1);
+        float4 c00 = src.read(uint2(x0c, y0c));
+        float4 c10 = src.read(uint2(x1c, y0c));
+        float4 c01 = src.read(uint2(x0c, y1c));
+        float4 c11 = src.read(uint2(x1c, y1c));
+        rgba = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+    }
+    float a = rgba.a;
+    float3 rgb = (a > 1e-6) ? rgba.rgb / a : float3(0.0);
+    dst.write(float4(rgb, 1.0), gid);
+}
+)";
+
 // mobiledlss/datagen/camera.py::taa_jitter -- Halton(2,3) TAA jitter in
 // TARGET-pixel units, cycling every `period` frames. Callers wanting the
 // proxy-pixel jitter (what MetalSplatRenderer::setJitter expects when
@@ -155,6 +212,19 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
     std::unique_ptr<MetalSplatRenderer> _splatR;    // target-res, live drawable (Stage A, hand path -- fine to keep as-is, just a display)
     std::unique_ptr<ProxyRenderer> _splatRProxy;    // proxy-res, offscreen DLSS attachments (B1, luxc path)
     NetInputAssembly _netInput;                     // B2: 26-ch net input assembly compute pass
+    MPSGraphUNet _unet;                             // B3: MPSGraph ParamPredUNet port
+    MTL::Buffer *_unetOutputBuffer;                 // fp16 NHWC, netW*netH*312
+    MTL::ComputePipelineState *_upscalePipeline;    // proxy -> drawable upscale (Proxy/Bicubic modes)
+    ReconstructPass _reconstruct;                   // B4: reconstruct-with-memory
+    MTL::Texture *_reconOutputTex;                  // RGBA16Float, target res -- Reconstruction mode's own output
+    DisplayMode _displayMode;
+    BOOL _reconDumped;
+
+    // Per-stage wall-clock ms (each stage's Metal call already commits+waits
+    // internally, so CPU-side deltas here are GPU-inclusive) -- logged every
+    // ~0.5s alongside FPS. Requested by the coordinator ahead of the full
+    // GPUStartTime/GPUEndTime instrumentation.
+    double _msTarget, _msProxy, _msInput, _msNet, _msRecon, _msDisplay;
     int _frame;
     int _loopFrames;
     BOOL _ready;
@@ -181,6 +251,7 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
         _frame = 0;
         _loopFrames = 300;  // replaced once the animation duration is known
         _ready = NO;
+        _displayMode = DisplayModeReconstruction;
 
         CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
         // MetalSplatRenderer's render pipeline hardcodes color attachment 0
@@ -295,6 +366,67 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
                         kProxyW, kProxyH, /*paramStride=*/2, /*hiddenChannels=*/8,
                         /*depthAlphaOffset=*/ProxyRenderer::kExpectedDepthChannels - 1);
 
+        // B3: MPSGraph ParamPredUNet port, running at NetInputAssembly's own
+        // (already-padded, multiple-of-8) net resolution.
+        NSString *unetBinPath = [[NSBundle mainBundle] pathForResource:@"unet_weights.fp16" ofType:@"bin"];
+        NSString *unetLayersPath = [[NSBundle mainBundle] pathForResource:@"unet_weights.layers" ofType:@"txt"];
+        if (!unetBinPath || !unetLayersPath) {
+            *errorOut = "bundle resource not found: unet_weights.fp16.bin / unet_weights.layers.txt";
+            return NO;
+        }
+        _unet.init(_ctx, std::string(unetBinPath.UTF8String), std::string(unetLayersPath.UTF8String),
+                   _netInput.getNetW(), _netInput.getNetH());
+        _unetOutputBuffer = _ctx.newBuffer(
+            static_cast<size_t>(_netInput.getNetW()) * _netInput.getNetH() * _unet.getOutChannels() * sizeof(uint16_t),
+            MTL::ResourceStorageModeShared);
+        NSLog(@"[SplatView] MPSGraphUNet ready: in=%u out=%u net=%ux%u K=%u hidden=%u",
+              _unet.getInChannels(), _unet.getOutChannels(), _unet.getNetW(), _unet.getNetH(),
+              _unet.getK(), _unet.getHiddenChannels());
+
+        {
+            NS::Error *error = nullptr;
+            auto *src = NS::String::string(kUpscaleMSL, NS::UTF8StringEncoding);
+            auto *opts = MTL::CompileOptions::alloc()->init();
+            auto *lib = _ctx.device->newLibrary(src, opts, &error);
+            opts->release();
+            if (!lib) {
+                *errorOut = std::string("upscale shader compile failed: ") +
+                            (error ? error->localizedDescription()->utf8String() : "?");
+                return NO;
+            }
+            auto *fn = lib->newFunction(NS::String::string("upscale_proxy", NS::UTF8StringEncoding));
+            _upscalePipeline = _ctx.device->newComputePipelineState(fn, &error);
+            fn->release();
+            lib->release();
+            if (!_upscalePipeline) {
+                *errorOut = "failed to create upscale_proxy pipeline";
+                return NO;
+            }
+        }
+
+        // B4: reconstruct-with-memory. nBlend isn't stored directly in the
+        // manifest -- derive it from out_channels = sp*sp*K*K + nBlend*sp*sp + hidden.
+        {
+            uint32_t sp = _unet.getUpscale() * _unet.getParamStride();
+            uint32_t kk = _unet.getK() * _unet.getK();
+            uint32_t nBlend = (_unet.getOutChannels() - sp * sp * kk - _unet.getHiddenChannels()) / (sp * sp);
+            NSString *memHeadPath = [[NSBundle mainBundle] pathForResource:@"memory_head" ofType:@"npz"];
+            if (!memHeadPath) {
+                *errorOut = "bundle resource not found: memory_head.npz";
+                return NO;
+            }
+            _reconstruct.init(_ctx, std::string(texPath.UTF8String), std::string(spherePath.UTF8String),
+                               std::string(memHeadPath.UTF8String), kTargetW, kTargetH, kProxyW, kProxyH,
+                               _netInput.getNetW(), _netInput.getNetH(), _unet.getK(), _unet.getHiddenChannels(),
+                               nBlend, kTargetW / kProxyW, _unet.getParamStride());
+            NSLog(@"[SplatView] ReconstructPass ready: nBlend=%u sp=%u", nBlend, sp);
+
+            auto *reconDesc = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA16Float, kTargetW, kTargetH, false);
+            reconDesc->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
+            reconDesc->setStorageMode(MTL::StorageModePrivate);
+            _reconOutputTex = _ctx.newTexture(reconDesc);
+        }
+
         if (_splatR->hasMotion()) {
             float dur = _splatR->animationDuration();
             _loopFrames = std::max(1, static_cast<int>(std::round(dur * kSimFps)));
@@ -325,91 +457,187 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
 - (void)tick:(CADisplayLink *)link {
     if (!_ready || !_splatR) return;
 
-    glm::vec3 eyeCur, eyePrev, rCur, uCur, fCur, rPrev, uPrev, fPrev;
-    glm::mat4 viewCur, viewPrev, projCur, projPrev;
-    float fxCur, fyCur, fxPrev, fyPrev;
-
     int prevFrame = (_frame > 0) ? (_frame - 1) : 0;
-    computeOrbitCamera(_frame, kTargetW, kTargetH, MetalSplatRenderer::kMetalYConvention,
-                        eyeCur, rCur, uCur, fCur, viewCur, projCur, fxCur, fyCur);
-    computeOrbitCamera(prevFrame, kTargetW, kTargetH, MetalSplatRenderer::kMetalYConvention,
-                        eyePrev, rPrev, uPrev, fPrev, viewPrev, projPrev, fxPrev, fyPrev);
-
     float tCur = _splatR->hasMotion() ? _splatR->frameToTime(_frame) : 0.0f;
     float tPrev = _splatR->hasMotion() ? _splatR->frameToTime(prevFrame) : 0.0f;
 
-    _splatR->updateCameraExplicit(eyeCur, viewCur, projCur, fxCur, fyCur);
-    _splatR->setPreviousCameraExplicit(viewPrev, projPrev);
-    if (_splatR->hasMotion()) {
-        _splatR->setMorphTime(tCur);
-        _splatR->seedPreviousMorphTime(tPrev);
-    }
+    _msTarget = 0.0;
 
-    @autoreleasepool {
-        NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
-        CA::MetalDrawable *drawable = _ctx.metalLayer->nextDrawable();
-        if (drawable) {
-            _splatR->renderToDrawable(_ctx, drawable);
-            if (_wantScreenshot) {
-                _wantScreenshot = NO;
-                [self saveScreenshotFromTexture:drawable->texture()];
-            }
+    // --- Target mode ONLY: full-res (960x540) hand-path splat render,
+    // straight to the drawable (renderToDrawable presents it itself). Per
+    // coordinator: this expensive pass (CPU sort ~19ms + full 960x540 draw)
+    // must NOT run in Proxy/Bicubic/Reconstruction modes.
+    if (_displayMode == DisplayModeTarget) {
+        CFTimeInterval t0 = CACurrentMediaTime();
+        glm::vec3 eyeCur, eyePrev, rCur, uCur, fCur, rPrev, uPrev, fPrev;
+        glm::mat4 viewCur, viewPrev, projCur, projPrev;
+        float fxCur, fyCur, fxPrev, fyPrev;
+        computeOrbitCamera(_frame, kTargetW, kTargetH, MetalSplatRenderer::kMetalYConvention,
+                            eyeCur, rCur, uCur, fCur, viewCur, projCur, fxCur, fyCur);
+        computeOrbitCamera(prevFrame, kTargetW, kTargetH, MetalSplatRenderer::kMetalYConvention,
+                            eyePrev, rPrev, uPrev, fPrev, viewPrev, projPrev, fxPrev, fyPrev);
+        _splatR->updateCameraExplicit(eyeCur, viewCur, projCur, fxCur, fyCur);
+        _splatR->setPreviousCameraExplicit(viewPrev, projPrev);
+        if (_splatR->hasMotion()) {
+            _splatR->setMorphTime(tCur);
+            _splatR->seedPreviousMorphTime(tPrev);
         }
-        pool->release();
-    }
-
-    // --- B1: proxy-res (480x270) DLSS-attachment pass, jittered, MV/morph
-    // history seeded exactly like the target-res pass above. Offscreen
-    // (render(), not renderToDrawable()) -- correct-size aux attachments
-    // only populate when colorTex == colorTarget_ at the renderer's own
-    // width/height (see MetalSplatRenderer::renderToTarget's `includeAux`).
-    {
-        glm::vec3 peyeCur, peyePrev, prCur, puCur, pfCur, prPrev, puPrev, pfPrev;
-        glm::mat4 pviewCur, pviewPrev, pprojCur, pprojPrev;
-        float pfxCur, pfyCur, pfxPrev, pfyPrev;
-        computeOrbitCamera(_frame, kProxyW, kProxyH, ProxyRenderer::kMetalYConvention,
-                            peyeCur, prCur, puCur, pfCur, pviewCur, pprojCur, pfxCur, pfyCur);
-        computeOrbitCamera(prevFrame, kProxyW, kProxyH, ProxyRenderer::kMetalYConvention,
-                            peyePrev, prPrev, puPrev, pfPrev, pviewPrev, pprojPrev, pfxPrev, pfyPrev);
-
-        // mobiledlss/train/data.py convention: jitter_proxy = jitter_target / S.
-        float jxTarget, jyTarget;
-        taaJitterTargetPx(_frame, /*period=*/16, jxTarget, jyTarget);
-        float jxProxy = jxTarget * kProxyScale;
-        float jyProxy = jyTarget * kProxyScale;
-
-        _splatRProxy->updateCameraExplicit(peyeCur, pviewCur, pprojCur, pfxCur, pfyCur);
-        _splatRProxy->setPreviousCameraExplicit(pviewPrev, pprojPrev);
-        if (_splatRProxy->hasMotion()) {
-            _splatRProxy->setMorphTime(tCur);
-            _splatRProxy->seedPreviousMorphTime(tPrev);
-        }
-        _splatRProxy->setJitter(jxProxy, jyProxy);
-
         @autoreleasepool {
             NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
-            _splatRProxy->render(_ctx);
+            CA::MetalDrawable *drawable = _ctx.metalLayer->nextDrawable();
+            if (drawable) {
+                _splatR->renderToDrawable(_ctx, drawable);
+                if (_wantScreenshot) {
+                    _wantScreenshot = NO;
+                    [self saveScreenshotFromTexture:drawable->texture()];
+                }
+            }
             pool->release();
         }
+        _msTarget = (CACurrentMediaTime() - t0) * 1000.0;
+    }
 
-        // B2: assemble the 26-ch net input from this frame's proxy DLSS
-        // attachments (hidden_in = zero -- see NetInputAssembly.h's
-        // validation-config note; the real recurrent hidden state arrives
-        // in B4/B5).
-        _netInput.run(_ctx, _splatRProxy->getOutputTexture(), _splatRProxy->getExpectedDepthTexture(),
-                      _splatRProxy->getMotionTexture(), /*hiddenIn=*/nullptr,
-                      peyeCur, prCur, puCur, pfCur, pfxCur, pfyCur,
-                      0.5f * kProxyW, 0.5f * kProxyH, jxProxy, jyProxy);
+    // --- Proxy pass (B1) + net input assembly (B2) + net (B3): ALWAYS runs,
+    // regardless of display mode, so the recurrent hidden state (B4) stays
+    // continuous across mode switches -- only the extra full-res Target
+    // pass above is mode-gated.
+    glm::vec3 peyeCur, peyePrev, prCur, puCur, pfCur, prPrev, puPrev, pfPrev;
+    glm::mat4 pviewCur, pviewPrev, pprojCur, pprojPrev;
+    float pfxCur, pfyCur, pfxPrev, pfyPrev;
+    computeOrbitCamera(_frame, kProxyW, kProxyH, ProxyRenderer::kMetalYConvention,
+                        peyeCur, prCur, puCur, pfCur, pviewCur, pprojCur, pfxCur, pfyCur);
+    computeOrbitCamera(prevFrame, kProxyW, kProxyH, ProxyRenderer::kMetalYConvention,
+                        peyePrev, prPrev, puPrev, pfPrev, pviewPrev, pprojPrev, pfxPrev, pfyPrev);
 
-        if (_frame == kProxyDumpFrame && !_proxyDumped) {
-            _proxyDumped = YES;
-            NSLog(@"[SplatView] B1 dump: frame=%d prevFrame=%d jitterTargetPx=(%.6f,%.6f) "
-                  @"jitterProxyPx=(%.6f,%.6f) tCur=%.6f tPrev=%.6f eyeCur=(%.6f,%.6f,%.6f)",
-                  _frame, prevFrame, jxTarget, jyTarget, jxProxy, jyProxy, tCur, tPrev,
-                  peyeCur.x, peyeCur.y, peyeCur.z);
-            [self dumpProxyFrame];
-            [self dumpNetInput];
+    // mobiledlss/train/data.py convention: jitter_proxy = jitter_target / S.
+    float jxTarget, jyTarget;
+    taaJitterTargetPx(_frame, /*period=*/16, jxTarget, jyTarget);
+    float jxProxy = jxTarget * kProxyScale;
+    float jyProxy = jyTarget * kProxyScale;
+
+    _splatRProxy->updateCameraExplicit(peyeCur, pviewCur, pprojCur, pfxCur, pfyCur);
+    _splatRProxy->setPreviousCameraExplicit(pviewPrev, pprojPrev);
+    if (_splatRProxy->hasMotion()) {
+        _splatRProxy->setMorphTime(tCur);
+        _splatRProxy->seedPreviousMorphTime(tPrev);
+    }
+    _splatRProxy->setJitter(jxProxy, jyProxy);
+
+    CFTimeInterval tp0 = CACurrentMediaTime();
+    @autoreleasepool {
+        NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
+        _splatRProxy->render(_ctx);
+        pool->release();
+    }
+    CFTimeInterval tp1 = CACurrentMediaTime();
+    _msProxy = (tp1 - tp0) * 1000.0;
+
+    // B4 step 0 (must run BEFORE B2/B3 this frame): warp+downsample last
+    // frame's raw hidden state into this frame's net-res hidden_in.
+    BOOL isFirstReconFrame = _netInput.isNextFrameFirst();
+    _reconstruct.prepareHiddenInput(_ctx, _splatRProxy->getMotionTexture(), isFirstReconFrame,
+                                     _reconstruct.getHiddenInputBuffer());
+
+    // B2: assemble the 26-ch net input from this frame's proxy DLSS
+    // attachments (hidden_in from B4's recurrence above).
+    _netInput.run(_ctx, _splatRProxy->getOutputTexture(), _splatRProxy->getExpectedDepthTexture(),
+                  _splatRProxy->getMotionTexture(), _reconstruct.getHiddenInputBuffer(),
+                  peyeCur, prCur, puCur, pfCur, pfxCur, pfyCur,
+                  0.5f * kProxyW, 0.5f * kProxyH, jxProxy, jyProxy);
+    CFTimeInterval tp2 = CACurrentMediaTime();
+    _msInput = (tp2 - tp1) * 1000.0;
+
+    // B3: run the network on this frame's assembled input, own command
+    // buffer (single-command-buffer fusion is a later optimization pass).
+    {
+        auto *unetCmdBuf = _ctx.beginCommandBuffer();
+        _unet.encode(_ctx, unetCmdBuf, _netInput.getOutputBuffer(), _unetOutputBuffer);
+    }
+    CFTimeInterval tp3 = CACurrentMediaTime();
+    _msNet = (tp3 - tp2) * 1000.0;
+
+    // B4: reconstruct-with-memory -- ALWAYS runs (own offscreen target,
+    // _reconOutputTex) so the hidden/prevColor history stays continuous
+    // across display-mode switches, exactly like the proxy/net passes above.
+    {
+        glm::vec3 teyeCur, teyePrev, trCur, tuCur, tfCur, trPrev, tuPrev, tfPrev;
+        glm::mat4 tviewCur, tviewPrev, tprojCur, tprojPrev;
+        float tfxCur, tfyCur, tfxPrev, tfyPrev;
+        computeOrbitCamera(_frame, kTargetW, kTargetH, MetalSplatRenderer::kMetalYConvention,
+                            teyeCur, trCur, tuCur, tfCur, tviewCur, tprojCur, tfxCur, tfyCur);
+        MTL::Texture *curDepth = _netInput.getDepthWrittenThisFrame();
+        MTL::Texture *prevDepth = _netInput.getDepthFromPreviousFrame();
+        BOOL wasFirst = _netInput.wasFirstFrame();
+        _reconstruct.run(_ctx, _splatRProxy->getOutputTexture(), _splatRProxy->getMotionTexture(), curDepth,
+                          prevDepth, wasFirst, _unetOutputBuffer, _reconOutputTex, teyeCur, trCur, tuCur, tfCur,
+                          tfxCur, tfyCur, 0.5f * kTargetW, 0.5f * kTargetH, jxTarget, jyTarget);
+    }
+    CFTimeInterval tp4 = CACurrentMediaTime();
+    _msRecon = (tp4 - tp3) * 1000.0;
+
+    if (_frame == kProxyDumpFrame && !_proxyDumped) {
+        _proxyDumped = YES;
+        NSLog(@"[SplatView] B1 dump: frame=%d prevFrame=%d jitterTargetPx=(%.6f,%.6f) "
+              @"jitterProxyPx=(%.6f,%.6f) tCur=%.6f tPrev=%.6f eyeCur=(%.6f,%.6f,%.6f)",
+              _frame, prevFrame, jxTarget, jyTarget, jxProxy, jyProxy, tCur, tPrev,
+              peyeCur.x, peyeCur.y, peyeCur.z);
+        [self dumpProxyFrame];
+        [self dumpNetInput];
+        [self dumpUnetOutput];
+        // ReconstructPass has already run every frame from 0 (real history
+        // in prevColor_/prevHidden_ by now), so frame 10's own reconstruction
+        // is directly comparable to a from-scratch PyTorch replay of frames 0..10.
+        _reconDumped = YES;
+        [self dumpReconOutput];
+    }
+
+    // --- Display (Proxy/Bicubic/Reconstruction): cheap upscale of the
+    // proxy colour texture straight into the drawable. Target mode already
+    // presented its own drawable above.
+    if (_displayMode != DisplayModeTarget) {
+        CFTimeInterval td0 = CACurrentMediaTime();
+        @autoreleasepool {
+            NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
+            CA::MetalDrawable *drawable = _ctx.metalLayer->nextDrawable();
+            if (drawable) {
+                auto *cmdBuf = _ctx.beginCommandBuffer();
+                if (_displayMode == DisplayModeReconstruction) {
+                    // _reconOutputTex is already target-res RGBA16Float --
+                    // straight blit into the (same-format) drawable.
+                    auto *blit = cmdBuf->blitCommandEncoder();
+                    blit->copyFromTexture(_reconOutputTex, 0, 0, MTL::Origin(0, 0, 0),
+                                           MTL::Size(kTargetW, kTargetH, 1), drawable->texture(), 0, 0,
+                                           MTL::Origin(0, 0, 0));
+                    blit->endEncoding();
+                } else {
+                    uint32_t bilinear = (_displayMode == DisplayModeBicubic) ? 1 : 0;
+                    auto *enc = cmdBuf->computeCommandEncoder();
+                    enc->setComputePipelineState(_upscalePipeline);
+                    enc->setTexture(_splatRProxy->getOutputTexture(), 0);
+                    enc->setTexture(drawable->texture(), 1);
+                    enc->setBytes(&bilinear, sizeof(bilinear), 0);
+                    MTL::Size grid(kTargetW, kTargetH, 1);
+                    NS::UInteger tew = _upscalePipeline->threadExecutionWidth();
+                    NS::UInteger maxT = _upscalePipeline->maxTotalThreadsPerThreadgroup();
+                    NS::UInteger th = maxT / tew;
+                    if (th == 0) th = 1;
+                    MTL::Size tg(tew, th, 1);
+                    enc->dispatchThreads(grid, tg);
+                    enc->endEncoding();
+                }
+                cmdBuf->presentDrawable(drawable);
+                cmdBuf->commit();
+                cmdBuf->waitUntilCompleted();
+                if (_wantScreenshot) {
+                    _wantScreenshot = NO;
+                    [self saveScreenshotFromTexture:drawable->texture()];
+                }
+            }
+            pool->release();
         }
+        _msDisplay = (CACurrentMediaTime() - td0) * 1000.0;
+    } else {
+        _msDisplay = 0.0;
     }
 
     _frame = (_frame + 1) % _loopFrames;
@@ -428,13 +656,21 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
         self.fpsFrameCount = 0;
         self.fpsWindowStart = now;
         self.hudLabel.text = [NSString stringWithFormat:
-            @"lux splat live | %u splats | frame %d/%d | %.1f fps",
-            _scene.getSplatData().num_splats, _frame, _loopFrames, self.fps];
-        NSLog(@"[SplatView] fps=%.1f frame=%d/%d", self.fps, _frame, _loopFrames);
+            @"%s | %u splats | frame %d/%d | %.1f fps\n"
+            @"target=%.1fms proxy=%.1fms input=%.1fms net=%.1fms recon=%.1fms disp=%.1fms",
+            kDisplayModeNames[_displayMode], _scene.getSplatData().num_splats, _frame, _loopFrames, self.fps,
+            _msTarget, _msProxy, _msInput, _msNet, _msRecon, _msDisplay];
+        NSLog(@"[SplatView] mode=%s fps=%.1f frame=%d/%d | target=%.2fms proxy=%.2fms input=%.2fms "
+              @"net=%.2fms recon=%.2fms display=%.2fms total=%.2fms",
+              kDisplayModeNames[_displayMode], self.fps, _frame, _loopFrames,
+              _msTarget, _msProxy, _msInput, _msNet, _msRecon, _msDisplay,
+              _msTarget + _msProxy + _msInput + _msNet + _msRecon + _msDisplay);
     }
 }
 
 - (void)handleTap:(UITapGestureRecognizer *)tap {
+    _displayMode = static_cast<DisplayMode>((_displayMode + 1) % DisplayModeCount);
+    NSLog(@"[SplatView] display mode -> %s", kDisplayModeNames[_displayMode]);
     _wantScreenshot = YES;
 }
 
@@ -525,6 +761,54 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
         });
     } catch (const std::exception &e) {
         NSLog(@"[SplatView] B2 dump failed: %s", e.what());
+    }
+}
+
+// B3 validation dump: raw packed UNet output (kernel logits + blend logits +
+// hidden_raw, all pre-activation -- matches ParamPredUNet.forward_packed's
+// single concatenated tensor) at the padded net resolution, for comparison
+// against PyTorch on the mobiledlss venv.
+- (void)dumpUnetOutput {
+    NSArray<NSString *> *docPaths =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *outPath = [docPaths.firstObject stringByAppendingPathComponent:@"unet_output_f10.npy"];
+    try {
+        uint32_t netW = _unet.getNetW(), netH = _unet.getNetH(), ch = _unet.getOutChannels();
+        const uint16_t *halfData = static_cast<const uint16_t *>(_unetOutputBuffer->contents());
+        size_t count = static_cast<size_t>(netW) * netH * ch;
+        std::vector<float> f32(count);
+        for (size_t i = 0; i < count; i++) f32[i] = DlssIO::halfToFloat(halfData[i]);
+        DlssIO::writeNpyFloat32(std::string(outPath.UTF8String), f32, {netH, netW, ch});
+        NSLog(@"[SplatView] B3 dump written: %@ (%u x %u x %u)", outPath, netH, netW, ch);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.hudLabel.text = [self.hudLabel.text stringByAppendingString:@"\n[B3 unet-output dump saved]"];
+        });
+    } catch (const std::exception &e) {
+        NSLog(@"[SplatView] B3 dump failed: %s", e.what());
+    }
+}
+
+// B4 validation dump: reconstruct output at frame 10 (RGBA16Float, target
+// res) -- read back via the existing MetalScreenshot/DlssIO helpers (same
+// un-premultiply-free path as a plain colour texture -- reconstruct's
+// output is already straight, non-premultiplied RGB, alpha=1).
+- (void)dumpReconOutput {
+    NSArray<NSString *> *docPaths =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *prefix = [docPaths.firstObject stringByAppendingPathComponent:@"recon_f10"];
+    std::string p = std::string(prefix.UTF8String);
+    try {
+        MetalScreenshot::saveTextureToPNG(_ctx, _reconOutputTex, kTargetW, kTargetH, p + ".png");
+        auto raw = MetalScreenshot::readTextureRaw(_ctx, _reconOutputTex, kTargetW, kTargetH, 8);
+        std::vector<uint8_t> unusedRgba8;
+        auto colorF32 = DlssIO::convertRgba16fColorAttachment(raw, kTargetW, kTargetH, unusedRgba8);
+        DlssIO::writeNpyFloat32(p + ".npy", colorF32, {kTargetH, kTargetW, 4});
+        NSLog(@"[SplatView] B4 dump written: %@.{png,npy}", prefix);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.hudLabel.text = [self.hudLabel.text stringByAppendingString:@"\n[B4 recon dump saved]"];
+        });
+    } catch (const std::exception &e) {
+        NSLog(@"[SplatView] B4 dump failed: %s", e.what());
     }
 }
 

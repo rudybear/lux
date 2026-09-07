@@ -10,6 +10,8 @@
 		08BA9FA7E54B4A71824375EF /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = E0802142ACB140038F13B697 /* main.mm */; };
 		0978CD32677F430C97AF6855 /* AppDelegate.mm in Sources */ = {isa = PBXBuildFile; fileRef = 58E8E8E1EF324B57A789E95E /* AppDelegate.mm */; };
 		610929FFD4AC4CE2867ABFB6 /* SplatView.mm in Sources */ = {isa = PBXBuildFile; fileRef = 65F5609D4C194BD6A4535C10 /* SplatView.mm */; };
+		4F6514F822D942F2AB0E7CA1 /* ReconstructPass.mm in Sources */ = {isa = PBXBuildFile; fileRef = D359D56C7188455F81C563DD /* ReconstructPass.mm */; };
+		2E332088F74A4635AF1AF15E /* MPSGraphUNet.mm in Sources */ = {isa = PBXBuildFile; fileRef = 04F93970F50041ACB8101C41 /* MPSGraphUNet.mm */; };
 		9CAF47923B284476B9E30DCC /* ios_metal_bridge_stub.mm in Sources */ = {isa = PBXBuildFile; fileRef = D5F97D10263C4B5785D36D1C /* ios_metal_bridge_stub.mm */; };
 		79F3D01F1C604665AC76FAFB /* NetInputAssembly.mm in Sources */ = {isa = PBXBuildFile; fileRef = 67F50891484A4DF5A0970801 /* NetInputAssembly.mm */; };
 		DF63C967A26D4946A51FB775 /* metal_context.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 07E03D36384745818C75A799 /* metal_context.cpp */; settings = {COMPILER_FLAGS = "-DNS_PRIVATE_IMPLEMENTATION -DCA_PRIVATE_IMPLEMENTATION -DMTL_PRIVATE_IMPLEMENTATION"; }; };
@@ -32,6 +34,9 @@
 		D84B834851B745DE99FD3072 /* spirv_msl.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EAE7417EF0AF444A96479284 /* spirv_msl.cpp */; };
 		B4647AC8C0284ED6A53B72D6 /* juggle_p0.8_stride4.glb in Resources */ = {isa = PBXBuildFile; fileRef = 8313202CBC794207A914ECE5 /* juggle_p0.8_stride4.glb */; };
 		871ABDA5F6464294B6191BFC /* texture.npy in Resources */ = {isa = PBXBuildFile; fileRef = B64F58B32DA7459A8FA040E0 /* texture.npy */; };
+		DBA021A1197344FB96422B7E /* unet_weights.fp16.bin in Resources */ = {isa = PBXBuildFile; fileRef = 6C1778C27581409CA5282CB2 /* unet_weights.fp16.bin */; };
+		DAA002B9D35C463FA3B85F10 /* unet_weights.layers.txt in Resources */ = {isa = PBXBuildFile; fileRef = 7FC88A7D33F04AD7869C2A3A /* unet_weights.layers.txt */; };
+		95DC5E4FC9A64DE2ACAA7594 /* memory_head.npz in Resources */ = {isa = PBXBuildFile; fileRef = 53E6C4130DA74B3194B60F7F /* memory_head.npz */; };
 		5CAEA93751D242B3B4B20ADE /* bg_sphere.npy in Resources */ = {isa = PBXBuildFile; fileRef = 9FE5F1AE0D8C4E79B59F1D71 /* bg_sphere.npy */; };
 		4888393131264F938557D1B6 /* examples in Resources */ = {isa = PBXBuildFile; fileRef = 3B685382008E46EDA539E98B /* examples */; };
 		8EE36E36D95A4E689D3ACC06 /* shaders in Resources */ = {isa = PBXBuildFile; fileRef = 52183A2E70764308B5E16630 /* shaders */; };
@@ -39,6 +44,8 @@
 		E1282CA934CA42AE9812EF0D /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 49DF897390D34A87951D074F /* QuartzCore.framework */; };
 		A1980183A72F4901B825D6FC /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0B073FD805C04E97BFCBA7B3 /* Foundation.framework */; };
 		3F45DFE114D24552B9F23EDF /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FDFB094FA3814525AD0BE3FA /* UIKit.framework */; };
+		DDB0742BD6F34A1A8BA76E6E /* MetalPerformanceShaders.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D110E229400C455AA2461F25 /* MetalPerformanceShaders.framework */; };
+		B4CF40B900CD430B9605F834 /* MetalPerformanceShadersGraph.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3C63ADC8485B446BA3935DD0 /* MetalPerformanceShadersGraph.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -47,6 +54,10 @@
 		58E8E8E1EF324B57A789E95E /* AppDelegate.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = AppDelegate.mm; sourceTree = "<group>"; };
 		0676F38E92224273BC027CDF /* SplatView.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SplatView.h; sourceTree = "<group>"; };
 		65F5609D4C194BD6A4535C10 /* SplatView.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = SplatView.mm; sourceTree = "<group>"; };
+		048FA9C778924FBAA44003F8 /* ReconstructPass.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ReconstructPass.h; sourceTree = "<group>"; };
+		D359D56C7188455F81C563DD /* ReconstructPass.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = ReconstructPass.mm; sourceTree = "<group>"; };
+		B8FE90719FC9489CA2571A26 /* MPSGraphUNet.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MPSGraphUNet.h; sourceTree = "<group>"; };
+		04F93970F50041ACB8101C41 /* MPSGraphUNet.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = MPSGraphUNet.mm; sourceTree = "<group>"; };
 		D5F97D10263C4B5785D36D1C /* ios_metal_bridge_stub.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = ios_metal_bridge_stub.mm; sourceTree = "<group>"; };
 		D3AEF019DD4C40FCBBA1CA43 /* NetInputAssembly.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NetInputAssembly.h; sourceTree = "<group>"; };
 		67F50891484A4DF5A0970801 /* NetInputAssembly.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NetInputAssembly.mm; sourceTree = "<group>"; };
@@ -71,6 +82,9 @@
 		EAE7417EF0AF444A96479284 /* spirv_msl.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = spirv_msl.cpp; path = ../playground_cpp/build-metal/_deps/spirv-cross-src/spirv_msl.cpp; sourceTree = "<group>"; };
 		8313202CBC794207A914ECE5 /* juggle_p0.8_stride4.glb */ = {isa = PBXFileReference; lastKnownFileType = file; name = juggle_p0.8_stride4.glb; path = ../../mobiledlss/demo/ios_assets/juggle_p0.8_stride4.glb; sourceTree = "<group>"; };
 		B64F58B32DA7459A8FA040E0 /* texture.npy */ = {isa = PBXFileReference; lastKnownFileType = file; name = texture.npy; path = ../../mobiledlss/demo/ios_assets/exported/texture.npy; sourceTree = "<group>"; };
+		6C1778C27581409CA5282CB2 /* unet_weights.fp16.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = unet_weights.fp16.bin; path = ../../mobiledlss/demo/ios_assets/exported/unet_weights.fp16.bin; sourceTree = "<group>"; };
+		7FC88A7D33F04AD7869C2A3A /* unet_weights.layers.txt */ = {isa = PBXFileReference; lastKnownFileType = file; name = unet_weights.layers.txt; path = ../../mobiledlss/demo/ios_assets/exported/unet_weights.layers.txt; sourceTree = "<group>"; };
+		53E6C4130DA74B3194B60F7F /* memory_head.npz */ = {isa = PBXFileReference; lastKnownFileType = file; name = memory_head.npz; path = ../../mobiledlss/demo/ios_assets/exported/memory_head.npz; sourceTree = "<group>"; };
 		9FE5F1AE0D8C4E79B59F1D71 /* bg_sphere.npy */ = {isa = PBXFileReference; lastKnownFileType = file; name = bg_sphere.npy; path = ../../mobiledlss/demo/ios_assets/bg_sphere.npy; sourceTree = "<group>"; };
 		3B685382008E46EDA539E98B /* examples */ = {isa = PBXFileReference; lastKnownFileType = folder; name = examples; path = ../examples; sourceTree = "<group>"; };
 		52183A2E70764308B5E16630 /* shaders */ = {isa = PBXFileReference; lastKnownFileType = folder; name = shaders; path = ../shaders; sourceTree = "<group>"; };
@@ -78,6 +92,8 @@
 		49DF897390D34A87951D074F /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		0B073FD805C04E97BFCBA7B3 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
 		FDFB094FA3814525AD0BE3FA /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		D110E229400C455AA2461F25 /* MetalPerformanceShaders.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalPerformanceShaders.framework; path = System/Library/Frameworks/MetalPerformanceShaders.framework; sourceTree = SDKROOT; };
+		3C63ADC8485B446BA3935DD0 /* MetalPerformanceShadersGraph.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalPerformanceShadersGraph.framework; path = System/Library/Frameworks/MetalPerformanceShadersGraph.framework; sourceTree = SDKROOT; };
 		CC1694FB466C4D56A8088036 /* playground_ios.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = playground_ios.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -90,6 +106,8 @@
 				E1282CA934CA42AE9812EF0D /* QuartzCore.framework in Frameworks */,
 				A1980183A72F4901B825D6FC /* Foundation.framework in Frameworks */,
 				3F45DFE114D24552B9F23EDF /* UIKit.framework in Frameworks */,
+				DDB0742BD6F34A1A8BA76E6E /* MetalPerformanceShaders.framework in Frameworks */,
+				B4CF40B900CD430B9605F834 /* MetalPerformanceShadersGraph.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -103,6 +121,9 @@
 				5A30D7C0BDC449A38F410AEA /* playground_cpp (external, read-only reuse) */,
 				8313202CBC794207A914ECE5 /* juggle_p0.8_stride4.glb */,
 				B64F58B32DA7459A8FA040E0 /* texture.npy */,
+				6C1778C27581409CA5282CB2 /* unet_weights.fp16.bin */,
+				7FC88A7D33F04AD7869C2A3A /* unet_weights.layers.txt */,
+				53E6C4130DA74B3194B60F7F /* memory_head.npz */,
 				9FE5F1AE0D8C4E79B59F1D71 /* bg_sphere.npy */,
 				3B685382008E46EDA539E98B /* examples */,
 				52183A2E70764308B5E16630 /* shaders */,
@@ -119,6 +140,10 @@
 				58E8E8E1EF324B57A789E95E /* AppDelegate.mm */,
 				0676F38E92224273BC027CDF /* SplatView.h */,
 				65F5609D4C194BD6A4535C10 /* SplatView.mm */,
+				048FA9C778924FBAA44003F8 /* ReconstructPass.h */,
+				D359D56C7188455F81C563DD /* ReconstructPass.mm */,
+				B8FE90719FC9489CA2571A26 /* MPSGraphUNet.h */,
+				04F93970F50041ACB8101C41 /* MPSGraphUNet.mm */,
 				D5F97D10263C4B5785D36D1C /* ios_metal_bridge_stub.mm */,
 				D3AEF019DD4C40FCBBA1CA43 /* NetInputAssembly.h */,
 				67F50891484A4DF5A0970801 /* NetInputAssembly.mm */,
@@ -159,6 +184,8 @@
 				49DF897390D34A87951D074F /* QuartzCore.framework */,
 				0B073FD805C04E97BFCBA7B3 /* Foundation.framework */,
 				FDFB094FA3814525AD0BE3FA /* UIKit.framework */,
+				D110E229400C455AA2461F25 /* MetalPerformanceShaders.framework */,
+				3C63ADC8485B446BA3935DD0 /* MetalPerformanceShadersGraph.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -232,6 +259,9 @@
 			files = (
 				B4647AC8C0284ED6A53B72D6 /* juggle_p0.8_stride4.glb in Resources */,
 				871ABDA5F6464294B6191BFC /* texture.npy in Resources */,
+				DBA021A1197344FB96422B7E /* unet_weights.fp16.bin in Resources */,
+				DAA002B9D35C463FA3B85F10 /* unet_weights.layers.txt in Resources */,
+				95DC5E4FC9A64DE2ACAA7594 /* memory_head.npz in Resources */,
 				5CAEA93751D242B3B4B20ADE /* bg_sphere.npy in Resources */,
 				4888393131264F938557D1B6 /* examples in Resources */,
 				8EE36E36D95A4E689D3ACC06 /* shaders in Resources */,
@@ -248,6 +278,8 @@
 				08BA9FA7E54B4A71824375EF /* main.mm in Sources */,
 				0978CD32677F430C97AF6855 /* AppDelegate.mm in Sources */,
 				610929FFD4AC4CE2867ABFB6 /* SplatView.mm in Sources */,
+				4F6514F822D942F2AB0E7CA1 /* ReconstructPass.mm in Sources */,
+				2E332088F74A4635AF1AF15E /* MPSGraphUNet.mm in Sources */,
 				9CAF47923B284476B9E30DCC /* ios_metal_bridge_stub.mm in Sources */,
 				79F3D01F1C604665AC76FAFB /* NetInputAssembly.mm in Sources */,
 				DF63C967A26D4946A51FB775 /* metal_context.cpp in Sources */,

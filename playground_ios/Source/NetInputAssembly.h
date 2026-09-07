@@ -32,6 +32,10 @@ public:
               const std::string& bgSphereNpyPath, uint32_t proxyW, uint32_t proxyH,
               uint32_t paramStride, uint32_t hiddenChannels, uint32_t depthAlphaOffset);
 
+    // Net resolution is the *padded* one (mobiledlss.train.export._PaddedExportModel's
+    // convention: proxy h/w replicate-padded up to a multiple of 8*paramStride before
+    // box-pooling, so the network itself always runs at a multiple-of-8 resolution --
+    // e.g. proxy 480x270, paramStride=2 -> net 240x136, not the "true" 240x135).
     uint32_t getNetW() const { return netW_; }
     uint32_t getNetH() const { return netH_; }
     uint32_t getChannels() const { return kNonHiddenChannels + hiddenChannels_; }
@@ -49,6 +53,23 @@ public:
 
     MTL::Buffer* getOutputBuffer() const { return outputBuffer_; }
 
+    // Exposed for B4's reconstruct pass, which needs its own proxy-resolution
+    // disocclusion (approximation note: `disocc_target` is the proxy-res
+    // disocclusion nearest-upsampled to target res, not the net-res-pooled
+    // copy baked into getOutputBuffer()'s channel 6). CALL THESE AFTER
+    // run() returns (run() flips the internal ping-pong index at the very
+    // end of each call, so "this frame's" and "previous frame's" swap sides
+    // relative to which index is "current" -- these two methods already
+    // account for that; see NetInputAssembly.mm's run() for the internal
+    // ordering these must match).
+    MTL::Texture* getDepthWrittenThisFrame() const { return depthPing_[1 - depthPingIndex_]; }
+    MTL::Texture* getDepthFromPreviousFrame() const { return depthPing_[depthPingIndex_]; }
+    // True iff the frame that was *just* run() was the first one (i.e. its
+    // disocclusion was forced to 1 with no real previous-frame history).
+    bool wasFirstFrame() const { return wasFirstFrame_; }
+    // True iff the *next* run() call will be the first one.
+    bool isNextFrameFirst() const { return firstFrame_; }
+
 private:
     MetalContext* ctx_ = nullptr;
     MTL::ComputePipelineState* unpremulPipeline_ = nullptr;
@@ -61,6 +82,7 @@ private:
     MTL::Texture* depthPing_[2] = {nullptr, nullptr};  // R32Float, proxy res, un-premultiplied
     int depthPingIndex_ = 0;
     bool firstFrame_ = true;
+    bool wasFirstFrame_ = true;
 
     MTL::Buffer* outputBuffer_ = nullptr;  // half, netW*netH*getChannels()
     MTL::Buffer* zeroHiddenBuffer_ = nullptr;
