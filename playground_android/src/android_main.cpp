@@ -35,6 +35,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -714,26 +715,58 @@ void copyFile(const std::string& src, const std::string& dst) {
 // the Mac CLI's --output-aux uses.
 // --------------------------------------------------------------------------
 
-std::vector<uint8_t> readImageRawAndroid(VulkanContext& ctx, VkImage image,
-                                          uint32_t width, uint32_t height,
-                                          uint32_t bytesPerPixel, VkImageLayout currentLayout) {
-    VkDeviceSize imageSize = static_cast<VkDeviceSize>(width) * height * bytesPerPixel;
+// Task 4 (docs/rendering-engines.md, remove the readback stalls/copies
+// where cheap): readColorRgb()/readMvProxy() -- called every displayed
+// Reconstruction-mode frame via runReconstructionModeFrame's dump_write
+// step (RECON_TIMING) -- used to pay vmaCreateBuffer+vmaDestroyBuffer on
+// EVERY call through this function, for a staging buffer whose size never
+// actually changes call to call (SplatRenderer's own output/aux images are
+// persistent GPU resources at a fixed resolution for the lifetime of the
+// renderer). Cached here by VkImage handle instead -- single-threaded (see
+// onInputEvent's comment: input callback and renderFrame() share one
+// thread), so a plain static map with no locking is safe, same convention
+// this file already uses for other frame-to-frame persistent state.
+// Recreates the cached buffer if a size mismatch is ever seen (defensive,
+// not expected to trigger given the callers above).
+struct StagingBuf {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    VkDeviceSize size = 0;
+};
 
-    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bufferInfo.size = imageSize;
-    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+// See readImageRawAndroid's comment: persistent per-image staging buffer,
+// created once and reused (recreated only if a size mismatch is ever seen).
+StagingBuf& getOrCreateStaging(VulkanContext& ctx, VkImage image, VkDeviceSize imageSize) {
+    static std::unordered_map<VkImage, StagingBuf> sStagingCache;
+    StagingBuf& cached = sStagingCache[image];
+    if (cached.buffer == VK_NULL_HANDLE || cached.size != imageSize) {
+        if (cached.buffer != VK_NULL_HANDLE) vmaDestroyBuffer(ctx.allocator, cached.buffer, cached.allocation);
 
-    VmaAllocationCreateInfo allocInfo{};
-    allocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
-    allocInfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bufferInfo.size = imageSize;
+        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-    VkBuffer stagingBuffer;
-    VmaAllocation stagingAllocation;
-    if (vmaCreateBuffer(ctx.allocator, &bufferInfo, &allocInfo, &stagingBuffer, &stagingAllocation, nullptr) != VK_SUCCESS) {
-        throw std::runtime_error("readImageRawAndroid: failed to create staging buffer");
+        VmaAllocationCreateInfo allocInfo{};
+        allocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+        allocInfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+        if (vmaCreateBuffer(ctx.allocator, &bufferInfo, &allocInfo, &cached.buffer, &cached.allocation, nullptr) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("getOrCreateStaging: failed to create staging buffer");
+        }
+        cached.size = imageSize;
     }
+    return cached;
+}
 
-    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+// Records image->staging-buffer barrier+copy into an ALREADY-OPEN command
+// buffer (no begin/end/submit of its own) -- lets callers batch several
+// image reads into ONE beginSingleTimeCommands/endSingleTimeCommands pair
+// (see readColorAndMvProxyCombined below), since endSingleTimeCommands is a
+// full vkQueueWaitIdle (see android_vulkan_context.cpp) that's otherwise
+// paid once per image read.
+void recordImageToStagingCopy(VkCommandBuffer cmd, VkImage image, uint32_t width, uint32_t height,
+                               VkBuffer dstBuffer, VkImageLayout currentLayout) {
     if (currentLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
         VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         barrier.oldLayout = currentLayout;
@@ -750,15 +783,35 @@ std::vector<uint8_t> readImageRawAndroid(VulkanContext& ctx, VkImage image,
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {width, height, 1};
-    vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingBuffer, 1, &region);
+    vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstBuffer, 1, &region);
+}
+
+// Task 4 (docs/rendering-engines.md, remove the readback stalls/copies
+// where cheap): readColorRgb()/readMvProxy() -- called every displayed
+// Reconstruction-mode frame via runReconstructionModeFrame's dump_write
+// step (RECON_TIMING) -- used to pay vmaCreateBuffer+vmaDestroyBuffer on
+// EVERY call through this function, for a staging buffer whose size never
+// actually changes call to call (SplatRenderer's own output/aux images are
+// persistent GPU resources at a fixed resolution for the lifetime of the
+// renderer). Cached here by VkImage handle instead -- single-threaded (see
+// onInputEvent's comment: input callback and renderFrame() share one
+// thread), so a plain static map with no locking is safe, same convention
+// this file already uses for other frame-to-frame persistent state.
+std::vector<uint8_t> readImageRawAndroid(VulkanContext& ctx, VkImage image,
+                                          uint32_t width, uint32_t height,
+                                          uint32_t bytesPerPixel, VkImageLayout currentLayout) {
+    VkDeviceSize imageSize = static_cast<VkDeviceSize>(width) * height * bytesPerPixel;
+    StagingBuf& cached = getOrCreateStaging(ctx, image, imageSize);
+
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    recordImageToStagingCopy(cmd, image, width, height, cached.buffer, currentLayout);
     ctx.endSingleTimeCommands(cmd);
 
     void* mapped = nullptr;
-    vmaMapMemory(ctx.allocator, stagingAllocation, &mapped);
+    vmaMapMemory(ctx.allocator, cached.allocation, &mapped);
     std::vector<uint8_t> pixels(imageSize);
     memcpy(pixels.data(), mapped, imageSize);
-    vmaUnmapMemory(ctx.allocator, stagingAllocation);
-    vmaDestroyBuffer(ctx.allocator, stagingBuffer, stagingAllocation);
+    vmaUnmapMemory(ctx.allocator, cached.allocation);
     return pixels;
 }
 
@@ -899,6 +952,73 @@ std::vector<float> readMvProxy(VulkanContext& ctx, SplatRenderer* splatR) {
         mvAlpha[i] = rgba[i * 4 + 3];
     }
     return DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
+}
+
+// Task 4 (docs/rendering-engines.md, remove the readback stalls/copies
+// where cheap): readColorRgb()+readMvProxy() combined into ONE
+// beginSingleTimeCommands/endSingleTimeCommands pair (see
+// recordImageToStagingCopy's comment -- endSingleTimeCommands is a full
+// vkQueueWaitIdle, otherwise paid twice per displayed Reconstruction-mode
+// frame here, once per image). Same conversions as those two functions,
+// applied to both images' raw bytes after the single combined copy+wait.
+// Used by runReconstructionModeFrame's per-frame dump_write step; the
+// separate readColorRgb()/readMvProxy() stay as-is for the one-shot Stage 5
+// debug dump path (dumpProxyDebugFrame, not latency-sensitive).
+void readColorAndMvProxyCombined(VulkanContext& ctx, SplatRenderer* splatR,
+                                  std::vector<float>* outColorRgb, std::vector<float>* outMv) {
+    uint32_t w = splatR->getWidth(), h = splatR->getHeight();
+    bool auxIsHalf = (splatR->getAuxFormat() == VK_FORMAT_R16G16B16A16_SFLOAT);
+    uint32_t auxBpp = auxIsHalf ? 8 : 16;
+    VkDeviceSize colorSize = static_cast<VkDeviceSize>(w) * h * 8;  // color attachment is always RGBA16F
+    VkDeviceSize auxSize = static_cast<VkDeviceSize>(w) * h * auxBpp;
+
+    StagingBuf& colorStaging = getOrCreateStaging(ctx, splatR->getOutputImage(), colorSize);
+    StagingBuf& auxStaging = getOrCreateStaging(ctx, splatR->getAuxImage(), auxSize);
+
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    recordImageToStagingCopy(cmd, splatR->getOutputImage(), w, h, colorStaging.buffer,
+                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    recordImageToStagingCopy(cmd, splatR->getAuxImage(), w, h, auxStaging.buffer,
+                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    ctx.endSingleTimeCommands(cmd);
+
+    std::vector<uint8_t> rawColor(colorSize), rawAux(auxSize);
+    void* mapped = nullptr;
+    vmaMapMemory(ctx.allocator, colorStaging.allocation, &mapped);
+    memcpy(rawColor.data(), mapped, colorSize);
+    vmaUnmapMemory(ctx.allocator, colorStaging.allocation);
+    vmaMapMemory(ctx.allocator, auxStaging.allocation, &mapped);
+    memcpy(rawAux.data(), mapped, auxSize);
+    vmaUnmapMemory(ctx.allocator, auxStaging.allocation);
+
+    // Color: same conversion as readColorRgb().
+    std::vector<uint8_t> unusedRgba8;
+    auto colorF32 = DlssIO::convertRgba16fColorAttachment(rawColor, w, h, unusedRgba8);
+    outColorRgb->resize(static_cast<size_t>(w) * h * 3);
+    for (size_t i = 0; i < static_cast<size_t>(w) * h; i++) {
+        (*outColorRgb)[i * 3 + 0] = colorF32[i * 4 + 0];
+        (*outColorRgb)[i * 3 + 1] = colorF32[i * 4 + 1];
+        (*outColorRgb)[i * 3 + 2] = colorF32[i * 4 + 2];
+    }
+
+    // Aux -> mv: same conversion as readAuxRgbaF32()+readMvProxy().
+    std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
+    if (auxIsHalf) {
+        for (size_t i = 0; i < rgba.size(); ++i) {
+            uint16_t half;
+            memcpy(&half, rawAux.data() + i * 2, 2);
+            rgba[i] = DlssIO::halfToFloat(half);
+        }
+    } else {
+        memcpy(rgba.data(), rawAux.data(), rawAux.size());
+    }
+    std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2), mvAlpha(static_cast<size_t>(w) * h);
+    for (size_t i = 0; i < mvAlpha.size(); ++i) {
+        mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
+        mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
+        mvAlpha[i] = rgba[i * 4 + 3];
+    }
+    *outMv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
 }
 
 // Stage 6: uploads a CPU-side [h,w,3] RGB buffer (Bicubic's or
@@ -1047,9 +1167,11 @@ std::vector<float> runReconstructionModeFrame(AppState* state, VulkanContext& ct
     }
 
     auto tDumpWrite = std::chrono::high_resolution_clock::now();
-    auto colorProxy = readColorRgb(ctx, splatR);
+    // Task 4: one combined color+aux readback (one queue-drain instead of
+    // two) -- see readColorAndMvProxyCombined's comment.
+    std::vector<float> colorProxy, mvProxy;
+    readColorAndMvProxyCombined(ctx, splatR, &colorProxy, &mvProxy);
     auto colorPadded = padRowsReplicate(colorProxy, kProxyHeight, kProxyWidth, 3, paddedProxyH);
-    auto mvProxy = readMvProxy(ctx, splatR);
     auto mvPadded = padRowsReplicate(mvProxy, kProxyHeight, kProxyWidth, 2, paddedProxyH);
 
     const float* netTensor = state->inputAssembly.getOutputHostPtr();

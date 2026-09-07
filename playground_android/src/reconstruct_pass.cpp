@@ -93,6 +93,24 @@ void uploadFloats(VmaAllocator allocator, VmaAllocation alloc, const std::vector
     vmaUnmapMemory(allocator, alloc);
 }
 
+// Task 4 (docs/rendering-engines.md, remove the readback stalls/copies where
+// cheap): raw-pointer overload -- ReconstructLive::run()'s FrameInputs are
+// already plain `const float*` (caller-owned, valid for the call's duration
+// per the header comment), so the std::vector<float>(ptr, ptr+n) the
+// original call sites built here was a second, whole-buffer CPU copy paid
+// on EVERY frame for no reason (measured worst on I.aPacked, the packed
+// net-output upload -- netW*netH*outCh floats, tens of MB at this model's
+// shapes) before this function's own memcpy into mapped GPU memory did the
+// real work a second time. This overload maps+memcpys directly from the
+// caller's pointer, same single copy uploadFloats(vector) already does
+// internally, just without manufacturing a throwaway vector first.
+void uploadFloats(VmaAllocator allocator, VmaAllocation alloc, const float* data, size_t n) {
+    void* mapped = nullptr;
+    vmaMapMemory(allocator, alloc, &mapped);
+    if (n > 0 && data != nullptr) std::memcpy(mapped, data, n * sizeof(float));
+    vmaUnmapMemory(allocator, alloc);
+}
+
 void zeroBuffer(VmaAllocator allocator, VmaAllocation alloc, size_t numFloats) {
     void* mapped = nullptr;
     vmaMapMemory(allocator, alloc, &mapped);
@@ -976,13 +994,17 @@ void ReconstructLive::reset(VulkanContext& ctx) {
 }
 
 ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const FrameInputs& in,
-                                                     ReconstructTimingsMs* outTimings) {
+                                                     ReconstructTimingsMs* outTimings, bool downloadDebugOutputs) {
     Impl& I = *impl_;
     auto tUpload = std::chrono::high_resolution_clock::now();
-    uploadFloats(ctx.allocator, I.aProxyColor, std::vector<float>(in.proxyColor, in.proxyColor + I.proxyColorN));
-    uploadFloats(ctx.allocator, I.aMvProxy, std::vector<float>(in.mvProxy, in.mvProxy + I.mvProxyN));
-    uploadFloats(ctx.allocator, I.aPacked, std::vector<float>(in.packed, in.packed + I.packedN));
-    uploadFloats(ctx.allocator, I.aDisocc, std::vector<float>(in.disocc, in.disocc + I.targetScalarN));
+    // Raw-pointer overload (see its own comment above) -- was
+    // std::vector<float>(in.X, in.X+N) per call, a full extra CPU copy of
+    // every input (worst: I.aPacked, tens of MB) before uploadFloats' own
+    // memcpy did the real work again.
+    uploadFloats(ctx.allocator, I.aProxyColor, in.proxyColor, I.proxyColorN);
+    uploadFloats(ctx.allocator, I.aMvProxy, in.mvProxy, I.mvProxyN);
+    uploadFloats(ctx.allocator, I.aPacked, in.packed, I.packedN);
+    uploadFloats(ctx.allocator, I.aDisocc, in.disocc, I.targetScalarN);
     if (outTimings != nullptr) outTimings->uploadMs += msSince(tUpload);
 
     auto tDispatch = std::chrono::high_resolution_clock::now();
@@ -1034,10 +1056,28 @@ ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const Fra
         outTimings->dispatchCpuMs += msSince(tDispatch);
     }
 
+    // Task 4 (docs/rendering-engines.md, remove the readback stalls/copies
+    // where cheap -- "debug dumps off by default"): I.aHidden/I.aBguvTarget
+    // are write-only scratch from the "apply"/"bguv" dispatches above --
+    // NEITHER feeds back into any later dispatch in this same run() (only
+    // aPrevColor does, via the copyBufferHost below) NOR does the live
+    // Reconstruction-mode display caller (runReconstructionModeFrame) ever
+    // read FrameOutputs::hidden/bguvTarget -- they only exist for the
+    // offline/dump tooling's hidden_f{t}.npy/bguv_target_f{t}.npy artifacts
+    // (runReconstructDump's OWN, separate download path, unaffected by this
+    // flag). Downloading them here on every live-displayed frame anyway was
+    // reading back ~21MB/frame (hiddenN=targetW*targetH*hidden, tens of MB
+    // at this model's shapes, plus bguvTarget when scene-memory is on) this
+    // caller then immediately discarded -- measured as the majority of
+    // RECON_TIMING's recon_download. `downloadDebugOutputs` (opt-in, off by
+    // default) restores the old always-download behavior for anyone who
+    // does want to inspect them live.
     auto tDownload = std::chrono::high_resolution_clock::now();
     I.outColorHost = downloadFloats(ctx.allocator, I.aOutColor, I.targetColorN);
-    I.hiddenHost = downloadFloats(ctx.allocator, I.aHidden, I.hiddenN);
-    if (I.hasMemory) I.bguvHost = downloadFloats(ctx.allocator, I.aBguvTarget, I.targetScalarN * 2);
+    if (downloadDebugOutputs) {
+        I.hiddenHost = downloadFloats(ctx.allocator, I.aHidden, I.hiddenN);
+        if (I.hasMemory) I.bguvHost = downloadFloats(ctx.allocator, I.aBguvTarget, I.targetScalarN * 2);
+    }
     if (outTimings != nullptr) outTimings->downloadMs += msSince(tDownload);
 
     // Carry forward as next call's prev_color -- see class comment re: this
@@ -1047,7 +1087,7 @@ ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const Fra
 
     FrameOutputs out;
     out.outColor = I.outColorHost.data();
-    out.hidden = I.hiddenHost.data();
-    out.bguvTarget = I.hasMemory ? I.bguvHost.data() : nullptr;
+    out.hidden = downloadDebugOutputs ? I.hiddenHost.data() : nullptr;
+    out.bguvTarget = (downloadDebugOutputs && I.hasMemory) ? I.bguvHost.data() : nullptr;
     return out;
 }

@@ -138,7 +138,14 @@ public:
         const float* hidden = nullptr;    // [targetH,targetW,hidden]
         const float* bguvTarget = nullptr;  // [targetH,targetW,2], null if memoryChannels<=0
     };
-    FrameOutputs run(VulkanContext& ctx, const FrameInputs& in, ReconstructTimingsMs* outTimings = nullptr);
+    // `downloadDebugOutputs` (task 4, off by default): also download
+    // FrameOutputs::hidden/bguvTarget -- scratch outputs neither fed back
+    // into this class' own state nor read by the live display caller, see
+    // the .cpp definition's comment. Leave false unless something actually
+    // wants to inspect them (e.g. an ad hoc live dump), since downloading
+    // them is the majority of a call's GPU->host readback cost.
+    FrameOutputs run(VulkanContext& ctx, const FrameInputs& in, ReconstructTimingsMs* outTimings = nullptr,
+                      bool downloadDebugOutputs = false);
 
 private:
     struct Impl;
