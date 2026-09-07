@@ -459,7 +459,7 @@ void MetalSplatLuxcRenderer::stepKeyframe(int direction) {
     setMorphTime(kf[static_cast<size_t>(stepped)].time);
 }
 
-void MetalSplatLuxcRenderer::setMorphTime(float seconds) {
+void MetalSplatLuxcRenderer::setMorphTime(float seconds, MTL::CommandBuffer* sharedCmdBuf) {
     if (!dynamics_.has_motion) return;
     currentMorphTime_ = seconds;
     SplatMorphState state = evaluateSplatMorphState(dynamics_, seconds);
@@ -471,7 +471,7 @@ void MetalSplatLuxcRenderer::setMorphTime(float seconds) {
         float weightHigh;
     };
 
-    auto* cmdBuf = ctx_->beginCommandBuffer();
+    MTL::CommandBuffer* cmdBuf = sharedCmdBuf ? sharedCmdBuf : ctx_->beginCommandBuffer();
     auto* enc = cmdBuf->computeCommandEncoder();
     enc->setComputePipelineState(morphPipeline_);
     trySetBuffer(enc, morphShader_, baseGpuPosBuffer_, 0);
@@ -510,10 +510,24 @@ void MetalSplatLuxcRenderer::setMorphTime(float seconds) {
     }
 
     enc->endEncoding();
-    cmdBuf->commit();
-    cmdBuf->waitUntilCompleted();
 
-    std::memcpy(hostPositions_.data(), posBuffer_->contents(), hostPositions_.size() * sizeof(float));
+    if (!sharedCmdBuf) {
+        // Self-contained mode (default): commit + block here, then refresh
+        // the CPU-side mirror -- needed by callers like stepKeyframe() (UI
+        // feedback prints currentMorphTimeSeconds() but reads no buffer
+        // contents), seedPreviousMorphTime() (memcpy's posBuffer_'s result
+        // into prevPosBuffer_ right after this call), and the headless
+        // one-shot LUX_DEBUG_SPLAT_DUMP/--dump-splat-buffers paths.
+        cmdBuf->commit();
+        cmdBuf->waitUntilCompleted();
+        std::memcpy(hostPositions_.data(), posBuffer_->contents(), hostPositions_.size() * sizeof(float));
+    }
+    // Shared-command-buffer mode: no commit/wait/readback here -- the caller
+    // owns the buffer's lifecycle (commit + waitUntilCompleted) and,
+    // because hostPositions_ is not refreshed in this mode, must not rely
+    // on it or on posBuffer_->contents() being valid until its own wait
+    // completes. This is the fold-into-the-frame's-own-command-buffer path
+    // (see this method's declaration comment in the header).
 }
 
 // --------------------------------------------------------------------------

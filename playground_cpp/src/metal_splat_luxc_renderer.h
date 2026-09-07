@@ -90,7 +90,23 @@ public:
     bool hasMotion() const { return dynamics_.has_motion; }
     float animationDuration() const;
     float frameToTime(int frame) const;
-    void setMorphTime(float seconds);
+    // `sharedCmdBuf` (default nullptr): when non-null, encodes the morph
+    // compute dispatch into THAT command buffer instead of beginning,
+    // committing, and blocking on a dedicated one of its own -- the caller
+    // is then responsible for committing/waiting and must NOT rely on
+    // hostPositions_/posBuffer_->contents() being valid until it does (no
+    // CPU readback happens in this mode). This is how render() itself
+    // could fold "evaluate this frame's morph" into its own single
+    // per-frame command buffer (mirroring splat_renderer.cpp's Vulkan
+    // render(), which already dispatches its morph this way) instead of
+    // paying a separate CPU<->GPU round trip -- available for a continuous
+    // per-frame caller (e.g. playground_ios/SplatView.mm) to adopt; not
+    // used internally by this class yet since render() currently expects
+    // posBuffer_/rotBuffer_/shBuffer_ to already hold the current frame's
+    // morphed data on entry (the caller calls plain setMorphTime(seconds)
+    // first). With sharedCmdBuf null (the default), behavior is unchanged:
+    // a fully self-contained, blocking call.
+    void setMorphTime(float seconds, MTL::CommandBuffer* sharedCmdBuf = nullptr);
     float currentMorphTimeSeconds() const { return currentMorphTime_; }
     void stepKeyframe(int direction);
 
@@ -108,12 +124,31 @@ public:
         prevProjMatrixUnjittered_ = prevProjMatrixUnjittered;
         firstMvFrame_ = false;
     }
+    // Seeds prevPosBuffer_ with a real (non-current-time) morph evaluation.
+    // Needed ONLY on the very first frame (no render() call has happened
+    // yet to establish "prev = last frame's current" via its own GPU
+    // ping-pong copy -- see render()'s posBuffer_->prevPosBuffer_ blit) or
+    // for an explicit one-shot reseed, such as the headless CLI's
+    // --time-prev/--frame-prev flags (called exactly once, before the
+    // first render()). Both of those cases are characterized by
+    // firstMvFrame_ still being true when this is called, which is what
+    // the guard below keys off. After the first render() call,
+    // prevPosBuffer_ is ALREADY correctly refreshed every frame by
+    // render()'s own blit (no CPU readback, no extra command buffer) --
+    // so a continuous per-frame caller that (redundantly, and previously
+    // unconditionally) calls this alongside its own per-frame
+    // setMorphTime(tCur) now pays nothing beyond the one-time first-frame
+    // cost. Before this guard, an unconditional per-frame call here cost
+    // TWO extra full blocking setMorphTime() GPU round trips (dispatch +
+    // waitUntilCompleted, once for prevTimeSeconds, once to restore
+    // currentTime) on top of the caller's own per-frame setMorphTime(tCur)
+    // -- three morph evaluations per frame instead of one, ~30ms of a
+    // 58ms frame measured on M1 iPad (playground_ios/SplatView.mm's
+    // continuous rendering loop).
     void seedPreviousMorphTime(float prevTimeSeconds) {
-        if (!dynamics_.has_motion) return;
-        if (firstMvFrame_) {
-            prevViewMatrix_ = viewMatrix_;
-            prevProjMatrixUnjittered_ = projMatrixUnjittered_;
-        }
+        if (!dynamics_.has_motion || !firstMvFrame_) return;
+        prevViewMatrix_ = viewMatrix_;
+        prevProjMatrixUnjittered_ = projMatrixUnjittered_;
         float savedTime = currentMorphTime_;
         setMorphTime(prevTimeSeconds);
         std::memcpy(prevPosBuffer_->contents(), hostPositions_.data(),

@@ -540,6 +540,38 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
         std::cerr << "[warn] --time/--frame given but scene has no morph-target animation" << std::endl;
     }
 
+    // Diagnostic: LUX_DEBUG_MORPH_BENCH=<N> simulates N frames of a
+    // continuous playback loop's per-frame morph evaluation pattern
+    // (setMorphTime(tCur) then seedPreviousMorphTime(tPrev), the sequence
+    // playground_ios/SplatView.mm's continuous rendering loop uses) inside
+    // this single process/renderer instance, and reports per-call timing --
+    // for measuring the fix in seedPreviousMorphTime()'s header comment
+    // (only the first call should do real GPU work; frames 2..N should be
+    // ~free). Exits early (no actual render) since this is a pure timing
+    // probe. Opt-in, zero effect on default behavior.
+    if (splatR->hasMotion()) {
+        if (const char* benchN = std::getenv("LUX_DEBUG_MORPH_BENCH")) {
+            int n = std::atoi(benchN);
+            float duration = splatR->animationDuration();
+            double totalMs = 0.0;
+            for (int i = 0; i < n; ++i) {
+                float tCur = duration > 0.0f ? std::fmod(static_cast<float>(i) * 0.033f, duration) : 0.0f;
+                float tPrev = duration > 0.0f ? std::fmod(static_cast<float>(i - 1) * 0.033f + duration, duration) : 0.0f;
+                auto t0 = std::chrono::steady_clock::now();
+                splatR->setMorphTime(tCur);
+                splatR->seedPreviousMorphTime(tPrev);
+                auto t1 = std::chrono::steady_clock::now();
+                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                totalMs += ms;
+                std::cout << "[metal] [timing] morph bench frame " << i << ": " << ms << "ms" << std::endl;
+            }
+            std::cout << "[metal] [timing] morph bench: " << n << " frames, total " << totalMs
+                      << "ms, mean " << (n > 0 ? totalMs / n : 0.0) << "ms/frame" << std::endl;
+            pool->release();
+            return 0;
+        }
+    }
+
     // Debug: same LUX_DEBUG_SPLAT_DUMP convention as the Vulkan
     // SplatRenderer::render() -- dumps the first N post-morph splat
     // attributes exactly as they're about to be handed to the preprocess
