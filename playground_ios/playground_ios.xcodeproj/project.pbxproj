@@ -33,6 +33,7 @@
 		9B910156ADA746E8802D9FA8 /* spirv_glsl.cpp in Sources */ = {isa = PBXBuildFile; fileRef = B4CAA495A9C6487FBDA998DF /* spirv_glsl.cpp */; };
 		D84B834851B745DE99FD3072 /* spirv_msl.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EAE7417EF0AF444A96479284 /* spirv_msl.cpp */; };
 		B4647AC8C0284ED6A53B72D6 /* juggle_p0.8_stride4.glb in Resources */ = {isa = PBXBuildFile; fileRef = 8313202CBC794207A914ECE5 /* juggle_p0.8_stride4.glb */; };
+		2F1C6E1A4B8A4B7A9C2E0D31 /* juggle_full_stride4.glb in Resources */ = {isa = PBXBuildFile; fileRef = 7A9D3F5E1C2B4A6E8F0D9C4B /* juggle_full_stride4.glb */; };
 		871ABDA5F6464294B6191BFC /* texture.npy in Resources */ = {isa = PBXBuildFile; fileRef = B64F58B32DA7459A8FA040E0 /* texture.npy */; };
 		DBA021A1197344FB96422B7E /* unet_weights.fp16.bin in Resources */ = {isa = PBXBuildFile; fileRef = 6C1778C27581409CA5282CB2 /* unet_weights.fp16.bin */; };
 		DAA002B9D35C463FA3B85F10 /* unet_weights.layers.txt in Resources */ = {isa = PBXBuildFile; fileRef = 7FC88A7D33F04AD7869C2A3A /* unet_weights.layers.txt */; };
@@ -81,6 +82,7 @@
 		B4CAA495A9C6487FBDA998DF /* spirv_glsl.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = spirv_glsl.cpp; path = ../playground_cpp/build-metal/_deps/spirv-cross-src/spirv_glsl.cpp; sourceTree = "<group>"; };
 		EAE7417EF0AF444A96479284 /* spirv_msl.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = spirv_msl.cpp; path = ../playground_cpp/build-metal/_deps/spirv-cross-src/spirv_msl.cpp; sourceTree = "<group>"; };
 		8313202CBC794207A914ECE5 /* juggle_p0.8_stride4.glb */ = {isa = PBXFileReference; lastKnownFileType = file; name = juggle_p0.8_stride4.glb; path = ../../mobiledlss/demo/ios_assets/juggle_p0.8_stride4.glb; sourceTree = "<group>"; };
+		7A9D3F5E1C2B4A6E8F0D9C4B /* juggle_full_stride4.glb */ = {isa = PBXFileReference; lastKnownFileType = file; name = juggle_full_stride4.glb; path = ../../mobiledlss/demo/ios_assets/juggle_full_stride4.glb; sourceTree = "<group>"; };
 		B64F58B32DA7459A8FA040E0 /* texture.npy */ = {isa = PBXFileReference; lastKnownFileType = file; name = texture.npy; path = ../../mobiledlss/demo/ios_assets/exported/texture.npy; sourceTree = "<group>"; };
 		6C1778C27581409CA5282CB2 /* unet_weights.fp16.bin */ = {isa = PBXFileReference; lastKnownFileType = file; name = unet_weights.fp16.bin; path = ../../mobiledlss/demo/ios_assets/exported/unet_weights.fp16.bin; sourceTree = "<group>"; };
 		7FC88A7D33F04AD7869C2A3A /* unet_weights.layers.txt */ = {isa = PBXFileReference; lastKnownFileType = file; name = unet_weights.layers.txt; path = ../../mobiledlss/demo/ios_assets/exported/unet_weights.layers.txt; sourceTree = "<group>"; };
@@ -120,6 +122,7 @@
 				A0C34482EBCF4775BE223A91 /* Source */,
 				5A30D7C0BDC449A38F410AEA /* playground_cpp (external, read-only reuse) */,
 				8313202CBC794207A914ECE5 /* juggle_p0.8_stride4.glb */,
+				7A9D3F5E1C2B4A6E8F0D9C4B /* juggle_full_stride4.glb */,
 				B64F58B32DA7459A8FA040E0 /* texture.npy */,
 				6C1778C27581409CA5282CB2 /* unet_weights.fp16.bin */,
 				7FC88A7D33F04AD7869C2A3A /* unet_weights.layers.txt */,
@@ -258,6 +261,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B4647AC8C0284ED6A53B72D6 /* juggle_p0.8_stride4.glb in Resources */,
+				2F1C6E1A4B8A4B7A9C2E0D31 /* juggle_full_stride4.glb in Resources */,
 				871ABDA5F6464294B6191BFC /* texture.npy in Resources */,
 				DBA021A1197344FB96422B7E /* unet_weights.fp16.bin in Resources */,
 				DAA002B9D35C463FA3B85F10 /* unet_weights.layers.txt in Resources */,

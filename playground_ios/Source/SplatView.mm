@@ -85,8 +85,21 @@ static const float kProxyScale = static_cast<float>(kProxyW) / static_cast<float
 static const int kProxyDumpFrame = 10;
 
 // Toggle to "juggle_p0.8_stride2" once app size / load time budget allows
-// (see task notes: stride4 first for size).
+// (see task notes: stride4 first for size). Proxy/Reconstruction render from
+// this 80%-background-pruned scene -- matches what the network was trained
+// on (mobiledlss/datagen/make_clips.py::render_clip's `proxy` split).
 static NSString *const kSceneAssetName = @"juggle_p0.8_stride4";
+
+// Target mode's OWN scene, unpruned (336,568 gaussians, stride 4) --
+// mobiledlss/reports/ipad_recon_gap.md's root-cause finding: Target used to
+// render the SAME pruned scene the network reconstructs *toward*, so the
+// on-device PSNR reference was itself missing 80% of the background (a
+// ~22.5dB ceiling on its own, independent of any reconstruction defect).
+// mobiledlss/datagen/make_clips.py::render_clip always renders `target_*`
+// from the unpruned scene and `proxy_*` from the pruned one -- this matches
+// that convention. Target-mode display/PSNR-reference only; the proxy/
+// reconstruction pipeline (_splatRProxy) keeps using kSceneAssetName above.
+static NSString *const kSceneAssetNameFullTarget = @"juggle_full_stride4";
 
 // Builds the OpenCV-convention world->camera viewmat + GL view/proj matrices
 // for orbit frame `frame` at resolution `width x height`, exactly matching
@@ -239,7 +252,8 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
 
 @interface SplatView () {
     MetalContext _ctx;
-    MetalSceneManager _scene;
+    MetalSceneManager _scene;        // pruned (kSceneAssetName) -- proxy/reconstruction
+    MetalSceneManager _sceneTarget;  // unpruned (kSceneAssetNameFullTarget) -- Target mode only
     // Target mode used to be MetalSplatRenderer (hand-written MSL, CPU sort)
     // rendering straight to the drawable -- this produced visibly wrong
     // splat ordering (no `sort:` source of truth, can silently drift from
@@ -382,7 +396,7 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
             *errorOut = "bundle resource not found: " + std::string(kSceneAssetName.UTF8String) + ".glb";
             return NO;
         }
-        NSLog(@"[SplatView] loading scene: %@", path);
+        NSLog(@"[SplatView] loading scene (pruned, proxy/reconstruction): %@", path);
         _scene.loadScene(std::string(path.UTF8String));
 
         if (!_scene.hasSplatData()) {
@@ -390,13 +404,30 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
             return NO;
         }
 
-        // Target mode: same luxc pipeline/shaderBase as the proxy pass (both
-        // share the scene), just at full target resolution and with no
+        // Target mode's own unpruned scene (see kSceneAssetNameFullTarget's
+        // comment / mobiledlss/reports/ipad_recon_gap.md) -- a SEPARATE
+        // MetalSceneManager since it's a different glb/splat count entirely,
+        // not just a different resolution of the same scene.
+        NSString *targetPath = [[NSBundle mainBundle] pathForResource:kSceneAssetNameFullTarget ofType:@"glb"];
+        if (!targetPath) {
+            *errorOut = "bundle resource not found: " + std::string(kSceneAssetNameFullTarget.UTF8String) + ".glb";
+            return NO;
+        }
+        NSLog(@"[SplatView] loading scene (unpruned, Target mode only): %@", targetPath);
+        _sceneTarget.loadScene(std::string(targetPath.UTF8String));
+
+        if (!_sceneTarget.hasSplatData()) {
+            *errorOut = "target scene has no KHR_gaussian_splatting data";
+            return NO;
+        }
+
+        // Target mode: same luxc pipeline/shaderBase as the proxy pass, just
+        // pointed at the unpruned scene, at full target resolution, no
         // jitter -- gets the same GPU radix sort (`sort: view_depth`, baked
         // into examples/gaussian_splat_dlss's compiled reflection) instead
         // of the old hand-written CPU-sorted path's wrong ordering.
         _splatRTarget = std::make_unique<ProxyRenderer>();
-        _splatRTarget->init(_ctx, _scene.getSplatData(), "examples/gaussian_splat_dlss", kTargetW, kTargetH);
+        _splatRTarget->init(_ctx, _sceneTarget.getSplatData(), "examples/gaussian_splat_dlss", kTargetW, kTargetH);
 
         // B1: a second renderer instance dedicated to the proxy-res (480x270)
         // DLSS-attachment pass -- ProxyRenderer::init() fixes its offscreen
@@ -499,7 +530,8 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
             float dur = _splatRTarget->animationDuration();
             _loopFrames = std::max(1, static_cast<int>(std::round(dur * kSimFps)));
         }
-        NSLog(@"[SplatView] ready: %u splats, loopFrames=%d", _scene.getSplatData().num_splats, _loopFrames);
+        NSLog(@"[SplatView] ready: %u splats (pruned, proxy/reconstruction), %u splats (unpruned, Target), loopFrames=%d",
+              _scene.getSplatData().num_splats, _sceneTarget.getSplatData().num_splats, _loopFrames);
         return YES;
     } catch (const std::exception &e) {
         *errorOut = e.what();
@@ -801,6 +833,14 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
                 if (_wantScreenshot) {
                     _wantScreenshot = NO;
                     [self saveScreenshotFromTexture:drawable->texture()];
+                }
+                // Bicubic-vs-Target PSNR baseline (task spec): the drawable
+                // already holds the final displayed (un-premultiplied,
+                // alpha=1) image at this point -- dumpSeqFrame's own
+                // rgb/alpha divide is a no-op on alpha=1, safe to reuse.
+                if (_displayMode == DisplayModeBicubic && _frame < 16 && !_seqDumped[_frame]) {
+                    _seqDumped[_frame] = YES;
+                    [self dumpSeqFrame:drawable->texture() tag:@"bicubic" frame:_frame];
                 }
             }
             pool->release();

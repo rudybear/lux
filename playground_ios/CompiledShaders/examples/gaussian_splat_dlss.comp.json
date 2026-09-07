@@ -271,8 +271,8 @@
     ]
   },
   "performance_hints": {
-    "instruction_count": 679,
-    "alu_ops": 173,
+    "instruction_count": 684,
+    "alu_ops": 175,
     "texture_samples": 0,
     "branches": 5,
     "function_calls": 0,
