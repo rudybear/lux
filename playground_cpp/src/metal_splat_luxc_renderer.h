@@ -126,6 +126,9 @@ public:
     // (unlike MetalSplatRenderer, which always computes both). ---
     bool hasMotionVectors() const { return hasMotionVectors_; }
     bool hasExpectedDepth() const { return hasExpectedDepth_; }
+    // Packed into getExpectedDepthTexture()'s .g channel -- no separate
+    // texture/attachment (see SPECIFICATION.md 12.8's foreground_coverage entry).
+    bool hasForegroundCoverage() const { return hasForegroundCoverage_; }
     void setJitter(float jitterXPixels, float jitterYPixels);
 
     MTL::Texture* getMotionTexture() const { return motionTarget_; }
@@ -196,6 +199,7 @@ private:
     MTL::ComputePipelineState* morphPipeline_ = nullptr;
     bool hasMotionVectors_ = false;
     bool hasExpectedDepth_ = false;
+    bool hasForegroundCoverage_ = false;
 
     // GPU radix sort (shaders/radix_sort/*.comp.spv, transpiled) -- same
     // 4-pass histogram/prefix_sum/scatter ping-pong scheme as
@@ -223,6 +227,10 @@ private:
     MTL::Buffer* projMvBuffer_ = nullptr;
     MTL::Buffer* projDepthBuffer_ = nullptr;
     MTL::Buffer* visibleCountBuffer_ = nullptr;
+    // foreground_coverage: splat_foreground (input, uploaded once from
+    // GaussianSplatData::foreground) and projected_foreground (output).
+    MTL::Buffer* foregroundBuffer_ = nullptr;
+    MTL::Buffer* projForegroundBuffer_ = nullptr;
 
     // Sort keys/values, ping-pong buffer B + radix-sort scratch (histogram,
     // partition sums) -- see splat_renderer.cpp's identical buffer set.

@@ -127,6 +127,14 @@ static void scrollCallback(GLFWwindow* /*window*/, double /*xoff*/, double yoff)
 
 struct CLIOptions {
     std::string shaderBase;
+    // True iff shaderBase was set from an explicit `--pipeline <base>` (or
+    // positional) CLI argument, as opposed to resolveDefaultPipeline()'s
+    // generic per-scene-type guess (see the splat-scene fallback below --
+    // that guess is always "examples/gltf_pbr" for ANY .glb, since pipeline
+    // resolution runs before the scene is loaded and can't yet know whether
+    // the file turns out to contain gaussian splat data).
+    bool shaderBaseExplicit = false;
+    bool splatBackendExplicit = false;
     std::string sceneSource;
     std::string iblName;
     std::string forceMode;
@@ -218,7 +226,7 @@ static void printUsage(const char* program) {
               << "  --time <SECONDS>       Dynamic splats: animation time (headless + initial interactive pose)\n"
               << "  --frame <N>            Dynamic splats: animation frame index (extras.fps, else keyframe times)\n"
               << "  --jitter <JX> <JY>     Sub-pixel jitter in pixels (splat projection matrix only)\n"
-              << "  --output-aux <PREFIX>  Write <PREFIX>_color.png, _depth.npy, _mv.npy + PNG previews\n"
+              << "  --output-aux <PREFIX>  Write <PREFIX>_color.png, _depth.npy, _mv.npy, _fg.npy (if foreground_coverage) + PNG previews\n"
               << "  --camera-json <FILE>   Drive the splat camera from {viewmat_cv, K, width, height}\n"
               << "  --camera-json-prev <FILE> Seed the mv \"previous frame\" camera explicitly (testing)\n"
               << "  --time-prev <SECONDS> / --frame-prev <N>  Dynamic splats: evaluate the morph at\n"
@@ -247,6 +255,7 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.sceneSource = argv[++i];
         } else if (arg == "--pipeline" && i + 1 < argc) {
             opts.shaderBase = argv[++i];
+            opts.shaderBaseExplicit = true;
         } else if (arg == "--ibl" && i + 1 < argc) {
             opts.iblName = argv[++i];
         } else if (arg == "--mode" && i + 1 < argc) {
@@ -305,6 +314,7 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             }
         } else if (arg == "--splat-backend" && i + 1 < argc) {
             opts.splatBackend = argv[++i];
+            opts.splatBackendExplicit = true;
             if (opts.splatBackend != "hand" && opts.splatBackend != "luxc") {
                 std::cerr << "Unknown --splat-backend: " << opts.splatBackend
                           << " (expected hand or luxc)" << std::endl;
@@ -330,6 +340,7 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.unetKernelDir = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
+            opts.shaderBaseExplicit = true;
         } else {
             std::cerr << "Unknown option: " << arg << std::endl;
             printUsage(argv[0]);
@@ -647,6 +658,20 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
             auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
             DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_depth.npy", depth, {h, w});
             DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png", depth, w, h, 1);
+
+            // foreground_coverage packs into out_depth's .g channel (index 1
+            // of 4 -- only the luxc backend has C==4 / this flag true at all,
+            // see MetalSplatLuxcRenderer::kExpectedDepthChannels), same
+            // alpha (.w, the last of C channels) as depth.
+            if (splatR->hasForegroundCoverage()) {
+                std::vector<float> fgPremul(static_cast<size_t>(w) * h);
+                for (size_t i = 0; i < fgPremul.size(); ++i) {
+                    fgPremul[i] = chans[i * C + 1];
+                }
+                auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, depthAlpha, w, h, 1);
+                DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_fg.npy", fg, {h, w});
+                DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_fg_preview.png", fg, w, h, 1);
+            }
         }
         if (splatR->hasMotionVectors()) {
             auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getMotionTexture(), w, h, 16);
@@ -664,7 +689,9 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
             DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_mv_preview.png", mv, w, h, 2);
         }
         std::cout << "[metal] Wrote aux dumps: " << opts.outputAuxPrefix
-                  << "_{color.png,color.npy,depth.npy,mv.npy,*_preview.png}" << std::endl;
+                  << "_{color.png,color.npy,depth.npy,mv.npy"
+                  << (splatR->hasForegroundCoverage() ? ",fg.npy" : "")
+                  << ",*_preview.png}" << std::endl;
     }
 
     splatR->cleanup();
@@ -707,7 +734,19 @@ static int runHeadless(const CLIOptions& opts) {
         // Check for gaussian splat data early -- splat scenes use embedded MSL
         // (hand backend) or the luxc-compiled pipeline (luxc backend, default).
         if (scene.hasSplatData()) {
-            if (opts.splatBackend == "hand") {
+            // resolveDefaultPipeline() ran before the scene was loaded and had
+            // no way to know this .glb would turn out to hold splat data --
+            // for any glTF scene it always guesses "examples/gltf_pbr" (a
+            // mesh pipeline with no .comp stage at all). If the caller didn't
+            // explicitly ask for --splat-backend luxc (or an explicit
+            // --pipeline that might target a real splat pipeline), fall back
+            // to the hand-written backend here: it's the one Metal splat
+            // backend that has no compiled-.lux source of truth and therefore
+            // needs no --pipeline at all, matching this binary's behavior
+            // before the luxc backend became the default (commit 08cfe8e).
+            bool useHandBackend = (opts.splatBackend == "hand") ||
+                (!opts.splatBackendExplicit && !opts.shaderBaseExplicit);
+            if (useHandBackend) {
                 return runSplatBranch<MetalSplatRenderer>(ctx, scene, opts, pool, "MetalSplatRenderer (hand)",
                     [&](MetalSplatRenderer& r) { r.init(ctx, scene.getSplatData(), opts.width, opts.height); });
             }

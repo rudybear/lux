@@ -91,6 +91,11 @@ public:
     // the extra textures/readback when it actually asks for them.
     bool hasMotionVectors() const { return true; }
     bool hasExpectedDepth() const { return true; }
+    // foreground_coverage is a luxc-compiled-pipeline-only feature (see
+    // MetalSplatLuxcRenderer): this hand-written MSL path never packs it
+    // into out_depth's .g channel. Stub kept only so metal_main.cpp's
+    // shared runSplatBranch<Renderer> template compiles for both backends.
+    bool hasForegroundCoverage() const { return false; }
     void setJitter(float jitterXPixels, float jitterYPixels);
 
     MTL::Texture* getMotionTexture() const { return motionTarget_; }

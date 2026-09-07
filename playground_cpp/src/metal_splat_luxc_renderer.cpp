@@ -128,6 +128,7 @@ void MetalSplatLuxcRenderer::createPipelines(MetalContext& ctx) {
     std::string compJson = readFile(shaderBase_ + ".comp.json");
     hasMotionVectors_ = readGsBoolFlag(compJson, "motion_vectors");
     hasExpectedDepth_ = readGsBoolFlag(compJson, "expected_depth");
+    hasForegroundCoverage_ = readGsBoolFlag(compJson, "foreground_coverage");
 
     transpiler_.transpileInto(compShader_, shaderBase_ + ".comp.spv", SpvExecModel::GLCompute);
     computePipeline_ = ctx.device->newComputePipelineState(compShader_.function, &error);
@@ -298,6 +299,22 @@ void MetalSplatLuxcRenderer::createBuffers(MetalContext& ctx, const GaussianSpla
         projDepthBuffer_ = ctx.newBuffer(numSplats_ * sizeof(float), MTL::ResourceStorageModeShared);
     } else {
         projDepthBuffer_ = ctx.newBuffer(4, MTL::ResourceStorageModeShared);
+    }
+    if (hasForegroundCoverage_) {
+        // gltf_loader.cpp already resolved the _FOREGROUND-attribute /
+        // morph-delta-fallback / all-zero precedence into data.foreground.
+        if (data.foreground.size() == numSplats_) {
+            foregroundBuffer_ = ctx.newBuffer(data.foreground.data(), numSplats_ * sizeof(float),
+                                               MTL::ResourceStorageModeShared);
+        } else {
+            std::vector<float> zeroFg(numSplats_, 0.0f);
+            foregroundBuffer_ = ctx.newBuffer(zeroFg.data(), numSplats_ * sizeof(float),
+                                               MTL::ResourceStorageModeShared);
+        }
+        projForegroundBuffer_ = ctx.newBuffer(numSplats_ * sizeof(float), MTL::ResourceStorageModeShared);
+    } else {
+        foregroundBuffer_ = ctx.newBuffer(4, MTL::ResourceStorageModeShared);
+        projForegroundBuffer_ = ctx.newBuffer(4, MTL::ResourceStorageModeShared);
     }
 
     // --- Sort buffers (GPU radix sort, ping-pong A/B) ---
@@ -554,7 +571,8 @@ void MetalSplatLuxcRenderer::init(MetalContext& ctx, const GaussianSplatData& da
 
     std::cout << "[metal-luxc] MetalSplatLuxcRenderer initialized: " << numSplats_ << " splats, "
               << width << "x" << height
-              << " (motion_vectors=" << hasMotionVectors_ << " expected_depth=" << hasExpectedDepth_ << ")"
+              << " (motion_vectors=" << hasMotionVectors_ << " expected_depth=" << hasExpectedDepth_
+              << " foreground_coverage=" << hasForegroundCoverage_ << ")"
               << std::endl;
 }
 
@@ -648,6 +666,10 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
         }
         if (hasExpectedDepth_) {
             trySetBuffer(enc, compShader_, projDepthBuffer_, nextBinding++);
+        }
+        if (hasForegroundCoverage_) {
+            trySetBuffer(enc, compShader_, foregroundBuffer_, nextBinding++);
+            trySetBuffer(enc, compShader_, projForegroundBuffer_, nextBinding++);
         }
         enc->setBytes(&push, sizeof(push), compShader_.pushConstantBufferIndex);
         uint32_t groups = (numSplats_ + 255) / 256;
@@ -833,6 +855,7 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
     uint32_t vNext = 4;
     if (hasMotionVectors_) trySetVertexBuffer(enc, vertShader_, projMvBuffer_, vNext++);
     if (hasExpectedDepth_) trySetVertexBuffer(enc, vertShader_, projDepthBuffer_, vNext++);
+    if (hasForegroundCoverage_) trySetVertexBuffer(enc, vertShader_, projForegroundBuffer_, vNext++);
 
     struct RenderPush { float screenW, screenH; uint32_t visibleCount; float alphaMin; } renderPush = {};
     renderPush.screenW = static_cast<float>(width_);
