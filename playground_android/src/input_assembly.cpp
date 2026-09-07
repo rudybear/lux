@@ -174,6 +174,7 @@ static_assert(sizeof(AssemblePush) == 160, "AssemblePush must match input_assemb
 
 struct UnpremulPush {
     uint32_t width, height;
+    uint32_t auxIsHalf;  // 0 = AuxRaw is RGBA32_SFLOAT, 1 = RGBA16_SFLOAT (packed) -- see input_assembly.h's init() comment
 };
 
 }  // namespace
@@ -254,6 +255,7 @@ void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
     proxyH_ = proxyH;
     paramStride_ = paramStride;
     hiddenChannels_ = hiddenChannels;
+    auxIsHalf_ = (auxFormat == VK_FORMAT_R16G16B16A16_SFLOAT);
 
     auto roundUp = [](uint32_t x, uint32_t m) { return ((x + m - 1) / m) * m; };
     uint32_t multiple = 8 * paramStride;
@@ -370,7 +372,7 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage
     // bFgCur (no ping-pong -- see its declaration comment).
     writeDescriptorSet(ctx.device, impl_->unpremulSet,
                         {impl_->bAuxRaw, impl_->bFgRaw, impl_->bDepthPing[curIdx], impl_->bFgCur});
-    UnpremulPush upPush{proxyW, proxyH};
+    UnpremulPush upPush{proxyW, proxyH, auxIsHalf_ ? 1u : 0u};
     uint32_t gx = (proxyW + 15) / 16, gy = (proxyH + 15) / 16;
     dispatchOne(ctx, impl_->unpremulPipe, impl_->unpremulPL, impl_->unpremulSet, &upPush, sizeof(upPush), gx, gy);
 
@@ -394,7 +396,8 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage
     push.extra[0] = bgSphere_[3]; push.extra[1] = 1.0f / 16.0f; push.extra[2] = jitterProxyX; push.extra[3] = jitterProxyY;
     push.dims1[0] = proxyW; push.dims1[1] = proxyH; push.dims1[2] = netW_; push.dims1[3] = netH_;
     push.dims2[0] = paramStride_; push.dims2[1] = hiddenChannels_; push.dims2[2] = texW_; push.dims2[3] = texH_;
-    push.flags[0] = firstFrame_ ? 1u : 0u; push.flags[1] = texChannels_; push.flags[2] = kFgSourceExpectedDepthG; push.flags[3] = 0;
+    push.flags[0] = firstFrame_ ? 1u : 0u; push.flags[1] = texChannels_; push.flags[2] = kFgSourceExpectedDepthG;
+    push.flags[3] = auxIsHalf_ ? 1u : 0u;
 
     uint32_t ngx = (netW_ + 15) / 16, ngy = (netH_ + 15) / 16;
     dispatchOne(ctx, impl_->assemblePipe, impl_->assemblePL, impl_->assembleSet, &push, sizeof(push), ngx, ngy);

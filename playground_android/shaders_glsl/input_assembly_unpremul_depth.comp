@@ -8,14 +8,20 @@
 // lux commit 6ed0334 ("splat: merge DLSS aux attachments") repacked
 // SplatRenderer's DLSS outputs: the old separate out_motion/out_depth
 // RGBA32F attachments are gone, replaced by one packed `out_aux`
-// (RGBA32F: x=mv.x*alpha, y=mv.y*alpha, z=depth*alpha, w=alpha -- `.w` is
-// the GENUINE per-fragment alpha, required for correct hardware blend
+// (x=mv.x*alpha, y=mv.y*alpha, z=depth*alpha, w=alpha -- `.w` is the
+// GENUINE per-fragment alpha, required for correct hardware blend
 // accumulation, NOT out_color's alpha -- see splat_renderer.h's
 // getAuxImage() comment / playground_android_perf/src/android_main.cpp's
 // dumpProxyDebugFrame(), the validated reference this shader's math
-// mirrors) plus a separate, smaller `out_fg` (RGBA16F: x=fg*alpha, y/z
-// unused, w=alpha -- foreground_coverage can't share out_aux's lanes,
+// mirrors) plus a separate, smaller `out_fg` (always RGBA16F: x=fg*alpha,
+// y/z unused, w=alpha -- foreground_coverage can't share out_aux's lanes,
 // same reason: it needs its OWN genuine alpha for hardware blending).
+// lux commit 5d5630c made `aux_precision: half` (RGBA16F out_aux) the
+// default (868e17f/8a66fbc measured+fixed it first) -- getAuxFormat() is a
+// runtime host query, not a fixed format, so AuxRaw's byte layout is
+// resolved at DISPATCH time via the auxIsHalf push-constant flag
+// (input_assembly.cpp queries SplatRenderer::getAuxFormat() once at run()
+// time and threads it through) rather than assumed at compile time.
 //
 // Un-premultiplies this frame's proxy-resolution aux depth (from AuxRaw.z,
 // AuxRaw's own alpha) and fg (from FgRaw.x, FgRaw's own SEPARATE alpha --
@@ -31,13 +37,18 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
+// Raw texel bytes, format-agnostic (see auxIsHalf below): RGBA32_SFLOAT is
+// 4 uint32/texel (bit-reinterpreted, no repacking); RGBA16_SFLOAT is 2
+// uint32/texel (2 fp16 lanes each, unpackHalf2x16 -- same convention
+// FgRaw/ColorRaw already use).
 layout(std430, binding = 0) readonly buffer AuxRaw {
-    vec4 data[];  // x = mv.x*alpha, y = mv.y*alpha, z = depth*alpha, w = alpha
+    uint data[];
 } auxRaw;
 
 // RGBA16_SFLOAT texels, 2 uint32 per texel (same unpackHalf2x16 convention
 // as input_assembly_assemble.comp's ColorRaw): data[idx*2+0] packs (fg, 0),
-// data[idx*2+1] packs (0, alpha).
+// data[idx*2+1] packs (0, alpha). Always this format regardless of
+// aux_precision -- see splat_renderer.h's getFgFormat() comment.
 layout(std430, binding = 1) readonly buffer FgRaw {
     uint data[];
 } fgRaw;
@@ -53,14 +64,27 @@ layout(std430, binding = 3) writeonly buffer CurFg {
 layout(push_constant) uniform PC {
     uint width;
     uint height;
+    uint auxIsHalf;  // 0 = AuxRaw is RGBA32_SFLOAT, 1 = RGBA16_SFLOAT (packed)
 } pc;
+
+vec4 readAux(uint idx) {
+    if (pc.auxIsHalf == 0u) {
+        uint base = idx * 4u;
+        return vec4(uintBitsToFloat(auxRaw.data[base + 0u]), uintBitsToFloat(auxRaw.data[base + 1u]),
+                    uintBitsToFloat(auxRaw.data[base + 2u]), uintBitsToFloat(auxRaw.data[base + 3u]));
+    }
+    uint base = idx * 2u;
+    vec2 xy = unpackHalf2x16(auxRaw.data[base + 0u]);
+    vec2 zw = unpackHalf2x16(auxRaw.data[base + 1u]);
+    return vec4(xy, zw);
+}
 
 void main() {
     uvec2 gid = gl_GlobalInvocationID.xy;
     if (gid.x >= pc.width || gid.y >= pc.height) return;
     uint idx = gid.y * pc.width + gid.x;
 
-    vec4 aux = auxRaw.data[idx];
+    vec4 aux = readAux(idx);
     float auxAlpha = aux.w;
     float depth = (auxAlpha > 1e-6) ? (aux.z / auxAlpha) : 0.0;
 

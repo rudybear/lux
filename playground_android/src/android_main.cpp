@@ -464,11 +464,19 @@ void initRenderer(AppState* state) {
         // Stage 3: input-assembly GLSL compute pipeline (assets pushed by
         // push_assets.sh: assets/texture.npy, assets/bg_sphere.npy,
         // shaders_ia/input_assembly_{unpremul_depth,assemble}.comp.spv).
+        // auxFormat/fgFormat queried from proxyRenderer itself (NOT
+        // hardcoded -- lux 5d5630c made `aux_precision: half` the default,
+        // superseding the RGBA32F this used to assume) so InputAssembly's
+        // GLSL readback stays correct regardless of which the compiled
+        // pipeline was built with.
         state->inputAssembly.init(state->ctx, base + "/assets/texture.npy", base + "/assets/bg_sphere.npy",
                                    kProxyWidth, kProxyHeight, AppState::kParamStride, AppState::kHiddenChannels,
-                                   base + "/shaders_ia");
-        LOGI("InputAssembly initialized: net=%ux%u channels=%u",
-             state->inputAssembly.getNetW(), state->inputAssembly.getNetH(), state->inputAssembly.getChannels());
+                                   base + "/shaders_ia", state->proxyRenderer->getAuxFormat(),
+                                   state->proxyRenderer->getFgFormat());
+        LOGI("InputAssembly initialized: net=%ux%u channels=%u aux_format=%d (half=%d)",
+             state->inputAssembly.getNetW(), state->inputAssembly.getNetH(), state->inputAssembly.getChannels(),
+             static_cast<int>(state->proxyRenderer->getAuxFormat()),
+             state->proxyRenderer->getAuxFormat() == VK_FORMAT_R16G16B16A16_SFLOAT);
 
         // Stage 4: TFLite net (best-effort -- GPU delegate availability
         // varies by driver; log and continue the rest of the demo on failure).

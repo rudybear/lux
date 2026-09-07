@@ -43,21 +43,25 @@ public:
     // proxy h/w replicate-padded up to a multiple of 8*paramStride before
     // box-pooling, so the network always runs at a multiple-of-8 resolution
     // (proxy 480x270, paramStride=2 -> net 240x136, not "true" 240x135).
-    // auxFormat/fgFormat: SplatRenderer::getAuxFormat()/getFgFormat() --
-    // defaulted to their current values (RGBA32F/RGBA16F) so existing call
-    // sites don't need updating; only used to SIZE the raw-texel storage
-    // buffers (see input_assembly.cpp's bytesPerTexel()) -- the GLSL unpack
-    // paths in shaders_glsl/input_assembly_*.comp still hardcode those same
-    // two formats' byte layouts, so passing anything else here would size
-    // the buffer correctly but still be interpreted wrong on the shader
-    // side (bytesPerTexel() throws on any other format instead of silently
-    // doing that).
+    // auxFormat/fgFormat: query these from the SAME SplatRenderer whose
+    // images run() will be given (SplatRenderer::getAuxFormat()/
+    // getFgFormat()) -- NOT hardcoded here, since lux 5d5630c made
+    // `aux_precision: half` (RGBA16F out_aux) the default, superseding the
+    // RGBA32F this class originally assumed (getAuxFormat() is itself a
+    // runtime host query on the SplatRenderer side, not a compile-time
+    // constant -- see its comment). Only RGBA32F/RGBA16F are supported
+    // (bytesPerTexel() throws otherwise); the GLSL side
+    // (shaders_glsl/input_assembly_*.comp's readAux()) resolves the actual
+    // byte layout per-dispatch from the auxIsHalf push-constant flag run()
+    // derives from auxFormat here, so passing either supported format is
+    // genuinely handled, not just sized correctly and silently
+    // misinterpreted. fgFormat is effectively always RGBA16F (see
+    // getFgFormat()'s comment for why that's independent of aux_precision)
+    // but still queried, not assumed, for the same reason.
     void init(VulkanContext& ctx, const std::string& textureNpyPath,
               const std::string& bgSphereNpyPath, uint32_t proxyW, uint32_t proxyH,
               uint32_t paramStride, uint32_t hiddenChannels,
-              const std::string& shaderDir,
-              VkFormat auxFormat = VK_FORMAT_R32G32B32A32_SFLOAT,
-              VkFormat fgFormat = VK_FORMAT_R16G16B16A16_SFLOAT);
+              const std::string& shaderDir, VkFormat auxFormat, VkFormat fgFormat);
 
     uint32_t getNetW() const { return netW_; }
     uint32_t getNetH() const { return netH_; }
@@ -140,5 +144,6 @@ private:
     uint32_t texChannels_ = 0, texW_ = 0, texH_ = 0;
     bool firstFrame_ = true;
     bool wasFirstFrame_ = true;
+    bool auxIsHalf_ = false;  // from init()'s auxFormat param -- see its comment
     std::vector<float> bgSphere_;  // cx, cy, cz, r
 };

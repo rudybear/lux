@@ -31,10 +31,13 @@ layout(std430, binding = 0) readonly buffer ColorRaw {
 // z=depth*alpha, w=alpha) -- this binding is now that same buffer
 // (input_assembly.cpp's bAuxRaw), read here for its x/y/w lanes exactly as
 // MotionRaw's used to be (.z/depth is pass 1's job, see
-// input_assembly_unpremul_depth.comp); unpremulMotion() below is
-// byte-for-byte unchanged.
+// input_assembly_unpremul_depth.comp). lux 5d5630c made `aux_precision:
+// half` (RGBA16F) the default, so this is raw bytes now (format resolved
+// at dispatch time via pc.flags.w -- see readAux()/
+// input_assembly_unpremul_depth.comp's identical pattern), not a plain
+// vec4 array.
 layout(std430, binding = 1) readonly buffer AuxRaw {
-    vec4 data[];  // x = mv.x*alpha, y = mv.y*alpha, z = depth*alpha (unused here), w = alpha
+    uint data[];
 } motionRaw;
 
 layout(std430, binding = 2) readonly buffer CurDepth {
@@ -71,7 +74,7 @@ layout(push_constant) uniform PC {
     vec4 extra;     // bgRadius, mvScale, jitterX, jitterY
     uvec4 dims1;    // proxyW, proxyH, netW, netH
     uvec4 dims2;    // paramStride, hiddenChannels, texW, texH
-    uvec4 flags;    // firstFrame, texChannels, fgSource, _pad
+    uvec4 flags;    // firstFrame, texChannels, fgSource, auxIsHalf (0=RGBA32F, 1=RGBA16F packed)
 } pc;
 
 const float PI = 3.14159265358979323846;
@@ -86,8 +89,20 @@ vec3 unpremulColor(uint idx) {
     return (alpha > 1e-6) ? (rgb / alpha) : vec3(0.0);
 }
 
+vec4 readAux(uint idx) {
+    if (pc.flags.w == 0u) {
+        uint base = idx * 4u;
+        return vec4(uintBitsToFloat(motionRaw.data[base + 0u]), uintBitsToFloat(motionRaw.data[base + 1u]),
+                    uintBitsToFloat(motionRaw.data[base + 2u]), uintBitsToFloat(motionRaw.data[base + 3u]));
+    }
+    uint base = idx * 2u;
+    vec2 xy = unpackHalf2x16(motionRaw.data[base + 0u]);
+    vec2 zw = unpackHalf2x16(motionRaw.data[base + 1u]);
+    return vec4(xy, zw);
+}
+
 vec2 unpremulMotion(uint idx) {
-    vec4 raw = motionRaw.data[idx];
+    vec4 raw = readAux(idx);
     float a = raw.w;
     return (a > 1e-6) ? (raw.xy / a) : vec2(0.0);
 }
