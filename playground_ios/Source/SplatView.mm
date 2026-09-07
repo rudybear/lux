@@ -681,7 +681,17 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     _ctx.metalLayer = (__bridge CA::MetalLayer *)metalLayer;
 
     self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
-    self.displayLink.preferredFramesPerSecond = 30;
+    // Request the panel's full ProMotion range so the compositor doesn't
+    // silently clamp us to the legacy 60Hz default -- preferredFramesPerSecond
+    // alone isn't honored reliably on ProMotion displays. iPad has no
+    // "minimum frame duration" opt-in (that's iPhone-only, via the
+    // CADisableMinimumFrameDurationOnPhone Info.plist key); the range API
+    // is sufficient here.
+    if (@available(iOS 15.0, *)) {
+        self.displayLink.preferredFrameRateRange = CAFrameRateRangeMake(30, 120, 120);
+    } else {
+        self.displayLink.preferredFramesPerSecond = 30;
+    }
     [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     self.fpsWindowStart = CACurrentMediaTime();
     self.fpsFrameCount = 0;
