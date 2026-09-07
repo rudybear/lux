@@ -75,6 +75,10 @@ public:
     // time by scanning the preprocess stage's reflection JSON.
     bool hasMotionVectors() const { return hasMotionVectors_; }
     bool hasExpectedDepth() const { return hasExpectedDepth_; }
+    // True when the compiled shader was built with `foreground_coverage: true`
+    // (implies hasExpectedDepth_ -- the flag is packed into out_depth's .g
+    // channel, no separate attachment). See getExpectedDepthImage() below.
+    bool hasForegroundCoverage() const { return hasForegroundCoverage_; }
 
     // Sub-pixel jitter in PIXELS, applied to the projection matrix used for
     // rasterization only -- motion vectors always use the unjittered
@@ -169,6 +173,7 @@ private:
     // flag is detected on the compiled shader) ---
     bool hasMotionVectors_ = false;
     bool hasExpectedDepth_ = false;
+    bool hasForegroundCoverage_ = false;
     VkImage motionImage_ = VK_NULL_HANDLE;
     VmaAllocation motionAlloc_ = VK_NULL_HANDLE;
     VkImageView motionView_ = VK_NULL_HANDLE;
@@ -226,6 +231,11 @@ private:
     // vkCmdUpdateBuffer each render() call, matching the old memcpy-into-
     // push-constants call site exactly.
     VkBuffer prevCameraBuffer_ = VK_NULL_HANDLE;  VmaAllocation prevCameraAlloc_ = VK_NULL_HANDLE;
+    // foreground_coverage: splat_foreground (input, uploaded once from
+    // GaussianSplatData::foreground) and projected_foreground (output,
+    // per-splat passthrough written by the preprocess compute stage).
+    VkBuffer foregroundBuffer_ = VK_NULL_HANDLE;      VmaAllocation foregroundAlloc_ = VK_NULL_HANDLE;
+    VkBuffer projForegroundBuffer_ = VK_NULL_HANDLE;  VmaAllocation projForegroundAlloc_ = VK_NULL_HANDLE;
 
     // Sort buffers (buffer A = primary, written by compute shader)
     VkBuffer sortKeysBuffer_ = VK_NULL_HANDLE;      VmaAllocation sortKeysAlloc_ = VK_NULL_HANDLE;
@@ -315,6 +325,12 @@ private:
     std::vector<uint32_t> segmentCounts_;
     uint32_t morphTotalEntries_ = 0;
     float currentMorphTime_ = 0.0f;
+    // Perf: dispatchMorph() only needs to reset the segment it PREVIOUSLY
+    // applied (not the full concatenated multi-keyframe morph_index array)
+    // before applying the new one -- see dispatchMorph()'s comment for the
+    // correctness argument. -1 == no segment applied yet (fresh buffers,
+    // already == base attrs, nothing to reset).
+    int lastAppliedSegment_ = -1;
 
     VkPipeline morphPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout morphLayout_ = VK_NULL_HANDLE;

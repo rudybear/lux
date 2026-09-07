@@ -531,11 +531,14 @@ void SplatRenderer::createPipelines(VulkanContext& ctx, const std::string& shade
     // Compute: 4 input + N SH coefficients + 6 output SSBOs
     // Output order: proj_center, proj_conic, proj_color, sort_keys, sorted_indices, visible_count
     // + (motion_vectors) splat_prev_pos, projected_mv, prev_camera_mats
-    // + (expected_depth) projected_depth, appended in that order (matches
-    // splat_expander._build_preprocess_stage exactly).
+    // + (expected_depth) projected_depth
+    // + (foreground_coverage) splat_foreground, projected_foreground,
+    // appended in that order (matches splat_expander._build_preprocess_stage
+    // exactly).
     uint32_t numShCoeffs = numShCoeffsForDegree(shaderShDegree_);
     uint32_t numComputeBindings = 4 + numShCoeffs + 6
-        + (hasMotionVectors_ ? 3 : 0) + (hasExpectedDepth_ ? 1 : 0);
+        + (hasMotionVectors_ ? 3 : 0) + (hasExpectedDepth_ ? 1 : 0)
+        + (hasForegroundCoverage_ ? 2 : 0);
     std::vector<VkDescriptorSetLayoutBinding> computeBindings(numComputeBindings);
     for (uint32_t i = 0; i < numComputeBindings; ++i) {
         computeBindings[i] = {};
@@ -552,8 +555,10 @@ void SplatRenderer::createPipelines(VulkanContext& ctx, const std::string& shade
     vkCreateDescriptorSetLayout(device, &computeLayoutInfo, nullptr, &computeSetLayout_);
 
     // Render: 4 SSBOs (projected_centers, conics, colors, sorted_indices)
-    // + (motion_vectors) projected_mv + (expected_depth) projected_depth.
-    uint32_t numRenderBindings = 4 + (hasMotionVectors_ ? 1 : 0) + (hasExpectedDepth_ ? 1 : 0);
+    // + (motion_vectors) projected_mv + (expected_depth) projected_depth
+    // + (foreground_coverage) projected_foreground.
+    uint32_t numRenderBindings = 4 + (hasMotionVectors_ ? 1 : 0) + (hasExpectedDepth_ ? 1 : 0)
+        + (hasForegroundCoverage_ ? 1 : 0);
     std::vector<VkDescriptorSetLayoutBinding> renderBindings(numRenderBindings);
     for (uint32_t i = 0; i < numRenderBindings; ++i) {
         renderBindings[i] = {};
@@ -987,6 +992,26 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
         createVmaBuffer(ctx.allocator, numSplats_ * sizeof(float), ssbo,
                         VMA_MEMORY_USAGE_GPU_ONLY, projDepthBuffer_, projDepthAlloc_);
     }
+    if (hasForegroundCoverage_) {
+        // Input: one 0.0/1.0 value per splat, uploaded once at load time
+        // (gltf_loader.cpp already resolved the _FOREGROUND-attribute /
+        // morph-delta-fallback / all-zero precedence into data.foreground).
+        VkDeviceSize fgSize = numSplats_ * sizeof(float);
+        createVmaBuffer(ctx.allocator, fgSize, ssbo,
+                        VMA_MEMORY_USAGE_CPU_TO_GPU, foregroundBuffer_, foregroundAlloc_);
+        if (data.foreground.size() == numSplats_) {
+            uploadVmaBuffer(ctx.allocator, foregroundAlloc_, data.foreground.data(), fgSize);
+        } else {
+            // Should not happen (gltf_loader.cpp always sizes `foreground`
+            // to num_splats), but never leave uninitialized GPU memory.
+            void* mapped = nullptr;
+            vmaMapMemory(ctx.allocator, foregroundAlloc_, &mapped);
+            std::memset(mapped, 0, static_cast<size_t>(fgSize));
+            vmaUnmapMemory(ctx.allocator, foregroundAlloc_);
+        }
+        createVmaBuffer(ctx.allocator, numSplats_ * sizeof(float), ssbo,
+                        VMA_MEMORY_USAGE_GPU_ONLY, projForegroundBuffer_, projForegroundAlloc_);
+    }
 
     // Sort keys (buffer A, GPU only)
     createVmaBuffer(ctx.allocator, numSplats_ * sizeof(uint32_t), ssbo,
@@ -1103,9 +1128,14 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     if (hasExpectedDepth_) {
         writeSSBO(computeDescSet_, computeNextBinding++, projDepthBuffer_, numSplats_ * sizeof(float));
     }
+    if (hasForegroundCoverage_) {
+        writeSSBO(computeDescSet_, computeNextBinding++, foregroundBuffer_, numSplats_ * sizeof(float));
+        writeSSBO(computeDescSet_, computeNextBinding++, projForegroundBuffer_, numSplats_ * sizeof(float));
+    }
 
     // Render set: projected_centers(0), conics(1), colors(2), sorted_indices(3)
-    // + (motion_vectors) projected_mv + (expected_depth) projected_depth.
+    // + (motion_vectors) projected_mv + (expected_depth) projected_depth
+    // + (foreground_coverage) projected_foreground.
     writeSSBO(renderDescSet_, 0, projCenterBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(renderDescSet_, 1, projConicBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(renderDescSet_, 2, projColorBuffer_, numSplats_ * 4 * sizeof(float));
@@ -1116,6 +1146,9 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     }
     if (hasExpectedDepth_) {
         writeSSBO(renderDescSet_, renderNextBinding++, projDepthBuffer_, numSplats_ * sizeof(float));
+    }
+    if (hasForegroundCoverage_) {
+        writeSSBO(renderDescSet_, renderNextBinding++, projForegroundBuffer_, numSplats_ * sizeof(float));
     }
 
     // --- Sort descriptor sets ---
@@ -1424,9 +1457,11 @@ void SplatRenderer::init(VulkanContext& ctx, const GaussianSplatData& data,
     // once from the preprocess stage's reflection JSON.
     hasMotionVectors_ = readShaderBoolFlag(shaderBase, "motion_vectors");
     hasExpectedDepth_ = readShaderBoolFlag(shaderBase, "expected_depth");
+    hasForegroundCoverage_ = readShaderBoolFlag(shaderBase, "foreground_coverage");
     if (hasMotionVectors_ || hasExpectedDepth_) {
         std::cout << "[info] DLSS outputs enabled: motion_vectors=" << hasMotionVectors_
-                  << " expected_depth=" << hasExpectedDepth_ << std::endl;
+                  << " expected_depth=" << hasExpectedDepth_
+                  << " foreground_coverage=" << hasForegroundCoverage_ << std::endl;
     }
 
     createOffscreenTarget(ctx);
@@ -1615,6 +1650,37 @@ void SplatRenderer::setJitter(float jitterXPixels, float jitterYPixels) {
 // currently active segment's weighted deltas. Both dispatch sizes are
 // proportional to sparse counts, not numSplats_. See docs/lux-4d-spec.md
 // and SPECIFICATION.md 12.8.
+// Perf note (mobile-DLSS Android live-demo Stage 1 timing breakdown,
+// docs/rendering-engines.md): this used to unconditionally "reset" the
+// FULL concatenated morph_index array (every keyframe segment's sparse
+// entries, summed across the whole clip -- num_keyframes * segment_size,
+// e.g. 38 * 65,641 = 2.49M entries for the pruned juggle clip) on every
+// single call, then "apply" just the current segment (65,641 entries) --
+// i.e. ~38x more reset work than apply work, every frame, regardless of
+// which keyframe was active. Measured cost on Pixel 9 Pro XL / Mali-G715
+// (playground_android): ~13ms of the ~18ms "preprocess" GPU-timestamp
+// window (which spans dispatchMorph() + the actual per-splat projection
+// compute) was this reset pass -- the per-splat projection itself is only
+// ~0.3-0.5ms for 119,826 splats.
+//
+// The full-array reset is unnecessary: the "apply" shader (splat_expander.
+// py's _build_morph_apply_body) is NOT incremental -- it always computes
+// `splat_pos[idx] = splat_base_pos[idx] + weight_lo*delta_lo + weight_hi*
+// delta_hi` from the immutable base buffers, so any index the CURRENT
+// apply touches is fully overwritten regardless of what reset did to it.
+// Reset only matters for indices that are NOT touched by the current
+// segment but hold a stale value some EARLIER apply call wrote. By
+// induction, any such residue is always fully bounded to the single
+// segment applied by the immediately preceding dispatchMorph() call
+// (whether from render()'s per-frame playback, seedPreviousMorphTime()'s
+// one-shot seed, or stepKeyframe()'s UI jump) -- every prior call already
+// cleaned up ITS predecessor's residue the same way, so residue never
+// accumulates past one step back. Resetting exactly that one segment
+// (segmentCounts_[lastAppliedSegment_], not the whole concatenated array)
+// is therefore both correct and ~num_keyframes times cheaper; when the
+// segment doesn't change between calls (typical -- keyframes are sparser
+// than the render frame rate) it's skipped entirely, since apply already
+// overwrites the same indices a moment later.
 void SplatRenderer::dispatchMorph(VkCommandBuffer cmd, float timeSeconds) {
     if (!hasMotion()) return;
 
@@ -1634,21 +1700,27 @@ void SplatRenderer::dispatchMorph(VkCommandBuffer cmd, float timeSeconds) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, morphLayout_,
                             0, 1, &morphDescSet_, 0, nullptr);
 
-    if (morphTotalEntries_ > 0) {
-        MorphPush resetPush = {0, morphTotalEntries_, 0.0f, 0.0f};
-        vkCmdPushConstants(cmd, morphLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(resetPush), &resetPush);
-        uint32_t resetGroups = (morphTotalEntries_ + 255) / 256;
-        vkCmdDispatch(cmd, resetGroups, 1, 1);
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 1, &morphBarrier, 0, nullptr, 0, nullptr);
+    SplatMorphState state = evaluateSplatMorphState(dynamics_, timeSeconds);
+    bool hasActive = (state.weightLow != 0.0f || state.weightHigh != 0.0f) &&
+                      state.highTargetIndex >= 0 &&
+                      static_cast<size_t>(state.highTargetIndex) < segmentCounts_.size() &&
+                      segmentCounts_[state.highTargetIndex] > 0;
+    int curSeg = hasActive ? state.highTargetIndex : -1;
+
+    if (lastAppliedSegment_ >= 0 && lastAppliedSegment_ != curSeg) {
+        uint32_t seg = static_cast<uint32_t>(lastAppliedSegment_);
+        if (segmentCounts_[seg] > 0) {
+            MorphPush resetPush = {segmentOffsets_[seg], segmentCounts_[seg], 0.0f, 0.0f};
+            vkCmdPushConstants(cmd, morphLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(resetPush), &resetPush);
+            uint32_t resetGroups = (segmentCounts_[seg] + 255) / 256;
+            vkCmdDispatch(cmd, resetGroups, 1, 1);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &morphBarrier, 0, nullptr, 0, nullptr);
+        }
     }
 
-    SplatMorphState state = evaluateSplatMorphState(dynamics_, timeSeconds);
-    if ((state.weightLow != 0.0f || state.weightHigh != 0.0f) &&
-        state.highTargetIndex >= 0 &&
-        static_cast<size_t>(state.highTargetIndex) < segmentCounts_.size() &&
-        segmentCounts_[state.highTargetIndex] > 0) {
-        uint32_t seg = static_cast<uint32_t>(state.highTargetIndex);
+    if (hasActive) {
+        uint32_t seg = static_cast<uint32_t>(curSeg);
         MorphPush applyPush = {segmentOffsets_[seg], segmentCounts_[seg], state.weightLow, state.weightHigh};
         vkCmdPushConstants(cmd, morphLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(applyPush), &applyPush);
         uint32_t applyGroups = (segmentCounts_[seg] + 255) / 256;
@@ -1656,6 +1728,8 @@ void SplatRenderer::dispatchMorph(VkCommandBuffer cmd, float timeSeconds) {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &morphBarrier, 0, nullptr, 0, nullptr);
     }
+
+    lastAppliedSegment_ = curSeg;
 }
 
 // --------------------------------------------------------------------------
@@ -1663,21 +1737,36 @@ void SplatRenderer::dispatchMorph(VkCommandBuffer cmd, float timeSeconds) {
 // evaluation (docs/lux-4d-spec.md section 3's --time-prev/--frame-prev
 // follow-up)
 // --------------------------------------------------------------------------
-
+//
+// Needed ONLY on the very first frame (no render() call has happened yet
+// to establish "prev = last frame's current" via its own GPU ping-pong
+// copy -- see render()'s "carry history forward for the NEXT frame"
+// posBuffer_->prevPosBuffer_ copy below) or for an explicit one-shot
+// reseed, such as the headless CLI's --time-prev/--frame-prev flags
+// (called exactly once, before the first render()). Both of those cases
+// are characterized by firstMvFrame_ still being true when this is
+// called, which the guard below keys off. After the first render() call,
+// prevPosBuffer_ is ALREADY correctly refreshed every frame by render()'s
+// own copy (no extra command buffer) -- so a continuous per-frame caller
+// that (redundantly) calls this every frame alongside render()'s own
+// per-frame dispatchMorph(cmd, currentMorphTime_) now pays nothing beyond
+// the one-time first-frame cost, instead of an extra full blocking
+// beginSingleTimeCommands/endSingleTimeCommands GPU round trip on every
+// frame (the analogous fix to metal_splat_luxc_renderer.h's
+// seedPreviousMorphTime -- see its comment for the measured M1 iPad cost
+// of this same redundant-call pattern on that backend).
 void SplatRenderer::seedPreviousMorphTime(VulkanContext& ctx, float prevTimeSeconds) {
-    if (!hasMotion() || !hasMotionVectors_ || !prevPosOwned_) return;
+    if (!hasMotion() || !hasMotionVectors_ || !prevPosOwned_ || !firstMvFrame_) return;
 
-    // If the previous camera hasn't been explicitly seeded yet (i.e. no
+    // Previous camera hasn't been explicitly seeded yet (i.e. no
     // setPreviousCameraExplicit()/--camera-json-prev call happened before
-    // this one), default it to the CURRENT camera -- same "prev == curr"
+    // this one): default it to the CURRENT camera -- same "prev == curr"
     // convention render() itself uses on frame 1 -- so mv reflects pure
     // actor motion, not a spurious jump from an unset (identity) previous
     // camera. Call setPreviousCameraExplicit() *before* this one to get
     // real previous-camera motion too.
-    if (firstMvFrame_) {
-        prevViewMatrix_ = viewMatrix_;
-        prevProjMatrixUnjittered_ = projMatrixUnjittered_;
-    }
+    prevViewMatrix_ = viewMatrix_;
+    prevProjMatrixUnjittered_ = projMatrixUnjittered_;
 
     // Evaluate the morph at prevTimeSeconds into the working splat_pos
     // buffer (scratch space here -- render() unconditionally re-dispatches
@@ -2508,6 +2597,8 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     destroyVmaBuffer(ctx.allocator, projMvBuffer_, projMvAlloc_);
     destroyVmaBuffer(ctx.allocator, prevCameraBuffer_, prevCameraAlloc_);
     destroyVmaBuffer(ctx.allocator, projDepthBuffer_, projDepthAlloc_);
+    destroyVmaBuffer(ctx.allocator, foregroundBuffer_, foregroundAlloc_);
+    destroyVmaBuffer(ctx.allocator, projForegroundBuffer_, projForegroundAlloc_);
     if (prevPosOwned_) {
         destroyVmaBuffer(ctx.allocator, prevPosBuffer_, prevPosAlloc_);
     }
@@ -2565,6 +2656,7 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     expectedDepthImage_ = VK_NULL_HANDLE;
     hasMotionVectors_ = false;
     hasExpectedDepth_ = false;
+    hasForegroundCoverage_ = false;
     firstMvFrame_ = true;
     computePipeline_ = VK_NULL_HANDLE;
     renderPipeline_ = VK_NULL_HANDLE;

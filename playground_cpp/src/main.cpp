@@ -198,8 +198,8 @@ static void printUsage(const char* program) {
               << "  --frame <N>            Dynamic splats: animation frame index (extras.fps, else keyframe times)\n"
               << "  --jitter <JX> <JY>     Sub-pixel jitter in pixels, applied to the splat projection\n"
               << "                         matrix only (motion vectors always use unjittered matrices)\n"
-              << "  --output-aux <PREFIX>  Splats compiled with motion_vectors/expected_depth: write\n"
-              << "                         <PREFIX>_color.png, _depth.npy, _mv.npy + normalized PNG previews\n"
+              << "  --output-aux <PREFIX>  Splats compiled with motion_vectors/expected_depth/foreground_coverage: write\n"
+              << "                         <PREFIX>_color.png, _depth.npy, _mv.npy, _fg.npy + normalized PNG previews\n"
               << "  --camera-json <FILE>   Drive the splat camera from {viewmat_cv, K, width, height}\n"
               << "                         (OpenCV convention -- see docs/lux-4d-spec.md section 4)\n"
               << "  --camera-json-prev <FILE> Seed the motion-vector \"previous frame\" camera\n"
@@ -903,6 +903,20 @@ static int runHeadless(const CLIOptions& opts) {
                                                  {h, w});
                         DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png",
                                                            depth, w, h, 1);
+
+                        // foreground_coverage packs into out_depth's .g
+                        // channel (index 1), same alpha (.w) as depth --
+                        // see SPECIFICATION.md 12.8's foreground_coverage entry.
+                        if (splatR->hasForegroundCoverage()) {
+                            std::vector<float> fgPremul(static_cast<size_t>(w) * h);
+                            for (size_t i = 0; i < fgPremul.size(); ++i) {
+                                fgPremul[i] = rgba[i * 4 + 1];
+                            }
+                            auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, depthAlpha, w, h, 1);
+                            DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_fg.npy", fg, {h, w});
+                            DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_fg_preview.png",
+                                                               fg, w, h, 1);
+                        }
                     }
                     if (splatR->hasMotionVectors()) {
                         auto raw = Screenshot::readImageRaw(ctx, splatR->getMotionImage(), w, h, 16,
@@ -923,7 +937,9 @@ static int runHeadless(const CLIOptions& opts) {
                                                            mv, w, h, 2);
                     }
                     std::cout << "[info] Wrote aux dumps: " << opts.outputAuxPrefix
-                              << "_{color.png,color.npy,depth.npy,mv.npy,*_preview.png}" << std::endl;
+                              << "_{color.png,color.npy,depth.npy,mv.npy"
+                              << (splatR->hasForegroundCoverage() ? ",fg.npy" : "")
+                              << ",*_preview.png}" << std::endl;
                 } else {
                     std::cerr << "[warn] --output-aux given but this pipeline wasn't compiled with "
                                  "motion_vectors/expected_depth -- only _color.png/_color.npy were written."
