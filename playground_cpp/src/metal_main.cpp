@@ -283,12 +283,26 @@ struct CLIOptions {
     // proxy/reconstruction scene -- same one SplatView.mm's kSceneAssetName
     // loads) when left empty.
     std::string liveSceneSource;
+    // Overrides the exported/{texture.npy,unet_weights.*,memory_head.npz} bundle's directory
+    // independent of --live-assets-dir/--live-scene/--live-target-scene, so a different
+    // checkpoint's export (e.g. demo/ios_assets/exported_p0.99/) can be benchmarked against
+    // the SAME bg_sphere.npy + scene .glb layout under --live-assets-dir, without copying
+    // those in too. Defaults to "" (empty), meaning <liveAssetsDir>/exported.
+    std::string liveExportedDir;
     std::string livePipeline = "examples/gaussian_splat_dlss";
     // Default proxy/target resolution -- what --live-bench/--live-psnr use
     // when --width/--height are NOT given (see resolveLiveResolutions()).
     // Matches the net trained at 480x270 -> 960x540.
     uint32_t liveProxyW = 480, liveProxyH = 270;
     uint32_t liveTargetW = 960, liveTargetH = 540;
+    // Overrides MetalLiveReconstruct::InitParams::paramStride (default 2, matching the
+    // checkpoints exported so far) -- ps=1 checkpoints (e.g. expY_mem3_juggle_p0.9x/p1.0's
+    // full-res nets) need this set to 1 or NetInputAssembly derives the net resolution at
+    // the wrong stride for the exported unet_weights.* manifest (which carries its own
+    // paramStride, read separately by MetalUnetRunner -- see metal_unet_runner.cpp's
+    // ManifestHeader parse). Independent of --live-assets-dir/--live-exported-dir; the user
+    // must keep this in sync with the checkpoint's `config['param_stride']`.
+    uint32_t liveParamStride = 2;
 
     // --live-psnr <N>: N-frame continuous Reconstruction-vs-Target PSNR
     // gate (the Mac-side counterpart of playground_ios/Source/SplatView.mm's
@@ -346,6 +360,13 @@ static void printUsage(const char* program) {
               << "                         bg_sphere.npy + the scene .glb (default: ../mobiledlss/demo/ios_assets)\n"
               << "  --live-scene <PATH>    Override the --live-bench scene .glb (default: <assets-dir>/juggle_p0.8_stride4.glb)\n"
               << "  --live-pipeline <BASE> Override the --live-bench compiled splat pipeline (default: examples/gaussian_splat_dlss)\n"
+              << "  --live-exported-dir <DIR>  Override just the exported/ subdir (texture.npy/unet_weights.*/\n"
+              << "                         memory_head.npz) independent of --live-assets-dir, so a\n"
+              << "                         different checkpoint export can reuse the same bg_sphere.npy/\n"
+              << "                         scene .glb (default: <assets-dir>/exported)\n"
+              << "  --live-param-stride <N>  Net param_stride the exported checkpoint was trained/exported\n"
+              << "                         at (default: 2) -- must match the checkpoint config, e.g. 1 for\n"
+              << "                         expY_mem3_juggle_p0.9/p0.95/p0.99/p1.0\n"
               << "  --live-psnr <N>        N-frame continuous Reconstruction-vs-Target PSNR gate (Mac-side\n"
               << "                         counterpart of SplatView.mm's LUX_PSNR_FRAMES) -- verifies the\n"
               << "                         shared live-inference port numerically.\n"
@@ -484,6 +505,10 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.liveSceneSource = argv[++i];
         } else if (arg == "--live-pipeline" && i + 1 < argc) {
             opts.livePipeline = argv[++i];
+        } else if (arg == "--live-exported-dir" && i + 1 < argc) {
+            opts.liveExportedDir = argv[++i];
+        } else if (arg == "--live-param-stride" && i + 1 < argc) {
+            opts.liveParamStride = static_cast<uint32_t>(std::stoi(argv[++i]));
         } else if (arg == "--live-psnr" && i + 1 < argc) {
             opts.livePsnrFrames = std::stoi(argv[++i]);
         } else if (arg == "--live-target-scene" && i + 1 < argc) {
@@ -816,13 +841,15 @@ static int runLiveBenchMetal(const CLIOptions& opts) {
     params.proxyH = proxyH;
     params.targetW = targetW;
     params.targetH = targetH;
-    params.paramStride = 2;
+    params.paramStride = opts.liveParamStride;
     params.hiddenChannels = 8;
-    params.textureNpyPath = opts.liveAssetsDir + "/exported/texture.npy";
+    const std::string liveExportedDir =
+        opts.liveExportedDir.empty() ? (opts.liveAssetsDir + "/exported") : opts.liveExportedDir;
+    params.textureNpyPath = liveExportedDir + "/texture.npy";
     params.bgSphereNpyPath = opts.liveAssetsDir + "/bg_sphere.npy";
-    params.unetWeightsBinPath = opts.liveAssetsDir + "/exported/unet_weights.fp16.bin";
-    params.unetLayersTxtPath = opts.liveAssetsDir + "/exported/unet_weights.layers.txt";
-    params.memoryHeadNpzPath = opts.liveAssetsDir + "/exported/memory_head.npz";
+    params.unetWeightsBinPath = liveExportedDir + "/unet_weights.fp16.bin";
+    params.unetLayersTxtPath = liveExportedDir + "/unet_weights.layers.txt";
+    params.memoryHeadNpzPath = liveExportedDir + "/memory_head.npz";
     // (4, 2.0f) -- perf; bench/lux_perf_ablation.md's "Motion-aware
     // schedule" (see runLivePsnrMetal's identical comment and
     // MetalSplatLuxcRenderer::setSortSchedule()'s header for the full
@@ -1027,13 +1054,15 @@ static int runLivePsnrMetal(const CLIOptions& opts) {
     params.proxyH = proxyH;
     params.targetW = targetW;
     params.targetH = targetH;
-    params.paramStride = 2;
+    params.paramStride = opts.liveParamStride;
     params.hiddenChannels = 8;
-    params.textureNpyPath = opts.liveAssetsDir + "/exported/texture.npy";
+    const std::string liveExportedDir =
+        opts.liveExportedDir.empty() ? (opts.liveAssetsDir + "/exported") : opts.liveExportedDir;
+    params.textureNpyPath = liveExportedDir + "/texture.npy";
     params.bgSphereNpyPath = opts.liveAssetsDir + "/bg_sphere.npy";
-    params.unetWeightsBinPath = opts.liveAssetsDir + "/exported/unet_weights.fp16.bin";
-    params.unetLayersTxtPath = opts.liveAssetsDir + "/exported/unet_weights.layers.txt";
-    params.memoryHeadNpzPath = opts.liveAssetsDir + "/exported/memory_head.npz";
+    params.unetWeightsBinPath = liveExportedDir + "/unet_weights.fp16.bin";
+    params.unetLayersTxtPath = liveExportedDir + "/unet_weights.layers.txt";
+    params.memoryHeadNpzPath = liveExportedDir + "/memory_head.npz";
     // (4, 2.0f) -- perf; bench/lux_perf_ablation.md's "Motion-aware
     // schedule": this used to badly break reconstruction quality on this
     // DYNAMIC (actor-motion) scene -- periodic ~15dB collapses on 3 of
