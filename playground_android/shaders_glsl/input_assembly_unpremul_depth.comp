@@ -6,21 +6,28 @@
 // luxc -- see input_assembly.cpp's header comment).
 //
 // Un-premultiplies this frame's proxy-resolution expected-depth attachment
-// (SplatRenderer's out_depth: RGBA32_SFLOAT, x=depth*alpha, w=alpha -- see
-// splat_renderer.h's getExpectedDepthFormat comment) into a plain R32F
-// buffer. Written to one side of input_assembly.cpp's depth ping-pong pair
-// so next frame's disocclusion pass can read *this* frame's depth as
-// "previous".
+// (SplatRenderer's out_depth: RGBA32_SFLOAT, x=depth*alpha, y=fg*alpha
+// (foreground_coverage, same alpha as depth -- SPECIFICATION.md 12.8 /
+// splat_renderer.h's getExpectedDepthFormat comment / playground_cpp/src/
+// main.cpp's --output-aux _fg.npy path), z unused, w=alpha) into two plain
+// R32F buffers. Depth is written to one side of input_assembly.cpp's depth
+// ping-pong pair so next frame's disocclusion pass can read *this* frame's
+// depth as "previous"; fg has no history requirement (build_input pools
+// only the current frame's fg) so it is a single non-ping-ponged buffer.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer DepthRaw {
-    vec4 data[];  // x = depth*alpha, y/z unused, w = alpha
+    vec4 data[];  // x = depth*alpha, y = fg*alpha, z unused, w = alpha
 } depthRaw;
 
 layout(std430, binding = 1) writeonly buffer CurDepth {
     float data[];
 } curDepth;
+
+layout(std430, binding = 2) writeonly buffer CurFg {
+    float data[];
+} curFg;
 
 layout(push_constant) uniform PC {
     uint width;
@@ -34,5 +41,7 @@ void main() {
     vec4 raw = depthRaw.data[idx];
     float a = raw.w;
     float depth = (a > 1e-6) ? (raw.x / a) : 0.0;
+    float fg = (a > 1e-6) ? (raw.y / a) : 0.0;
     curDepth.data[idx] = depth;
+    curFg.data[idx] = fg;
 }

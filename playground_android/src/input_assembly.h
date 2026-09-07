@@ -54,12 +54,14 @@ public:
     uint32_t getChannels() const { return kNonHiddenChannels + hiddenChannels_; }
 
     // fg channel source (see NetInputAssembly.h's identical enum/comment):
-    // constant 0 (background) until lux's gaussian_splat_dlss ships a real
-    // per-pixel foreground_coverage output -- NEVER proxy alpha (measured on
-    // iOS to collapse the model 36.4->24.3dB). This Vulkan port has no
-    // alternate path at all yet (kFgSourceConstantZero is hardcoded in the
-    // .comp source), so this enum exists only to document the constraint
-    // for whoever wires foreground_coverage in later.
+    // NEVER proxy alpha -- measured on iOS to collapse the model
+    // 36.4->24.3dB (the net reads "alpha coverage" as "moving actor here,
+    // distrust history/memory" everywhere alpha>0, not just where the
+    // actor truly is). run() always requests kFgSourceExpectedDepthG now
+    // that gaussian_splat_dlss's foreground_coverage output is wired
+    // (unpremul_depth.comp's CurFg buffer, read via out_depth's .g channel
+    // -- see input_assembly.cpp/the .comp sources); kFgSourceConstantZero
+    // is kept only as the pre-foreground-coverage fallback value.
     enum FgSource : uint32_t { kFgSourceConstantZero = 0, kFgSourceExpectedDepthG = 1 };
 
     // Runs both passes for one frame: (1) un-premultiply this frame's proxy

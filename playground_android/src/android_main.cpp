@@ -656,6 +656,19 @@ void dumpProxyDebugFrame(VulkanContext& ctx, SplatRenderer* splatR, const std::s
         }
         auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
         DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_depth.npy", depth, {h, w});
+
+        // foreground_coverage packs into out_depth's .g channel (index 1),
+        // same alpha (.w) as depth -- see SPECIFICATION.md 12.8 /
+        // playground_cpp/src/main.cpp's --output-aux _fg.npy path (identical
+        // extraction, reused here for Stage-3 fg validation).
+        if (splatR->hasForegroundCoverage()) {
+            std::vector<float> fgPremul(static_cast<size_t>(w) * h);
+            for (size_t i = 0; i < fgPremul.size(); ++i) {
+                fgPremul[i] = rgba[i * 4 + 1];
+            }
+            auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, depthAlpha, w, h, 1);
+            DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_fg.npy", fg, {h, w});
+        }
     }
     if (splatR->hasMotionVectors()) {
         auto raw = readImageRawAndroid(ctx, splatR->getMotionImage(), w, h, 16,

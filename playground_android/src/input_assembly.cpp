@@ -166,6 +166,12 @@ struct InputAssembly::Impl {
     VmaAllocation aDepthPing[2]{};
     int depthPingIndex = 0;
 
+    // Current frame's un-premultiplied foreground coverage (out_depth's .g
+    // channel) -- no ping-pong needed, build_input pools only this frame's
+    // fg (see input_assembly_unpremul_depth.comp's header comment).
+    VkBuffer bFgCur = VK_NULL_HANDLE;
+    VmaAllocation aFgCur{};
+
     VkBuffer bTexture = VK_NULL_HANDLE;
     VmaAllocation aTexture{};
 
@@ -201,6 +207,7 @@ InputAssembly::~InputAssembly() {
         if (impl_->bDepthRaw) vmaDestroyBuffer(alloc, impl_->bDepthRaw, impl_->aDepthRaw);
         if (impl_->bDepthPing[0]) vmaDestroyBuffer(alloc, impl_->bDepthPing[0], impl_->aDepthPing[0]);
         if (impl_->bDepthPing[1]) vmaDestroyBuffer(alloc, impl_->bDepthPing[1], impl_->aDepthPing[1]);
+        if (impl_->bFgCur) vmaDestroyBuffer(alloc, impl_->bFgCur, impl_->aFgCur);
         if (impl_->bTexture) vmaDestroyBuffer(alloc, impl_->bTexture, impl_->aTexture);
         if (impl_->bZeroHidden) vmaDestroyBuffer(alloc, impl_->bZeroHidden, impl_->aZeroHidden);
         if (impl_->bOutput) vmaDestroyBuffer(alloc, impl_->bOutput, impl_->aOutput);
@@ -261,6 +268,9 @@ void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
     impl_->depthPingIndex = 0;
     firstFrame_ = true;
 
+    impl_->bFgCur = createBuffer(alloc, proxyN * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, impl_->aFgCur);
+    zeroBuffer(alloc, impl_->aFgCur, proxyN * sizeof(float));
+
     uint32_t channels = getChannels();
     const size_t hiddenN = static_cast<size_t>(netW_) * netH_ * hiddenChannels;
     impl_->bZeroHidden = createBuffer(alloc, std::max<size_t>(hiddenN, 1) * sizeof(float),
@@ -272,8 +282,8 @@ void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
     vmaMapMemory(alloc, impl_->aOutput, &impl_->mappedOutput);
 
     // --- pipelines ---
-    impl_->unpremulLayout = makeSetLayout(ctx.device, 2);
-    impl_->assembleLayout = makeSetLayout(ctx.device, 7);
+    impl_->unpremulLayout = makeSetLayout(ctx.device, 3);
+    impl_->assembleLayout = makeSetLayout(ctx.device, 8);
     impl_->unpremulPL = makePipelineLayout(ctx.device, impl_->unpremulLayout, sizeof(UnpremulPush));
     impl_->assemblePL = makePipelineLayout(ctx.device, impl_->assembleLayout, sizeof(AssemblePush));
     impl_->unpremulPipe = makeComputePipeline(ctx.device, impl_->unpremulPL,
@@ -281,7 +291,7 @@ void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
     impl_->assemblePipe = makeComputePipeline(ctx.device, impl_->assemblePL,
                                                shaderDir + "/input_assembly_assemble.comp.spv");
 
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 + 7};
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 + 8};
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 2;
     poolInfo.poolSizeCount = 1;
@@ -298,13 +308,13 @@ void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
     impl_->unpremulSet = sets[0];
     impl_->assembleSet = sets[1];
 
-    writeDescriptorSet(ctx.device, impl_->unpremulSet, {impl_->bDepthRaw, impl_->bDepthPing[0]});
+    writeDescriptorSet(ctx.device, impl_->unpremulSet, {impl_->bDepthRaw, impl_->bDepthPing[0], impl_->bFgCur});
     // assembleSet bindings 2/3 (curDepth/prevDepth) are rewritten per-frame
     // in run() (ping-pong swap) -- initial wiring here just needs valid
     // buffers bound so the descriptor set is complete from the start.
     writeDescriptorSet(ctx.device, impl_->assembleSet,
                         {impl_->bColorRaw, impl_->bMotionRaw, impl_->bDepthPing[0], impl_->bDepthPing[1],
-                         impl_->bTexture, impl_->bZeroHidden, impl_->bOutput});
+                         impl_->bTexture, impl_->bZeroHidden, impl_->bFgCur, impl_->bOutput});
 }
 
 void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage depthImage, VkImage motionImage,
@@ -321,8 +331,11 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage depthIma
     int curIdx = impl_->depthPingIndex;
     int prevIdx = 1 - curIdx;
 
-    // Pass 1: unpremultiply this frame's depth into the "current" ping side.
-    writeDescriptorSet(ctx.device, impl_->unpremulSet, {impl_->bDepthRaw, impl_->bDepthPing[curIdx]});
+    // Pass 1: unpremultiply this frame's depth into the "current" ping side,
+    // and this frame's foreground coverage (out_depth's .g channel) into
+    // bFgCur (no ping-pong -- see its declaration comment).
+    writeDescriptorSet(ctx.device, impl_->unpremulSet,
+                        {impl_->bDepthRaw, impl_->bDepthPing[curIdx], impl_->bFgCur});
     UnpremulPush upPush{proxyW, proxyH};
     uint32_t gx = (proxyW + 15) / 16, gy = (proxyH + 15) / 16;
     dispatchOne(ctx, impl_->unpremulPipe, impl_->unpremulPL, impl_->unpremulSet, &upPush, sizeof(upPush), gx, gy);
@@ -335,7 +348,7 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage depthIma
     }
     writeDescriptorSet(ctx.device, impl_->assembleSet,
                         {impl_->bColorRaw, impl_->bMotionRaw, impl_->bDepthPing[curIdx], impl_->bDepthPing[prevIdx],
-                         impl_->bTexture, hiddenBuf, impl_->bOutput});
+                         impl_->bTexture, hiddenBuf, impl_->bFgCur, impl_->bOutput});
 
     AssemblePush push{};
     push.eye[0] = eyeX; push.eye[1] = eyeY; push.eye[2] = eyeZ; push.eye[3] = 0;
@@ -347,7 +360,7 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage depthIma
     push.extra[0] = bgSphere_[3]; push.extra[1] = 1.0f / 16.0f; push.extra[2] = jitterProxyX; push.extra[3] = jitterProxyY;
     push.dims1[0] = proxyW; push.dims1[1] = proxyH; push.dims1[2] = netW_; push.dims1[3] = netH_;
     push.dims2[0] = paramStride_; push.dims2[1] = hiddenChannels_; push.dims2[2] = texW_; push.dims2[3] = texH_;
-    push.flags[0] = firstFrame_ ? 1u : 0u; push.flags[1] = texChannels_; push.flags[2] = kFgSourceConstantZero; push.flags[3] = 0;
+    push.flags[0] = firstFrame_ ? 1u : 0u; push.flags[1] = texChannels_; push.flags[2] = kFgSourceExpectedDepthG; push.flags[3] = 0;
 
     uint32_t ngx = (netW_ + 15) / 16, ngy = (netH_ + 15) / 16;
     dispatchOne(ctx, impl_->assemblePipe, impl_->assemblePL, impl_->assembleSet, &push, sizeof(push), ngx, ngy);

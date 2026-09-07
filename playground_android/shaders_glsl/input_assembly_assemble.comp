@@ -46,7 +46,11 @@ layout(std430, binding = 5) readonly buffer HiddenIn {
     float data[];  // NHWC, netW*netH*hiddenChannels (may be all-zero)
 } hiddenIn;
 
-layout(std430, binding = 6) writeonly buffer OutBuf {
+layout(std430, binding = 6) readonly buffer CurFg {
+    float data[];  // this frame's un-premultiplied proxy foreground coverage
+} curFg;
+
+layout(std430, binding = 7) writeonly buffer OutBuf {
     float data[];  // NHWC, netW*netH*(18+hiddenChannels)
 } outBuf;
 
@@ -157,9 +161,10 @@ void main() {
             vec3 rgb = unpremulColor(pidx);
             colorSum += rgb;
 
-            // fg: constant 0 until lux's foreground_coverage output lands
-            // (see input_assembly.h) -- fgSource is always 0 in this build.
-            float fgVal = (fgSource == 1u) ? 0.0 : 0.0;
+            // fg: real per-pixel foreground_coverage (see input_assembly.h's
+            // FgSource enum) -- NEVER proxy alpha (collapses the model,
+            // measured on iOS 36.4->24.3dB).
+            float fgVal = (fgSource == 1u) ? curFg.data[pidx] : 0.0;
             fgSum += fgVal;
 
             float depthVal = curDepth.data[pidx];

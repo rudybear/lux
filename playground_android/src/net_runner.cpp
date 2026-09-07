@@ -159,7 +159,7 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
     bufDepth_.resize(proxyN);
     bufMv_.resize(proxyN * 2);
     bufDisocc_.resize(proxyN);
-    bufFg_.assign(proxyN, 0.0f);
+    bufFg_.resize(proxyN);
     bufJitter_.resize(2);
     bufHidden_.resize(static_cast<size_t>(netW_) * netH_ * hiddenChannels_);
     bufTex_.resize(proxyN * texChannels_);
@@ -190,6 +190,7 @@ const float* NetRunner::run(const float* netTensor26ch, const float* hiddenInNet
                     bufMv_[pidx * 2 + 0] = px[kMvOff + 0] / kMvScale;
                     bufMv_[pidx * 2 + 1] = px[kMvOff + 1] / kMvScale;
                     bufDisocc_[pidx] = px[kDisoccOff];
+                    bufFg_[pidx] = px[kFgOff];
                     for (uint32_t c = 0; c < texChannels_; c++) {
                         bufTex_[pidx * texChannels_ + c] = px[kTexOff + c];
                     }
