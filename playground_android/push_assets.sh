@@ -61,5 +61,13 @@ push_one "$MOBILEDLSS_ROOT/demo/ios_assets/bg_sphere.npy" "assets/bg_sphere.npy"
 echo "=== pushing Stage 4 TFLite net (unet_ps2_mem.tflite, fp16) ==="
 push_one "$MOBILEDLSS_ROOT/demo/ios_assets/exported/unet_ps2_mem.tflite" "assets/unet_ps2_mem.tflite"
 
+echo "=== pushing Stage 5 memory-head weights (memory_head.npz, from expY_mem3_juggle_p0.8_ps2.pt) ==="
+push_one "$MOBILEDLSS_ROOT/demo/ios_assets/exported/memory_head.npz" "assets/memory_head.npz"
+
+echo "=== pushing examples/reconstruct_mem_ps2 compiled pipeline (Stage 5 live capture) ==="
+for ext in warp.comp.spv apply.comp.spv bguv.comp.spv memory.comp.spv blend.comp.spv; do
+    push_one "$LUX_ROOT/examples/reconstruct_mem_ps2.$ext" "examples/reconstruct_mem_ps2.$ext"
+done
+
 echo "done. Remote layout (internal files dir):"
 "$ADB" shell run-as "$PKG" find files -type f

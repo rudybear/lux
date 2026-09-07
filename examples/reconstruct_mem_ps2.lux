@@ -1,0 +1,31 @@
+// mobile-DLSS Android live demo Stage 5 (docs/rendering-engines.md):
+// scene-memory reconstruct pass (3-way blend) at param_stride: 2 -- the
+// combination examples/reconstruct_mem.lux (memory, param_stride: 1) and
+// examples/reconstruct_ps2.lux (param_stride: 2, no memory) each cover
+// separately, but this task's checkpoint (demo/ios_assets/
+// expY_mem3_juggle_p0.8_ps2.pt) needs both together: s=2, k=4,
+// param_stride=2, hidden=8, memory channels=8/hidden=16 (see
+// mobiledlss/train/export.py's loaded checkpoint config).
+//
+// Compile: python -m luxc examples/reconstruct_mem_ps2.lux
+//   -> reconstruct_mem_ps2.warp.comp.spv
+//   -> reconstruct_mem_ps2.apply.comp.spv
+//   -> reconstruct_mem_ps2.bguv.comp.spv
+//   -> reconstruct_mem_ps2.memory.comp.spv
+//   -> reconstruct_mem_ps2.blend.comp.spv
+
+reconstruct DlssReconstructMemPS2 {
+    s: 2,
+    k: 4,
+    param_stride: 2,
+    hidden: 8,
+    memory: {
+        channels: 8,
+        hidden: 16,
+    },
+}
+
+pipeline ReconstructMemPS2Pass {
+    mode: reconstruct,
+    reconstruct: DlssReconstructMemPS2,
+}

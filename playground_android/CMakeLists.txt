@@ -90,6 +90,7 @@ add_library(lux_android SHARED
     src/android_vulkan_context.cpp
     src/input_assembly.cpp
     src/net_runner.cpp
+    src/reconstruct_pass.cpp
 
     # --- Reused-by-reference lux Vulkan splat pipeline (playground_cpp/src) ---
     "${PGCPP}/src/splat_renderer.cpp"

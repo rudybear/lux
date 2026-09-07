@@ -45,6 +45,7 @@
 #include "android_vulkan_context.h"
 #include "input_assembly.h"
 #include "net_runner.h"
+#include "reconstruct_pass.h"
 
 #define LOG_TAG "lux_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -200,6 +201,24 @@ struct AppState {
     // (Stage 5 wires the recurrent hidden state + per-frame invocation).
     NetRunner netRunner;
     bool netRunnerReady = false;
+    // Recurrent hidden state (net-res, hiddenChannels) fed back frame to
+    // frame once the Stage 5 net-warmup window starts; empty == zero.
+    std::vector<float> hiddenState;
+
+    // Stage 5 (docs/rendering-engines.md): live reconstruct-with-memory
+    // validation against the REAL juggle scene (not the synthetic clip
+    // Stage 5's runReconstructDump() startup pass above already validated
+    // bit-for-bit). kNetWarmupStart..kReconWindowStart gives the recurrent
+    // hidden state 16 frames to leave its zero-initial condition before the
+    // 16-frame capture window [kReconWindowStart, +kReconWindowFrames)
+    // that's actually dumped and reconstructed/compared -- both ranges stay
+    // inside the auto-cycle's first Proxy segment (frames [0,180), see
+    // DemoMode's kModeSwitchFrames) so `isProxy` is guaranteed true
+    // throughout without touching the display auto-cycle at all.
+    static constexpr int kNetWarmupStart = 34;
+    static constexpr int kReconWindowStart = 50;
+    static constexpr int kReconWindowFrames = 16;
+    bool stage5Done = false;
 
     DemoMode mode = DemoMode::Proxy;
     // Auto-cycle Proxy/Target every kModeSwitchFrames frames so a single run
@@ -316,6 +335,38 @@ void initRenderer(AppState* state) {
             state->netRunnerReady = false;
         }
 
+        // Stage 5 validation: runs playground_cpp/src/reconstruct_runner.cpp's
+        // runReconstructDump() -- reused BY REFERENCE, unmodified, exactly
+        // as docs/rendering-engines.md's Stage 5 plan allows -- once at
+        // startup, against a 16-frame synthetic dump (mobiledlss/tools/
+        // reconstruct_reference_dump.py --checkpoint expY_mem3_juggle_p0.8_ps2.pt
+        // --memory --net-h 136 --net-w 240 --frames 16) pushed onto the
+        // device by push_assets.sh, using the new examples/
+        // reconstruct_mem_ps2 pipeline (s=2 k=4 param_stride=2 hidden=8
+        // memory channels=8/hidden=16 -- this checkpoint's exact config,
+        // which neither examples/reconstruct_mem.lux [ps=1] nor
+        // examples/reconstruct_ps2.lux [no memory] alone covers). Desktop
+        // (`playground_cpp/build/lux-playground --reconstruct-dump`) was
+        // already checked bit-for-bit against mobiledlss.train.reconstruct
+        // (max|diff| ~4e-5 over all 16 frames/hidden state, docs/
+        // rendering-engines.md's commit for this stage has the full table)
+        // -- this on-device run re-validates the identical SPIR-V pipeline
+        // on the Mali-G715 itself.
+        {
+            std::string reconDumpDir = base + "/recon_dump";
+            std::string reconOutDir = base + "/recon_out";
+            struct stat st{};
+            if (stat(reconDumpDir.c_str(), &st) == 0) {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                int rc = runReconstructDump(state->ctx, reconDumpDir, reconOutDir,
+                                             base + "/examples/reconstruct_mem_ps2");
+                double ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+                LOGI("Stage5 runReconstructDump: rc=%d elapsed=%.1fms out=%s", rc, ms, reconOutDir.c_str());
+            } else {
+                LOGI("Stage5: %s not found on device, skipping runReconstructDump validation pass", reconDumpDir.c_str());
+            }
+        }
+
         // NOTE: deliberately NOT using scene.getAutoTarget()/getAutoEye()
         // here -- SceneManager::computeAutoCamera frames the WHOLE scene's
         // bounding box (person + the ~2.5-3.2-unit PanopticSports dome
@@ -345,6 +396,73 @@ void initRenderer(AppState* state) {
 // Stage 1 helper: milliseconds between two high_resolution_clock points.
 inline double msSince(std::chrono::high_resolution_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+}
+
+// --------------------------------------------------------------------------
+// Stage 5 helpers: live reconstruct-with-memory validation against the real
+// juggle scene (docs/rendering-engines.md). Writes a mobiledlss/tools/
+// reconstruct_reference_dump.py-shaped directory from ACTUAL on-device
+// render/InputAssembly/NetRunner output over kReconWindowFrames consecutive
+// orbit frames, then replays it once through reconstruct_pass.h's
+// runReconstructDump() (same reused-by-reference code already bit-for-bit
+// validated against mobiledlss.train.reconstruct on the synthetic dump at
+// startup -- see initRenderer()'s comment).
+// --------------------------------------------------------------------------
+
+// Replicate-pads [h,w,c] -> [targetH,w,c] by repeating the last row (proxy
+// 270 -> 272 rows, matching netH*paramStride -- the same "135->136" pad
+// convention InputAssembly's own subtap clamp applies internally, just
+// materialized here as real padded rows since reconstruct_pass.h's
+// runReconstructDump reads proxy_color/mv_proxy straight off disk at the
+// meta.json-declared padded proxy resolution).
+std::vector<float> padRowsReplicate(const std::vector<float>& src, uint32_t h, uint32_t w, uint32_t c, uint32_t targetH) {
+    std::vector<float> out(static_cast<size_t>(targetH) * w * c);
+    for (uint32_t y = 0; y < targetH; y++) {
+        uint32_t srcY = std::min(y, h - 1);
+        std::memcpy(out.data() + static_cast<size_t>(y) * w * c,
+                    src.data() + static_cast<size_t>(srcY) * w * c, static_cast<size_t>(w) * c * sizeof(float));
+    }
+    return out;
+}
+
+void writeMetaJson(const std::string& path, int s, int k, int paramStride, int hidden,
+                    int proxyW, int proxyH, int targetW, int targetH, int netW, int netH, int numFrames,
+                    int memChannels, int memHidden, int texW, int texH) {
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) {
+        LOGE("writeMetaJson: failed to open %s", path.c_str());
+        return;
+    }
+    fprintf(f,
+            "{\"s\":%d,\"k\":%d,\"param_stride\":%d,\"hidden\":%d,\"proxy_w\":%d,\"proxy_h\":%d,"
+            "\"target_w\":%d,\"target_h\":%d,\"net_w\":%d,\"net_h\":%d,\"num_frames\":%d,"
+            "\"memory_channels\":%d,\"memory_hidden\":%d,\"tex_w\":%d,\"tex_h\":%d}\n",
+            s, k, paramStride, hidden, proxyW, proxyH, targetW, targetH, netW, netH, numFrames,
+            memChannels, memHidden, texW, texH);
+    fclose(f);
+}
+
+// Copies a small static asset file (bg_sphere.npy / texture.npy /
+// memory_head.npz) into the live dump directory, once, so runReconstructDump
+// finds everything it needs (bg_sphere.npy/texture.npy/memory_head.npz)
+// alongside the per-frame files in the SAME directory.
+void copyFile(const std::string& src, const std::string& dst) {
+    FILE* in = fopen(src.c_str(), "rb");
+    if (!in) {
+        LOGE("copyFile: failed to open src %s", src.c_str());
+        return;
+    }
+    FILE* out = fopen(dst.c_str(), "wb");
+    if (!out) {
+        LOGE("copyFile: failed to open dst %s", dst.c_str());
+        fclose(in);
+        return;
+    }
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, out);
+    fclose(in);
+    fclose(out);
 }
 
 // --------------------------------------------------------------------------
@@ -454,6 +572,43 @@ void dumpProxyDebugFrame(VulkanContext& ctx, SplatRenderer* splatR, const std::s
     LOGI("DUMP done: %s/android_%s_{color,depth,mv}.npy", outDir.c_str(), tag.c_str());
 }
 
+// Stage 5: un-premultiplied RGB color only, at whatever resolution splatR
+// currently renders (used both for proxy_color_f{t}.npy at proxy res and
+// the Target-render ground truth at target res -- see the header comment
+// above writeMetaJson()). DlssIO::convertRgba16fColorAttachment already
+// returns un-premultiplied RGBA (see dumpProxyDebugFrame's identical call),
+// so only the alpha channel needs dropping here.
+std::vector<float> readColorRgb(VulkanContext& ctx, SplatRenderer* splatR) {
+    uint32_t w = splatR->getWidth(), h = splatR->getHeight();
+    auto rawColor = readImageRawAndroid(ctx, splatR->getOutputImage(), w, h, 8, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    std::vector<uint8_t> unusedRgba8;
+    auto colorF32 = DlssIO::convertRgba16fColorAttachment(rawColor, w, h, unusedRgba8);  // [h,w,4]
+    std::vector<float> rgb(static_cast<size_t>(w) * h * 3);
+    for (size_t i = 0; i < static_cast<size_t>(w) * h; i++) {
+        rgb[i * 3 + 0] = colorF32[i * 4 + 0];
+        rgb[i * 3 + 1] = colorF32[i * 4 + 1];
+        rgb[i * 3 + 2] = colorF32[i * 4 + 2];
+    }
+    return rgb;
+}
+
+// Stage 5: proxy_h,proxy_w-resolution un-premultiplied MV (backward, jitter
+// -free -- SplatRenderer's out_motion is always jitter-free by construction,
+// see setJitter()'s header comment), matching mv_proxy_f{t}.npy's contract.
+std::vector<float> readMvProxy(VulkanContext& ctx, SplatRenderer* splatR) {
+    uint32_t w = splatR->getWidth(), h = splatR->getHeight();
+    auto raw = readImageRawAndroid(ctx, splatR->getMotionImage(), w, h, 16, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
+    memcpy(rgba.data(), raw.data(), raw.size());
+    std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2), mvAlpha(static_cast<size_t>(w) * h);
+    for (size_t i = 0; i < mvAlpha.size(); ++i) {
+        mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
+        mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
+        mvAlpha[i] = rgba[i * 4 + 3];
+    }
+    return DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
+}
+
 void renderFrame(AppState* state) {
     if (!state->vulkanReady) return;
     VulkanContext& ctx = state->ctx;
@@ -516,8 +671,11 @@ void renderFrame(AppState* state) {
     // vectors -- see setJitter()'s header comment). Target mode is never
     // jittered (setJitter defaults to 0,0 and is never called on it).
     float jitterPxX = 0.0f, jitterPxY = 0.0f;
+    float jitterTargetX = 0.0f, jitterTargetY = 0.0f;  // Stage 5: reconstruct-spec's jitter, target px
     if (isProxy) {
         glm::vec2 jTarget = taaJitterTargetPixels(state->frameCounter);
+        jitterTargetX = jTarget.x;
+        jitterTargetY = jTarget.y;
         float scale = static_cast<float>(kProxyWidth) / static_cast<float>(kWidth);  // 0.5
         jitterPxX = jTarget.x * scale;
         jitterPxY = jTarget.y * scale;
@@ -549,6 +707,130 @@ void renderFrame(AppState* state) {
                                   frame.uAxis.x, frame.uAxis.y, frame.uAxis.z,
                                   frame.fAxis.x, frame.fAxis.y, frame.fAxis.z,
                                   frame.fx, frame.fy, cx, cy, jitterPxX, jitterPxY);
+    }
+
+    // --- Stage 5: net inference with recurrent hidden feedback + live
+    // reconstruct-with-memory capture (docs/rendering-engines.md). Runs the
+    // net every proxy frame from kNetWarmupStart on (letting the zero-
+    // initial hidden state settle for kReconWindowStart-kNetWarmupStart
+    // frames before anything is dumped), and writes one
+    // reconstruct_reference_dump.py-shaped frame per proxy frame during
+    // [kReconWindowStart, +kReconWindowFrames) -- see the AppState field
+    // comments. Runs unconditionally within that range regardless of
+    // `state->mode` being Proxy (guaranteed true there, see the comment),
+    // but the Target-render ground-truth capture below is independent of
+    // the display auto-cycle entirely (renders scene.getSplatRenderer()
+    // on-demand at the SAME orbit frame index, whatever `state->mode`
+    // currently is).
+    if (isProxy && state->netRunnerReady && state->frameCounter >= AppState::kNetWarmupStart &&
+        state->frameCounter < AppState::kReconWindowStart + AppState::kReconWindowFrames) {
+        NetRunner::RunTimingsMs t{};
+        const float* hiddenPtr = state->hiddenState.empty() ? nullptr : state->hiddenState.data();
+        const float* out = state->netRunner.run(state->inputAssembly.getOutputHostPtr(), hiddenPtr, t);
+        uint32_t netW = state->inputAssembly.getNetW(), netH = state->inputAssembly.getNetH();
+        uint32_t outCh = state->netRunner.getOutputChannels();
+        uint32_t hiddenCh = AppState::kHiddenChannels;
+
+        // Carry hidden_raw (the LAST hiddenCh channels of the packed output)
+        // forward as next frame's hidden_in.
+        state->hiddenState.assign(static_cast<size_t>(netW) * netH * hiddenCh, 0.0f);
+        for (size_t p = 0; p < static_cast<size_t>(netW) * netH; p++) {
+            memcpy(&state->hiddenState[p * hiddenCh], &out[p * outCh + (outCh - hiddenCh)], hiddenCh * sizeof(float));
+        }
+
+        int t0 = AppState::kReconWindowStart;
+        int idx = state->frameCounter - t0;
+        if (idx >= 0 && idx < AppState::kReconWindowFrames) {
+            std::string dumpDir = basePath(state) + "/live_recon_dump";
+            if (idx == 0) {
+                mkdir(dumpDir.c_str(), 0755);
+                copyFile(basePath(state) + "/assets/bg_sphere.npy", dumpDir + "/bg_sphere.npy");
+                copyFile(basePath(state) + "/assets/texture.npy", dumpDir + "/texture.npy");
+                copyFile(basePath(state) + "/assets/memory_head.npz", dumpDir + "/memory_head.npz");
+                // proxy padded to netH*paramStride (272), matching the
+                // "135->136"-style replicate pad InputAssembly applies
+                // internally (see padRowsReplicate's comment).
+                writeMetaJson(dumpDir + "/meta.json", /*s=*/2, /*k=*/4, AppState::kParamStride, hiddenCh,
+                              kProxyWidth, netH * AppState::kParamStride, kWidth, netH * AppState::kParamStride * 2,
+                              netW, netH, AppState::kReconWindowFrames, AppState::kTexChannels,
+                              /*memHidden=*/16, /*texW=*/512, /*texH=*/256);
+            }
+            std::string suf = "_f" + std::to_string(idx) + ".npy";
+
+            uint32_t paddedProxyH = netH * AppState::kParamStride;
+            auto colorProxy = readColorRgb(ctx, splatR);  // [proxyH,proxyW,3] @ true 270 rows
+            auto colorPadded = padRowsReplicate(colorProxy, kProxyHeight, kProxyWidth, 3, paddedProxyH);
+            DlssIO::writeNpyFloat32(dumpDir + "/proxy_color" + suf, colorPadded, {paddedProxyH, kProxyWidth, 3});
+
+            auto mvProxy = readMvProxy(ctx, splatR);
+            auto mvPadded = padRowsReplicate(mvProxy, kProxyHeight, kProxyWidth, 2, paddedProxyH);
+            DlssIO::writeNpyFloat32(dumpDir + "/mv_proxy" + suf, mvPadded, {paddedProxyH, kProxyWidth, 2});
+
+            std::vector<float> jitterArr = {jitterTargetX, jitterTargetY};
+            DlssIO::writeNpyFloat32(dumpDir + "/jitter" + suf, jitterArr, {2});
+
+            std::vector<float> packed(out, out + static_cast<size_t>(netW) * netH * outCh);
+            DlssIO::writeNpyFloat32(dumpDir + "/packed_params" + suf, packed, {netH, netW, outCh});
+
+            // disocc at target res: nearest-upsample the net-res disocc
+            // channel (Stage 3's InputAssembly tensor, channel 6) by
+            // s*param_stride=4 -- see the header comment above
+            // writeMetaJson() re: this approximation vs. the iOS reference's
+            // proxy-res version.
+            uint32_t targetW = kWidth, targetH = paddedProxyH * 2;
+            const float* netTensor = state->inputAssembly.getOutputHostPtr();
+            uint32_t ch26 = state->inputAssembly.getChannels();
+            std::vector<float> disoccTarget(static_cast<size_t>(targetW) * targetH);
+            uint32_t upFactor = AppState::kParamStride * 2;  // s * param_stride
+            for (uint32_t y = 0; y < targetH; y++) {
+                uint32_t gy = std::min(y / upFactor, netH - 1);
+                for (uint32_t x = 0; x < targetW; x++) {
+                    uint32_t gx = std::min(x / upFactor, netW - 1);
+                    disoccTarget[static_cast<size_t>(y) * targetW + x] = netTensor[(static_cast<size_t>(gy) * netW + gx) * ch26 + 6];
+                }
+            }
+            DlssIO::writeNpyFloat32(dumpDir + "/disocc" + suf, disoccTarget, {targetH, targetW});
+
+            // k_params/cam_to_world at the reconstruct pass's OWN target
+            // resolution (960x544, from padding -- see writeMetaJson's
+            // header comment), a separate camera evaluation from the
+            // displayed Target renderer's own 960x540 camera (computeOrbitFrame
+            // is a pure function of (frameIndex,width,height); only height differs).
+            OrbitFrame reconTargetFrame = computeOrbitFrame(static_cast<float>(state->frameCounter), targetW, targetH);
+            std::vector<float> kParams = {reconTargetFrame.fx, reconTargetFrame.fy,
+                                           targetW * 0.5f, targetH * 0.5f};
+            DlssIO::writeNpyFloat32(dumpDir + "/k_params" + suf, kParams, {4});
+
+            std::vector<float> camToWorld(16, 0.0f);
+            camToWorld[0] = reconTargetFrame.rAxis.x; camToWorld[1] = reconTargetFrame.uAxis.x; camToWorld[2] = reconTargetFrame.fAxis.x; camToWorld[3] = reconTargetFrame.eye.x;
+            camToWorld[4] = reconTargetFrame.rAxis.y; camToWorld[5] = reconTargetFrame.uAxis.y; camToWorld[6] = reconTargetFrame.fAxis.y; camToWorld[7] = reconTargetFrame.eye.y;
+            camToWorld[8] = reconTargetFrame.rAxis.z; camToWorld[9] = reconTargetFrame.uAxis.z; camToWorld[10] = reconTargetFrame.fAxis.z; camToWorld[11] = reconTargetFrame.eye.z;
+            camToWorld[15] = 1.0f;
+            DlssIO::writeNpyFloat32(dumpDir + "/cam_to_world" + suf, camToWorld, {4, 4});
+
+            // Ground-truth Target render at the SAME orbit frame index, for
+            // the PSNR comparison -- independent of state->mode/the display
+            // auto-cycle (a direct render() call on the Target SplatRenderer
+            // instance, not a mode switch).
+            SplatRenderer* targetR = state->scene.getSplatRenderer();
+            OrbitFrame targetFrame = computeOrbitFrame(static_cast<float>(state->frameCounter), kWidth, kHeight);
+            targetR->updateCameraExplicit(targetFrame.eye, targetFrame.viewGl, targetFrame.proj, targetFrame.fx, targetFrame.fy);
+            if (targetR->hasMotion()) targetR->setMorphTime(morphT);
+            targetR->render(ctx);
+            auto targetColor = readColorRgb(ctx, targetR);  // [540,960,3]
+            DlssIO::writeNpyFloat32(dumpDir + "/target_color" + suf, targetColor, {kHeight, kWidth, 3});
+
+            LOGI("Stage5 capture frame %d/%d (app frame %d)", idx + 1, AppState::kReconWindowFrames, state->frameCounter);
+
+            if (idx == AppState::kReconWindowFrames - 1 && !state->stage5Done) {
+                state->stage5Done = true;
+                std::string outDir = basePath(state) + "/live_recon_out";
+                auto tRecon = std::chrono::high_resolution_clock::now();
+                int rc = runReconstructDump(ctx, dumpDir, outDir, basePath(state) + "/examples/reconstruct_mem_ps2");
+                double reconMs = msSince(tRecon);
+                LOGI("Stage5 LIVE runReconstructDump: rc=%d elapsed=%.1fms out=%s", rc, reconMs, outDir.c_str());
+            }
+        }
     }
 
     // --- Stage 2 validation dump: one fixed proxy frame, diffed against

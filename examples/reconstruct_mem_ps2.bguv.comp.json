@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "source": "reconstruct_mem_ps2.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "bguv_out",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "push",
+      "fields": [
+        {
+          "name": "width",
+          "type": "uint",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "height",
+          "type": "uint",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "k_params",
+          "type": "vec4",
+          "offset": 16,
+          "size": 16
+        },
+        {
+          "name": "cam_to_world",
+          "type": "mat4",
+          "offset": 32,
+          "size": 64
+        },
+        {
+          "name": "bg_sphere",
+          "type": "vec4",
+          "offset": 96,
+          "size": 16
+        }
+      ],
+      "size": 112,
+      "stage_flags": [
+        "compute"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      256,
+      1,
+      1
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 173,
+    "alu_ops": 29,
+    "texture_samples": 0,
+    "branches": 1,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}
