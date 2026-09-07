@@ -452,6 +452,19 @@ static std::vector<float> readTextureAsFloats(MetalContext &ctx, MTL::Texture *t
         // of the old hand-written CPU-sorted path's wrong ordering.
         _splatRTarget = std::make_unique<ProxyRenderer>();
         _splatRTarget->init(_ctx, _sceneTarget.getSplatData(), "examples/gaussian_splat_dlss", kTargetW, kTargetH);
+        // Perf (bench/lux_perf_ablation.md in mobiledlss, Mac M4 Max Metal
+        // parity session): this continuous per-frame rendering loop was
+        // paying the full GPU radix sort every single frame -- measured as
+        // the entire remaining gap vs. MetalSplatter on the desktop Metal
+        // CLI (~1.87ms/frame, flat, regardless of resolution/scene).
+        // setSortSchedule(4, 2.0f) (re-sort every 4th frame OR >=2deg
+        // camera-view rotation since the last real sort, whichever first)
+        // amortizes this to near-zero on typical orbit/viewing motion with
+        // ZERO measured pixel difference at realistic rotation rates (see
+        // the ablation doc's bit-exact PNG-diff verification) -- default
+        // behavior (unconditional every-frame sort) is unchanged for every
+        // other caller (headless CLI, tests).
+        _splatRTarget->setSortSchedule(4, 2.0f);
 
         // B1: a second renderer instance dedicated to the proxy-res (480x270)
         // DLSS-attachment pass -- ProxyRenderer::init() fixes its offscreen
@@ -463,6 +476,9 @@ static std::vector<float> readTextureAsFloats(MetalContext &ctx, MTL::Texture *t
         // parity comparison in commit 08cfe8e.
         _splatRProxy = std::make_unique<ProxyRenderer>();
         _splatRProxy->init(_ctx, _scene.getSplatData(), "examples/gaussian_splat_dlss", kProxyW, kProxyH);
+        // Perf: same sort-scheduling amortization as _splatRTarget above --
+        // see that call site's comment.
+        _splatRProxy->setSortSchedule(4, 2.0f);
 
         // B2: net input assembly (bg-sphere UV + texture sample + disocclusion
         // + box-pool). texture.npy/bg_sphere.npy exported by
