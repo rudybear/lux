@@ -762,9 +762,11 @@ StagingBuf& getOrCreateStaging(VulkanContext& ctx, VkImage image, VkDeviceSize i
 // Records image->staging-buffer barrier+copy into an ALREADY-OPEN command
 // buffer (no begin/end/submit of its own) -- lets callers batch several
 // image reads into ONE beginSingleTimeCommands/endSingleTimeCommands pair
-// (see readColorAndMvProxyCombined below), since endSingleTimeCommands is a
-// full vkQueueWaitIdle (see android_vulkan_context.cpp) that's otherwise
-// paid once per image read.
+// (used by dumpProxyDebugFrame's multi-attachment dump below; the
+// Reconstruction-mode live per-frame path no longer needs a readback of
+// its own at all -- see unpremultiplyColorAndMvFromInputAssembly), since
+// endSingleTimeCommands is a full vkQueueWaitIdle (see
+// android_vulkan_context.cpp) that's otherwise paid once per image read.
 void recordImageToStagingCopy(VkCommandBuffer cmd, VkImage image, uint32_t width, uint32_t height,
                                VkBuffer dstBuffer, VkImageLayout currentLayout) {
     if (currentLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
@@ -954,46 +956,55 @@ std::vector<float> readMvProxy(VulkanContext& ctx, SplatRenderer* splatR) {
     return DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
 }
 
-// Task 4 (docs/rendering-engines.md, remove the readback stalls/copies
-// where cheap): readColorRgb()+readMvProxy() combined into ONE
-// beginSingleTimeCommands/endSingleTimeCommands pair (see
-// recordImageToStagingCopy's comment -- endSingleTimeCommands is a full
-// vkQueueWaitIdle, otherwise paid twice per displayed Reconstruction-mode
-// frame here, once per image). Same conversions as those two functions,
-// applied to both images' raw bytes after the single combined copy+wait.
-// Used by runReconstructionModeFrame's per-frame dump_write step; the
-// separate readColorRgb()/readMvProxy() stay as-is for the one-shot Stage 5
-// debug dump path (dumpProxyDebugFrame, not latency-sensitive).
-void readColorAndMvProxyCombined(VulkanContext& ctx, SplatRenderer* splatR,
-                                  std::vector<float>* outColorRgb, std::vector<float>* outMv) {
-    uint32_t w = splatR->getWidth(), h = splatR->getHeight();
-    bool auxIsHalf = (splatR->getAuxFormat() == VK_FORMAT_R16G16B16A16_SFLOAT);
-    uint32_t auxBpp = auxIsHalf ? 8 : 16;
+// GPU-pipelining task (docs/rendering-engines.md, "restructure the
+// Reconstruction frame into a GPU-pipelined chain"): supersedes the old
+// readColorAndMvProxyCombined(), which paid its OWN separate
+// beginSingleTimeCommands/endSingleTimeCommands round trip (2x
+// copyImageToBuffer + one vkQueueWaitIdle) to read back the exact same
+// splatR->getOutputImage()/getAuxImage() bytes InputAssembly::run() ALSO
+// reads back into its own bColorRaw/bAuxRaw buffers, moments earlier the
+// same frame -- a real, redundant GPU copy of identical data, once per
+// displayed Reconstruction-mode frame. `ia` must be the SAME InputAssembly
+// instance whose run() already executed this frame (guaranteed by
+// runReconstructionModeFrame's call order) -- its getRawColorHostPtr()/
+// getRawAuxHostPtr() are the persistently-mapped, already-host-coherent
+// destination buffers of that run()'s own copyImageToBuffer work, so
+// reading them here costs no extra GPU work/submit/wait. Conversion math
+// below is copied verbatim from the old function (same DlssIO::
+// convertRgba16fColorAttachment/unpremultiplyByAlpha calls, same channel
+// layout) -- only the byte SOURCE changed, so output is unchanged.
+//
+// IMPORTANT (measured regression, fixed here): bColorRaw/bAuxRaw are
+// VMA_MEMORY_USAGE_CPU_TO_GPU (input_assembly.cpp's createBuffer -- sized
+// for the GPU compute shaders that are their PRIMARY reader), which on
+// this UMA device's VMA allocator is host-visible but NOT necessarily
+// host-CACHED (optimized for CPU-write/GPU-read, the opposite traffic
+// direction from what this function does) -- unlike the old
+// getOrCreateStaging() buffers (VMA_MEMORY_USAGE_CPU_ONLY, cached).
+// Reading auxIsHalf's per-pixel half-floats directly out of such memory
+// with a tight little-endian memcpy(&half, rawAux+i*2, 2) loop (one
+// 2-byte transaction per pixel against uncached/write-combined memory)
+// measured 3-4x SLOWER than the old GPU-copy-then-cached-read path despite
+// doing strictly less work (RECON_TIMING's dump_write ~60-80ms vs. the old
+// ~17-25ms) -- an A/B rebuild+redeploy against the pre-merge baseline
+// confirmed it, not a guess. Fix: bulk `memcpy` rawAux into a normal
+// heap-allocated std::vector ONCE (one sequential scan pays the
+// uncached-read cost, same as the color path already did via
+// rawColorVec below and the old code's own staging-buffer->std::vector
+// memcpy), then do all the tight per-pixel conversion work against that
+// cached copy instead of the raw pointer.
+void unpremultiplyColorAndMvFromInputAssembly(InputAssembly& ia, uint32_t w, uint32_t h,
+                                               std::vector<float>* outColorRgb, std::vector<float>* outMv) {
+    bool auxIsHalf = ia.isAuxHalf();
     VkDeviceSize colorSize = static_cast<VkDeviceSize>(w) * h * 8;  // color attachment is always RGBA16F
-    VkDeviceSize auxSize = static_cast<VkDeviceSize>(w) * h * auxBpp;
-
-    StagingBuf& colorStaging = getOrCreateStaging(ctx, splatR->getOutputImage(), colorSize);
-    StagingBuf& auxStaging = getOrCreateStaging(ctx, splatR->getAuxImage(), auxSize);
-
-    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
-    recordImageToStagingCopy(cmd, splatR->getOutputImage(), w, h, colorStaging.buffer,
-                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    recordImageToStagingCopy(cmd, splatR->getAuxImage(), w, h, auxStaging.buffer,
-                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    ctx.endSingleTimeCommands(cmd);
-
-    std::vector<uint8_t> rawColor(colorSize), rawAux(auxSize);
-    void* mapped = nullptr;
-    vmaMapMemory(ctx.allocator, colorStaging.allocation, &mapped);
-    memcpy(rawColor.data(), mapped, colorSize);
-    vmaUnmapMemory(ctx.allocator, colorStaging.allocation);
-    vmaMapMemory(ctx.allocator, auxStaging.allocation, &mapped);
-    memcpy(rawAux.data(), mapped, auxSize);
-    vmaUnmapMemory(ctx.allocator, auxStaging.allocation);
+    VkDeviceSize auxSize = static_cast<VkDeviceSize>(w) * h * (auxIsHalf ? 8 : 16);
+    const uint8_t* rawColor = static_cast<const uint8_t*>(ia.getRawColorHostPtr());
+    const uint8_t* rawAux = static_cast<const uint8_t*>(ia.getRawAuxHostPtr());
 
     // Color: same conversion as readColorRgb().
+    std::vector<uint8_t> rawColorVec(rawColor, rawColor + colorSize);
     std::vector<uint8_t> unusedRgba8;
-    auto colorF32 = DlssIO::convertRgba16fColorAttachment(rawColor, w, h, unusedRgba8);
+    auto colorF32 = DlssIO::convertRgba16fColorAttachment(rawColorVec, w, h, unusedRgba8);
     outColorRgb->resize(static_cast<size_t>(w) * h * 3);
     for (size_t i = 0; i < static_cast<size_t>(w) * h; i++) {
         (*outColorRgb)[i * 3 + 0] = colorF32[i * 4 + 0];
@@ -1001,16 +1012,21 @@ void readColorAndMvProxyCombined(VulkanContext& ctx, SplatRenderer* splatR,
         (*outColorRgb)[i * 3 + 2] = colorF32[i * 4 + 2];
     }
 
-    // Aux -> mv: same conversion as readAuxRgbaF32()+readMvProxy().
+    // One bulk sequential copy off the (possibly uncached-for-CPU) IA
+    // buffer -- see the function comment above.
+    std::vector<uint8_t> rawAuxVec(rawAux, rawAux + auxSize);
+
+    // Aux -> mv: same conversion as readAuxRgbaF32()+readMvProxy(), now
+    // reading rawAuxVec (cached heap memory) instead of rawAux directly.
     std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
     if (auxIsHalf) {
         for (size_t i = 0; i < rgba.size(); ++i) {
             uint16_t half;
-            memcpy(&half, rawAux.data() + i * 2, 2);
+            memcpy(&half, rawAuxVec.data() + i * 2, 2);
             rgba[i] = DlssIO::halfToFloat(half);
         }
     } else {
-        memcpy(rgba.data(), rawAux.data(), rawAux.size());
+        memcpy(rgba.data(), rawAuxVec.data(), auxSize);
     }
     std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2), mvAlpha(static_cast<size_t>(w) * h);
     for (size_t i = 0; i < mvAlpha.size(); ++i) {
@@ -1167,10 +1183,14 @@ std::vector<float> runReconstructionModeFrame(AppState* state, VulkanContext& ct
     }
 
     auto tDumpWrite = std::chrono::high_resolution_clock::now();
-    // Task 4: one combined color+aux readback (one queue-drain instead of
-    // two) -- see readColorAndMvProxyCombined's comment.
+    // GPU-pipelining task: zero-copy readback -- reuses InputAssembly::
+    // run()'s (already executed this frame, above the caller's Stage 3
+    // block) own raw color/aux buffers instead of paying for a second GPU
+    // copyImageToBuffer + vkQueueWaitIdle round trip of the same image
+    // data -- see unpremultiplyColorAndMvFromInputAssembly's comment.
     std::vector<float> colorProxy, mvProxy;
-    readColorAndMvProxyCombined(ctx, splatR, &colorProxy, &mvProxy);
+    unpremultiplyColorAndMvFromInputAssembly(state->inputAssembly, splatR->getWidth(), splatR->getHeight(),
+                                              &colorProxy, &mvProxy);
     auto colorPadded = padRowsReplicate(colorProxy, kProxyHeight, kProxyWidth, 3, paddedProxyH);
     auto mvPadded = padRowsReplicate(mvProxy, kProxyHeight, kProxyWidth, 2, paddedProxyH);
 
@@ -1301,6 +1321,14 @@ void renderFrame(AppState* state) {
     auto tRender = std::chrono::high_resolution_clock::now();
     splatR->render(ctx);
     double renderMs = msSince(tRender);
+    // GPU-pipelining task (goal 1, "per-stage GPU timestamps for every
+    // stage next to CPU wall"): splatR's own GPU timestamp query pool is
+    // already enabled unconditionally (setGpuTimingEnabled() at init, see
+    // AppState setup) and already reports preprocess/sort/draw -- just read
+    // it here too so Reconstruction mode's RECON_TIMING line below carries
+    // real proxy-stage GPU ms alongside its CPU wall (renderMs), the same
+    // way the Proxy/Target-mode TIMING line below already does.
+    SplatRenderer::GpuTimingsMs proxyGpuT = splatR->lastGpuTimingsMs();
 
     // Task 2 (Reconstruction-mode time budget, docs/rendering-engines.md):
     // filled in by the input_assembly.run() call just below when isProxy
@@ -1576,16 +1604,46 @@ void renderFrame(AppState* state) {
         // runReconstructDump (dumpWrite=write dump npys, reconstruct.*=its
         // internal setup/read/upload/dispatch[cpu+gpu]/download/write/
         // teardown breakdown, outputRead=read the final out_f0.npy back).
+        //
+        // GPU-pipelining task (goal 1): proxy_gpu_* (splatR's own
+        // preprocess/sort/draw VkQueryPool, read above into proxyGpuT) and
+        // ia_gpu (input_assembly.cpp's own 2-slot bracket around its
+        // now-merged copy+dispatch command buffer, iaTimings.gpuMs) sit
+        // next to their CPU-wall counterparts; recon_dispatch_gpu already
+        // existed (ReconstructLive::run()'s own bracket). submits/waits is
+        // a hand-derived per-frame count of this function's own
+        // vkQueueSubmit/vkQueueWaitIdle/vkWaitForFences round trips (same
+        // "manually accounted, not auto-instrumented" convention the
+        // Proxy/Target-mode TIMING line below already uses for splat_
+        // renderer.cpp's inner_vkQueueWaitIdle count) -- proxy_render=1
+        // (splatR->render()'s own endSingleTimeCommands, unchanged/
+        // untouched this pass -- see the commit message for why),
+        // ia_merged=1 (was 5 pre-merge: 3x copyImageToBuffer + 2x
+        // dispatchOne), recon=1 (already merged pre-existing:
+        // ReconstructLive::run()'s own vkQueueSubmit+vkWaitForFences),
+        // display_upload=1 (uploadRgbToDisplayImage's own
+        // beginSingleTimeCommands/endSingleTimeCommands), blit_submit=1
+        // (submitted with state->inFlightFence, waited by the NEXT frame's
+        // outer vkWaitForFences, not counted again here) -- was 9 Vulkan
+        // submit+wait round trips pre-merge (1+5+1[readColorAndMvProxyCombined,
+        // now removed]+1+1), now 4 (down from 9), plus the net stage's own
+        // non-Vulkan CPU Lock()+memcpy() upload/download (unavoidable with
+        // today's LiteRT Next API -- no VkCommandBuffer to record into; see
+        // the commit message's AHWB-interop assessment).
         const ReconstructTimingsMs& rt = reconT.reconstruct;
         double reconstructTotalMs = rt.setupMs + rt.fileReadMs + rt.uploadMs + rt.dispatchCpuMs +
                                      rt.downloadMs + rt.fileWriteMs + rt.teardownMs;
-        LOGI("RECON_TIMING (ms) proxy_render=%.1f | ia_readback=%.1f ia_compute=%.1f | "
+        LOGI("RECON_TIMING (ms) proxy_render=%.1f proxy_gpu_preprocess=%.2f proxy_gpu_sort=%.2f "
+             "proxy_gpu_draw=%.2f | ia_readback=%.1f ia_compute=%.1f ia_gpu=%.2f | "
              "net_adapter=%.1f net_upload=%.1f net_infer=%.1f net_download=%.1f | "
              "dump_write=%.1f | recon_setup=%.1f recon_read=%.1f recon_upload=%.1f "
              "recon_dispatch_cpu=%.1f recon_dispatch_gpu=%.1f recon_download=%.1f "
              "recon_write=%.1f recon_teardown=%.1f recon_total=%.1f | output_read=%.1f | "
-             "stage6_total=%.1f",
-             renderMs, iaTimings.readbackMs, iaTimings.computeMs,
+             "stage6_total=%.1f | submits=4 vulkan_waits=4 (proxy_render=1 ia_merged=1 recon=1 "
+             "display_upload=1; blit_submit pipelined via inFlightFence, waited next frame) "
+             "net_cpu_roundtrips=2 (upload_lock_memcpy download_lock_memcpy, non-Vulkan/LiteRT-owned)",
+             renderMs, proxyGpuT.preprocessMs, proxyGpuT.sortMs, proxyGpuT.drawMs,
+             iaTimings.readbackMs, iaTimings.computeMs, iaTimings.gpuMs,
              reconT.net.adapterMs, reconT.net.uploadMs, reconT.net.inferMs, reconT.net.downloadMs,
              reconT.dumpWriteMs, rt.setupMs, rt.fileReadMs, rt.uploadMs, rt.dispatchCpuMs, rt.dispatchGpuMs,
              rt.downloadMs, rt.fileWriteMs, rt.teardownMs, reconstructTotalMs, reconT.outputReadMs, stage6Ms);
