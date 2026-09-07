@@ -708,6 +708,38 @@ std::vector<uint8_t> readImageRawAndroid(VulkanContext& ctx, VkImage image,
     return pixels;
 }
 
+// Task-4-follow-up fix: dumpProxyDebugFrame()/readMvProxy() (below) both
+// read SplatRenderer::getAuxImage() -- these are plain CPU-side host
+// readback helpers, NOT the GLSL input_assembly.cpp path (which was
+// already made format-agnostic, see its own readAux()/bytesPerTexel()) --
+// so they independently need the same fix: lux 5d5630c made
+// `aux_precision: half` (RGBA16F out_aux) the default, and reading that as
+// if it were still RGBA32F (the old hardcoded assumption) reads the wrong
+// byte count AND bit-reinterprets fp16 bit patterns as fp32, producing
+// wildly wrong garbage (confirmed: depth means in the -200k range, mv
+// magnitudes in the millions, on data that should be O(1)-O(10)) -- this
+// silently corrupted BOTH the frame-30 validation dumps AND, more
+// seriously, readMvProxy()'s actual mv_proxy_f{t}.npy that
+// ReconstructLive's warp stage consumes for real Reconstruction-mode
+// frames. Queries splatR->getAuxFormat() and branches, mirroring
+// input_assembly.cpp's readAux()/bytesPerTexel() pattern exactly.
+std::vector<float> readAuxRgbaF32(VulkanContext& ctx, SplatRenderer* splatR, uint32_t w, uint32_t h) {
+    bool isHalf = (splatR->getAuxFormat() == VK_FORMAT_R16G16B16A16_SFLOAT);
+    uint32_t bpp = isHalf ? 8 : 16;
+    auto raw = readImageRawAndroid(ctx, splatR->getAuxImage(), w, h, bpp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    std::vector<float> out(static_cast<size_t>(w) * h * 4);
+    if (isHalf) {
+        for (size_t i = 0; i < out.size(); ++i) {
+            uint16_t half;
+            memcpy(&half, raw.data() + i * 2, 2);
+            out[i] = DlssIO::halfToFloat(half);
+        }
+    } else {
+        memcpy(out.data(), raw.data(), raw.size());
+    }
+    return out;
+}
+
 void dumpProxyDebugFrame(VulkanContext& ctx, SplatRenderer* splatR, const std::string& outDir,
                           const std::string& tag, int frameIndex, float t, float jx, float jy) {
     uint32_t w = splatR->getWidth(), h = splatR->getHeight();
@@ -731,10 +763,7 @@ void dumpProxyDebugFrame(VulkanContext& ctx, SplatRenderer* splatR, const std::s
     // baseline in playground_android_perf/src/android_main.cpp's identical
     // dumpProxyDebugFrame() (docs/rendering-engines.md's migration note).
     if (splatR->hasMotionVectors() || splatR->hasExpectedDepth()) {
-        auto rawAux = readImageRawAndroid(ctx, splatR->getAuxImage(), w, h, 16,
-                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        std::vector<float> auxF32(static_cast<size_t>(w) * h * 4);
-        memcpy(auxF32.data(), rawAux.data(), rawAux.size());
+        auto auxF32 = readAuxRgbaF32(ctx, splatR, w, h);
         std::vector<float> auxAlpha(static_cast<size_t>(w) * h);
         for (size_t i = 0; i < auxAlpha.size(); ++i) {
             auxAlpha[i] = auxF32[i * 4 + 3];
@@ -808,9 +837,7 @@ std::vector<float> readColorRgb(VulkanContext& ctx, SplatRenderer* splatR) {
 // .w) -- see dumpProxyDebugFrame's identical extraction.
 std::vector<float> readMvProxy(VulkanContext& ctx, SplatRenderer* splatR) {
     uint32_t w = splatR->getWidth(), h = splatR->getHeight();
-    auto raw = readImageRawAndroid(ctx, splatR->getAuxImage(), w, h, 16, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
-    memcpy(rgba.data(), raw.data(), raw.size());
+    auto rgba = readAuxRgbaF32(ctx, splatR, w, h);
     std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2), mvAlpha(static_cast<size_t>(w) * h);
     for (size_t i = 0; i < mvAlpha.size(); ++i) {
         mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
