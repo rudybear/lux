@@ -83,6 +83,7 @@ void init(VulkanContext& ctx, ANativeWindow* window, bool forceValidation) {
     ctx.physicalDevice = vkbPhysDevice.physical_device;
 
     LOGI("Selected physical device: %s", vkbPhysDevice.properties.deviceName);
+    LOGI("maxPushConstantsSize = %u bytes", vkbPhysDevice.properties.limits.maxPushConstantsSize);
 
     vkb::DeviceBuilder deviceBuilder(vkbPhysDevice);
     VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};

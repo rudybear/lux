@@ -358,16 +358,16 @@ std::vector<uint8_t> readImageRawAndroid(VulkanContext& ctx, VkImage image,
 }
 
 void dumpProxyDebugFrame(VulkanContext& ctx, SplatRenderer* splatR, const std::string& outDir,
-                          int frameIndex, float t, float jx, float jy) {
+                          const std::string& tag, int frameIndex, float t, float jx, float jy) {
     uint32_t w = splatR->getWidth(), h = splatR->getHeight();
-    LOGI("DUMP frame=%d t=%.6f jitter=(%.6f,%.6f) size=%ux%u dir=%s",
-         frameIndex, t, jx, jy, w, h, outDir.c_str());
+    LOGI("DUMP tag=%s frame=%d t=%.6f jitter=(%.6f,%.6f) size=%ux%u dir=%s",
+         tag.c_str(), frameIndex, t, jx, jy, w, h, outDir.c_str());
 
     auto rawColor = readImageRawAndroid(ctx, splatR->getOutputImage(), w, h, 8,
                                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     std::vector<uint8_t> unusedRgba8;
     auto colorF32 = DlssIO::convertRgba16fColorAttachment(rawColor, w, h, unusedRgba8);
-    DlssIO::writeNpyFloat32(outDir + "/android_proxy_color.npy", colorF32, {h, w, 4});
+    DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_color.npy", colorF32, {h, w, 4});
 
     if (splatR->hasExpectedDepth()) {
         auto raw = readImageRawAndroid(ctx, splatR->getExpectedDepthImage(), w, h, 16,
@@ -380,7 +380,7 @@ void dumpProxyDebugFrame(VulkanContext& ctx, SplatRenderer* splatR, const std::s
             depthAlpha[i] = rgba[i * 4 + 3];
         }
         auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
-        DlssIO::writeNpyFloat32(outDir + "/android_proxy_depth.npy", depth, {h, w});
+        DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_depth.npy", depth, {h, w});
     }
     if (splatR->hasMotionVectors()) {
         auto raw = readImageRawAndroid(ctx, splatR->getMotionImage(), w, h, 16,
@@ -394,9 +394,9 @@ void dumpProxyDebugFrame(VulkanContext& ctx, SplatRenderer* splatR, const std::s
             mvAlpha[i] = rgba[i * 4 + 3];
         }
         auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
-        DlssIO::writeNpyFloat32(outDir + "/android_proxy_mv.npy", mv, {h, w, 2});
+        DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_mv.npy", mv, {h, w, 2});
     }
-    LOGI("DUMP done: %s/android_proxy_{color,depth,mv}.npy", outDir.c_str());
+    LOGI("DUMP done: %s/android_%s_{color,depth,mv}.npy", outDir.c_str(), tag.c_str());
 }
 
 void renderFrame(AppState* state) {
@@ -514,8 +514,17 @@ void renderFrame(AppState* state) {
     // root-caused -- flagged to the task owner rather than guessed at
     // further here.
     constexpr int kDumpFrame = 30;
+    // Diagnostic (see the MV bug investigation above): also dump the
+    // SceneManager-owned TARGET renderer at frame 181 (its own 2nd-ever
+    // render() call, within the first target window 180-359) to check
+    // whether the automatic prev-camera/prev-pos carry-forward is broken
+    // for ANY continuously-run SplatRenderer, or specific to the
+    // proxyRenderer_ this app constructs directly from splat_data.
+    constexpr int kDumpFrameTarget = 181;
     if (isProxy && state->frameCounter == kDumpFrame) {
-        dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", state->frameCounter, morphT, jitterPxX, jitterPxY);
+        dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", "proxy", state->frameCounter, morphT, jitterPxX, jitterPxY);
+    } else if (!isProxy && state->frameCounter == kDumpFrameTarget) {
+        dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", "target", state->frameCounter, morphT, jitterPxX, jitterPxY);
     }
 
     auto tBlit = std::chrono::high_resolution_clock::now();
