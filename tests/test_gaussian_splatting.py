@@ -285,13 +285,19 @@ class TestSplatAntialiasing:
         from luxc.expansion.splat_expander import _build_fragment_body
         config = _get_splat_config(SplatDecl("S", []))
         body = _build_fragment_body(config)
-        # There should be exactly one power-related discard (`power > 0.0`),
-        # not the old `power < -4.0`.
-        literals = [stmt.condition.right.value for stmt in body
-                    if hasattr(stmt, "condition") and hasattr(stmt.condition, "right")
-                    and getattr(stmt.condition, "op", None) == ">"
-                    and getattr(stmt.condition.left, "name", None) == "power"]
-        assert literals == ["0.0"]
+        # No power-related discard at all: with the isotropic eigenbasis
+        # evaluation (`d2 = dot(rel, rel)`, `power = -0.5*d2`), `power` can
+        # never be positive under IEEE-754 (a sum of two non-negative
+        # squares), so the old `power > 0.0` safety-net discard (itself a
+        # replacement for an even older, arbitrary `power < -4.0` cutoff)
+        # is now provably dead code and has been removed -- see
+        # splat_expander.py's "Isotropic fragment evaluation" docstring
+        # note. The only remaining discard is the real visibility cutoff,
+        # `alpha < alpha_min`.
+        power_conditions = [stmt.condition for stmt in body
+                             if hasattr(stmt, "condition") and hasattr(stmt.condition, "right")
+                             and getattr(stmt.condition.left, "name", None) == "power"]
+        assert power_conditions == []
 
     def test_fragment_alpha_clamped_to_099(self):
         from luxc.expansion.splat_expander import _build_fragment_body
@@ -352,17 +358,17 @@ class TestSplatExpansion:
         assert "splat_sh0" in sb_names
         # Output buffers
         assert "projected_center" in sb_names
-        assert "projected_conic" in sb_names
+        assert "projected_extent" in sb_names
         assert "projected_color" in sb_names
         assert "sort_keys" in sb_names
         assert "visible_count" in sb_names
 
     def test_expand_vertex_outputs(self):
-        """Vertex stage should have outputs for conic, color, center, and offset."""
+        """Vertex stage should have outputs for the isotropic rel + color."""
         stages = self._expand(_PIPELINE_WITH_SPLAT)
         vertex = stages[1]
         out_names = {v.name for v in vertex.outputs}
-        assert out_names == {"frag_conic", "frag_color", "frag_center", "frag_offset"}
+        assert out_names == {"frag_rel", "frag_color"}
 
     def test_expand_fragment_inputs_match_vertex_outputs(self):
         """Fragment inputs should exactly match vertex outputs in name and type."""

@@ -112,6 +112,25 @@ public:
     void stepKeyframe(int direction);
 
     void render(MetalContext& ctx) override;
+    // Encodes the SAME preprocess+sort+draw sequence render() does, but into
+    // the CALLER's own `cmdBuf` (no beginCommandBuffer()/commit()/
+    // waitUntilCompleted() -- the caller owns the buffer's lifetime and
+    // hazard tracking across the rest of its own frame). render() itself is
+    // just `cmdBuf = ctx.beginCommandBuffer(); encodeFrame(ctx, cmdBuf);
+    // cmdBuf->commit(); cmdBuf->waitUntilCompleted();` plus its own GPU-timing
+    // readback -- a verbatim factor-out, not a behavioral change, so
+    // render()'s own parity guarantees (tests/mobiledlss's Vulkan/gsplat
+    // comparison) are untouched. Added for a continuous per-frame caller
+    // (playground_cpp/src/metal_live_reconstruct.*) that fuses this splat
+    // pass into the SAME command buffer as its input-assembly/UNet/
+    // reconstruct passes, eliminating the extra CPU<->GPU round trip a
+    // dedicated render() call would otherwise force between stages every
+    // frame. lastPreprocessMs_/lastSortMs_/lastRenderMs_ are still updated
+    // (CPU encode-time estimates, as documented on getLastGpuTotalMs());
+    // lastGpuTotalMs_ is NOT (it needs cmdBuf's post-commit GPUStartTime/
+    // GPUEndTime, which only the buffer's actual committer can read) -- read
+    // `cmdBuf->GPUStartTime()/GPUEndTime()` after your own commit instead.
+    void encodeFrame(MetalContext& ctx, MTL::CommandBuffer* cmdBuf);
     void renderToDrawable(MetalContext& ctx, CA::MetalDrawable* drawable) override;
     void updateCamera(glm::vec3 eye, glm::vec3 target, glm::vec3 up,
                       float fovY, float aspect,
@@ -392,7 +411,10 @@ private:
     // Oriented-quad half-axis vectors (major.xy, minor.xy) -- see
     // splat_expander.py's "Oriented quads" note.
     MTL::Buffer* projAxesBuffer_ = nullptr;
-    MTL::Buffer* projConicBuffer_ = nullptr;
+    // (t_major, t_minor, 0, 0) per splat -- replaces the old inverse-2D-
+    // covariance "conic" this buffer held; see splat_expander.py's
+    // "Isotropic fragment evaluation" note.
+    MTL::Buffer* projExtentBuffer_ = nullptr;
     MTL::Buffer* projColorBuffer_ = nullptr;
     MTL::Buffer* projMvBuffer_ = nullptr;
     MTL::Buffer* projDepthBuffer_ = nullptr;

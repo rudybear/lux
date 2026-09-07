@@ -66,11 +66,11 @@ class TestFlagsOff:
         frag = stages["frag"]
         assert [o["name"] for o in frag["outputs"]] == ["out_color"]
         assert [i["name"] for i in frag["inputs"]] == [
-            "frag_conic", "frag_color", "frag_center", "frag_offset"]
+            "frag_rel", "frag_color"]
 
         vert = stages["vert"]
         assert [o["name"] for o in vert["outputs"]] == [
-            "frag_conic", "frag_color", "frag_center", "frag_offset"]
+            "frag_rel", "frag_color"]
 
     def _compile_off(self, tmp_path):
         return _compile(tmp_path, "off_test", motion_vectors=False, expected_depth=False)
@@ -152,8 +152,7 @@ class TestBothOutputs:
 
         vert = stages["vert"]
         out_names = [o["name"] for o in vert["outputs"]]
-        assert out_names == ["frag_conic", "frag_color", "frag_center",
-                              "frag_offset", "frag_mv", "frag_depth"]
+        assert out_names == ["frag_rel", "frag_color", "frag_mv", "frag_depth"]
 
         comp = stages["comp"]
         # 176, not 304 -- proj_matrix_unjittered/prev_view_proj_unjittered

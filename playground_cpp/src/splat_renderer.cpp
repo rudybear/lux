@@ -1022,7 +1022,7 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     createVmaBuffer(ctx.allocator, numSplats_ * 4 * sizeof(float), ssbo,
                     VMA_MEMORY_USAGE_GPU_ONLY, projAxesBuffer_, projAxesAlloc_);
     createVmaBuffer(ctx.allocator, numSplats_ * 4 * sizeof(float), ssbo,
-                    VMA_MEMORY_USAGE_GPU_ONLY, projConicBuffer_, projConicAlloc_);
+                    VMA_MEMORY_USAGE_GPU_ONLY, projExtentBuffer_, projExtentAlloc_);
     createVmaBuffer(ctx.allocator, numSplats_ * 4 * sizeof(float), ssbo,
                     VMA_MEMORY_USAGE_GPU_ONLY, projColorBuffer_, projColorAlloc_);
 
@@ -1159,7 +1159,7 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
 
     writeSSBO(computeDescSet_, outputBase + 0, projCenterBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(computeDescSet_, outputBase + 1, projAxesBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(computeDescSet_, outputBase + 2, projConicBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(computeDescSet_, outputBase + 2, projExtentBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(computeDescSet_, outputBase + 3, projColorBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(computeDescSet_, outputBase + 4, sortKeysBuffer_, numSplats_ * sizeof(uint32_t));
     writeSSBO(computeDescSet_, outputBase + 5, sortedIndicesBuffer_, numSplats_ * sizeof(uint32_t));
@@ -1188,7 +1188,7 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     // + (foreground_coverage) projected_foreground.
     writeSSBO(renderDescSet_, 0, projCenterBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(renderDescSet_, 1, projAxesBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(renderDescSet_, 2, projConicBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(renderDescSet_, 2, projExtentBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(renderDescSet_, 3, projColorBuffer_, numSplats_ * 4 * sizeof(float));
     writeSSBO(renderDescSet_, 4, sortedIndicesBuffer_, numSplats_ * sizeof(uint32_t));
     uint32_t renderNextBinding = 5;
@@ -2692,7 +2692,7 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     destroyVmaBuffer(ctx.allocator, opacityBuffer_, opacityAlloc_);
     destroyVmaBuffer(ctx.allocator, projCenterBuffer_, projCenterAlloc_);
     destroyVmaBuffer(ctx.allocator, projAxesBuffer_, projAxesAlloc_);
-    destroyVmaBuffer(ctx.allocator, projConicBuffer_, projConicAlloc_);
+    destroyVmaBuffer(ctx.allocator, projExtentBuffer_, projExtentAlloc_);
     destroyVmaBuffer(ctx.allocator, projColorBuffer_, projColorAlloc_);
     destroyVmaBuffer(ctx.allocator, projMvBuffer_, projMvAlloc_);
     destroyVmaBuffer(ctx.allocator, prevCameraBuffer_, prevCameraAlloc_);

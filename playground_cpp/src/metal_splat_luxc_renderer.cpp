@@ -309,7 +309,7 @@ void MetalSplatLuxcRenderer::createBuffers(MetalContext& ctx, const GaussianSpla
     size_t vec4Size = numSplats_ * 4 * sizeof(float);
     projCenterBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
     projAxesBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
-    projConicBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
+    projExtentBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
     projColorBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
     visibleCountBuffer_ = ctx.newBuffer(std::max<size_t>(4, sizeof(uint32_t)), MTL::ResourceStorageModeShared);
 
@@ -652,7 +652,13 @@ void MetalSplatLuxcRenderer::init(MetalContext& ctx, const GaussianSplatData& da
 // render()
 // --------------------------------------------------------------------------
 
-void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
+// encodeFrame()/render() split (playground_cpp/src/metal_live_reconstruct.* --
+// see encodeFrame()'s header comment): everything below through the render
+// pass's endEncoding()/rpDesc->release() is the exact body render() used to
+// run inline, now factored into encodeFrame() so a continuous per-frame
+// caller can fuse it into its own command buffer. render() itself (below
+// encodeFrame()) is just begin+encodeFrame+commit+wait+GPU-timing-readback.
+void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* cmdBuf) {
     if (numSplats_ == 0) return;
 
     if (hasMotionVectors_ && firstMvFrame_) {
@@ -706,16 +712,17 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
 
     auto t0 = std::chrono::steady_clock::now();
     // Single command buffer for the *entire* frame (preprocess + all 4 radix-sort
-    // passes + render), committed and waited on exactly once at the very end of
-    // this function -- see the final `cmdBuf->commit()` below. Previously each of
-    // the ~22 individual dispatches (1 preprocess + 4 passes x 5 sub-dispatches +
-    // 1 render) used its own beginCommandBuffer()+commit()+waitUntilCompleted(),
-    // which is resolution-independent CPU<->GPU synchronization overhead (Metal
-    // already auto-tracks buffer/texture hazards *within* one command buffer
-    // across encoder boundaries in submission order, so no manual fences are
-    // needed to merge these safely). The inner `{ }` scopes below are kept only
-    // to let each stage redeclare its own `enc` without a name clash.
-    MTL::CommandBuffer* cmdBuf = ctx.beginCommandBuffer();
+    // passes + render) -- `cmdBuf` is the caller's own (render() below passes a
+    // freshly-begun one it will commit+wait on itself right after this call
+    // returns; metal_live_reconstruct.* passes its own per-frame buffer and
+    // keeps encoding into it afterwards). Previously each of the ~22 individual
+    // dispatches (1 preprocess + 4 passes x 5 sub-dispatches + 1 render) used
+    // its own beginCommandBuffer()+commit()+waitUntilCompleted(), which is
+    // resolution-independent CPU<->GPU synchronization overhead (Metal already
+    // auto-tracks buffer/texture hazards *within* one command buffer across
+    // encoder boundaries in submission order, so no manual fences are needed to
+    // merge these safely). The inner `{ }` scopes below are kept only to let
+    // each stage redeclare its own `enc` without a name clash.
     {
         auto* enc = cmdBuf->computeCommandEncoder();
         enc->setComputePipelineState(computePipeline_);
@@ -726,7 +733,7 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
         trySetBuffer(enc, compShader_, shBuffer_, 4);
         trySetBuffer(enc, compShader_, projCenterBuffer_, 5);
         trySetBuffer(enc, compShader_, projAxesBuffer_, 6);
-        trySetBuffer(enc, compShader_, projConicBuffer_, 7);
+        trySetBuffer(enc, compShader_, projExtentBuffer_, 7);
         trySetBuffer(enc, compShader_, projColorBuffer_, 8);
         trySetBuffer(enc, compShader_, sortKeysBuffer_, 9);
         trySetBuffer(enc, compShader_, sortedIndicesBuffer_, 10);
@@ -959,7 +966,7 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
     // vertex stage pulls from buffers.
     trySetVertexBuffer(enc, vertShader_, projCenterBuffer_, 0);
     trySetVertexBuffer(enc, vertShader_, projAxesBuffer_, 1);
-    trySetVertexBuffer(enc, vertShader_, projConicBuffer_, 2);
+    trySetVertexBuffer(enc, vertShader_, projExtentBuffer_, 2);
     trySetVertexBuffer(enc, vertShader_, projColorBuffer_, 3);
     trySetVertexBuffer(enc, vertShader_, sortedIndicesBuffer_, 4);
     uint32_t vNext = 5;
@@ -980,20 +987,24 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
     enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(6), NS::UInteger(numSplats_));
     enc->endEncoding();
     rpDesc->release();
+    lastRenderMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
+}
+
+void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
+    if (numSplats_ == 0) return;
+    MTL::CommandBuffer* cmdBuf = ctx.beginCommandBuffer();
+    encodeFrame(ctx, cmdBuf);
     cmdBuf->commit();
     cmdBuf->waitUntilCompleted();
-    lastRenderMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
     // Real GPU busy time for the WHOLE fused command buffer (preprocess +
     // sort + draw) -- directly comparable to MetalSplatter's own
     // commandBuffer.gpuStartTime/gpuEndTime methodology (bench/
     // lux_perf_ablation.md in mobiledlss). Unlike lastPreprocessMs_/
-    // lastSortMs_/lastRenderMs_ above (CPU wall-clock deltas taken WHILE
-    // encoding, before this single commit()/waitUntilCompleted() at the
-    // very end of the function -- i.e. they mostly measure CPU encode
-    // time, not GPU execution time, in this fused-command-buffer design;
-    // only lastRenderMs_ happens to also include the real GPU wait since
-    // it's the stage after the only wait in the function), this is a true
-    // GPU timestamp, unaffected by CPU-side encode/dispatch overhead.
+    // lastSortMs_/lastRenderMs_ (CPU wall-clock deltas taken WHILE encoding,
+    // before this single commit()/waitUntilCompleted() -- i.e. they mostly
+    // measure CPU encode time, not GPU execution time, in this
+    // fused-command-buffer design), this is a true GPU timestamp,
+    // unaffected by CPU-side encode/dispatch overhead.
     lastGpuTotalMs_ = (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
 
     std::cout << "[metal-luxc] render(): preprocess=" << lastPreprocessMs_ << "ms sort="
@@ -1068,7 +1079,7 @@ void MetalSplatLuxcRenderer::renderProfiled(MetalContext& ctx, double* preproces
         trySetBuffer(enc, compShader_, shBuffer_, 4);
         trySetBuffer(enc, compShader_, projCenterBuffer_, 5);
         trySetBuffer(enc, compShader_, projAxesBuffer_, 6);
-        trySetBuffer(enc, compShader_, projConicBuffer_, 7);
+        trySetBuffer(enc, compShader_, projExtentBuffer_, 7);
         trySetBuffer(enc, compShader_, projColorBuffer_, 8);
         trySetBuffer(enc, compShader_, sortKeysBuffer_, 9);
         trySetBuffer(enc, compShader_, sortedIndicesBuffer_, 10);
@@ -1239,7 +1250,7 @@ void MetalSplatLuxcRenderer::renderProfiled(MetalContext& ctx, double* preproces
     enc->setDepthStencilState(depthStencilState_);
     trySetVertexBuffer(enc, vertShader_, projCenterBuffer_, 0);
     trySetVertexBuffer(enc, vertShader_, projAxesBuffer_, 1);
-    trySetVertexBuffer(enc, vertShader_, projConicBuffer_, 2);
+    trySetVertexBuffer(enc, vertShader_, projExtentBuffer_, 2);
     trySetVertexBuffer(enc, vertShader_, projColorBuffer_, 3);
     trySetVertexBuffer(enc, vertShader_, sortedIndicesBuffer_, 4);
     uint32_t vNext = 5;

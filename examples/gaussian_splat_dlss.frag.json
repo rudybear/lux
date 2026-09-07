@@ -7,8 +7,8 @@
   "feature_suffix": "",
   "inputs": [
     {
-      "name": "frag_conic",
-      "type": "vec3",
+      "name": "frag_rel",
+      "type": "vec2",
       "location": 0
     },
     {
@@ -17,29 +17,19 @@
       "location": 1
     },
     {
-      "name": "frag_center",
+      "name": "frag_mv",
       "type": "vec2",
       "location": 2
     },
     {
-      "name": "frag_offset",
-      "type": "vec2",
-      "location": 3
-    },
-    {
-      "name": "frag_mv",
-      "type": "vec2",
-      "location": 4
-    },
-    {
       "name": "frag_depth",
       "type": "scalar",
-      "location": 5
+      "location": 3
     },
     {
       "name": "frag_foreground",
       "type": "scalar",
-      "location": 6
+      "location": 4
     }
   ],
   "outputs": [
@@ -95,10 +85,10 @@
     "splat_name": "DlssGaussianCloud"
   },
   "performance_hints": {
-    "instruction_count": 131,
-    "alu_ops": 18,
+    "instruction_count": 103,
+    "alu_ops": 10,
     "texture_samples": 0,
-    "branches": 2,
+    "branches": 1,
     "function_calls": 0,
     "vgpr_estimate": "high"
   }

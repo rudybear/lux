@@ -7,24 +7,14 @@
   "feature_suffix": "",
   "inputs": [
     {
-      "name": "frag_conic",
-      "type": "vec3",
+      "name": "frag_rel",
+      "type": "vec2",
       "location": 0
     },
     {
       "name": "frag_color",
       "type": "vec4",
       "location": 1
-    },
-    {
-      "name": "frag_center",
-      "type": "vec2",
-      "location": 2
-    },
-    {
-      "name": "frag_offset",
-      "type": "vec2",
-      "location": 3
     }
   ],
   "outputs": [
@@ -70,11 +60,11 @@
     "splat_name": "GaussianCloudRelaxed"
   },
   "performance_hints": {
-    "instruction_count": 114,
-    "alu_ops": 14,
+    "instruction_count": 80,
+    "alu_ops": 6,
     "texture_samples": 0,
-    "branches": 2,
+    "branches": 1,
     "function_calls": 0,
-    "vgpr_estimate": "high"
+    "vgpr_estimate": "medium"
   }
 }

@@ -503,7 +503,16 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
                        projected 2D covariance's own eigenvectors (see
                        "Oriented quads" below) -- replaces the old
                        axis-aligned `radius`-only quad.
-        projected_conic  -- upper triangle of inverse 2D covariance
+        projected_extent -- (t_major, t_minor, 0, 0): the per-axis
+                       "opacity-tight extent / sqrt(eigenvalue)" ratios
+                       used by the render vertex stage to reconstruct the
+                       fragment-space isotropic offset `rel` (see
+                       "Isotropic fragment evaluation" below) -- replaces
+                       the old inverse-2D-covariance (conic) upper
+                       triangle, which the fragment stage no longer needs.
+                       Kept as vec4 (not vec2) so the host's existing
+                       fixed-stride buffer allocation/binding code needs
+                       no changes; .zw are unused padding.
         projected_color  -- evaluated SH color + opacity
         sort_keys        -- depth value for radix sort
         visible_count    -- atomic counter (incremented per visible splat)
@@ -527,16 +536,48 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
     radius. The vertex stage then offsets each corner by
     `quad_x*major + quad_y*minor` (an oriented rectangle exactly
     circumscribing the covariance ellipse at extent `t`) instead of
-    `vec2(quad_x,quad_y)*radius` (an axis-aligned square). The FRAGMENT
-    stage is unchanged -- it evaluates the same conic/Gaussian formula
-    against `frag_offset` regardless of which shape produced it, so pixel
-    output is bit-identical except for fragments the smaller oriented
-    quad no longer rasterizes at all (which would have been discarded by
-    the existing `alpha < alpha_min` check anyway, exactly like the
+    `vec2(quad_x,quad_y)*radius` (an axis-aligned square). Pixel output
+    is bit-identical (up to fp reassociation; see "Isotropic fragment
+    evaluation" below) except for fragments the smaller oriented quad no
+    longer rasterizes at all (which would have been discarded by the
+    existing `alpha < alpha_min` check anyway, exactly like the
     opacity-tight-extent fix above). Measured ~2.4x area-weighted overdraw
     reduction on the reference scene (mobiledlss's ablation, using the
     real per-splat covariance/opacity data with the same screen-size
     clamp applied to both variants).
+
+    Isotropic fragment evaluation (perf; bench/lux_perf_ablation.md's
+    "root-causing the remaining 1080p/1440p per-fragment gap" follow-up):
+    the fragment stage used to re-derive the general ANISOTROPIC quadratic
+    form `-0.5*(a*dx^2 + 2*b*dx*dy + c*dy^2)` from a `frag_conic` (inverse-
+    covariance) varying every pixel -- 12 bytes/fragment of interpolated
+    bandwidth plus 5 extra multiplies, vs. MetalSplatter's hand-written
+    shader, which pre-normalizes into the covariance's own eigenbasis at
+    the VERTEX stage and evaluates a branchless isotropic `dot(rel,rel)`
+    per fragment. Since this stage's oriented-quad corners are already
+    placed at `quad_x*major + quad_y*minor` with `major`/`minor` along the
+    covariance eigenvectors (by construction, `major=radius*e1`,
+    `minor=minor_len*e2`, e1/e2 orthonormal), the Mahalanobis distance at
+    ANY point in the quad (not just the corners -- this holds for every
+    `(quad_x, quad_y)` since it's a bilinear function of the vertex
+    attributes, same as `offset` itself) is EXACTLY
+    `(quad_x*radius)^2/lambda_max + (quad_y*minor_len)^2/lambda_min`
+    (orthonormal-eigenbasis identity: `offset^T Sigma^-1 offset = v^T
+    Lambda^-1 v` for `offset = R*v`). Defining `t_major =
+    radius/sqrt(lambda_max)`, `t_minor = minor_len/sqrt(lambda_min)` here
+    (once per splat) and `rel = (quad_x*t_major, quad_y*t_minor)` in the
+    render vertex stage (once per VERTEX, not per fragment) makes that
+    distance exactly `dot(rel, rel)` -- so the fragment stage's `power =
+    -0.5*dot(rel,rel)` is bit-exact (up to reassociation) with the old
+    conic form, for the ACTUAL (ceil'd/screen-clamped) `radius`/
+    `minor_len` this shader emits, not merely the idealized un-clamped
+    `t*sqrt(lambda)` -- using `t_major`/`t_minor` rather than the shared
+    scalar `t` (sigma_t) is what keeps this exact despite `radius` and
+    `minor_len` being ceil'd/clamped independently. This also makes the
+    old `power > 0` discard provably dead code (`dot(rel,rel) >= 0`
+    always under IEEE-754, since each term is a non-negative square), a
+    free simplification matching MetalSplatter's own branchless
+    evaluation -- see `_build_fragment_body`.
     """
     stage = StageBlock(stage_type="compute")
 
@@ -553,7 +594,7 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
     # --- Output storage buffers ---
     stage.storage_buffers.append(StorageBufferDecl("projected_center", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("projected_axes", "vec4"))
-    stage.storage_buffers.append(StorageBufferDecl("projected_conic", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("projected_extent", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("projected_color", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("sort_keys", "uint"))
     stage.storage_buffers.append(StorageBufferDecl("sorted_indices", "uint"))
@@ -640,7 +681,7 @@ def _cull_writes(config: dict | None = None) -> list:
     writes = [
         _assign_idx("projected_center", _ref("gid"), zero4),
         _assign_idx("projected_axes", _ref("gid"), zero4),
-        _assign_idx("projected_conic", _ref("gid"), zero4),
+        _assign_idx("projected_extent", _ref("gid"), zero4),
         _assign_idx("projected_color", _ref("gid"), zero4),
         _assign_idx("sort_keys", _ref("gid"), _uint_lit("4294967295")),
         _assign_idx("sorted_indices", _ref("gid"), _ref("gid")),
@@ -888,7 +929,7 @@ def _build_preprocess_body(config: dict) -> list:
     body.append(_let("cov2d_11f", "scalar",
         _binop("+", _ref("cov2d_11"), _lit(config["dilation"]))))
 
-    # --- Compute inverse covariance (conic) for the fragment shader ---
+    # --- Determinant / degenerate-ellipse check ---
     # det = cov2d_00f * cov2d_11f - cov2d_01^2
     body.append(_let("det", "scalar",
         _binop("-",
@@ -901,18 +942,10 @@ def _build_preprocess_body(config: dict) -> list:
         _cull_writes(config) + [ReturnStmt(None)],
     ))
 
-    body.append(_let("inv_det", "scalar", _binop("/", _lit("1.0"), _ref("det"))))
-
-    # Conic = inverse of 2D covariance (symmetric 2x2):
-    #   conic.x = cov2d_11f * inv_det
-    #   conic.y = -cov2d_01 * inv_det
-    #   conic.z = cov2d_00f * inv_det
-    body.append(_let("conic_x", "scalar",
-        _binop("*", _ref("cov2d_11f"), _ref("inv_det"))))
-    body.append(_let("conic_y", "scalar",
-        _binop("*", _neg(_ref("cov2d_01")), _ref("inv_det"))))
-    body.append(_let("conic_z", "scalar",
-        _binop("*", _ref("cov2d_00f"), _ref("inv_det"))))
+    # (No inverse-covariance/conic computation here anymore -- the
+    # fragment stage now evaluates an isotropic `dot(rel,rel)` in the
+    # eigenbasis instead; see `_build_preprocess_stage`'s "Isotropic
+    # fragment evaluation" docstring note and `t_major`/`t_minor` below.)
 
     # --- Read opacity (sigmoid activation) ---
     # Hoisted here (was originally after NDC projection/frustum culling,
@@ -994,9 +1027,15 @@ def _build_preprocess_body(config: dict) -> list:
     body.append(_let("eig_cos", "scalar", _call("cos", [_ref("eig_theta")])))
     body.append(_let("eig_sin", "scalar", _call("sin", [_ref("eig_theta")])))
 
+    # sqrt(lambda_max)/sqrt(lambda_min): hoisted into named lets (used
+    # both for the ceil'd radius/minor_len below AND for t_major/t_minor,
+    # the isotropic-fragment-evaluation ratios -- see the "Isotropic
+    # fragment evaluation" docstring note above).
+    body.append(_let("sqrt_lambda_max", "scalar", _call("sqrt", [_ref("lambda_max")])))
+    body.append(_let("sqrt_lambda_min", "scalar", _call("sqrt", [_ref("lambda_min")])))
+
     body.append(_let("raw_radius", "scalar",
-        _call("ceil", [_binop("*", _ref("sigma_t"),
-                               _call("sqrt", [_ref("lambda_max")]))])))
+        _call("ceil", [_binop("*", _ref("sigma_t"), _ref("sqrt_lambda_max"))])))
     # Clamp radius to screen size (prevents excessively large quads) --
     # `radius` is now the major-axis (larger eigenvector) extent; kept
     # under this name since it's still written to projected_center.w for
@@ -1006,8 +1045,7 @@ def _build_preprocess_body(config: dict) -> list:
                _call("max", [_swizzle(_push_field("screen_size"), "x"),
                               _swizzle(_push_field("screen_size"), "y")])])))
     body.append(_let("raw_minor", "scalar",
-        _call("ceil", [_binop("*", _ref("sigma_t"),
-                               _call("sqrt", [_ref("lambda_min")]))])))
+        _call("ceil", [_binop("*", _ref("sigma_t"), _ref("sqrt_lambda_min"))])))
     body.append(_let("minor_len", "scalar",
         _call("min", [_ref("raw_minor"),
                _call("max", [_swizzle(_push_field("screen_size"), "x"),
@@ -1018,6 +1056,18 @@ def _build_preprocess_body(config: dict) -> list:
     body.append(_let("minor_vec", "vec2",
         _ctor("vec2", [_binop("*", _neg(_ref("eig_sin")), _ref("minor_len")),
                         _binop("*", _ref("eig_cos"), _ref("minor_len"))])))
+
+    # t_major/t_minor: the ACTUAL (ceil'd, screen-clamped) radius/minor_len
+    # divided by sqrt(eigenvalue) -- NOT the shared un-ceil'd `sigma_t` --
+    # so `rel = (quad_x*t_major, quad_y*t_minor)` in the render vertex
+    # stage reproduces the true per-fragment Mahalanobis distance exactly
+    # for the quad this shader actually emits (see the "Isotropic fragment
+    # evaluation" docstring note above). sqrt_lambda_max/min are always
+    # strictly positive here (lambda_max > 0 from the trace argument above;
+    # lambda_min > 0 from the degenerate-ellipse cull), so this division is
+    # always well-defined.
+    body.append(_let("t_major", "scalar", _binop("/", _ref("radius"), _ref("sqrt_lambda_max"))))
+    body.append(_let("t_minor", "scalar", _binop("/", _ref("minor_len"), _ref("sqrt_lambda_min"))))
 
     # --- Project center to NDC ---
     # let clip_pos = push.proj_matrix * vec4(view_pos, 1.0);
@@ -1125,8 +1175,8 @@ def _build_preprocess_body(config: dict) -> list:
         _ctor("vec4", [_swizzle(_ref("major_vec"), "x"), _swizzle(_ref("major_vec"), "y"),
                         _swizzle(_ref("minor_vec"), "x"), _swizzle(_ref("minor_vec"), "y")])))
 
-    body.append(_assign_idx("projected_conic", _ref("gid"),
-        _ctor("vec4", [_ref("conic_x"), _ref("conic_y"), _ref("conic_z"), _ref("opacity")])))
+    body.append(_assign_idx("projected_extent", _ref("gid"),
+        _ctor("vec4", [_ref("t_major"), _ref("t_minor"), _lit("0.0"), _lit("0.0")])))
 
     body.append(_assign_idx("projected_color", _ref("gid"),
         _ctor("vec4", [_ref("clamped_r"), _ref("clamped_g"), _ref("clamped_b"), _ref("opacity")])))
@@ -1359,26 +1409,41 @@ def _build_sh_evaluation(sh_degree: int) -> list:
 def _build_vertex_stage(config: dict) -> StageBlock:
     """Generate the render vertex stage.
 
-    This is an instanced draw with 6 vertices per instance (two triangles
-    forming a screen-aligned quad).  Each instance corresponds to a sorted
-    visible splat.
+    This is an INDEXED instanced draw with 4 unique vertices per instance
+    (an index buffer of 6 indices, `{0,1,2, 2,1,3}`, draws the two
+    triangles forming a screen-aligned quad) -- perf; bench/
+    lux_perf_ablation.md's per-fragment-gap follow-up (5): 4 vertex-shader
+    invocations/splat instead of the old non-indexed 6 (33% fewer),
+    matching MetalSplatter's own indexed layout. Each instance corresponds
+    to a sorted visible splat. Hosts must bind a `uint16`/`uint32` index
+    buffer with content `{0, 1, 2, 2, 1, 3}` and issue an INDEXED draw
+    (`vkCmdDrawIndexed`/`drawIndexedPrimitives`) -- see
+    `_build_vertex_body`'s quad-corner comment for the exact index→corner
+    mapping this shader assumes.
 
     Inputs (storage buffers from the preprocess pass):
         projected_center -- (ndc_x, ndc_y, depth, major_extent)
         projected_axes   -- (major.x, major.y, minor.x, minor.y): oriented
                        quad half-axis vectors (see the preprocess stage's
                        "Oriented quads" docstring note)
-        projected_conic  -- (inv_cov_a, inv_cov_b, inv_cov_c, opacity)
+        projected_extent -- (t_major, t_minor, 0, 0): see the preprocess
+                       stage's "Isotropic fragment evaluation" docstring
+                       note
         projected_color  -- (r, g, b, opacity)
         sorted_indices   -- indirection table from radix sort
         projected_mv     -- (optional, motion_vectors) pixel-space MV
         projected_depth  -- (optional, expected_depth) camera-space z
 
     Outputs (to fragment stage):
-        frag_conic   -- vec3: inverse 2D covariance upper triangle
+        frag_rel     -- vec2: eigenbasis-normalized offset such that
+                       `dot(frag_rel, frag_rel)` is exactly the Mahalanobis
+                       distance^2 at this fragment (see the preprocess
+                       stage's "Isotropic fragment evaluation" docstring
+                       note) -- replaces the old `frag_conic` (vec3) +
+                       `frag_offset` (vec2) + unused `frag_center` (vec2),
+                       cutting vertex->fragment varying bandwidth from 44
+                       bytes/fragment to 24.
         frag_color   -- vec4: splat color + opacity
-        frag_center  -- vec2: screen-pixel center of the splat
-        frag_offset  -- vec2: pixel offset from center for this vertex
         frag_mv      -- (optional) vec2: pixel-space motion vector
         frag_depth   -- (optional) scalar: camera-space z
     """
@@ -1387,7 +1452,7 @@ def _build_vertex_stage(config: dict) -> StageBlock:
     # --- Storage buffers (read-only) ---
     stage.storage_buffers.append(StorageBufferDecl("projected_center", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("projected_axes", "vec4"))
-    stage.storage_buffers.append(StorageBufferDecl("projected_conic", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("projected_extent", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("projected_color", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("sorted_indices", "uint"))
     if config.get("motion_vectors"):
@@ -1406,8 +1471,7 @@ def _build_vertex_stage(config: dict) -> StageBlock:
     stage.push_constants.append(PushBlock("push", pc_fields))
 
     # --- Vertex outputs → fragment inputs ---
-    out_vars = [("frag_conic", "vec3"), ("frag_color", "vec4"),
-                ("frag_center", "vec2"), ("frag_offset", "vec2")]
+    out_vars = [("frag_rel", "vec2"), ("frag_color", "vec4")]
     if config.get("motion_vectors"):
         out_vars.append(("frag_mv", "vec2"))
     if config.get("expected_depth"):
@@ -1441,8 +1505,8 @@ def _build_vertex_body(config: dict) -> list:
         _idx("projected_center", _ref("splat_idx"))))
     body.append(_let("axes_data", "vec4",
         _idx("projected_axes", _ref("splat_idx"))))
-    body.append(_let("conic_data", "vec4",
-        _idx("projected_conic", _ref("splat_idx"))))
+    body.append(_let("extent_data", "vec4",
+        _idx("projected_extent", _ref("splat_idx"))))
     body.append(_let("color_data", "vec4",
         _idx("projected_color", _ref("splat_idx"))))
     if config.get("motion_vectors"):
@@ -1466,6 +1530,10 @@ def _build_vertex_body(config: dict) -> list:
         _swizzle(_ref("axes_data"), "xy")))
     body.append(_let("minor_vec", "vec2",
         _swizzle(_ref("axes_data"), "zw")))
+    body.append(_let("t_major", "scalar",
+        _swizzle(_ref("extent_data"), "x")))
+    body.append(_let("t_minor", "scalar",
+        _swizzle(_ref("extent_data"), "y")))
 
     # --- Build quad corners (6 vertices → 2 triangles) ---
     # Vertex order: 0,1,2 and 3,4,5 forming a quad
@@ -1473,104 +1541,6 @@ def _build_vertex_body(config: dict) -> list:
     #   0 → (-1,-1), 1 → (1,-1), 2 → (-1,1)
     #   3 → (-1,1),  4 → (1,-1), 5 → (1,1)
     # We use integer math: ox = (vert_id % 2) * 2 - 1, sign logic
-
-    # Compute x component: vertices 1,4,5 have +1, others -1
-    # Simple lookup via conditionals encoded as arithmetic:
-    #   bit0 = vert_id & 1 for triangles  -- but easier to use a small table
-
-    # Use the pattern: for the two triangles of a quad,
-    #   tri_idx = vert_id / 3  (0 or 1)
-    #   corner  = vert_id % 3  (0, 1, or 2)
-    # Triangle 0 corners: BL(0), BR(1), TL(2)  → offsets (-1,-1),(1,-1),(-1,1)
-    # Triangle 1 corners: TL(0), BR(1), TR(2)  → offsets (-1,1),(1,-1),(1,1)
-
-    # We flatten the offset lookup using the vert_id directly.
-    # x_offset: [-1, 1, -1, -1, 1, 1]  →  (vert_id==1||vert_id==4||vert_id==5) ? 1 : -1
-    # y_offset: [-1, -1, 1, 1, -1, 1]  →  (vert_id==2||vert_id==3||vert_id==5) ? 1 : -1
-
-    # Encode as:  x_sign = step(0.5, fract(float(vert_id) * 0.5)) * 2.0 - 1.0
-    # Actually, a cleaner approach for AST: use conditional selection
-
-    # Compute via bit manipulation pattern:
-    # For x: odd indices in the "effective" pattern
-    #   effective = [0,1,0,0,1,1]
-    #   Observation: this equals ((vert_id + 1) / 2) & 1 ... but that's complex.
-    # Simpler: express as two selects based on vert_id.
-
-    # Actually, the cleanest AST pattern: define the offsets from the vert_id
-    # using the standard quad approach with modular arithmetic:
-    #   x_off = float((vert_id & 1) ^ (vert_id / 3)) * 2.0 - 1.0
-    #   y_off = float((vert_id / 2) & 1) * 2.0 - 1.0
-    # But these bit ops aren't standard in Lux's scalar world.
-
-    # Pragmatic approach: encode as a known lookup with add/multiply:
-    # For 6-vertex quad, a well-known trick:
-    #   x = float(vert_id % 2) * 2.0 - 1.0       (but wrong for tri 1)
-    # Better: use the formula from 3DGS reference:
-    #   x = float((vert_id & 1) * 2 - 1)  -- needs bitwise
-    # Since Lux doesn't have bitwise ops at AST level, we'll use a lookup
-    # table approach: 6 if-else branches is too verbose.
-
-    # Simplest correct approach: use two modular operations.
-    # quad_x = (vert_id % 2) * 2 - 1  works for {0:-1, 1:1} per triangle
-    # quad_y = (vert_id / 2 % 2) * 2 - 1 ... etc.
-    # But we need to handle both triangles correctly.
-
-    # Use the reference 3DGS approach with subtraction tricks:
-    #   let t = vert_id / 3;        // 0 for first tri, 1 for second
-    #   let c = vert_id - t * 3;    // 0,1,2 within triangle
-    #   Triangle 0 (t=0): c=0→BL(-1,-1), c=1→BR(1,-1), c=2→TL(-1,1)
-    #   Triangle 1 (t=1): c=0→TL(-1,1),  c=1→BR(1,-1), c=2→TR(1,1)
-    # x: t0: [-1,1,-1]  t1: [-1,1,1]
-    # y: t0: [-1,-1,1]  t1: [1,-1,1]
-
-    # Encode with arithmetic (float-based):
-    #   For t=0: x = float(c==1)*2-1,   y = float(c==2)*2-1
-    #   For t=1: x = float(c>=1)*2-1,   y = float(c!=1)*2-1
-
-    # This is getting complex. Use the simplest universal formula:
-    #   index into a conceptual array. Since we can't do real array lookups
-    #   easily in the AST, we'll use the well-known formula:
-    #     ox = (1 - 2*step(2.5, float(vert_id))) * (2*step(0.5, fmod(...)) - 1)
-    #   ... which is unreadable.
-
-    # Pragmatic solution: just use step functions for each component.
-    # x:  verts {1,4,5} → +1, else -1
-    #     = step(0.5, abs(sin(float(vert_id) * 1.5))) * 2.0 - 1.0  -- fragile
-    # Cleanest: express with conditional:
-    #   let fx = float(vert_id);
-    #   let quad_x = step(0.5, fx) - step(1.5, fx) + step(3.5, fx);
-    #     -> 0: 0, 1: 1, 2: 0, 3: 0, 4: 1, 5: 1  ... wait that doesn't work.
-
-    # Fine -- just use the simple, clean, correct approach with float vert_id
-    # and the known bit trick that works universally in splatting renderers:
-    # Let's express it directly using (vert_id % 2) and (vert_id / 3):
-    #   let col = vert_id - (vert_id / 3) * 3;   // vert_id % 3
-    #   let row = vert_id / 3;                    // 0 or 1
-    # Then for triangle 0: corners are BL, BR, TL
-    # For triangle 1: corners are TL, BR, TR
-    # x_off for tri 0: col==1 ? 1 : -1
-    # x_off for tri 1: col>=1 ? 1 : -1
-    # y_off for tri 0: col==2 ? 1 : -1
-    # y_off for tri 1: col!=1 ? 1 : -1
-    # Combine: x_off = (col==1 || (row==1 && col==2)) ? 1 : -1
-    #          y_off = (col==2 || (row==1 && col==0)) ? 1 : -1
-
-    # Express in Lux arithmetic (no booleans, just scalar comparisons):
-    # Step-based approach (step(edge, x) = x >= edge ? 1.0 : 0.0):
-
-    # Actually the simplest correct formula for the standard quad expansion:
-    # The six vertices are indexed as:
-    #   0: (-1, -1)    3: (-1,  1)
-    #   1: ( 1, -1)    4: ( 1, -1)
-    #   2: (-1,  1)    5: ( 1,  1)
-    # So we directly encode:
-    #   x: [-1, 1, -1, -1, 1, 1]
-    #   y: [-1, -1, 1, 1, -1, 1]
-
-    # Using the formula: x = ((vert_id & 1u) | (vert_id >> 2u)) * 2 - 1
-    # and             :  y = ((vert_id >> 1u) & 1u) * 2 - 1 ... hmm
-    # These need bit ops.
 
     # Just use modular arithmetic with floor division:
     # Convert uint vert_id to float via multiply by 1.0
@@ -1585,10 +1555,6 @@ def _build_vertex_body(config: dict) -> list:
 
     # Offset x: tri0: {-1,1,-1}[corner], tri1: {-1,1,1}[corner]
     # = (corner == 1 || (tri == 1 && corner == 2)) ? 1 : -1
-    # Using step: s1 = step(0.5, corner) * step(corner, 1.5) -> 1 if corner==1
-    #             s2 = step(0.5, tri) * step(1.5, corner) -> 1 if tri>=1 && corner>=2
-    #             ox = (s1 + s2 - s1*s2) * 2.0 - 1.0  (OR logic via inclusion-exclusion)
-
     # For corner==1: step(0.5,c)*step(c,1.5) = [c>=0.5 && c<=1.5] = 1.0 when c=1
     body.append(_let("is_c1", "scalar",
         _binop("*",
@@ -1614,16 +1580,7 @@ def _build_vertex_body(config: dict) -> list:
     body.append(_let("is_c2", "scalar",
         _call("step", [_lit("1.5"), _ref("corner")])))
 
-    # tri==1 && corner==0: step(0.5,tri) * step(corner, 0.5)... corner<0.5
-    # step(corner, 0.5) = corner <= 0.5 ? 1 : 0  -> 1 when corner=0
-    body.append(_let("is_c0", "scalar",
-        _call("step", [_neg(_ref("corner")), _lit("0.5")])))
-    # Actually step(x, edge) = 1 if x >= edge, so step(-corner, -0.5) doesn't
-    # quite work. Use: is_c0 = 1.0 - step(0.5, corner)
-    # When corner=0: step(0.5,0)=0 → 1-0=1. When corner>=1: step(0.5,c)=1 → 0.
-
-    # Fix is_c0:
-    body.pop()  # remove wrong is_c0
+    # is_c0 = 1.0 - step(0.5, corner): 1 when corner==0, else 0.
     body.append(_let("is_c0", "scalar",
         _binop("-", _lit("1.0"), _call("step", [_lit("0.5"), _ref("corner")]))))
 
@@ -1645,6 +1602,21 @@ def _build_vertex_body(config: dict) -> list:
         _binop("+",
             _binop("*", _ref("major_vec"), _ref("quad_x")),
             _binop("*", _ref("minor_vec"), _ref("quad_y")))))
+
+    # --- Isotropic fragment-space coordinate (see preprocess stage's
+    # "Isotropic fragment evaluation" docstring note): `rel` is the
+    # eigenbasis-normalized offset, computed ONCE PER VERTEX (not per
+    # fragment) and linearly interpolated -- since it's an affine function
+    # of the same (quad_x, quad_y) that `offset` above is, the fragment
+    # stage's interpolated `frag_rel` at any pixel equals
+    # (quad_x*t_major, quad_y*t_minor) evaluated at that pixel's own
+    # (quad_x, quad_y), making `dot(frag_rel, frag_rel)` exactly the
+    # Mahalanobis distance^2 the old conic form computed from `frag_offset`.
+    body.append(_let("rel", "vec2",
+        _ctor("vec2", [
+            _binop("*", _ref("quad_x"), _ref("t_major")),
+            _binop("*", _ref("quad_y"), _ref("t_minor")),
+        ])))
 
     # Screen-pixel center from NDC:
     # pixel_center = (ndc_center * 0.5 + 0.5) * screen_size
@@ -1684,11 +1656,8 @@ def _build_vertex_body(config: dict) -> list:
         ])))
 
     # --- Write varying outputs ---
-    body.append(_assign("frag_conic",
-        _swizzle(_ref("conic_data"), "xyz")))
+    body.append(_assign("frag_rel", _ref("rel")))
     body.append(_assign("frag_color", _ref("color_data")))
-    body.append(_assign("frag_center", _ref("pixel_center")))
-    body.append(_assign("frag_offset", _ref("offset")))
     if config.get("motion_vectors"):
         body.append(_assign("frag_mv", _ref("mv_data")))
     if config.get("expected_depth"):
@@ -1706,16 +1675,19 @@ def _build_vertex_body(config: dict) -> list:
 def _build_fragment_stage(config: dict) -> StageBlock:
     """Generate the Gaussian splat fragment stage.
 
-    The fragment shader evaluates the 2D Gaussian function at each pixel
-    using the inverse covariance (conic) and the pixel offset from the
-    splat center.  Fragments with alpha below the cutoff are discarded.
-    Output is premultiplied-alpha color.
+    The fragment shader evaluates the 2D Gaussian function at each pixel as
+    an ISOTROPIC quadratic form `-0.5*dot(frag_rel, frag_rel)` in the
+    covariance's own eigenbasis (see the preprocess stage's "Isotropic
+    fragment evaluation" docstring note) rather than the general
+    anisotropic conic form -- `frag_rel` already has the ellipse's
+    anisotropy baked in from the vertex stage's oriented-quad corner
+    placement. Fragments with alpha below the cutoff are discarded. Output
+    is premultiplied-alpha color.
     """
     stage = StageBlock(stage_type="fragment")
 
     # --- Fragment inputs (from vertex stage) ---
-    in_vars = [("frag_conic", "vec3"), ("frag_color", "vec4"),
-               ("frag_center", "vec2"), ("frag_offset", "vec2")]
+    in_vars = [("frag_rel", "vec2"), ("frag_color", "vec4")]
     if config.get("motion_vectors"):
         in_vars.append(("frag_mv", "vec2"))
     if config.get("expected_depth"):
@@ -1811,7 +1783,7 @@ def _build_fragment_stage(config: dict) -> StageBlock:
     # anything else here would just be a harmless no-op, not a risk).
     if config.get("precision") == "relaxed":
         relaxed_names = [
-            "conic", "d", "dx", "dy", "a", "b", "c",
+            "rel", "d2",
             "power", "gauss_weight", "opacity", "raw_alpha", "alpha",
             "rgb", "final_rgb",
         ]
@@ -1826,41 +1798,29 @@ def _build_fragment_body(config: dict) -> list:
     """Generate the fragment shader main() body."""
     body = []
 
-    # --- Evaluate Gaussian weight ---
-    # The conic is the inverse covariance matrix (symmetric 2x2):
-    #   conic = (a, b, c)  →  [[a, b], [b, c]]
-    # The Gaussian exponent:
-    #   power = -0.5 * (a*dx^2 + 2*b*dx*dy + c*dy^2)
-    # where (dx, dy) = frag_offset (pixel offset from splat center)
+    # --- Evaluate Gaussian weight (isotropic eigenbasis form) ---
+    # `frag_rel` is the eigenbasis-normalized offset computed by the vertex
+    # stage (see the preprocess stage's "Isotropic fragment evaluation"
+    # docstring note): dot(rel, rel) is exactly the Mahalanobis distance^2
+    # that the old `-0.5*(a*dx^2 + 2*b*dx*dy + c*dy^2)` conic form computed,
+    # for the ACTUAL oriented-quad extent this shader emits (up to fp
+    # reassociation).
+    body.append(_let("rel", "vec2", _ref("frag_rel")))
+    body.append(_let("d2", "scalar", _call("dot", [_ref("rel"), _ref("rel")])))
 
-    body.append(_let("conic", "vec3", _ref("frag_conic")))
-    body.append(_let("d", "vec2", _ref("frag_offset")))
-
-    body.append(_let("dx", "scalar", _swizzle(_ref("d"), "x")))
-    body.append(_let("dy", "scalar", _swizzle(_ref("d"), "y")))
-    body.append(_let("a", "scalar", _swizzle(_ref("conic"), "x")))
-    body.append(_let("b", "scalar", _swizzle(_ref("conic"), "y")))
-    body.append(_let("c", "scalar", _swizzle(_ref("conic"), "z")))
-
-    # power = -0.5 * (a*dx*dx + 2*b*dx*dy + c*dy*dy)
+    # power = -0.5 * d2
     body.append(_let("power", "scalar",
-        _binop("*", _lit("-0.5"),
-            _binop("+",
-                _binop("+",
-                    _binop("*", _ref("a"), _binop("*", _ref("dx"), _ref("dx"))),
-                    _binop("*", _binop("*", _lit("2.0"), _ref("b")),
-                        _binop("*", _ref("dx"), _ref("dy")))),
-                _binop("*", _ref("c"), _binop("*", _ref("dy"), _ref("dy")))))))
+        _binop("*", _lit("-0.5"), _ref("d2"))))
 
-    # power > 0 is numerically invalid for a valid (positive-definite) conic;
-    # the actual visibility cutoff is the alpha_min check below, evaluated
-    # out to the quad's own 3-sigma extent (see `raw_radius` above) --
+    # No `power > 0` discard here (unlike the old anisotropic conic form):
+    # d2 = dot(rel,rel) is a sum of two non-negative squares, so under
+    # IEEE-754 arithmetic power = -0.5*d2 can never be positive -- this
+    # branch would be provably dead code. The actual visibility cutoff is
+    # the alpha_min check below, evaluated out to the quad's own opacity-
+    # tight extent (see `raw_radius`/`sigma_t` in the preprocess stage) --
     # matching the reference 3DGS/gsplat rasterizer (no separate arbitrary
-    # power threshold).
-    body.append(_if(
-        _binop(">", _ref("power"), _lit("0.0")),
-        [DiscardStmt()],
-    ))
+    # power threshold) and MetalSplatter's own branchless isotropic
+    # evaluation (bench/lux_perf_ablation.md's per-fragment-gap follow-up).
 
     # alpha = opacity * exp(-0.5*d^2), clamped to <= 0.99 (reference 3DGS/gsplat)
     body.append(_let("gauss_weight", "scalar", _call("exp", [_ref("power")])))

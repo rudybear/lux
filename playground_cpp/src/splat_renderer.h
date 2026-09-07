@@ -343,7 +343,14 @@ private:
     // splat -- see splat_expander.py's "Oriented quads" note. Read by the
     // vertex stage instead of the old scalar radius*(quad_x,quad_y) offset.
     VkBuffer projAxesBuffer_ = VK_NULL_HANDLE;    VmaAllocation projAxesAlloc_ = VK_NULL_HANDLE;
-    VkBuffer projConicBuffer_ = VK_NULL_HANDLE;   VmaAllocation projConicAlloc_ = VK_NULL_HANDLE;
+    // (t_major, t_minor, 0, 0) per splat -- the eigenbasis-normalized
+    // extent ratios the render vertex stage uses to build `frag_rel`
+    // (replaces the old inverse-2D-covariance "conic" this buffer held;
+    // see splat_expander.py's "Isotropic fragment evaluation" note). Kept
+    // as vec4-sized (not shrunk to vec2) so this buffer's size/binding
+    // code needed no changes -- only the compute shader's WRITE and the
+    // vertex shader's READ of its content changed.
+    VkBuffer projExtentBuffer_ = VK_NULL_HANDLE;   VmaAllocation projExtentAlloc_ = VK_NULL_HANDLE;
     VkBuffer projColorBuffer_ = VK_NULL_HANDLE;   VmaAllocation projColorAlloc_ = VK_NULL_HANDLE;
     VkBuffer projMvBuffer_ = VK_NULL_HANDLE;      VmaAllocation projMvAlloc_ = VK_NULL_HANDLE;
     VkBuffer projDepthBuffer_ = VK_NULL_HANDLE;   VmaAllocation projDepthAlloc_ = VK_NULL_HANDLE;

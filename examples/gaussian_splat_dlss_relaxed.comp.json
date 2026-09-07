@@ -75,7 +75,7 @@
       {
         "binding": 7,
         "type": "storage_buffer",
-        "name": "projected_conic",
+        "name": "projected_extent",
         "element_type": "vec4",
         "stage_flags": [
           "compute"
@@ -272,7 +272,7 @@
     "output_buffers": [
       "projected_center",
       "projected_axes",
-      "projected_conic",
+      "projected_extent",
       "projected_color",
       "sort_keys",
       "visible_count",
@@ -282,8 +282,8 @@
     ]
   },
   "performance_hints": {
-    "instruction_count": 725,
-    "alu_ops": 185,
+    "instruction_count": 722,
+    "alu_ops": 182,
     "texture_samples": 0,
     "branches": 5,
     "function_calls": 0,

@@ -75,7 +75,7 @@
       {
         "binding": 7,
         "type": "storage_buffer",
-        "name": "projected_conic",
+        "name": "projected_extent",
         "element_type": "vec4",
         "stage_flags": [
           "compute"
@@ -200,6 +200,7 @@
     "motion_vectors": false,
     "expected_depth": false,
     "foreground_coverage": false,
+    "aux_precision": "half",
     "workgroup_size": [
       256,
       1,
@@ -215,15 +216,15 @@
     "output_buffers": [
       "projected_center",
       "projected_axes",
-      "projected_conic",
+      "projected_extent",
       "projected_color",
       "sort_keys",
       "visible_count"
     ]
   },
   "performance_hints": {
-    "instruction_count": 606,
-    "alu_ops": 176,
+    "instruction_count": 603,
+    "alu_ops": 173,
     "texture_samples": 0,
     "branches": 5,
     "function_calls": 0,

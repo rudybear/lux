@@ -8,24 +8,14 @@
   "inputs": [],
   "outputs": [
     {
-      "name": "frag_conic",
-      "type": "vec3",
+      "name": "frag_rel",
+      "type": "vec2",
       "location": 0
     },
     {
       "name": "frag_color",
       "type": "vec4",
       "location": 1
-    },
-    {
-      "name": "frag_center",
-      "type": "vec2",
-      "location": 2
-    },
-    {
-      "name": "frag_offset",
-      "type": "vec2",
-      "location": 3
     }
   ],
   "descriptor_sets": {
@@ -51,7 +41,7 @@
       {
         "binding": 2,
         "type": "storage_buffer",
-        "name": "projected_conic",
+        "name": "projected_extent",
         "element_type": "vec4",
         "stage_flags": [
           "vertex"
@@ -112,8 +102,8 @@
     "splat_name": "DynamicGaussianCloud"
   },
   "performance_hints": {
-    "instruction_count": 199,
-    "alu_ops": 27,
+    "instruction_count": 193,
+    "alu_ops": 29,
     "texture_samples": 0,
     "branches": 0,
     "function_calls": 0,
