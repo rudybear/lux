@@ -1,24 +1,37 @@
-// aux_precision: half variant of gaussian_splat_dlss.lux (bench/
-// lux_perf_ablation.md task 2 follow-up): out_aux as RGBA16F
-// (mv.x*alpha, mv.y*alpha, depth*alpha, alpha) instead of the default
-// RGBA32F -- 8B/px vs. 16B/px for out_aux. out_fg stays RGBA16F
-// (fg*alpha, 0, 0, alpha), exactly as in the float variant -- an earlier
-// version of this option also shrank out_fg to RG16F under "half", which
-// broke the fixed-function blend outright (the blend reads "source alpha"
-// from each blended attachment's own 4th component, and a 2-channel
-// format has none), not merely a precision tradeoff; see
-// splat_renderer.h's getFgFormat() comment. out_aux's own "half" is
-// MEASURED (bench/lux_perf_ablation.md) to FAIL the parity gate on both
-// Vulkan and Metal: MV median error 0.012-0.016px (gate <=0.01px), depth
-// relative median error ~5.4e-3 (gate <=1e-3) -- pure half-float
-// blend-accumulation rounding, since premultiplied mv/depth values aren't
-// magnitude-bounded like color's own [0,1] channels. Kept as a real,
-// working, OPT-IN-ONLY example -- the default (`gaussian_splat_dlss.lux`,
-// no aux_precision member, i.e. "float") is what's actually safe to use.
-// See gaussian_splat_dlss.lux for the base pipeline this mirrors, and
-// splat_renderer.h's getAuxFormat()/getFgFormat() comments for exactly
-// what changes host-side (the compiled shader itself is identical either
-// way -- aux_precision is a host format hint, not a codegen switch).
+// Explicit aux_precision: half variant of gaussian_splat_dlss.lux
+// (bench/lux_perf_ablation.md task 2 follow-up): out_aux as RGBA16F
+// (mv.x*alpha, mv.y*alpha, depth*alpha, alpha) instead of RGBA32F --
+// 8B/px vs. 16B/px for out_aux. out_fg stays RGBA16F (fg*alpha, 0, 0,
+// alpha) regardless -- an earlier version of this option also shrank
+// out_fg to RG16F under "half", which broke the fixed-function blend
+// outright (the blend reads "source alpha" from each blended
+// attachment's own 4th component, and a 2-channel format has none), not
+// merely a precision tradeoff; see splat_renderer.h's getFgFormat()
+// comment.
+//
+// NOTE: `aux_precision: half` is now `gaussian_splat_dlss.lux`'s own
+// DEFAULT (i.e. this file is functionally IDENTICAL to it -- both
+// compile to the same reflected "aux_precision": "half"), because the
+// out_fg fix above makes it safe, and the MODEL-LEVEL verdict (the
+// actual mobiledlss DLSS reconstructor, not a pixel-exact comparison)
+// found "half" indistinguishable from "float": 35.494 vs 35.491 dB PSNR
+// on lux-rendered clips, fg bit-exact, mv 0.008px, depth 0.4% -- all
+// invisible to the reconstructor. (out_aux's own half-float
+// blend-accumulation rounding DOES fail this repo's original tight
+// pixel-level bar, <=0.01px MV / <=1e-3-relative depth --
+// tests/test_dlss_outputs.py's tolerances were loosened to <=0.02px /
+// <=1e-2-relative to reflect the model-level result instead.) This file
+// is kept anyway as an explicit, self-documenting example of setting
+// `aux_precision: half` on a splat block (useful as a template, and for
+// any caller/test that wants to pin the "half" behavior by name rather
+// than relying on the current default) -- see gaussian_splat_dlss.lux
+// for the base pipeline this mirrors, and splat_renderer.h's
+// getAuxFormat()/getFgFormat() comments for exactly what changes
+// host-side (the compiled shader itself is identical either way --
+// aux_precision is a host format hint, not a codegen switch). To use
+// the pixel-precise "float" option instead, set `aux_precision: float`
+// explicitly on a splat block (no example file for it currently exists,
+// since "float" used to be the implicit default and had one for free).
 //
 // Compile: python -m luxc examples/gaussian_splat_dlss_half.lux
 

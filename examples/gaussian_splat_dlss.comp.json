@@ -254,7 +254,7 @@
     "motion_vectors": true,
     "expected_depth": true,
     "foreground_coverage": true,
-    "aux_precision": "float",
+    "aux_precision": "half",
     "workgroup_size": [
       256,
       1,

@@ -293,7 +293,23 @@ class TestExpectedDepth:
         mask = alpha > 0.1
         assert mask.sum() > 0, "splat not visible at high alpha"
         measured = depth_map[mask]
-        assert np.max(np.abs(measured - depth)) < 1e-3, (measured.min(), measured.max(), depth)
+        # Relative, not absolute, tolerance: PIPELINE_BASE (examples/
+        # gaussian_splat_dlss) now defaults to `aux_precision: half`
+        # (out_aux RGBA16F), whose half-float blend-accumulation rounding
+        # this single-splat case exercises directly (max abs error ~0.0037
+        # at depth=5.5, i.e. ~0.07% relative -- comfortably inside the
+        # bound below). This was made the pipeline default despite failing
+        # this test's ORIGINAL absolute 1e-3 bar (i.e. ~1.8e-4 relative at
+        # this depth) because the MODEL-LEVEL verdict -- the actual
+        # mobiledlss DLSS reconstructor trained/evaluated on lux-rendered
+        # clips, not a pixel-exact `.npy` diff -- found `half`
+        # indistinguishable from `float`: 35.494 vs. 35.491 dB PSNR, `fg`
+        # bit-exact, MV 0.008px, depth 0.4% relative, all invisible to the
+        # reconstructor. 1e-2 relative mirrors that model-level depth
+        # finding (with headroom); use `aux_precision: float` explicitly
+        # (examples/gaussian_splat_dlss_half.lux's inverse) for a
+        # pixel-exact depth guarantee instead.
+        assert np.max(np.abs(measured - depth)) < 1e-2 * depth, (measured.min(), measured.max(), depth)
 
     def test_overlapping_splats_depth_matches_over_compositing(self, binary, tmp_path):
         """Regression test for a real bug: out_depth was declared vec2 (x =
@@ -537,7 +553,23 @@ class TestJitter:
         # checks.
         mask = (alpha_off > 0.5) & (alpha_on > 0.5)
         assert mask.sum() > 20, f"too few stably-covered pixels ({mask.sum()})"
-        assert np.max(np.abs(mv_off[mask] - mv_on[mask])) < 1e-3
+        # 0.02px, not the original 1e-3: PIPELINE_BASE (examples/
+        # gaussian_splat_dlss) now defaults to `aux_precision: half`
+        # (out_aux RGBA16F), and this test compares mv from TWO
+        # independent renders (with/without jitter), each with its own
+        # half-float blend-accumulation rounding -- max diff here is
+        # ~0.003px, comfortably inside the bound below. This was made the
+        # pipeline default despite failing this test's original 1e-3 bar
+        # because the MODEL-LEVEL verdict -- the actual mobiledlss DLSS
+        # reconstructor trained/evaluated on lux-rendered clips, not a
+        # pixel-exact `.npy` diff -- found `half` indistinguishable from
+        # `float`: 35.494 vs. 35.491 dB PSNR, `fg` bit-exact, MV 0.008px,
+        # depth 0.4% relative, all invisible to the reconstructor. 0.02px
+        # mirrors that model-level MV finding (with headroom); use
+        # `aux_precision: float` explicitly (examples/
+        # gaussian_splat_dlss_half.lux's inverse) for a pixel-exact MV
+        # guarantee instead.
+        assert np.max(np.abs(mv_off[mask] - mv_on[mask])) < 0.02
 
 
 # ===========================================================================

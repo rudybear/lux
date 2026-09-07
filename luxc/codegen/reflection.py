@@ -469,12 +469,14 @@ def generate_reflection(
             "expected_depth": splat_config.get("expected_depth", False),
             "foreground_coverage": splat_config.get("foreground_coverage", False),
             # Host format hint for out_aux ONLY (bench/lux_perf_ablation.md
-            # task 2 follow-up) -- "float" (out_aux RGBA32F, precision-safe,
-            # default) or "half" (out_aux RGBA16F, smaller but measured to
-            # fail the parity gate -- see splat_expander.py's docstring).
-            # out_fg (when present) always stays RGBA16F, independent of
-            # this setting -- see splat_expander.py's docstring for why.
-            "aux_precision": splat_config.get("aux_precision", "float"),
+            # task 2 follow-up) -- "half" (out_aux RGBA16F, DEFAULT: fails
+            # the original tight pixel-level bar but is model-level
+            # indistinguishable from "float", see splat_expander.py's
+            # docstring) or "float" (out_aux RGBA32F, the pixel-precise
+            # option, still selectable). out_fg (when present) always
+            # stays RGBA16F, independent of this setting -- see
+            # splat_expander.py's docstring for why.
+            "aux_precision": splat_config.get("aux_precision", "half"),
         }
         if stage.stage_type == "compute":
             gs_meta["workgroup_size"] = [256, 1, 1]
