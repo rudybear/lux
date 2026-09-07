@@ -2183,7 +2183,6 @@ void SplatRenderer::render(VulkanContext& ctx) {
         uint32_t numWg = sortNumWg_;
         uint32_t totalHistogram = 256 * numWg;
         uint32_t numParts = (totalHistogram + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
-        uint32_t numQuantizeWg = (numElements + 255) / 256;  // 1:1 dispatch, workgroup_size=256
 
         VkMemoryBarrier sortBarrier = {};
         sortBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -2233,7 +2232,7 @@ void SplatRenderer::render(VulkanContext& ctx) {
             SortPush quantPush = {numElements, 0};
             vkCmdPushConstants(cmd, sortRangeLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(quantPush), &quantPush);
-            vkCmdDispatch(cmd, numQuantizeWg, 1, 1);
+            vkCmdDispatch(cmd, numWg, 1, 1);
 
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

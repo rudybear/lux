@@ -854,7 +854,6 @@ void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* 
         uint32_t numWg = sortNumWg_;
         uint32_t totalHistogram = 256 * numWg;
         uint32_t numParts = (totalHistogram + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
-        uint32_t numQuantizeWg = (numElements + 255) / 256;  // 1:1 dispatch, workgroup_size=256
 
         struct SortPush { uint32_t numElements; uint32_t bitOffset; };
 
@@ -893,7 +892,7 @@ void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* 
                 trySetBuffer(enc, sortQuantizeShader_, keyRangeBuffer_, 1);
                 SortPush qp = {numElements, 0};
                 enc->setBytes(&qp, sizeof(qp), sortQuantizeShader_.pushConstantBufferIndex);
-                enc->dispatchThreadgroups(MTL::Size(numQuantizeWg, 1, 1), MTL::Size(256, 1, 1));
+                enc->dispatchThreadgroups(MTL::Size(numWg, 1, 1), MTL::Size(256, 1, 1));
                 enc->endEncoding();
             }
         }
@@ -1236,7 +1235,6 @@ void MetalSplatLuxcRenderer::renderProfiled(MetalContext& ctx, double* preproces
         uint32_t numWg = sortNumWg_;
         uint32_t totalHistogram = 256 * numWg;
         uint32_t numParts = (totalHistogram + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
-        uint32_t numQuantizeWg = (numElements + 255) / 256;
         struct SortPush { uint32_t numElements; uint32_t bitOffset; };
 
         // --- Range reduction + quantization (see render()'s identical,
@@ -1264,7 +1262,7 @@ void MetalSplatLuxcRenderer::renderProfiled(MetalContext& ctx, double* preproces
                 trySetBuffer(enc, sortQuantizeShader_, keyRangeBuffer_, 1);
                 SortPush qp = {numElements, 0};
                 enc->setBytes(&qp, sizeof(qp), sortQuantizeShader_.pushConstantBufferIndex);
-                enc->dispatchThreadgroups(MTL::Size(numQuantizeWg, 1, 1), MTL::Size(256, 1, 1));
+                enc->dispatchThreadgroups(MTL::Size(numWg, 1, 1), MTL::Size(256, 1, 1));
                 enc->endEncoding();
             }
         }

@@ -20,6 +20,19 @@
 // that -- ties break by the radix sort's existing stable scatter (index
 // order), same as any other tied key today.
 //
+// Tiling (perf; bench/lux_perf_ablation.md, "Sort kernel efficiency" --
+// larger items-per-thread): uses the SAME 3840-elements/workgroup,
+// 15-items/thread tiling as radix_sort_histogram.lux/scatter.lux/
+// radix_sort_reduce_range.lux (dispatched with `sortNumWg_` workgroups,
+// not a separate 1-item/thread `ceil(n/256)` count) -- this is a trivially
+// parallel elementwise map with no cross-thread communication, so there's
+// no correctness reason to launch ~15x more (256-thread, 1-item/thread)
+// workgroups than every other pass in this same sort uses; matching their
+// tiling cuts this stage's workgroup-launch count from ceil(n/256) to
+// ceil(n/3840), reducing fixed per-workgroup dispatch overhead
+// proportionally with no change to total element-level work. `key_range`
+// is read once per THREAD (not once per element) since it's loop-invariant.
+//
 // Compile: luxc radix_sort_quantize.lux --define workgroup_size=256
 
 compute {
@@ -31,29 +44,35 @@ compute {
     }
 
     fn main() {
-        let gid: uint = global_invocation_id.x;
-        if (gid < num_elements) {
-            let key: uint = keys[gid];
+        let local_id: uint = local_invocation_id.x;
+        let group_id: uint = workgroup_id.x;
 
-            if (key >= 4294967295) {
-                keys[gid] = 65535;
-            } else {
-                let lo: uint = key_range[0];
-                let hi: uint = key_range[1];
-                let span: uint = hi - lo;
+        let lo: uint = key_range[0];
+        let hi: uint = key_range[1];
+        let span: uint = hi - lo;
 
-                let quant: uint = 0;
-                if (span > 0) {
-                    let rel: scalar = key - lo;
-                    let denom: scalar = span;
-                    let scaled: scalar = (rel / denom) * 65535.0;
-                    quant = scaled;
-                    if (quant > 65535) {
-                        quant = 65535;
+        let tile_start: uint = group_id * 3840;
+
+        for (let i: uint = 0; i < 15; i = i + 1) {
+            let idx: uint = tile_start + local_id + i * 256;
+            if (idx < num_elements) {
+                let key: uint = keys[idx];
+
+                if (key >= 4294967295) {
+                    keys[idx] = 65535;
+                } else {
+                    let quant: uint = 0;
+                    if (span > 0) {
+                        let rel: scalar = key - lo;
+                        let denom: scalar = span;
+                        let scaled: scalar = (rel / denom) * 65535.0;
+                        quant = scaled;
+                        if (quant > 65535) {
+                            quant = 65535;
+                        }
                     }
+                    keys[idx] = quant;
                 }
-
-                keys[gid] = quant;
             }
         }
     }
