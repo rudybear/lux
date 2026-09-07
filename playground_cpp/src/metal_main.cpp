@@ -143,6 +143,14 @@ struct CLIOptions {
     std::string forceMode;
     uint32_t width = 512;
     uint32_t height = 512;
+    // Set when the user actually passes --width/--height on the command
+    // line (as opposed to `width`/`height` above sitting at their struct
+    // defaults) -- --live-bench/--live-psnr use this to tell "the user
+    // asked for a specific output size" apart from "just use the
+    // live-chain's own 960x540 default" (see CLIOptions::liveTargetW's
+    // comment and resolveLiveResolutions()).
+    bool widthExplicit = false;
+    bool heightExplicit = false;
     std::string output = "output.png";
     bool interactive = false;
     bool headless = true;
@@ -251,11 +259,16 @@ struct CLIOptions {
     // assembly -> MPSGraph UNet -> reconstruct-with-memory), driven by the
     // identical orbit camera (LiveOrbitCamera, orbit_camera.h) -- so this
     // number is directly comparable to the iPad's own on-device log. 0
-    // (default) = disabled. Independent of --scene/--pipeline/--width/
-    // --height (which drive the generic splat/mesh code paths above) --
-    // uses its own --live-* flags instead, since it needs a proxy AND a
-    // target resolution plus the exported UNet/memory-head/texture asset
-    // bundle, not a single scene+pipeline+resolution.
+    // (default) = disabled. Independent of --scene/--pipeline (which drive
+    // the generic splat/mesh code paths above) -- uses its own --live-*
+    // flags instead, since it needs a proxy AND a target resolution plus
+    // the exported UNet/memory-head/texture asset bundle, not a single
+    // scene+pipeline+resolution. --width/--height ARE consulted, though
+    // (see resolveLiveResolutions()): when the user passes either one
+    // explicitly, it becomes the live chain's TARGET (output) size and the
+    // proxy is derived as half that (rounded down) -- otherwise (the
+    // default) liveProxyW/H and liveTargetW/H below apply unchanged, byte-
+    // identical to before --width/--height were wired in here.
     int liveBenchFrames = 0;
     // Sibling-repo asset bundle (mobiledlss/demo/ios_assets/, playground_ios's
     // own bundled resources -- see the Xcode project's ../../mobiledlss/
@@ -271,6 +284,9 @@ struct CLIOptions {
     // loads) when left empty.
     std::string liveSceneSource;
     std::string livePipeline = "examples/gaussian_splat_dlss";
+    // Default proxy/target resolution -- what --live-bench/--live-psnr use
+    // when --width/--height are NOT given (see resolveLiveResolutions()).
+    // Matches the net trained at 480x270 -> 960x540.
     uint32_t liveProxyW = 480, liveProxyH = 270;
     uint32_t liveTargetW = 960, liveTargetH = 540;
 
@@ -294,8 +310,9 @@ static void printUsage(const char* program) {
               << "  --pipeline <BASE>      Compiled shader base path\n"
               << "  --ibl <NAME>           IBL environment name\n"
               << "  --mode <MODE>          Rendering mode: mesh\n"
-              << "  --width <N>            Output width (default: 512)\n"
-              << "  --height <N>           Output height (default: 512)\n"
+              << "  --width <N>            Output width (default: 512; also sets --live-bench/--live-psnr's\n"
+              << "                         target size when given -- see --live-bench below)\n"
+              << "  --height <N>           Output height (default: 512; see --width)\n"
               << "  --output <PATH>        Output PNG path (default: output.png)\n"
               << "  --interactive          Open GLFW preview window\n"
               << "  --editor               Open interactive editor with ImGui overlay\n"
@@ -320,7 +337,11 @@ static void printUsage(const char* program) {
               << "                         net input assembly + MPSGraph UNet + reconstruct-with-memory) --\n"
               << "                         the same chain playground_ios/Source/SplatView.mm runs, driven\n"
               << "                         by the identical orbit camera. Reports fused CPU/GPU ms + fps and\n"
-              << "                         a per-stage GPU breakdown.\n"
+              << "                         a per-stage GPU breakdown. Default proxy/target res is\n"
+              << "                         480x270 -> 960x540; pass --width/--height to use a different\n"
+              << "                         target (output) size instead -- the proxy becomes half that\n"
+              << "                         (net res is derived automatically). --live-psnr honors the\n"
+              << "                         same --width/--height override.\n"
               << "  --live-assets-dir <DIR> exported/{texture.npy,unet_weights.*,memory_head.npz} +\n"
               << "                         bg_sphere.npy + the scene .glb (default: ../mobiledlss/demo/ios_assets)\n"
               << "  --live-scene <PATH>    Override the --live-bench scene .glb (default: <assets-dir>/juggle_p0.8_stride4.glb)\n"
@@ -359,8 +380,10 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.forceMode = argv[++i];
         } else if (arg == "--width" && i + 1 < argc) {
             opts.width = static_cast<uint32_t>(std::stoi(argv[++i]));
+            opts.widthExplicit = true;
         } else if (arg == "--height" && i + 1 < argc) {
             opts.height = static_cast<uint32_t>(std::stoi(argv[++i]));
+            opts.heightExplicit = true;
         } else if (arg == "--output" && i + 1 < argc) {
             opts.output = argv[++i];
         } else if (arg == "--interactive") {
@@ -720,6 +743,42 @@ static void runSplatBench(MetalSplatLuxcRenderer& splatR, MetalContext& ctx,
     std::cout << "[bench]   split_total_gpu_ms median=" << totMed << " p90=" << totP90 << std::endl;
 }
 
+// Resolves the live chain's proxy/target resolution from CLIOptions, for
+// both --live-bench and --live-psnr. Default (no --width/--height on the
+// command line) reproduces the old hardcoded behavior exactly:
+// liveProxyW/H x liveTargetW/H (480x270 -> 960x540). When the user passes
+// --width and/or --height explicitly, THAT becomes the live chain's target
+// (output) resolution instead, and the proxy is derived as half of it
+// (integer division, rounded down) -- matching this measurement's
+// "proxy at half res" convention (see bench/lux_perf_ablation.md in
+// mobiledlss). The net's own resolution is NOT set here: MetalLiveReconstruct
+// ::init() -> NetInputAssembly::init() derives netW/H from proxyW/H itself
+// (round proxy up to a multiple of 8*paramStride, then divide by
+// paramStride -- e.g. proxy 480x270, paramStride=2 -> net 240x136), and
+// that derivation was already fully general (parameterized on proxyW/H,
+// not hardcoded), so any proxy size handed to it here "just works" -- see
+// net_input_assembly.mm's NetInputAssembly::init(). Likewise
+// MPSGraphUNet::init() rebuilds its MPSGraph graph for whatever netW/H it's
+// given (the model is fully convolutional -- mobiledlss/train/model.py),
+// and the scene texture / bg-sphere UV sampling in NetInputAssembly /
+// LiveReconstructPass is resolution-independent (UV-based, not a fixed
+// pixel grid), so no further plumbing is needed for --live-bench/
+// --live-psnr to run the whole chain at an arbitrary output size.
+static void resolveLiveResolutions(const CLIOptions& opts, uint32_t& proxyW, uint32_t& proxyH, uint32_t& targetW,
+                                    uint32_t& targetH) {
+    if (opts.widthExplicit || opts.heightExplicit) {
+        targetW = opts.width;
+        targetH = opts.height;
+        proxyW = targetW / 2;
+        proxyH = targetH / 2;
+    } else {
+        proxyW = opts.liveProxyW;
+        proxyH = opts.liveProxyH;
+        targetW = opts.liveTargetW;
+        targetH = opts.liveTargetH;
+    }
+}
+
 // --------------------------------------------------------------------------
 // --live-bench N: headless benchmark of the SAME per-frame live-inference
 // chain playground_ios/Source/SplatView.mm runs in Reconstruction mode
@@ -729,7 +788,8 @@ static void runSplatBench(MetalSplatLuxcRenderer& splatR, MetalContext& ctx,
 // resolutions -- so this Mac number is directly comparable to the iPad's
 // own on-device log. Self-contained (own MetalContext/MetalSceneManager,
 // like runReconstructDumpMetal/runUnetDumpMetal), independent of the
-// generic --scene/--pipeline splat/mesh code paths above.
+// generic --scene/--pipeline splat/mesh code paths above (--width/--height
+// ARE consulted -- see resolveLiveResolutions()).
 // --------------------------------------------------------------------------
 
 static int runLiveBenchMetal(const CLIOptions& opts) {
@@ -746,13 +806,16 @@ static int runLiveBenchMetal(const CLIOptions& opts) {
         return 1;
     }
 
+    uint32_t proxyW, proxyH, targetW, targetH;
+    resolveLiveResolutions(opts, proxyW, proxyH, targetW, targetH);
+
     MetalLiveReconstruct live;
     MetalLiveReconstruct::InitParams params;
     params.shaderBase = opts.livePipeline;
-    params.proxyW = opts.liveProxyW;
-    params.proxyH = opts.liveProxyH;
-    params.targetW = opts.liveTargetW;
-    params.targetH = opts.liveTargetH;
+    params.proxyW = proxyW;
+    params.proxyH = proxyH;
+    params.targetW = targetW;
+    params.targetH = targetH;
     params.paramStride = 2;
     params.hiddenChannels = 8;
     params.textureNpyPath = opts.liveAssetsDir + "/exported/texture.npy";
@@ -954,13 +1017,16 @@ static int runLivePsnrMetal(const CLIOptions& opts) {
         return 1;
     }
 
+    uint32_t proxyW, proxyH, targetW, targetH;
+    resolveLiveResolutions(opts, proxyW, proxyH, targetW, targetH);
+
     MetalLiveReconstruct live;
     MetalLiveReconstruct::InitParams params;
     params.shaderBase = opts.livePipeline;
-    params.proxyW = opts.liveProxyW;
-    params.proxyH = opts.liveProxyH;
-    params.targetW = opts.liveTargetW;
-    params.targetH = opts.liveTargetH;
+    params.proxyW = proxyW;
+    params.proxyH = proxyH;
+    params.targetW = targetW;
+    params.targetH = targetH;
     params.paramStride = 2;
     params.hiddenChannels = 8;
     params.textureNpyPath = opts.liveAssetsDir + "/exported/texture.npy";
@@ -992,7 +1058,7 @@ static int runLivePsnrMetal(const CLIOptions& opts) {
     // left un-scheduled (exactness-preserving default, no explicit
     // setSortSchedule() call) rather than reproducing the same bug.
     MetalSplatLuxcRenderer target;
-    target.init(ctx, sceneTarget.getSplatData(), opts.livePipeline, opts.liveTargetW, opts.liveTargetH);
+    target.init(ctx, sceneTarget.getSplatData(), opts.livePipeline, targetW, targetH);
 
     std::cout << "[live-psnr] proxy splats=" << sceneProxy.getSplatData().num_splats
               << " target splats=" << sceneTarget.getSplatData().num_splats
