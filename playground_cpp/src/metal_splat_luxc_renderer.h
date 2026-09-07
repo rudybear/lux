@@ -70,6 +70,7 @@
 #include <string>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 
 struct GaussianSplatData;
 
@@ -251,6 +252,23 @@ public:
     // it; use --splat-backend hand + --sort to override sort at the CLI.
     void setSortByViewDepth(bool) {}
 
+    // --- Sort scheduling (perf; port of splat_renderer.h's Vulkan
+    // setSortSchedule() -- see that header's comment for the full
+    // rationale). Metal previously had NO equivalent: render() always ran
+    // the full 4-pass GPU radix sort every frame regardless of whether the
+    // camera view had actually changed enough to need a fresh
+    // back-to-front order. Default (everyNFrames=1, viewChangeThresholdDeg
+    // =0) is UNCHANGED, exactness-preserving behavior -- a single render()
+    // call always has framesSinceSort_==0 (never skips), so headless
+    // one-shot renders, tests, and the mobiledlss parity checks are
+    // unaffected. Opt in via setSortSchedule() for a continuous multi-frame
+    // caller (interactive/live rendering, or --bench) willing to trade
+    // briefly-stale blend order for amortized sort cost.
+    void setSortSchedule(uint32_t everyNFrames, float viewChangeThresholdDeg) {
+        sortEveryNFrames_ = std::max<uint32_t>(1, everyNFrames);
+        sortViewThresholdDeg_ = viewChangeThresholdDeg;
+    }
+
     MTL::Texture* getOutputTexture() const override { return colorTarget_; }
     uint32_t getWidth() const override { return width_; }
     uint32_t getHeight() const override { return height_; }
@@ -402,6 +420,14 @@ private:
     // (skip the reset entirely on the very first call: posBuffer_/
     // rotBuffer_/shBuffer_ already hold base values from createBuffers()).
     int lastAppliedSegment_ = -1;
+
+    // Sort scheduling state (see setSortSchedule() above) -- mirrors
+    // splat_renderer.h's identical Vulkan fields exactly.
+    uint32_t sortEveryNFrames_ = 1;
+    float sortViewThresholdDeg_ = 0.0f;
+    uint32_t framesSinceSort_ = 0;
+    glm::vec3 lastSortedViewDir_{0.0f, 0.0f, -1.0f};
+    bool hasLastSortedView_ = false;
 
     // Helpers
     void createRenderTargets(MetalContext& ctx);

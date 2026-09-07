@@ -770,9 +770,45 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
         firstMvFrame_ = false;
     }
 
+    // --- Sort scheduling decision (see setSortSchedule()'s header comment;
+    // ported verbatim from splat_renderer.cpp's identical Vulkan logic).
+    // Default (sortEveryNFrames_==1, sortViewThresholdDeg_==0) always
+    // re-sorts (needsSort stays true unconditionally below), so behavior is
+    // unchanged unless a caller opts in.
+    bool needsSort = true;
+    if (sortEveryNFrames_ > 1 || sortViewThresholdDeg_ > 0.0f) {
+        glm::vec3 viewDir = glm::normalize(
+            -glm::vec3(viewMatrix_[0][2], viewMatrix_[1][2], viewMatrix_[2][2]));
+        bool viewChanged = true;
+        if (hasLastSortedView_ && sortViewThresholdDeg_ > 0.0f) {
+            float cosAngle = glm::clamp(glm::dot(viewDir, lastSortedViewDir_), -1.0f, 1.0f);
+            float angleDeg = glm::degrees(std::acos(cosAngle));
+            viewChanged = angleDeg >= sortViewThresholdDeg_;
+        }
+        bool budgetElapsed = framesSinceSort_ >= sortEveryNFrames_;
+        needsSort = !hasLastSortedView_ || budgetElapsed ||
+            (sortViewThresholdDeg_ > 0.0f && viewChanged);
+        if (needsSort) {
+            framesSinceSort_ = 0;
+            lastSortedViewDir_ = viewDir;
+            hasLastSortedView_ = true;
+        } else {
+            framesSinceSort_++;
+        }
+    }
+
     // --- GPU radix sort (4 passes, 8 bits/pass = 32-bit keys) ---
+    // Skipped on frames the schedule above decides don't need a fresh
+    // order -- sortedIndicesBuffer_/sortKeysBuffer_ simply keep whatever
+    // the last real sort left in them (GPU-only buffers, never implicitly
+    // cleared; always land back in buffer A after an even pass count, and
+    // this always runs 0 or 4 passes, never a partial/odd count, so that
+    // invariant holds across skipped frames too). Splat VISIBILITY is
+    // unaffected either way (a per-splat decision made in
+    // preprocess/fragment, not by sort position) -- only back-to-front
+    // BLEND ORDER can be briefly stale.
     auto t1 = std::chrono::steady_clock::now();
-    {
+    if (needsSort) {
         static const uint32_t PREFIX_SUM_BLOCK_SIZE = 2048;
         uint32_t numElements = numSplats_;
         uint32_t numWg = sortNumWg_;
