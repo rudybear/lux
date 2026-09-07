@@ -107,10 +107,19 @@ class TestMotionVectorsOnly:
         assert "projected_mv" in buf_names
         assert "projected_depth" not in buf_names
 
+        # proj_matrix_unjittered/prev_view_proj_unjittered live in the
+        # prev_camera_mats storage buffer, NOT push constants (see
+        # splat_expander.py's "Why not push constants" comment): pushing
+        # them as two extra mat4 fields put this block at 304 bytes, over
+        # Mali-G715's real 256-byte maxPushConstantsSize, which silently
+        # corrupted every motion vector on Android
+        # (docs/rendering-engines.md's Android live-rendering demo MV
+        # investigation) -- VUID-VkPushConstantRange-size-00298.
+        assert "prev_camera_mats" in buf_names
         push_fields = [f["name"] for f in comp["push_constants"][0]["fields"]]
-        assert "proj_matrix_unjittered" in push_fields
-        assert "prev_view_proj_unjittered" in push_fields
-        assert comp["push_constants"][0]["size"] == 304
+        assert "proj_matrix_unjittered" not in push_fields
+        assert "prev_view_proj_unjittered" not in push_fields
+        assert comp["push_constants"][0]["size"] == 176
 
         frag = stages["frag"]
         assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_motion"]
@@ -145,7 +154,12 @@ class TestBothOutputs:
                               "frag_offset", "frag_mv", "frag_depth"]
 
         comp = stages["comp"]
-        assert comp["push_constants"][0]["size"] == 304
+        # 176, not 304 -- proj_matrix_unjittered/prev_view_proj_unjittered
+        # live in the prev_camera_mats storage buffer now, see
+        # TestMotionVectorsOnly.test_mv_buffers_push_and_output above.
+        assert comp["push_constants"][0]["size"] == 176
+        buf_names = {b["name"] for b in comp["descriptor_sets"]["0"]}
+        assert "prev_camera_mats" in buf_names
         # morph stage's own reflection is unaffected by the new flags.
         morph = stages["morph.comp"]["gaussian_splatting_morph"]
         assert morph["role"] == "morph_apply"
