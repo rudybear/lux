@@ -46,9 +46,48 @@
 
 namespace {
 
-// Display resolution for Stage A (task spec: 960x540 display target).
+// Display resolution for Stage A (task spec: 960x540 display target). Stage
+// 2 (docs/rendering-engines.md "Android live-rendering demo") adds a second,
+// quarter-area "proxy" resolution -- exactly half linear (480x270 = 960x540
+// / 2) -- rendered by an independent SplatRenderer instance with TAA jitter;
+// kWidth/kHeight above remain the unjittered "Target" (full-res) pass.
 constexpr uint32_t kWidth = 960;
 constexpr uint32_t kHeight = 540;
+constexpr uint32_t kProxyWidth = 480;
+constexpr uint32_t kProxyHeight = 270;
+
+// Which SplatRenderer instance's output gets blitted to the swapchain this
+// frame. Only PROXY and TARGET exist as of Stage 2; Stage 6 adds BICUBIC
+// (upsample of the proxy colour, no net) and RECONSTRUCTION (proxy + net +
+// reconstruct pass) and wires this to a tap-to-cycle input handler instead
+// of the time-based auto-cycle Stage 2 uses below (so both breakdowns show
+// up in one logcat capture without needing touch input yet).
+enum class DemoMode { Proxy, Target };
+
+// Halton(2,3) TAA jitter, exactly mirroring mobiledlss/datagen/camera.py::
+// halton/taa_jitter: 1-indexed low-discrepancy sequence, period 16, output
+// centred in [-0.5, +0.5]. docs/lux-reconstruct-spec.md's input-contract
+// table defines this jitter in TARGET pixels; the proxy pass (this stage)
+// scales it by (proxyWidth/targetWidth) == 0.5 here before feeding it to
+// SplatRenderer::setJitter(), which expects pixels in the renderer's OWN
+// (proxy) resolution -- "0.5*jitter in proxy px" per the task brief.
+float haltonSequence(int index, int base) {
+    float f = 1.0f, r = 0.0f;
+    int i = index;
+    while (i > 0) {
+        f /= static_cast<float>(base);
+        r += f * static_cast<float>(i % base);
+        i /= base;
+    }
+    return r;
+}
+
+constexpr int kJitterPeriod = 16;
+
+glm::vec2 taaJitterTargetPixels(int frameIndex) {
+    int i = (frameIndex % kJitterPeriod) + 1;
+    return glm::vec2(haltonSequence(i, 2) - 0.5f, haltonSequence(i, 3) - 0.5f);
+}
 
 // Orbit parameters, matching mobiledlss/datagen/camera.py::orbit_path exactly:
 // radius 2.0, elevation 15deg, 0.6deg/frame, PanopticSports y-down world (up=(0,-1,0)).
@@ -119,7 +158,18 @@ struct AppState {
     bool windowInitialized = false;
 
     VulkanContext ctx;
-    SceneManager scene;
+    SceneManager scene;  // owns the Target (full-res, jitter-free) SplatRenderer
+
+    // Stage 2: independent proxy-resolution SplatRenderer (480x270, jittered)
+    // constructed directly from scene.getGltfScene().splat_data -- a second
+    // GPU-resident copy of the splat buffers/pipelines at a different
+    // resolution, entirely separate from SceneManager's Target renderer.
+    std::unique_ptr<SplatRenderer> proxyRenderer;
+    DemoMode mode = DemoMode::Proxy;
+    // Auto-cycle Proxy/Target every kModeSwitchFrames frames so a single run
+    // captures a TIMING window for both resolutions (see the DemoMode
+    // comment above -- Stage 6 replaces this with tap-to-cycle).
+    static constexpr int kModeSwitchFrames = 180;
 
     VkSemaphore imageAvailableSem = VK_NULL_HANDLE;
     VkSemaphore renderFinishedSem = VK_NULL_HANDLE;
@@ -197,6 +247,15 @@ void initRenderer(AppState* state) {
         state->scene.initSplatRenderer(state->ctx, shaderBase, kWidth, kHeight);
         state->scene.getSplatRenderer()->setGpuTimingEnabled(state->ctx, true);
 
+        // Stage 2: second, independent SplatRenderer at proxy resolution,
+        // built directly from the same CPU-side splat_data the Target
+        // renderer above was built from (SplatRenderer::init() uploads its
+        // own copy of the buffers -- the two renderers share no GPU state).
+        state->proxyRenderer = std::make_unique<SplatRenderer>();
+        state->proxyRenderer->init(state->ctx, state->scene.getGltfScene().splat_data,
+                                    shaderBase, kProxyWidth, kProxyHeight);
+        state->proxyRenderer->setGpuTimingEnabled(state->ctx, true);
+
         // NOTE: deliberately NOT using scene.getAutoTarget()/getAutoEye()
         // here -- SceneManager::computeAutoCamera frames the WHOLE scene's
         // bounding box (person + the ~2.5-3.2-unit PanopticSports dome
@@ -260,10 +319,40 @@ void renderFrame(AppState* state) {
     }
     vkResetFences(ctx.device, 1, &state->inFlightFence);
 
-    SplatRenderer* splatR = state->scene.getSplatRenderer();
+    // --- Stage 2: time-based Proxy/Target auto-cycle (see DemoMode comment) ---
+    DemoMode newMode = ((state->frameCounter / AppState::kModeSwitchFrames) % 2 == 0)
+                            ? DemoMode::Proxy : DemoMode::Target;
+    if (newMode != state->mode) {
+        state->mode = newMode;
+        // Don't mix a partial window's samples across the mode switch --
+        // the two modes use different renderers/resolutions entirely.
+        state->timingFrameCount = 0;
+        state->sumCpuWaitFenceMs = state->sumCpuRenderMs = state->sumCpuBlitPresentMs = state->sumCpuFrameMs = 0.0;
+        state->sumGpuPreprocessMs = state->sumGpuSortMs = state->sumGpuDrawMs = 0.0;
+        state->gpuTimingValidFrames = 0;
+        LOGI("mode switch -> %s", state->mode == DemoMode::Proxy ? "PROXY (480x270, jittered)" : "TARGET (960x540, unjittered)");
+    }
 
-    OrbitFrame frame = computeOrbitFrame(static_cast<float>(state->frameCounter), kWidth, kHeight);
+    bool isProxy = (state->mode == DemoMode::Proxy);
+    SplatRenderer* splatR = isProxy ? state->proxyRenderer.get() : state->scene.getSplatRenderer();
+    uint32_t activeW = isProxy ? kProxyWidth : kWidth;
+    uint32_t activeH = isProxy ? kProxyHeight : kHeight;
+
+    OrbitFrame frame = computeOrbitFrame(static_cast<float>(state->frameCounter), activeW, activeH);
     splatR->updateCameraExplicit(frame.eye, frame.viewGl, frame.proj, frame.fx, frame.fy);
+
+    // --- Stage 2: Halton(2,3) TAA jitter, proxy pass only (docs/lux-
+    // reconstruct-spec.md's jitter is defined in TARGET px; scale by
+    // proxyWidth/targetWidth == 0.5 to get proxy-px jitter for
+    // setJitter(), which rasterizes with it but leaves the unjittered
+    // view/proj SplatRenderer::render() already carries forward for motion
+    // vectors -- see setJitter()'s header comment). Target mode is never
+    // jittered (setJitter defaults to 0,0 and is never called on it).
+    if (isProxy) {
+        glm::vec2 jTarget = taaJitterTargetPixels(state->frameCounter);
+        float scale = static_cast<float>(kProxyWidth) / static_cast<float>(kWidth);  // 0.5
+        splatR->setJitter(jTarget.x * scale, jTarget.y * scale);
+    }
 
     if (splatR->hasMotion()) {
         float t = std::fmod(state->frameCounter * (1.0f / 30.0f), std::max(splatR->animationDuration(), 0.001f));
@@ -341,11 +430,14 @@ void renderFrame(AppState* state) {
     if (state->timingFrameCount >= AppState::kTimingWindowFrames) {
         int n = state->timingFrameCount;
         int gn = std::max(state->gpuTimingValidFrames, 1);
-        LOGI("TIMING avg-over-%d-frames (ms): cpu_wait_fence=%.2f cpu_render(preprocess+sort+draw)=%.2f "
+        LOGI("TIMING mode=%s %ux%u avg-over-%d-frames (ms): cpu_wait_fence=%.2f cpu_render(preprocess+sort+draw)=%.2f "
              "cpu_blit_present=%.2f cpu_frame_total=%.2f | gpu_preprocess=%.2f gpu_sort=%.2f gpu_draw=%.2f "
              "gpu_valid_frames=%d/%d | sync_stalls_per_frame: outer_vkWaitForFences=1 "
              "inner_vkQueueWaitIdle=%d (splat_renderer.cpp render(): 1 after preprocess [MV drain, "
              "hasMotionVectors=%d] + 1 final submit)",
+             state->mode == DemoMode::Proxy ? "PROXY" : "TARGET",
+             state->mode == DemoMode::Proxy ? kProxyWidth : kWidth,
+             state->mode == DemoMode::Proxy ? kProxyHeight : kHeight,
              n, state->sumCpuWaitFenceMs / n, state->sumCpuRenderMs / n,
              state->sumCpuBlitPresentMs / n, state->sumCpuFrameMs / n,
              state->sumGpuPreprocessMs / gn, state->sumGpuSortMs / gn, state->sumGpuDrawMs / gn,
@@ -377,6 +469,7 @@ void cleanupRenderer(AppState* state) {
     if (state->renderFinishedSem) vkDestroySemaphore(state->ctx.device, state->renderFinishedSem, nullptr);
     if (state->inFlightFence) vkDestroyFence(state->ctx.device, state->inFlightFence, nullptr);
     if (state->scene.getSplatRenderer()) state->scene.getSplatRenderer()->cleanup(state->ctx);
+    if (state->proxyRenderer) { state->proxyRenderer->cleanup(state->ctx); state->proxyRenderer.reset(); }
     AndroidVulkan::cleanup(state->ctx);
     state->vulkanReady = false;
 }
