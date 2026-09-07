@@ -42,6 +42,7 @@
 #include "vulkan_context.h"
 #include "scene_manager.h"
 #include "splat_renderer.h"
+#include "gltf_loader.h"
 #include "dlss_io.h"
 #include "android_vulkan_context.h"
 #include "input_assembly.h"
@@ -260,6 +261,26 @@ struct AppState {
     // resolution, entirely separate from SceneManager's Target renderer.
     std::unique_ptr<SplatRenderer> proxyRenderer;
 
+    // Full-scene Target switch (queued follow-up, docs/rendering-engines.md):
+    // Target mode currently renders the SAME pruned scene (juggle_p0.8_
+    // stride4.glb) `scene`/`proxyRenderer` both come from, which makes it a
+    // biased PSNR reference for Reconstruction/Bicubic -- Reconstruction
+    // restores the pruned-away background from its scene-memory texture, so
+    // scoring it against a Target missing ~80% of that background measured
+    // (offline, mobiledlss-side) 22.5 dB pruned-vs-full on this orbit,
+    // nowhere near the real ceiling. juggle_full_stride4.glb (336,568
+    // gaussians, unpruned, stride 4, has _FOREGROUND, 149MB) is loaded HERE
+    // instead, ONLY for Target's own SplatRenderer and the PSNR reference --
+    // the proxy path (`proxyRenderer`, input assembly, net, reconstruct)
+    // keeps the pruned scene throughout, unchanged. Gated by a
+    // full_scene_target.txt marker file (cwd-relative, same convention as
+    // force_gpu_net/gpu_net_config.txt) so it stays OFF (old single-pruned-
+    // scene behavior, fullSceneTargetRenderer left null) until the 149MB
+    // asset is actually pushed and the marker deliberately dropped --
+    // NEITHER has happened yet, this is prep only.
+    std::unique_ptr<SplatRenderer> fullSceneTargetRenderer;
+    bool useFullSceneTarget = false;
+
     // Stage 3: assembles ParamPredUNet's 26-channel input tensor from the
     // proxy renderer's per-frame attachments (docs/rendering-engines.md).
     // param_stride=2, hidden=8 match the checkpoint this demo targets
@@ -411,6 +432,34 @@ void initRenderer(AppState* state) {
         state->proxyRenderer->init(state->ctx, state->scene.getGltfScene().splat_data,
                                     shaderBase, kProxyWidth, kProxyHeight);
         state->proxyRenderer->setGpuTimingEnabled(state->ctx, true);
+
+        // Full-scene Target switch (prep only -- see the AppState field
+        // comment above): loads a SECOND, independent GltfScene from
+        // juggle_full_stride4.glb (via the same free loadGltf() gltf_loader.h
+        // exposes -- SceneManager::loadScene is a thin wrapper around it plus
+        // GPU upload bookkeeping this doesn't need, exactly like proxyRenderer
+        // already builds its own SplatRenderer straight from a
+        // GaussianSplatData without going through SceneManager) and builds a
+        // dedicated full-res SplatRenderer from it, entirely independent of
+        // `state->scene`'s pruned data -- `proxyRenderer` above is already
+        // built and stays on the pruned scene regardless of this block.
+        if (FILE* fullSceneMarker = fopen("full_scene_target.txt", "r")) {
+            fclose(fullSceneMarker);
+            std::string fullScenePath = base + "/scene/juggle_full_stride4.glb";
+            LOGI("full_scene_target.txt marker present: loading full scene for Target: %s", fullScenePath.c_str());
+            GltfScene fullGltfScene = loadGltf(fullScenePath);
+            if (fullGltfScene.splat_data.has_splats) {
+                state->fullSceneTargetRenderer = std::make_unique<SplatRenderer>();
+                state->fullSceneTargetRenderer->init(state->ctx, fullGltfScene.splat_data, shaderBase, kWidth, kHeight);
+                state->fullSceneTargetRenderer->setGpuTimingEnabled(state->ctx, true);
+                state->useFullSceneTarget = true;
+                LOGI("Full-scene Target renderer initialized (%u splats) -- Target now uses the FULL scene, "
+                     "proxy/net/reconstruct still use the pruned one",
+                     fullGltfScene.splat_data.num_splats);
+            } else {
+                LOGE("juggle_full_stride4.glb has no splat data; keeping the pruned scene for Target");
+            }
+        }
 
         // Stage 3: input-assembly GLSL compute pipeline (assets pushed by
         // push_assets.sh: assets/texture.npy, assets/bg_sphere.npy,
@@ -984,7 +1033,9 @@ void renderFrame(AppState* state) {
     // pipeline (InputAssembly + NetRunner); only Target renders the
     // separate full-res unjittered scene -- see DemoMode's comment.
     bool isProxy = (state->mode != DemoMode::Target);
-    SplatRenderer* splatR = isProxy ? state->proxyRenderer.get() : state->scene.getSplatRenderer();
+    SplatRenderer* targetSplatR =
+        state->useFullSceneTarget ? state->fullSceneTargetRenderer.get() : state->scene.getSplatRenderer();
+    SplatRenderer* splatR = isProxy ? state->proxyRenderer.get() : targetSplatR;
     uint32_t activeW = isProxy ? kProxyWidth : kWidth;
     uint32_t activeH = isProxy ? kProxyHeight : kHeight;
 
@@ -1146,8 +1197,13 @@ void renderFrame(AppState* state) {
             // Ground-truth Target render at the SAME orbit frame index, for
             // the PSNR comparison -- independent of state->mode/the display
             // auto-cycle (a direct render() call on the Target SplatRenderer
-            // instance, not a mode switch).
-            SplatRenderer* targetR = state->scene.getSplatRenderer();
+            // instance, not a mode switch). Full-scene Target switch (prep):
+            // when active, the PSNR reference is the FULL scene too, per the
+            // AppState field comment -- this is the whole point (the pruned
+            // scene was a biased reference, missing ~80% of the background
+            // Reconstruction's scene-memory restores).
+            SplatRenderer* targetR =
+                state->useFullSceneTarget ? state->fullSceneTargetRenderer.get() : state->scene.getSplatRenderer();
             OrbitFrame targetFrame = computeOrbitFrame(static_cast<float>(state->frameCounter), kWidth, kHeight);
             targetR->updateCameraExplicit(targetFrame.eye, targetFrame.viewGl, targetFrame.proj, targetFrame.fx, targetFrame.fy);
             if (targetR->hasMotion()) targetR->setMorphTime(morphT);
@@ -1411,6 +1467,10 @@ void cleanupRenderer(AppState* state) {
     if (state->inFlightFence) vkDestroyFence(state->ctx.device, state->inFlightFence, nullptr);
     if (state->scene.getSplatRenderer()) state->scene.getSplatRenderer()->cleanup(state->ctx);
     if (state->proxyRenderer) { state->proxyRenderer->cleanup(state->ctx); state->proxyRenderer.reset(); }
+    if (state->fullSceneTargetRenderer) {
+        state->fullSceneTargetRenderer->cleanup(state->ctx);
+        state->fullSceneTargetRenderer.reset();
+    }
     if (state->displayImage) vmaDestroyImage(state->ctx.allocator, state->displayImage, state->displayAlloc);
     AndroidVulkan::cleanup(state->ctx);
     state->vulkanReady = false;
