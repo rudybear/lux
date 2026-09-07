@@ -203,7 +203,7 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
     VkImageCreateInfo imageInfo = {};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    imageInfo.format = getColorFormat();
     imageInfo.extent = {width_, height_, 1};
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
@@ -222,7 +222,7 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = colorImage_;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    viewInfo.format = getColorFormat();
     viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.subresourceRange.levelCount = 1;
     viewInfo.subresourceRange.layerCount = 1;
@@ -292,7 +292,7 @@ void SplatRenderer::createRenderPass(VkDevice device) {
     std::vector<VkAttachmentReference> colorRefs;
 
     VkAttachmentDescription colorAttach = {};
-    colorAttach.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    colorAttach.format = getColorFormat();
     colorAttach.samples = VK_SAMPLE_COUNT_1_BIT;
     colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -374,7 +374,7 @@ void SplatRenderer::createRenderPassLoad(VkDevice device) {
     VkAttachmentDescription attachments[2] = {};
 
     // Color — LOAD existing contents (background was blitted in)
-    attachments[0].format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    attachments[0].format = getColorFormat();
     attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
     attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -442,7 +442,7 @@ void SplatRenderer::createRenderPassLoadDepth(VkDevice device) {
     VkAttachmentDescription attachments[2] = {};
 
     // Color — LOAD existing contents (background was blitted in)
-    attachments[0].format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    attachments[0].format = getColorFormat();
     attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
     attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -748,7 +748,18 @@ void SplatRenderer::createPipelines(VulkanContext& ctx, const std::string& shade
 
     VkPipelineDepthStencilStateCreateInfo depthStencil = {};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depthStencil.depthTestEnable = VK_TRUE;
+    // bench/lux_perf_ablation.md draw-stage ablation (task 4, vertex/depth
+    // path check): the depth attachment here is always cleared to far and
+    // never written (depthWriteEnable is already VK_FALSE, unconditionally,
+    // below), so in the STANDALONE splat pass (this renderPass_ -- NOT
+    // renderPassLoad_/renderPassLoadDepth_, which genuinely depth-test
+    // against a previously-rendered mesh for hybrid compositing) the depth
+    // test is comparing every fragment only against the frame's own clear
+    // value -- i.e. it can never actually reject anything, pure overhead.
+    // depthTestExperimentOff_ (opt-in, default false/unchanged) lets this
+    // be measured; see the ablation doc for the result before flipping the
+    // default.
+    depthStencil.depthTestEnable = depthTestExperimentOff_ ? VK_FALSE : VK_TRUE;
     depthStencil.depthWriteEnable = VK_FALSE;
     depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 

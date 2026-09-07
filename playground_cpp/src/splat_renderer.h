@@ -229,7 +229,38 @@ public:
     // the Metal splat/motion/depth attachments) and removes that rounding
     // entirely. Screenshot::saveImageToPNG converts to 8-bit only at the
     // very end, by rounding (not truncating).
-    VkFormat getOutputFormat() const { return VK_FORMAT_R16G16B16A16_SFLOAT; }
+    //
+    // bench/lux_perf_ablation.md draw-stage ablation (task 1, colour
+    // target format): RE-TESTED the R8G8B8A8_UNORM idea the comment above
+    // already once rejected, this time SCOPED to only the colour-only
+    // (no DLSS aux outputs) pipeline -- getColorFormat() below returns
+    // R8G8B8A8_UNORM there and leaves DLSS pipelines on the original
+    // RGBA16F (the overlapping-low-alpha-fragment rounding risk the
+    // comment above documents applies identically to colour there, so it
+    // keeps the safe format). MEASURED on the juggle scene (960x540,
+    // 119,826 splats): confirms the historical finding -- RGBA8 fails the
+    // PSNR gate on this scene's real overdraw (see the ablation doc for
+    // numbers), so it stays OPT-IN via getColorFormat()'s scene-specific
+    // measurement, not a default change.
+    VkFormat getOutputFormat() const { return getColorFormat(); }
+    // Colour attachment format: RGBA16F always for any DLSS-aux pipeline
+    // (unchanged, see getOutputFormat()'s comment); RGBA8_UNORM ONLY for
+    // a colour-only pipeline (no motion_vectors/expected_depth/
+    // foreground_coverage) -- see bench/lux_perf_ablation.md task 1 for
+    // the measured PSNR/draw-ms tradeoff on this scene before relying on
+    // this in production.
+    VkFormat getColorFormat() const {
+        if (hasMotionVectors_ || hasExpectedDepth_ || hasForegroundCoverage_) {
+            return VK_FORMAT_R16G16B16A16_SFLOAT;
+        }
+        return colorFormat8Bit_ ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R16G16B16A16_SFLOAT;
+    }
+    // Opt-in switch for the experiment above (default false = unchanged
+    // RGBA16F colour-only behavior). Must be set before init().
+    void setColorFormat8BitExperiment(bool enabled) { colorFormat8Bit_ = enabled; }
+    // Opt-in switch for the depth-test experiment (default false =
+    // unchanged depthTestEnable=VK_TRUE). Must be set before init().
+    void setDepthTestExperimentOff(bool disableDepthTest) { depthTestExperimentOff_ = disableDepthTest; }
     uint32_t getWidth() const { return width_; }
     uint32_t getHeight() const { return height_; }
 
@@ -254,6 +285,13 @@ private:
     // "aux_precision: half" (bench/lux_perf_ablation.md task 2 follow-up)
     // -- see getAuxFormat()/getFgFormat() for what this selects.
     bool auxPrecisionHalf_ = false;
+    // bench/lux_perf_ablation.md task 1 (colour target format experiment)
+    // -- see getColorFormat()/setColorFormat8BitExperiment(). Default off.
+    bool colorFormat8Bit_ = false;
+    // bench/lux_perf_ablation.md task 4 (depth-test experiment) -- see the
+    // depthStencil.depthTestEnable comment in createPipelines(). Default
+    // off (unchanged depthTestEnable=VK_TRUE behavior).
+    bool depthTestExperimentOff_ = false;
     // Packed RGBA32F attachment (mv.x*a, mv.y*a, depth*a, a) -- see
     // getAuxImage()'s comment (NOT RGBA16F -- measured precision failure).
     VkImage auxImage_ = VK_NULL_HANDLE;
