@@ -166,6 +166,31 @@ public:
     // texture/attachment, getFgTexture() below (see its comment for why it
     // can't share getAuxTexture()'s lanes).
     bool hasForegroundCoverage() const { return hasForegroundCoverage_; }
+
+    // Colour attachment format experiment (port of splat_renderer.h's
+    // Vulkan getColorFormat()/setColorFormat8BitExperiment() -- see that
+    // header's comment for the full history/rationale: RGBA16Float was
+    // adopted over 8-bit specifically because hundreds of overlapping
+    // low-alpha blended fragments accumulate 1/255 rounding at 8 bits;
+    // bench/lux_perf_ablation.md's draw-stage ablation re-tested it
+    // scoped to colour-only (no DLSS aux) pipelines and measured a real
+    // ~8.6% draw win on Mali but a PSNR estimate below this task's >=50dB
+    // gate, so it stayed opt-in there too). RGBA16Float always for any
+    // DLSS-aux pipeline (motion_vectors/expected_depth/
+    // foreground_coverage); RGBA8Unorm ONLY for colour-only, and ONLY
+    // when explicitly enabled via setColorFormat8BitExperiment(). Must be
+    // set before init() -- createRenderTargets()/createPipelines() both
+    // read it once at construction time.
+    MTL::PixelFormat getColorFormat() const {
+        if (hasMotionVectors_ || hasExpectedDepth_ || hasForegroundCoverage_) {
+            return MTL::PixelFormatRGBA16Float;
+        }
+        return colorFormat8Bit_ ? MTL::PixelFormatRGBA8Unorm : MTL::PixelFormatRGBA16Float;
+    }
+    // Opt-in switch (default false = unchanged RGBA16Float colour-only
+    // behavior).
+    void setColorFormat8BitExperiment(bool enabled) { colorFormat8Bit_ = enabled; }
+
     // "aux_precision: half" was set on the compiled splat block -- see
     // getAuxFormat() (out_fg's format is independent of this flag -- see
     // getFgFormat()).
@@ -338,6 +363,10 @@ private:
     bool hasExpectedDepth_ = false;
     bool hasForegroundCoverage_ = false;
     bool auxPrecisionHalf_ = false;
+    // Colour attachment format experiment -- see getColorFormat()/
+    // setColorFormat8BitExperiment() above. Default false = unchanged
+    // RGBA16Float colour-only behavior.
+    bool colorFormat8Bit_ = false;
 
     // GPU radix sort (shaders/radix_sort/*.comp.spv, transpiled) -- same
     // 4-pass histogram/prefix_sum/scatter ping-pong scheme as

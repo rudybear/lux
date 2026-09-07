@@ -100,7 +100,7 @@ MetalSplatLuxcRenderer::~MetalSplatLuxcRenderer() {}
 
 void MetalSplatLuxcRenderer::createRenderTargets(MetalContext& ctx) {
     auto* colorDesc = MTL::TextureDescriptor::texture2DDescriptor(
-        MTL::PixelFormatRGBA16Float, width_, height_, false);
+        getColorFormat(), width_, height_, false);
     colorDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
     colorDesc->setStorageMode(MTL::StorageModePrivate);
     colorTarget_ = ctx.newTexture(colorDesc);
@@ -171,7 +171,7 @@ void MetalSplatLuxcRenderer::createPipelines(MetalContext& ctx) {
     pipeDesc->setFragmentFunction(fragShader_.function);
 
     auto* colorAtt = pipeDesc->colorAttachments()->object(0);
-    colorAtt->setPixelFormat(MTL::PixelFormatRGBA16Float);
+    colorAtt->setPixelFormat(getColorFormat());
     colorAtt->setBlendingEnabled(true);
     colorAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
     colorAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);

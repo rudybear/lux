@@ -230,6 +230,11 @@ struct CLIOptions {
     bool benchSortSchedule = false;
     uint32_t benchSortEveryNFrames = 4;
     float benchSortViewThresholdDeg = 2.0f;
+
+    // Colour attachment format experiment (--splat-backend luxc only; see
+    // MetalSplatLuxcRenderer::setColorFormat8BitExperiment()'s comment).
+    // Default false = unchanged RGBA16Float colour-only behavior.
+    bool colorFormat8Bit = false;
 };
 
 static void printUsage(const char* program) {
@@ -335,6 +340,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.benchFrames = std::stoi(argv[++i]);
         } else if (arg == "--bench-orbit-deg" && i + 1 < argc) {
             opts.benchOrbitDegPerFrame = std::stof(argv[++i]);
+        } else if (arg == "--color-format-8bit") {
+            opts.colorFormat8Bit = true;
         } else if (arg == "--bench-sort-schedule" && i + 2 < argc) {
             opts.benchSortSchedule = true;
             opts.benchSortEveryNFrames = static_cast<uint32_t>(std::stoi(argv[++i]));
@@ -640,6 +647,13 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
     std::cout << "[metal] Detected gaussian splat data, using " << backendLabel << std::endl;
     auto splatR = std::make_unique<Renderer>();
     splatR->setSortByViewDepth(opts.sortByViewDepth);
+    if (opts.colorFormat8Bit) {
+        if constexpr (std::is_same_v<Renderer, MetalSplatLuxcRenderer>) {
+            splatR->setColorFormat8BitExperiment(true);
+        } else {
+            std::cerr << "[warn] --color-format-8bit requires --splat-backend luxc; ignored" << std::endl;
+        }
+    }
     auto tInitStart = std::chrono::steady_clock::now();
     initFn(*splatR);
     auto tInitEnd = std::chrono::steady_clock::now();
