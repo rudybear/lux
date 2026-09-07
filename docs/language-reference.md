@@ -644,6 +644,32 @@ camera-bridge flags are all host (playground) responsibilities, not
 compiler ones — see `docs/lux-4d-spec.md` sections 3-4 for the full
 runtime design.
 
+**`foreground_coverage: true`** adds a per-pixel actor/foreground coverage
+mask — a visibility-weighted composite of a per-splat is-foreground flag,
+computed exactly like `out_motion`/`out_depth` above. It implies
+`expected_depth: true` (auto-enabled even if not written explicitly),
+because rather than adding a fourth attachment it packs into `out_depth`'s
+otherwise-unused `.g` channel: `y = frag_foreground * alpha`, alongside
+`x = frag_depth * alpha` and `w = alpha` (the host un-premultiplies `.g`
+by the same `.w` alpha it already uses for `.x`). This adds an input
+storage buffer `splat_foreground` (scalar, one 0.0/1.0 value per splat)
+and an output buffer `projected_foreground` (scalar); the preprocess
+stage does no per-frame computation on it beyond a straight
+buffer-to-buffer passthrough, since the flag is a static per-splat
+property, not something derived from the current camera or animation
+time. A `frag_foreground` varying carries it from vertex to fragment
+stage. No new push-constant fields.
+
+Populating `splat_foreground` on the host is a loader/renderer
+responsibility: the C++ playground's `gltf_loader.cpp` reads the custom
+`_FOREGROUND` glTF vertex attribute (`SCALAR`, `UNSIGNED_BYTE`,
+normalized — 255 means foreground) when the splat primitive has one;
+otherwise it falls back to "this gaussian has any morph-target delta"
+(the union of `dynamics.targets[*].indices` across all keyframes, i.e. a
+gaussian counts as foreground iff it ever moves); otherwise every splat
+defaults to `0.0` (non-foreground). See `docs/rendering-engines.md` for
+the host-side buffer wiring and the `--output-aux` `_fg.npy` output.
+
 ### Bindless Rendering
 
 The `--bindless` flag enables uber-shaders with runtime descriptor arrays, eliminating per-material descriptor switching:

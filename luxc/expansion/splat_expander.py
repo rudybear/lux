@@ -95,6 +95,21 @@ def _get_splat_config(splat: SplatDecl) -> dict:
                        mode. vec4 (not vec2) so Vulkan's fixed-function
                        alpha blend has a genuine 4th-component alpha to
                        read -- see the fragment-stage output comment.
+        foreground_coverage -- bool (default False): when true, the
+                       preprocess stage reads a per-splat `splat_foreground`
+                       input (0.0 or 1.0 -- see docs/rendering-engines.md's
+                       `_FOREGROUND` attribute / morph-target fallback) and
+                       the render stages composite it with the SAME
+                       visibility-weighted premultiplied-alpha blend as the
+                       MV/depth channels, PACKED into out_depth's .g
+                       component (`out_depth`: x = depth*alpha, y =
+                       foreground*alpha, z unused, w = alpha) -- no new
+                       attachment needed, since RGBA32F's y/z were unused
+                       padding. Implies expected_depth: true (auto-enabled
+                       if not already set on the same splat block) since
+                       there is nowhere else to pack it. The host divides
+                       .y by .w to recover the per-pixel foreground/actor
+                       coverage fraction, exactly like depth's own .x/.w.
     """
     config = {
         "sh_degree": 0,
@@ -107,6 +122,7 @@ def _get_splat_config(splat: SplatDecl) -> dict:
         "motion": "none",
         "motion_vectors": False,
         "expected_depth": False,
+        "foreground_coverage": False,
     }
     for m in splat.members:
         if m.name == "sh_degree":
@@ -123,13 +139,17 @@ def _get_splat_config(splat: SplatDecl) -> dict:
             config["alpha_cutoff"] = float(m.value.value)
         elif m.name == "dilation":
             config["dilation"] = float(m.value.value)
-        elif m.name in ("motion_vectors", "expected_depth"):
+        elif m.name in ("motion_vectors", "expected_depth", "foreground_coverage"):
             if isinstance(m.value, BoolLit):
                 config[m.name] = bool(m.value.value)
             else:
                 # Accept true/false spelled as a bare identifier too, for
                 # symmetry with the other enum-like members.
                 config[m.name] = getattr(m.value, "name", "") == "true"
+    if config["foreground_coverage"]:
+        # Packed into out_depth's .g channel -- nowhere to write it without
+        # the depth attachment also being enabled.
+        config["expected_depth"] = True
     return config
 
 
@@ -406,6 +426,14 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
         stage.storage_buffers.append(StorageBufferDecl("prev_camera_mats", "mat4"))
     if config.get("expected_depth"):
         stage.storage_buffers.append(StorageBufferDecl("projected_depth", "scalar"))
+    if config.get("foreground_coverage"):
+        # Per-splat is-foreground flag (0.0/1.0), passed straight through
+        # to a per-pixel output buffer of the same name/shape as
+        # projected_depth -- see docs/rendering-engines.md for how the host
+        # populates the INPUT splat_foreground buffer (glTF _FOREGROUND
+        # attribute, else "has any morph-target delta", else 0).
+        stage.storage_buffers.append(StorageBufferDecl("splat_foreground", "scalar"))
+        stage.storage_buffers.append(StorageBufferDecl("projected_foreground", "scalar"))
 
     # --- Push constants ---
     #
@@ -470,6 +498,8 @@ def _cull_writes(config: dict | None = None) -> list:
         writes.append(_assign_idx("projected_mv", _ref("gid"), zero2))
     if config and config.get("expected_depth"):
         writes.append(_assign_idx("projected_depth", _ref("gid"), _lit("0.0")))
+    if config and config.get("foreground_coverage"):
+        writes.append(_assign_idx("projected_foreground", _ref("gid"), _lit("0.0")))
     return writes
 
 
@@ -865,6 +895,13 @@ def _build_preprocess_body(config: dict) -> list:
         # Camera-space z (already computed as `t = -view_pos.z` above).
         body.append(_assign_idx("projected_depth", _ref("gid"), _ref("t")))
 
+    if config.get("foreground_coverage"):
+        # Straight passthrough -- the flag itself is a fixed per-splat
+        # value (glTF attribute or morph-membership, computed host-side),
+        # not something to derive per-frame here.
+        body.append(_assign_idx("projected_foreground", _ref("gid"),
+            _idx("splat_foreground", _ref("gid"))))
+
     # --- Write output buffers ---
     body.append(_assign_idx("projected_center", _ref("gid"),
         _ctor("vec4", [_ref("ndc_x"), _ref("ndc_y"), _ref("ndc_z"), _ref("radius")])))
@@ -1134,6 +1171,8 @@ def _build_vertex_stage(config: dict) -> StageBlock:
         stage.storage_buffers.append(StorageBufferDecl("projected_mv", "vec2"))
     if config.get("expected_depth"):
         stage.storage_buffers.append(StorageBufferDecl("projected_depth", "scalar"))
+    if config.get("foreground_coverage"):
+        stage.storage_buffers.append(StorageBufferDecl("projected_foreground", "scalar"))
 
     # --- Push constants (shared block with fragment to avoid Vulkan offset conflicts) ---
     pc_fields = [
@@ -1150,6 +1189,8 @@ def _build_vertex_stage(config: dict) -> StageBlock:
         out_vars.append(("frag_mv", "vec2"))
     if config.get("expected_depth"):
         out_vars.append(("frag_depth", "scalar"))
+    if config.get("foreground_coverage"):
+        out_vars.append(("frag_foreground", "scalar"))
     for name, ty in out_vars:
         v = VarDecl(name, ty)
         v._is_input = False
@@ -1185,6 +1226,9 @@ def _build_vertex_body(config: dict) -> list:
     if config.get("expected_depth"):
         body.append(_let("depth_data", "scalar",
             _idx("projected_depth", _ref("splat_idx"))))
+    if config.get("foreground_coverage"):
+        body.append(_let("foreground_data", "scalar",
+            _idx("projected_foreground", _ref("splat_idx"))))
 
     # Unpack center / radius
     body.append(_let("ndc_center", "vec2",
@@ -1419,6 +1463,8 @@ def _build_vertex_body(config: dict) -> list:
         body.append(_assign("frag_mv", _ref("mv_data")))
     if config.get("expected_depth"):
         body.append(_assign("frag_depth", _ref("depth_data")))
+    if config.get("foreground_coverage"):
+        body.append(_assign("frag_foreground", _ref("foreground_data")))
 
     return body
 
@@ -1444,6 +1490,8 @@ def _build_fragment_stage(config: dict) -> StageBlock:
         in_vars.append(("frag_mv", "vec2"))
     if config.get("expected_depth"):
         in_vars.append(("frag_depth", "scalar"))
+    if config.get("foreground_coverage"):
+        in_vars.append(("frag_foreground", "scalar"))
     for name, ty in in_vars:
         v = VarDecl(name, ty)
         v._is_input = True
@@ -1596,13 +1644,17 @@ def _build_fragment_body(config: dict) -> list:
                 _ref("alpha"),
             ])))
     if config.get("expected_depth"):
-        # x = depth*alpha, y/z unused, w = alpha (the genuine 4th-component
-        # alpha the hardware blend needs -- see the output-declaration
-        # comment above). The host un-premultiplies by .w now, not .y.
+        # x = depth*alpha, y = foreground*alpha (only when
+        # foreground_coverage; otherwise unused padding), z unused, w =
+        # alpha (the genuine 4th-component alpha the hardware blend needs
+        # -- see the output-declaration comment above). The host
+        # un-premultiplies by .w now, not .y.
+        fg_term = (_binop("*", _ref("frag_foreground"), _ref("alpha"))
+                   if config.get("foreground_coverage") else _lit("0.0"))
         body.append(_assign("out_depth",
             _ctor("vec4", [
                 _binop("*", _ref("frag_depth"), _ref("alpha")),
-                _lit("0.0"),
+                fg_term,
                 _lit("0.0"),
                 _ref("alpha"),
             ])))

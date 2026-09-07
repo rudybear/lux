@@ -16,7 +16,7 @@ from luxc.compiler import compile_source
 
 
 def _compile(tmp_path: Path, stem: str, *, motion_vectors: bool, expected_depth: bool,
-             motion_keyframes: bool = False) -> dict:
+             motion_keyframes: bool = False, foreground_coverage: bool = False) -> dict:
     """Compile a minimal gaussian_splat pipeline and return {stage: reflection_json}."""
     members = [
         "sh_degree: 0",
@@ -31,6 +31,8 @@ def _compile(tmp_path: Path, stem: str, *, motion_vectors: bool, expected_depth:
         members.append("motion_vectors: true")
     if expected_depth:
         members.append("expected_depth: true")
+    if foreground_coverage:
+        members.append("foreground_coverage: true")
     source = (
         "splat TestCloud {\n    " + ",\n    ".join(members) + ",\n}\n\n"
         "pipeline TestViewer {\n    mode: gaussian_splat,\n    splat: TestCloud,\n}\n"
@@ -163,6 +165,53 @@ class TestBothOutputs:
         # morph stage's own reflection is unaffected by the new flags.
         morph = stages["morph.comp"]["gaussian_splatting_morph"]
         assert morph["role"] == "morph_apply"
+
+
+class TestForegroundCoverage:
+    """`foreground_coverage: true` packs into out_depth's .g channel and
+    implies expected_depth even when not explicitly set."""
+
+    def test_implies_expected_depth(self, tmp_path):
+        stages = _compile(tmp_path, "fg_implies_depth", motion_vectors=False,
+                           expected_depth=False, foreground_coverage=True)
+        gs = stages["comp"]["gaussian_splatting"]
+        assert gs["expected_depth"] is True
+        assert gs["foreground_coverage"] is True
+
+        frag = stages["frag"]
+        # No new attachment -- still just out_color, out_depth.
+        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_depth"]
+        assert frag["outputs"][1]["type"] == "vec4"
+
+    def test_buffers_and_no_new_push_fields(self, tmp_path):
+        stages = _compile(tmp_path, "fg_buffers", motion_vectors=True,
+                           expected_depth=True, foreground_coverage=True)
+        comp = stages["comp"]
+        buf_names = {b["name"] for b in comp["descriptor_sets"]["0"]}
+        assert "splat_foreground" in buf_names
+        assert "projected_foreground" in buf_names
+        gs = comp["gaussian_splatting"]
+        assert "splat_foreground" in gs["input_buffers"]
+        assert "projected_foreground" in gs["output_buffers"]
+        # foreground_coverage adds a storage buffer, not a push field.
+        assert comp["push_constants"][0]["size"] == 176
+
+        vert = stages["vert"]
+        vert_bufs = {b["name"] for b in vert["descriptor_sets"]["0"]}
+        assert "projected_foreground" in vert_bufs
+
+        frag = stages["frag"]
+        assert "frag_foreground" in [i["name"] for i in frag["inputs"]]
+        # Still no new fragment output -- reuses out_depth's .g channel.
+        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_motion", "out_depth"]
+
+    def test_off_by_default(self, tmp_path):
+        stages = _compile(tmp_path, "fg_off", motion_vectors=False, expected_depth=False)
+        gs = stages["comp"]["gaussian_splatting"]
+        assert gs["foreground_coverage"] is False
+        buf_names = {b["name"] for b in stages["comp"]["descriptor_sets"]["0"]}
+        assert "splat_foreground" not in buf_names
+        assert "projected_foreground" not in buf_names
 
 
 class TestBoolLiteralParsing:

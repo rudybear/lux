@@ -35,6 +35,11 @@
       "name": "frag_depth",
       "type": "scalar",
       "location": 5
+    },
+    {
+      "name": "frag_foreground",
+      "type": "scalar",
+      "location": 6
     }
   ],
   "outputs": [
@@ -90,8 +95,8 @@
     "splat_name": "DlssGaussianCloud"
   },
   "performance_hints": {
-    "instruction_count": 126,
-    "alu_ops": 17,
+    "instruction_count": 131,
+    "alu_ops": 18,
     "texture_samples": 0,
     "branches": 2,
     "function_calls": 0,

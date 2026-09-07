@@ -36,6 +36,11 @@
       "name": "frag_depth",
       "type": "scalar",
       "location": 5
+    },
+    {
+      "name": "frag_foreground",
+      "type": "scalar",
+      "location": 6
     }
   ],
   "descriptor_sets": {
@@ -93,6 +98,15 @@
         "stage_flags": [
           "vertex"
         ]
+      },
+      {
+        "binding": 6,
+        "type": "storage_buffer",
+        "name": "projected_foreground",
+        "element_type": "scalar",
+        "stage_flags": [
+          "vertex"
+        ]
       }
     ]
   },
@@ -131,7 +145,7 @@
     "splat_name": "DlssGaussianCloud"
   },
   "performance_hints": {
-    "instruction_count": 224,
+    "instruction_count": 240,
     "alu_ops": 25,
     "texture_samples": 0,
     "branches": 0,

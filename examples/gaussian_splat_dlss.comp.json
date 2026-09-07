@@ -143,6 +143,24 @@
         "stage_flags": [
           "compute"
         ]
+      },
+      {
+        "binding": 15,
+        "type": "storage_buffer",
+        "name": "splat_foreground",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 16,
+        "type": "storage_buffer",
+        "name": "projected_foreground",
+        "element_type": "scalar",
+        "stage_flags": [
+          "compute"
+        ]
       }
     ]
   },
@@ -226,6 +244,7 @@
     "motion": "keyframes",
     "motion_vectors": true,
     "expected_depth": true,
+    "foreground_coverage": true,
     "workgroup_size": [
       256,
       1,
@@ -237,7 +256,8 @@
       "splat_scale",
       "splat_opacity",
       "splat_sh0",
-      "splat_prev_pos"
+      "splat_prev_pos",
+      "splat_foreground"
     ],
     "output_buffers": [
       "projected_center",
@@ -246,11 +266,12 @@
       "sort_keys",
       "visible_count",
       "projected_mv",
-      "projected_depth"
+      "projected_depth",
+      "projected_foreground"
     ]
   },
   "performance_hints": {
-    "instruction_count": 651,
+    "instruction_count": 679,
     "alu_ops": 173,
     "texture_samples": 0,
     "branches": 5,

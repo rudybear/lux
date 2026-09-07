@@ -190,6 +190,7 @@
     "motion": "keyframes",
     "motion_vectors": false,
     "expected_depth": false,
+    "foreground_coverage": false,
     "workgroup_size": [
       256,
       1,

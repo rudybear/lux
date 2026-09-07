@@ -467,6 +467,7 @@ def generate_reflection(
             "motion": splat_config.get("motion", "none"),
             "motion_vectors": splat_config.get("motion_vectors", False),
             "expected_depth": splat_config.get("expected_depth", False),
+            "foreground_coverage": splat_config.get("foreground_coverage", False),
         }
         if stage.stage_type == "compute":
             gs_meta["workgroup_size"] = [256, 1, 1]
