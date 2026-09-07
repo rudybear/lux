@@ -10,6 +10,11 @@
 #include <stdexcept>
 #include <memory>
 #include <cstdlib>
+#include <cstdio>
+#include <filesystem>
+#include <array>
+#include <unistd.h>
+#include <TargetConditionals.h>
 
 // ---------------------------------------------------------------------------
 // TranspiledShader helpers
@@ -79,6 +84,71 @@ std::vector<uint32_t> ShaderTranspiler::loadSPIRV(const std::string& path) {
     return data;
 }
 
+void ShaderTranspiler::convertRelaxedToHalfIfFragment(std::vector<uint32_t>& spirvData,
+                                                        uint32_t executionModel) {
+    if (executionModel != SpvExecModel::Fragment) return;
+    if (spirvData.empty()) return;
+
+#if TARGET_OS_IPHONE
+    // iOS (device and simulator) has no subprocess/shell-exec capability
+    // (`std::system()`/`fork+exec` are unavailable in the sandbox -- this
+    // was a real build failure caught building playground_ios, not a
+    // theoretical concern). This is a desktop-CLI-only perf diagnostic
+    // (bench/lux_perf_ablation.md's "precision: relaxed" follow-up); on
+    // iOS this is simply a no-op, exactly matching this codebase's
+    // pre-existing iOS behavior (spirvData is left as the ordinary fp32
+    // SPIR-V SPIRV-Cross always produced before this session -- no
+    // correctness or performance regression, since iOS never ran the
+    // conversion pass before either).
+    return;
+#else
+    namespace fs = std::filesystem;
+    // Unique-ish temp file names (PID + this vector's data pointer as a
+    // cheap discriminator) -- this runs at pipeline-load time, not per
+    // frame, so a simple scheme is fine; not shared across processes.
+    fs::path tmpDir = fs::temp_directory_path();
+    std::string tag = std::to_string(static_cast<long>(getpid())) + "_" +
+                       std::to_string(reinterpret_cast<uintptr_t>(spirvData.data()));
+    fs::path inPath = tmpDir / ("lux_relaxed_in_" + tag + ".spv");
+    fs::path outPath = tmpDir / ("lux_relaxed_out_" + tag + ".spv");
+
+    {
+        std::ofstream out(inPath, std::ios::binary);
+        if (!out.is_open()) return;
+        out.write(reinterpret_cast<const char*>(spirvData.data()),
+                  static_cast<std::streamsize>(spirvData.size() * sizeof(uint32_t)));
+    }
+
+    // Mirrors luxc/codegen/spv_assembler.py's run_spirv_opt: shell out to
+    // spirv-opt, fail open (leave spirvData untouched) if it's missing or
+    // errors. --convert-relaxed-to-half is a real SPIR-V type-rewriting
+    // pass (SPIRV-Tools), not a SPIRV-Cross transpile option -- it
+    // physically changes eligible RelaxedPrecision-decorated fp32
+    // instructions to OpTypeFloat16, which SPIRV-Cross's MSL backend then
+    // naturally emits as `half`.
+    std::string cmd = "spirv-opt --convert-relaxed-to-half " + inPath.string() +
+                       " -o " + outPath.string() + " >/dev/null 2>&1";
+    int rc = std::system(cmd.c_str());
+
+    if (rc == 0 && fs::exists(outPath)) {
+        std::ifstream in(outPath, std::ios::binary | std::ios::ate);
+        if (in.is_open()) {
+            size_t size = static_cast<size_t>(in.tellg());
+            if (size > 0 && size % 4 == 0) {
+                in.seekg(0);
+                std::vector<uint32_t> converted(size / 4);
+                in.read(reinterpret_cast<char*>(converted.data()), static_cast<std::streamsize>(size));
+                spirvData = std::move(converted);
+            }
+        }
+    }
+
+    std::error_code ec;
+    fs::remove(inPath, ec);
+    fs::remove(outPath, ec);
+#endif  // !TARGET_OS_IPHONE
+}
+
 MTL::Library* ShaderTranspiler::compileMSL(const std::string& source) {
     NS::Error* error = nullptr;
     auto* nsSource = NS::String::string(source.c_str(), NS::UTF8StringEncoding);
@@ -121,6 +191,7 @@ TranspiledShader ShaderTranspiler::transpile(const std::string& spvPath, uint32_
 
 void ShaderTranspiler::transpileInto(TranspiledShader& result, const std::string& spvPath, uint32_t executionModel) {
     auto spirvData = loadSPIRV(spvPath);
+    convertRelaxedToHalfIfFragment(spirvData, executionModel);
     transpileInto(result, spirvData, executionModel);
 }
 

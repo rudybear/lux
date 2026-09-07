@@ -60,6 +60,27 @@ private:
 
     // Compile MSL source to Metal library
     MTL::Library* compileMSL(const std::string& source);
+
+    // Metal-only, fragment-stage-only: runs `spirv-opt
+    // --convert-relaxed-to-half` on the given SPIR-V (in place) via
+    // subprocess (mirrors luxc/codegen/spv_assembler.py's run_spirv_opt
+    // pattern). See bench/lux_perf_ablation.md in mobiledlss ("precision:
+    // relaxed" follow-up): SPIRV-Cross's MSL backend does NOT
+    // automatically lower `RelaxedPrecision`-decorated fp32 ops to real
+    // MSL `half` -- that requires this actual SPIR-V type-rewriting pass
+    // (part of SPIRV-Tools, distinct from SPIRV-Cross) BEFORE the
+    // transpile step. Applying it to a shader with no RelaxedPrecision
+    // decorations (i.e. every non-`_relaxed` pipeline) is a verified
+    // byte-identical no-op (spirv-opt has nothing to convert), so this is
+    // safe to call unconditionally on every fragment-stage SPIR-V module
+    // without needing a separate runtime flag -- it only ever changes
+    // anything for pipelines actually compiled with the `precision:
+    // relaxed` splat option (the "existing option" this is gated behind).
+    // Silently leaves spirvData unmodified if spirv-opt is unavailable or
+    // fails (matches the Python helper's fail-open behavior) -- Vulkan is
+    // completely unaffected either way (this only touches the in-memory
+    // copy loaded for the Metal transpile, never the .spv file on disk).
+    void convertRelaxedToHalfIfFragment(std::vector<uint32_t>& spirvData, uint32_t executionModel);
 };
 
 // SPIR-V execution model constants (matches spirv.hpp values)
