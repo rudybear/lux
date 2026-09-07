@@ -17,6 +17,7 @@
 #include "unet_runner.h"
 
 #include <GLFW/glfw3.h>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -879,58 +880,80 @@ static int runHeadless(const CLIOptions& opts) {
                 }
 
                 if (splatR->hasMotionVectors() || splatR->hasExpectedDepth()) {
-                    // Each aux attachment carries its OWN alpha in its last
-                    // component (out_depth.y / out_motion.w, see
-                    // splat_expander._build_fragment_body) at full float32
-                    // precision -- un-premultiplying against the 8-bit
-                    // color attachment's alpha would lose precision (a
-                    // splat rarely reaches exactly alpha=1.0 there).
+                    // Packed out_aux attachment (bench/lux_perf_ablation.md
+                    // task 2: replaces the earlier two-attachment
+                    // out_motion/out_depth design): RGBA32F
+                    // (mv.x*alpha, mv.y*alpha, depth*alpha, alpha) -- `.w`
+                    // is the GENUINE per-fragment alpha (required for
+                    // correct hardware blend accumulation, see
+                    // getAuxFormat()'s comment), used here to un-premultiply
+                    // `.xyz`. NOT RGBA16F: measured on the juggle DLSS
+                    // scene, downgrading this attachment to half-float
+                    // produces catastrophic error (tens of pixels of MV
+                    // error) in background regions with heavy overdraw --
+                    // premultiplied mv/depth values (unlike color's own
+                    // [0,1]-bounded channels) are NOT magnitude-bounded, so
+                    // repeated half-float blend-accumulation steps compound
+                    // rounding error badly over many overlapping low-alpha
+                    // splats.
+                    auto rawAux = Screenshot::readImageRaw(ctx, splatR->getAuxImage(), w, h, 16,
+                                                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                    std::vector<float> auxF32(static_cast<size_t>(w) * h * 4);
+                    std::memcpy(auxF32.data(), rawAux.data(), rawAux.size());
+                    std::vector<float> auxAlpha(static_cast<size_t>(w) * h);
+                    for (size_t i = 0; i < auxAlpha.size(); ++i) {
+                        auxAlpha[i] = auxF32[i * 4 + 3];
+                    }
+
                     if (splatR->hasExpectedDepth()) {
-                        // getExpectedDepthFormat() is vec4 (x=depth*alpha,
-                        // y/z unused, w=alpha), not vec2 -- see its comment.
-                        auto raw = Screenshot::readImageRaw(ctx, splatR->getExpectedDepthImage(), w, h, 16,
-                                                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                        std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
-                        std::memcpy(rgba.data(), raw.data(), raw.size());
+                        // out_aux.z = depth*alpha.
                         std::vector<float> depthPremul(static_cast<size_t>(w) * h);
-                        std::vector<float> depthAlpha(static_cast<size_t>(w) * h);
                         for (size_t i = 0; i < depthPremul.size(); ++i) {
-                            depthPremul[i] = rgba[i * 4 + 0];
-                            depthAlpha[i] = rgba[i * 4 + 3];
+                            depthPremul[i] = auxF32[i * 4 + 2];
                         }
-                        auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
+                        auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, auxAlpha, w, h, 1);
                         DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_depth.npy", depth,
                                                  {h, w});
                         DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png",
                                                            depth, w, h, 1);
 
-                        // foreground_coverage packs into out_depth's .g
-                        // channel (index 1), same alpha (.w) as depth --
-                        // see SPECIFICATION.md 12.8's foreground_coverage entry.
+                        // foreground_coverage: a SECOND attachment out_fg
+                        // (fg*alpha, 0, 0, alpha) -- can't share out_aux's
+                        // lanes, see splat_renderer.h's getFgImage()
+                        // comment. RGBA16F (not RGBA32F): fg is bounded to
+                        // [0,1] like alpha itself, so it's safe in
+                        // half-float the same way out_color's own channels
+                        // are (measured: no precision regression vs.
+                        // RGBA32F on this scene).
                         if (splatR->hasForegroundCoverage()) {
-                            std::vector<float> fgPremul(static_cast<size_t>(w) * h);
-                            for (size_t i = 0; i < fgPremul.size(); ++i) {
-                                fgPremul[i] = rgba[i * 4 + 1];
+                            auto rawFg = Screenshot::readImageRaw(ctx, splatR->getFgImage(), w, h, 8,
+                                                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                            std::vector<float> fgF32(static_cast<size_t>(w) * h * 4);
+                            for (size_t i = 0; i < fgF32.size(); ++i) {
+                                uint16_t half;
+                                std::memcpy(&half, rawFg.data() + i * 2, 2);
+                                fgF32[i] = DlssIO::halfToFloat(half);
                             }
-                            auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, depthAlpha, w, h, 1);
+                            std::vector<float> fgPremul(static_cast<size_t>(w) * h);
+                            std::vector<float> fgAlpha(static_cast<size_t>(w) * h);
+                            for (size_t i = 0; i < fgPremul.size(); ++i) {
+                                fgPremul[i] = fgF32[i * 4 + 0];
+                                fgAlpha[i] = fgF32[i * 4 + 3];
+                            }
+                            auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, fgAlpha, w, h, 1);
                             DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_fg.npy", fg, {h, w});
                             DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_fg_preview.png",
                                                                fg, w, h, 1);
                         }
                     }
                     if (splatR->hasMotionVectors()) {
-                        auto raw = Screenshot::readImageRaw(ctx, splatR->getMotionImage(), w, h, 16,
-                                                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                        std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
-                        std::memcpy(rgba.data(), raw.data(), raw.size());
+                        // out_aux.xy = mv*alpha.
                         std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
-                        std::vector<float> mvAlpha(static_cast<size_t>(w) * h);
-                        for (size_t i = 0; i < mvAlpha.size(); ++i) {
-                            mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
-                            mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
-                            mvAlpha[i] = rgba[i * 4 + 3];
+                        for (size_t i = 0; i < auxAlpha.size(); ++i) {
+                            mvPremul[i * 2 + 0] = auxF32[i * 4 + 0];
+                            mvPremul[i * 2 + 1] = auxF32[i * 4 + 1];
                         }
-                        auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
+                        auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, auxAlpha, w, h, 2);
                         DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_mv.npy", mv,
                                                  {h, w, 2});
                         DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_mv_preview.png",

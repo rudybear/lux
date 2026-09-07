@@ -79,37 +79,57 @@ def _get_splat_config(splat: SplatDecl) -> dict:
                        stage also projects each splat's *previous* frame
                        position with the *previous* frame's (unjittered)
                        view-projection and emits a `projected_mv` buffer;
-                       the render stages carry it through as an additional
-                       premultiplied-alpha vec4 output (`out_motion`: xy =
-                       mv*alpha, z = 0, w = alpha itself, so the host can
-                       un-premultiply at full float32 precision instead of
-                       relying on the 8-bit color attachment's alpha). See
-                       docs/lux-4d-spec.md section 3 ("DLSS input contract
-                       outputs") and docs/language-reference.md.
+                       the render stages carry it through into a shared
+                       `out_aux` attachment's .x/.y lanes (see
+                       expected_depth below for the full packed layout).
+                       See docs/lux-4d-spec.md section 3 ("DLSS input
+                       contract outputs") and docs/language-reference.md.
         expected_depth -- bool (default False): when true, the preprocess
                        stage emits a `projected_depth` buffer (camera-space
-                       z) and the render stages carry it through as an
-                       additional premultiplied-alpha vec4 output
-                       (`out_depth`: x = depth*alpha, y/z unused, w =
-                       alpha), matching gsplat's "ED" (expected depth)
-                       mode. vec4 (not vec2) so Vulkan's fixed-function
-                       alpha blend has a genuine 4th-component alpha to
-                       read -- see the fragment-stage output comment.
+                       z), matching gsplat's "ED" (expected depth) mode.
+                       When either motion_vectors or expected_depth is set,
+                       the render stages emit ONE additional attachment
+                       `out_aux` (RGBA32F, premultiplied-alpha-blended with
+                       the SAME (ONE, ONE_MINUS_SRC_ALPHA) equation as
+                       out_color): `(mv.x*alpha, mv.y*alpha, depth*alpha,
+                       alpha)` -- lanes for a disabled feature are written
+                       0.0. `.w` carries the GENUINE per-fragment alpha,
+                       not a packed data value: Vulkan's fixed-function
+                       SRC_ALPHA/ONE_MINUS_SRC_ALPHA blend factors read
+                       "source alpha" from THIS attachment's own 4th
+                       component specifically (not a shared/global value),
+                       so whatever occupies `.w` directly controls how
+                       every overlapping fragment decays into this
+                       attachment -- an earlier version of this packing
+                       put `fg*alpha` there instead (reasoning the host
+                       could un-premultiply from `out_color`'s alpha
+                       instead), which is a genuinely different, GPU-side
+                       correctness bug, not a precision tradeoff: it made
+                       `ONE_MINUS_SRC_ALPHA` evaluate to ~1 (no decay) for
+                       every background/non-actor fragment, producing an
+                       unbounded running SUM instead of a proper "over"
+                       composite (measured 10-50x MV/depth blowups in
+                       heavily-overdrawn regions). Vs. the earlier
+                       two-attachment (`out_motion`/`out_depth`, each
+                       RGBA32F with an always-0 `.z`) design, `out_aux` now
+                       packs 3 real values with zero wasted lanes:
+                       attachment count 2->1 and bytes 32B->16B whenever
+                       foreground_coverage is off.
         foreground_coverage -- bool (default False): when true, the
                        preprocess stage reads a per-splat `splat_foreground`
                        input (0.0 or 1.0 -- see docs/rendering-engines.md's
                        `_FOREGROUND` attribute / morph-target fallback) and
-                       the render stages composite it with the SAME
-                       visibility-weighted premultiplied-alpha blend as the
-                       MV/depth channels, PACKED into out_depth's .g
-                       component (`out_depth`: x = depth*alpha, y =
-                       foreground*alpha, z unused, w = alpha) -- no new
-                       attachment needed, since RGBA32F's y/z were unused
-                       padding. Implies expected_depth: true (auto-enabled
-                       if not already set on the same splat block) since
-                       there is nowhere else to pack it. The host divides
-                       .y by .w to recover the per-pixel foreground/actor
-                       coverage fraction, exactly like depth's own .x/.w.
+                       the render stages composite it into a SECOND
+                       attachment `out_fg` (`x = fg*alpha, y = 0, z = 0,
+                       w = alpha` -- same genuine-alpha-in-`.w` requirement
+                       as `out_aux` above; `out_fg` can't share `out_aux`
+                       because `out_aux` already uses all 3 non-alpha lanes
+                       for mv.xy/depth). Implies expected_depth: true
+                       (auto-enabled if not already set on the same splat
+                       block). The host divides `out_fg.x` by `out_fg.w`
+                       (or, equivalently, by `out_color`'s alpha -- both are
+                       the same per-fragment alpha) to recover the
+                       per-pixel foreground/actor coverage fraction.
     """
     config = {
         "sh_degree": 0,
@@ -1622,33 +1642,58 @@ def _build_fragment_stage(config: dict) -> StageBlock:
     out._is_input = False
     stage.outputs.append(out)
     # Additional DLSS input-contract outputs (docs/lux-4d-spec.md section 3),
-    # blended with the SAME premultiplied-alpha equation as out_color. Each
-    # ALSO carries its own copy of the per-fragment alpha in its last
-    # component (out_motion.w, out_depth.y): un-premultiplying by an alpha
-    # sourced from the 8-bit color attachment would lose precision (a splat
-    # rarely reaches exactly alpha=1.0 there), so the host instead divides
-    # by this full-float32-precision alpha accumulated in the SAME
-    # attachment via the SAME blend equation.
-    if config.get("motion_vectors"):
-        out_mv = VarDecl("out_motion", "vec4")
-        out_mv._is_input = False
-        stage.outputs.append(out_mv)
-    if config.get("expected_depth"):
-        # vec4, not vec2: Vulkan's fixed-function alpha blend factors
-        # (ONE_MINUS_SRC_ALPHA) read "source alpha" from the 4th component
-        # of the fragment shader's output for that attachment -- a vec2
-        # output has no 4th component, and MoltenVK/Apple GPUs were
-        # empirically observed to then blend as if src alpha were 0 (i.e.
-        # dst_new = src + dst_old, an un-decayed running SUM instead of the
-        # correct back-to-front "over" composite), silently producing a
-        # simple order-independent alpha-weighted average biased toward
-        # farther/occluded splats instead of the correct visibility-
-        # weighted one. out_motion (already vec4, alpha genuinely at .w)
-        # never had this bug -- see docs/lux-4d-spec.md section 3's depth
-        # regression follow-up. y/z are unused padding.
-        out_depth = VarDecl("out_depth", "vec4")
-        out_depth._is_input = False
-        stage.outputs.append(out_depth)
+    # PACKED into `out_aux` (mv.x*alpha, mv.y*alpha, depth*alpha, **alpha**)
+    # -- emitted whenever motion_vectors OR expected_depth is set -- and, iff
+    # foreground_coverage is ALSO set, a second attachment `out_fg`
+    # (fg*alpha, 0, 0, **alpha**). Both use the SAME premultiplied-alpha
+    # blend equation/factors as out_color (fixed-function
+    # (ONE, ONE_MINUS_SRC_ALPHA)).
+    #
+    # IMPORTANT (bench/lux_perf_ablation.md task 2 -- this replaced an
+    # EARLIER, BROKEN attempt at this task that packed `fg*alpha` into
+    # `out_aux`'s `.w` lane and dropped alpha entirely, reasoning it could
+    # be recovered from `out_color`'s own alpha instead): Vulkan's
+    # fixed-function `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` blend factors read
+    # "source alpha" from THAT SPECIFIC ATTACHMENT's own 4th output
+    # component -- NOT a globally shared value, and NOT `out_color`'s alpha
+    # -- so whatever value sits in `out_aux.w` directly controls how much
+    # EVERY overlapping fragment's contribution decays into this
+    # attachment. Packing `fg*alpha` there (which is 0 for the common
+    # "background, non-actor" case) made `ONE_MINUS_SRC_ALPHA` evaluate to
+    # 1 for most fragments -- i.e. NO decay, an unbounded running SUM
+    # instead of a proper "over" composite -- and blew up MV/depth by
+    # 10-50x specifically in heavily-overdrawn background regions (measured
+    # on the juggle DLSS scene: MV median error 39.9px vs. the ~0.002px the
+    # old two-attachment design achieved). This is the SAME class of bug
+    # `out_depth`'s original vec4-not-vec2 fix (see the historical comment
+    # this replaced) was created to prevent -- it just wasn't obvious it
+    # also applies to what value OCCUPIES an existing alpha lane, not only
+    # whether one exists. `out_color`'s own alpha remains a fine
+    # UN-PREMULTIPLY divisor host-side (that math doesn't care which
+    # attachment produced the alpha value, since they're all computed from
+    # the identical per-fragment `alpha`) -- the bug is specifically about
+    # what the GPU'S OWN fixed-function blend unit reads per attachment
+    # while accumulating, which is a completely different, per-attachment,
+    # structural requirement. Each blended attachment MUST carry its own
+    # genuine (undiluted) alpha in its last component, full stop.
+    #
+    # Net effect vs. the original two-attachment (out_motion, out_depth,
+    # each RGBA32F with a wasted always-0 `.z`) design: `out_aux` now packs
+    # 3 real values (mv.xy, depth) with zero wasted lanes (attachment count
+    # 2->1, bytes 32B->16B) whenever foreground_coverage is off; when it's
+    # on, `out_fg` is a second, mostly-wasted-but-safe-to-shrink attachment
+    # (see the host's format choice for it) -- attachment count stays 2,
+    # but total bytes still drop (see splat_renderer.h's getAuxFormat()/
+    # getFgFormat() comments for the exact host-side format choices and
+    # measured precision).
+    if config.get("motion_vectors") or config.get("expected_depth"):
+        out_aux = VarDecl("out_aux", "vec4")
+        out_aux._is_input = False
+        stage.outputs.append(out_aux)
+    if config.get("foreground_coverage"):
+        out_fg = VarDecl("out_fg", "vec4")
+        out_fg._is_input = False
+        stage.outputs.append(out_fg)
 
     # --- Push constants (shared block with vertex to avoid Vulkan offset conflicts) ---
     pc_fields = [
@@ -1749,32 +1794,29 @@ def _build_fragment_body(config: dict) -> list:
             _ref("alpha"),
         ])))
 
-    # --- Additional DLSS input-contract outputs, premultiplied by the same
-    # alpha as out_color so the fixed-function (ONE, ONE_MINUS_SRC_ALPHA)
-    # blend used for color also does the correct visibility-weighted average
-    # for motion/depth. Each also carries alpha itself in its last
-    # component, full-float32-precision, for the host to un-premultiply
-    # with (see the output-declaration comment above). ---
-    if config.get("motion_vectors"):
-        body.append(_assign("out_motion",
+    # --- Additional DLSS input-contract outputs, packed into `out_aux`
+    # (mv.x*alpha, mv.y*alpha, depth*alpha, alpha) and, iff
+    # foreground_coverage, a second `out_fg` (fg*alpha, 0, 0, alpha) --
+    # premultiplied by the same alpha as out_color so the fixed-function
+    # (ONE, ONE_MINUS_SRC_ALPHA) blend also does the correct visibility-
+    # weighted average for each packed channel. Each attachment's `.w`
+    # carries the GENUINE per-fragment alpha (not a packed data value) --
+    # see the output-declaration comment above for why this is a hardware
+    # blend-correctness requirement, not merely a host-precision nicety. ---
+    if config.get("motion_vectors") or config.get("expected_depth"):
+        mv_x_term = (_binop("*", _swizzle(_ref("frag_mv"), "x"), _ref("alpha"))
+                     if config.get("motion_vectors") else _lit("0.0"))
+        mv_y_term = (_binop("*", _swizzle(_ref("frag_mv"), "y"), _ref("alpha"))
+                     if config.get("motion_vectors") else _lit("0.0"))
+        depth_term = (_binop("*", _ref("frag_depth"), _ref("alpha"))
+                      if config.get("expected_depth") else _lit("0.0"))
+        body.append(_assign("out_aux",
+            _ctor("vec4", [mv_x_term, mv_y_term, depth_term, _ref("alpha")])))
+    if config.get("foreground_coverage"):
+        body.append(_assign("out_fg",
             _ctor("vec4", [
-                _binop("*", _swizzle(_ref("frag_mv"), "x"), _ref("alpha")),
-                _binop("*", _swizzle(_ref("frag_mv"), "y"), _ref("alpha")),
+                _binop("*", _ref("frag_foreground"), _ref("alpha")),
                 _lit("0.0"),
-                _ref("alpha"),
-            ])))
-    if config.get("expected_depth"):
-        # x = depth*alpha, y = foreground*alpha (only when
-        # foreground_coverage; otherwise unused padding), z unused, w =
-        # alpha (the genuine 4th-component alpha the hardware blend needs
-        # -- see the output-declaration comment above). The host
-        # un-premultiplies by .w now, not .y.
-        fg_term = (_binop("*", _ref("frag_foreground"), _ref("alpha"))
-                   if config.get("foreground_coverage") else _lit("0.0"))
-        body.append(_assign("out_depth",
-            _ctor("vec4", [
-                _binop("*", _ref("frag_depth"), _ref("alpha")),
-                fg_term,
                 _lit("0.0"),
                 _ref("alpha"),
             ])))

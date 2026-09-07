@@ -88,11 +88,11 @@ class TestExpectedDepthOnly:
         assert comp["push_constants"][0]["size"] == 176
 
         frag = stages["frag"]
-        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_depth"]
+        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_aux"]
         # vec4, not vec2: Vulkan's fixed-function alpha blend reads "source
         # alpha" from the 4th component of the fragment output for this
         # attachment, which a vec2 output doesn't have -- see
-        # splat_expander.py's out_depth comment.
+        # splat_expander.py's out_aux comment.
         assert frag["outputs"][1]["type"] == "vec4"
 
         gs = comp["gaussian_splatting"]
@@ -124,7 +124,7 @@ class TestMotionVectorsOnly:
         assert comp["push_constants"][0]["size"] == 176
 
         frag = stages["frag"]
-        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_motion"]
+        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_aux"]
         assert frag["outputs"][1]["type"] == "vec4"
 
         vert = stages["vert"]
@@ -147,8 +147,8 @@ class TestBothOutputs:
         assert "morph.comp" in stages  # morph-apply stage still emitted
 
         frag = stages["frag"]
-        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_motion", "out_depth"]
-        assert [o["location"] for o in frag["outputs"]] == [0, 1, 2]
+        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_aux"]
+        assert [o["location"] for o in frag["outputs"]] == [0, 1]
 
         vert = stages["vert"]
         out_names = [o["name"] for o in vert["outputs"]]
@@ -168,8 +168,10 @@ class TestBothOutputs:
 
 
 class TestForegroundCoverage:
-    """`foreground_coverage: true` packs into out_depth's .g channel and
-    implies expected_depth even when not explicitly set."""
+    """`foreground_coverage: true` composites into a SEPARATE `out_fg`
+    attachment (can't share `out_aux`'s lanes -- see splat_expander.py's
+    out_aux comment) and implies expected_depth even when not explicitly
+    set."""
 
     def test_implies_expected_depth(self, tmp_path):
         stages = _compile(tmp_path, "fg_implies_depth", motion_vectors=False,
@@ -179,9 +181,11 @@ class TestForegroundCoverage:
         assert gs["foreground_coverage"] is True
 
         frag = stages["frag"]
-        # No new attachment -- still just out_color, out_depth.
-        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_depth"]
+        # A new attachment: out_color, out_aux (depth only, mv lanes 0),
+        # out_fg.
+        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_aux", "out_fg"]
         assert frag["outputs"][1]["type"] == "vec4"
+        assert frag["outputs"][2]["type"] == "vec4"
 
     def test_buffers_and_no_new_push_fields(self, tmp_path):
         stages = _compile(tmp_path, "fg_buffers", motion_vectors=True,
@@ -202,8 +206,8 @@ class TestForegroundCoverage:
 
         frag = stages["frag"]
         assert "frag_foreground" in [i["name"] for i in frag["inputs"]]
-        # Still no new fragment output -- reuses out_depth's .g channel.
-        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_motion", "out_depth"]
+        # out_aux (mv+depth) plus a separate out_fg attachment.
+        assert [o["name"] for o in frag["outputs"]] == ["out_color", "out_aux", "out_fg"]
 
     def test_off_by_default(self, tmp_path):
         stages = _compile(tmp_path, "fg_off", motion_vectors=False, expected_depth=False)

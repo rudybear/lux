@@ -77,8 +77,8 @@ public:
     bool hasMotionVectors() const { return hasMotionVectors_; }
     bool hasExpectedDepth() const { return hasExpectedDepth_; }
     // True when the compiled shader was built with `foreground_coverage: true`
-    // (implies hasExpectedDepth_ -- the flag is packed into out_depth's .g
-    // channel, no separate attachment). See getExpectedDepthImage() below.
+    // (implies hasExpectedDepth_ -- the flag adds a SECOND small attachment,
+    // getFgImage() below, not a channel of getAuxImage()).
     bool hasForegroundCoverage() const { return hasForegroundCoverage_; }
 
     // Sub-pixel jitter in PIXELS, applied to the projection matrix used for
@@ -87,18 +87,46 @@ public:
     // Positive jx shifts rendered content right, positive jy shifts it down.
     void setJitter(float jitterXPixels, float jitterYPixels);
 
-    VkImage getMotionImage() const { return motionImage_; }
-    VkFormat getMotionFormat() const { return VK_FORMAT_R32G32B32A32_SFLOAT; }  // xy=mv*alpha, z=0, w=alpha
-    VkImage getExpectedDepthImage() const { return expectedDepthImage_; }
-    // vec4 (x=depth*alpha, y/z unused, w=alpha), not vec2 -- Vulkan's
-    // fixed-function alpha blend reads "source alpha" from the 4th
-    // component of the fragment output for THIS attachment; a vec2 output
-    // has none, and this was empirically found to blend as if src alpha
-    // were 0 (undecayed running sum instead of the correct back-to-front
-    // "over" composite) on MoltenVK/Apple GPUs. See
-    // luxc/expansion/splat_expander.py's out_depth comment and
-    // docs/lux-4d-spec.md section 3's depth-regression follow-up.
-    VkFormat getExpectedDepthFormat() const { return VK_FORMAT_R32G32B32A32_SFLOAT; }
+    // Packed DLSS aux attachment (bench/lux_perf_ablation.md task 2):
+    // `out_aux` is ONE RGBA32F attachment carrying
+    // (mv.x*alpha, mv.y*alpha, depth*alpha, alpha) -- replaces the earlier
+    // TWO-attachment (out_motion RGBA32F, out_depth RGBA32F, each with an
+    // always-0 `.z`) design with one attachment that packs 3 real values
+    // with ZERO wasted lanes (2->1 attachment, 32B/px->16B/px whenever
+    // foreground_coverage is off). `.w` MUST be the genuine per-fragment
+    // alpha, not a repurposed data channel -- see
+    // luxc/expansion/splat_expander.py's out_aux comment for why: Vulkan's
+    // fixed-function SRC_ALPHA/ONE_MINUS_SRC_ALPHA blend factors read
+    // "source alpha" from THIS attachment's own 4th component specifically,
+    // so anything else there corrupts the blend accumulation itself (a
+    // real, measured, 10-50x MV/depth error in an earlier version of this
+    // design that tried to pack `fg` into `.w` instead and un-premultiply
+    // everything via out_color's alpha -- NOT merely a precision tradeoff).
+    // NOT RGBA16F: also measured on the juggle DLSS scene, downgrading this
+    // attachment to half-float still produces catastrophic error in
+    // heavily-overdrawn background regions (tens of pixels of MV error) --
+    // premultiplied mv/depth values (unlike color's own [0,1]-bounded
+    // channels) are NOT magnitude-bounded, so repeated half-float blend
+    // accumulation steps compound rounding error badly over many
+    // overlapping low-alpha splats. RGBA32F keeps the SAME full-precision
+    // accumulation the old two-attachment design had. Valid whenever
+    // hasMotionVectors() || hasExpectedDepth().
+    VkImage getAuxImage() const { return auxImage_; }
+    VkFormat getAuxFormat() const { return VK_FORMAT_R32G32B32A32_SFLOAT; }
+
+    // Second, smaller attachment for foreground_coverage (only allocated
+    // when hasForegroundCoverage()): `out_fg` = (fg*alpha, 0, 0, alpha).
+    // Can't share `out_aux` -- that attachment's 3 non-alpha lanes are
+    // already spoken for by mv.xy/depth, and `.w` must stay genuine alpha
+    // (see getAuxImage()'s comment) in EVERY blended attachment
+    // independently, not just one. RGBA16F, not RGBA32F: fg (like alpha
+    // itself) is bounded to [0,1] -- the same magnitude-boundedness that
+    // keeps out_color's own RGBA16F blend accumulation safe applies here
+    // too (measured: no precision regression vs. RGBA32F on the same
+    // scene), unlike out_aux's mv/depth values which are NOT
+    // magnitude-bounded.
+    VkImage getFgImage() const { return fgImage_; }
+    VkFormat getFgFormat() const { return VK_FORMAT_R16G16B16A16_SFLOAT; }
 
     void render(VulkanContext& ctx);
 
@@ -195,17 +223,21 @@ private:
     VmaAllocation depthAlloc_ = VK_NULL_HANDLE;
     VkImageView depthView_ = VK_NULL_HANDLE;
 
-    // --- DLSS input-contract outputs (only allocated when the respective
-    // flag is detected on the compiled shader) ---
+    // --- DLSS input-contract outputs (only allocated when motion_vectors
+    // or expected_depth is detected on the compiled shader) ---
     bool hasMotionVectors_ = false;
     bool hasExpectedDepth_ = false;
     bool hasForegroundCoverage_ = false;
-    VkImage motionImage_ = VK_NULL_HANDLE;
-    VmaAllocation motionAlloc_ = VK_NULL_HANDLE;
-    VkImageView motionView_ = VK_NULL_HANDLE;
-    VkImage expectedDepthImage_ = VK_NULL_HANDLE;
-    VmaAllocation expectedDepthAlloc_ = VK_NULL_HANDLE;
-    VkImageView expectedDepthView_ = VK_NULL_HANDLE;
+    // Packed RGBA32F attachment (mv.x*a, mv.y*a, depth*a, a) -- see
+    // getAuxImage()'s comment (NOT RGBA16F -- measured precision failure).
+    VkImage auxImage_ = VK_NULL_HANDLE;
+    VmaAllocation auxAlloc_ = VK_NULL_HANDLE;
+    VkImageView auxView_ = VK_NULL_HANDLE;
+    // Second, smaller RGBA16F attachment (fg*a, 0, 0, a) -- only allocated
+    // when hasForegroundCoverage_ -- see getFgImage()'s comment.
+    VkImage fgImage_ = VK_NULL_HANDLE;
+    VmaAllocation fgAlloc_ = VK_NULL_HANDLE;
+    VkImageView fgView_ = VK_NULL_HANDLE;
 
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;

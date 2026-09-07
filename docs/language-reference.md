@@ -543,8 +543,8 @@ alongside `out_color` (see `docs/lux-4d-spec.md` section 3):
 splat DlssGaussianCloud {
     sh_degree: 0,
     motion: keyframes,      // optional, independent of the two flags below
-    motion_vectors: true,   // adds a vec4 "out_motion" fragment output
-    expected_depth: true,   // adds a vec4 "out_depth" fragment output
+    motion_vectors: true,   // packs mv.xy into the shared "out_aux" fragment output
+    expected_depth: true,   // packs depth into the shared "out_aux" fragment output
 }
 
 pipeline DlssSplatViewer {
@@ -580,15 +580,16 @@ splat cloud under camera motion alone can still emit motion vectors.
   previous frame's pixel location of the same surface point. `uv` uses a
   top-left origin with +y down, matching the existing `pixel_center`
   convention in the vertex stage. Carried through as `frag_mv` (vertex →
-  fragment) and written to the `out_motion` fragment output (**vec4**:
-  `xy = frag_mv * alpha`, `z = 0`, `w = alpha`) — i.e. **premultiplied by
-  the same per-fragment alpha as `out_color`**, so the engine can reuse the
-  identical `(ONE, ONE_MINUS_SRC_ALPHA)` blend state for the motion
-  attachment and get the correct visibility-weighted average of
-  overlapping splats for free. Alpha is also duplicated into `.w` (rather
-  than making the host divide by `out_color`'s alpha) so un-premultiplying
-  `mv` happens at full float32 precision instead of being limited by an
-  8-bit color attachment's alpha resolution. On the very first rendered
+  fragment) and written into the shared `out_aux` fragment output's `.xy`
+  lanes (`x = frag_mv.x * alpha`, `y = frag_mv.y * alpha` — see the packed
+  `out_aux` layout below) — i.e. **premultiplied by the same per-fragment
+  alpha as `out_color`**, so the engine can reuse the identical
+  `(ONE, ONE_MINUS_SRC_ALPHA)` blend state for the aux attachment and get
+  the correct visibility-weighted average of overlapping splats for free.
+  `out_aux.w` carries the genuine per-fragment alpha (see the packed
+  `out_aux` note below for why this can't be recovered from `out_color`'s
+  alpha instead), which the host divides by to un-premultiply `.xy`. On
+  the very first rendered
   frame (no previous camera/position data yet), the host is expected to
   set `prev_view_proj_unjittered` equal to the current frame's unjittered
   view-projection and alias/copy `splat_prev_pos` to the current
@@ -610,33 +611,62 @@ splat cloud under camera motion alone can still emit motion vectors.
 **`expected_depth: true`** adds an output buffer `projected_depth`
 (scalar): the camera-space depth `t = -view_pos.z` already computed by the
 preprocess stage's Jacobian projection (gsplat's `"ED"` — expected depth
-— mode). Carried through as `frag_depth` and written to `out_depth`
-(**vec4**: `x = frag_depth * alpha`, `y`/`z` unused, `w = alpha`), again
-using the same premultiplied-alpha blend as color (with the same
-full-precision-alpha rationale as `out_motion` above), so overlapping
-splats contribute an alpha-weighted average depth and pixels with no
-splats at all end up at exactly `0.0`. `out_depth` is `vec4`, not `vec2`,
-even though only one data channel is used: Vulkan's fixed-function alpha
-blend factors (`ONE_MINUS_SRC_ALPHA`) read "source alpha" from the 4th
-component of the fragment shader's output for that attachment specifically
-— a `vec2` output has no 4th component, and this was empirically found to
-make MoltenVK/Apple GPUs blend as if source alpha were always 0 (i.e.
-`dst_new = src + dst_old`, an undecayed running sum across overlapping
-splats) instead of the correct back-to-front `dst_new = src + dst_old *
-(1 - alpha)` composite. `out_motion` never had this bug (already `vec4`,
-alpha genuinely at `.w`). See `tests/test_dlss_outputs.py`'s
-`TestExpectedDepth::test_overlapping_splats_depth_matches_over_compositing`.
+— mode). Carried through as `frag_depth` and written into the shared
+`out_aux` fragment output's `.z` lane (`z = frag_depth * alpha`), again
+using the same premultiplied-alpha blend as color, so overlapping splats
+contribute an alpha-weighted average depth and pixels with no splats at
+all end up at exactly `0.0`.
 
-Both new fragment outputs are appended *after* `out_color` in declaration
-order (so `out_color` is always location 0, `out_motion`/`out_depth` take
-the next free locations in the order the flags are checked:
-motion first, then depth), and both new vertex-stage varyings
-(`frag_mv`/`frag_depth`) are appended after the existing four. Reflection
-JSON's `gaussian_splatting` section (on the preprocess stage) reports
-`"motion_vectors"` and `"expected_depth"` booleans, and the buffer/push
-changes are visible in the usual `descriptor_sets`/`push_constants`
-sections — see `examples/gaussian_splat_dlss.lux` for a compiling example
-with both flags and `motion: keyframes` all enabled together.
+**Packed `out_aux` fragment output**: when EITHER `motion_vectors` or
+`expected_depth` is set, the fragment stage emits ONE additional `vec4`
+attachment `out_aux`: `(x = frag_mv.x * alpha, y = frag_mv.y * alpha,
+z = frag_depth * alpha, w = alpha)` — lanes for a disabled feature are
+written `0.0`. `.w` is `vec4`'s reason for being here, and it MUST hold
+the genuine per-fragment alpha, not a repurposed data channel: Vulkan's
+fixed-function alpha blend factors (`SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA`)
+read "source alpha" from the 4th component of THIS attachment's own
+fragment output specifically (not a shared/global value, and not
+`out_color`'s alpha) — so whatever occupies `.w` directly controls how
+every overlapping fragment decays into this attachment. An earlier
+version of this design packed `frag_foreground * alpha` into `.w` instead
+(reasoning the host could un-premultiply everything from `out_color`'s own
+alpha afterward, since that math is agnostic to which attachment produced
+the value) — that is a genuinely different, GPU-side correctness bug, not
+a precision tradeoff: `ONE_MINUS_SRC_ALPHA` evaluates to ~1 (no decay) for
+every fragment where `foreground` is 0 (the common "background" case),
+turning the blend into an unbounded running SUM instead of a proper
+"over" composite — measured as a 10-50x MV/depth error in heavily
+overdrawn background regions on a real scene. This is the same class of
+bug the historical vec2-vs-vec4 `out_depth` fix (below) guards against; it
+just wasn't obvious it also applies to what VALUE occupies an existing
+alpha lane, not only whether one exists at all.
+
+Vs. the earlier two-attachment (`out_motion`, `out_depth`, each RGBA32F
+with an always-`0.0` `.z`) design, `out_aux` packs 3 real values (mv.xy,
+depth) with ZERO wasted lanes: attachment count 2→1 and bytes 32B→16B
+whenever `foreground_coverage` is off (see below for when it's on).
+`out_aux` stays `RGBA32F`, not `RGBA16F`: downgrading it to half-float
+(even with the `.w`-alpha bug fixed) reproduces the same class of
+catastrophic error, because premultiplied mv/depth values — unlike
+`out_color`'s own `[0, 1]`-bounded channels — are not magnitude-bounded,
+so repeated half-float blend-accumulation steps compound rounding error
+badly over the many overlapping low-alpha fragments a real scene's
+background can have.
+
+`out_aux` is appended *after* `out_color` in declaration order (so
+`out_color` is always location 0, `out_aux` takes location 1), and the
+`frag_mv`/`frag_depth` vertex-stage varyings feeding it are appended after
+the existing four, exactly as before — only the final fragment-output
+packing changed, not the preprocess/vertex stages. Reflection JSON's
+`gaussian_splatting` section (on the preprocess stage) still reports
+independent `"motion_vectors"` and `"expected_depth"` booleans (each
+buffer/push-constant addition is unaffected by the packing change), and
+the buffer/push changes are visible in the usual
+`descriptor_sets`/`push_constants` sections — see
+`examples/gaussian_splat_dlss.lux` for a compiling example with both
+flags and `motion: keyframes` all enabled together. See
+`tests/test_dlss_outputs.py`'s
+`TestExpectedDepth::test_overlapping_splats_depth_matches_over_compositing`.
 
 Sub-pixel jitter (`--jitter jx jy` in the playgrounds), the previous-frame
 double buffering, and the `--output-aux`/`--camera-json` headless dump and
@@ -646,13 +676,21 @@ runtime design.
 
 **`foreground_coverage: true`** adds a per-pixel actor/foreground coverage
 mask — a visibility-weighted composite of a per-splat is-foreground flag,
-computed exactly like `out_motion`/`out_depth` above. It implies
-`expected_depth: true` (auto-enabled even if not written explicitly),
-because rather than adding a fourth attachment it packs into `out_depth`'s
-otherwise-unused `.g` channel: `y = frag_foreground * alpha`, alongside
-`x = frag_depth * alpha` and `w = alpha` (the host un-premultiplies `.g`
-by the same `.w` alpha it already uses for `.x`). This adds an input
-storage buffer `splat_foreground` (scalar, one 0.0/1.0 value per splat)
+computed exactly like `mv`/`depth` above. It implies `expected_depth:
+true` (auto-enabled even if not written explicitly). Composited into a
+SECOND attachment `out_fg` (`vec4`: `x = frag_foreground * alpha`, `y`/`z`
+unused, `w = alpha`) — it can't share `out_aux`'s lanes: `out_aux` already
+uses all 3 non-alpha lanes for mv.xy/depth, and `.w` must independently
+stay genuine alpha in EVERY blended attachment (see the `out_aux` note
+above — the exact bug that note describes is what happens if you try to
+squeeze `foreground` into `out_aux.w` instead of giving it its own
+attachment). `out_fg` is safely `RGBA16F` (not `RGBA32F`, unlike
+`out_aux`): `foreground` is bounded to `[0, 1]` just like alpha itself, so
+it doesn't have the unbounded-magnitude precision problem `out_aux`'s
+mv/depth values do — measured with no precision regression vs. `RGBA32F`
+on the reference scene. The host divides `out_fg.x` by `out_fg.w` to
+recover the coverage value in `[0, 1]`. This adds an input storage buffer
+`splat_foreground` (scalar, one 0.0/1.0 value per splat)
 and an output buffer `projected_foreground` (scalar); the preprocess
 stage does no per-frame computation on it beyond a straight
 buffer-to-buffer passthrough, since the flag is a static per-splat

@@ -221,25 +221,35 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
     vkCreateImageView(ctx.device, &depthViewInfo, nullptr, &depthView_);
 
     // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
-    if (hasMotionVectors_) {
-        VkImageCreateInfo mvInfo = imageInfo;
-        mvInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        vmaCreateImage(ctx.allocator, &mvInfo, &allocInfo, &motionImage_, &motionAlloc_, nullptr);
+    // Single packed RGBA32F `out_aux` attachment (mv.x*a, mv.y*a, depth*a,
+    // a) -- replaces the earlier two-attachment (RGBA32F each)
+    // out_motion/out_depth design with zero wasted lanes (still a real 2x
+    // bandwidth win when foreground_coverage is off; NOT downgraded to
+    // RGBA16F -- see splat_renderer.h's getAuxImage() comment for the
+    // measured precision failure that ruled that out) and
+    // luxc/expansion/splat_expander.py's out_aux comment.
+    if (hasMotionVectors_ || hasExpectedDepth_) {
+        VkImageCreateInfo auxInfo = imageInfo;
+        auxInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        vmaCreateImage(ctx.allocator, &auxInfo, &allocInfo, &auxImage_, &auxAlloc_, nullptr);
 
-        VkImageViewCreateInfo mvViewInfo = viewInfo;
-        mvViewInfo.image = motionImage_;
-        mvViewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        vkCreateImageView(ctx.device, &mvViewInfo, nullptr, &motionView_);
+        VkImageViewCreateInfo auxViewInfo = viewInfo;
+        auxViewInfo.image = auxImage_;
+        auxViewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        vkCreateImageView(ctx.device, &auxViewInfo, nullptr, &auxView_);
     }
-    if (hasExpectedDepth_) {
-        VkImageCreateInfo edInfo = imageInfo;
-        edInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        vmaCreateImage(ctx.allocator, &edInfo, &allocInfo, &expectedDepthImage_, &expectedDepthAlloc_, nullptr);
+    // Second, smaller RGBA16F `out_fg` attachment (fg*a, 0, 0, a) -- see
+    // splat_renderer.h's getFgImage() comment for why this can't share
+    // out_aux's lanes.
+    if (hasForegroundCoverage_) {
+        VkImageCreateInfo fgInfo = imageInfo;
+        fgInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        vmaCreateImage(ctx.allocator, &fgInfo, &allocInfo, &fgImage_, &fgAlloc_, nullptr);
 
-        VkImageViewCreateInfo edViewInfo = viewInfo;
-        edViewInfo.image = expectedDepthImage_;
-        edViewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        vkCreateImageView(ctx.device, &edViewInfo, nullptr, &expectedDepthView_);
+        VkImageViewCreateInfo fgViewInfo = viewInfo;
+        fgViewInfo.image = fgImage_;
+        fgViewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        vkCreateImageView(ctx.device, &fgViewInfo, nullptr, &fgView_);
     }
 }
 
@@ -248,11 +258,12 @@ void SplatRenderer::createOffscreenTarget(VulkanContext& ctx) {
 // --------------------------------------------------------------------------
 
 void SplatRenderer::createRenderPass(VkDevice device) {
-    // Color attachments: out_color always present; out_motion/out_depth
-    // (docs/lux-4d-spec.md section 3) appended in that order when enabled,
-    // each with the SAME premultiplied-alpha blend as color (set up in
-    // createPipelines) so overlapping splats blend correctly. The
-    // depth-test attachment is always last.
+    // Color attachments: out_color always present; the single packed
+    // out_aux attachment (docs/lux-4d-spec.md section 3) appended when
+    // motion_vectors or expected_depth is enabled, with the SAME
+    // premultiplied-alpha blend as color (set up in createPipelines) so
+    // overlapping splats blend correctly. The depth-test attachment is
+    // always last.
     std::vector<VkAttachmentDescription> attachments;
     std::vector<VkAttachmentReference> colorRefs;
 
@@ -268,16 +279,16 @@ void SplatRenderer::createRenderPass(VkDevice device) {
     attachments.push_back(colorAttach);
     colorRefs.push_back({static_cast<uint32_t>(attachments.size() - 1), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
 
-    if (hasMotionVectors_) {
-        VkAttachmentDescription mv = colorAttach;
-        mv.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        attachments.push_back(mv);
+    if (hasMotionVectors_ || hasExpectedDepth_) {
+        VkAttachmentDescription aux = colorAttach;
+        aux.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attachments.push_back(aux);
         colorRefs.push_back({static_cast<uint32_t>(attachments.size() - 1), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
     }
-    if (hasExpectedDepth_) {
-        VkAttachmentDescription ed = colorAttach;
-        ed.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        attachments.push_back(ed);
+    if (hasForegroundCoverage_) {
+        VkAttachmentDescription fg = colorAttach;
+        fg.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        attachments.push_back(fg);
         colorRefs.push_back({static_cast<uint32_t>(attachments.size() - 1), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
     }
 
@@ -475,8 +486,8 @@ void SplatRenderer::createRenderPassLoadDepth(VkDevice device) {
 void SplatRenderer::createFramebuffer(VkDevice device) {
     std::vector<VkImageView> fbViews;
     fbViews.push_back(colorView_);
-    if (hasMotionVectors_) fbViews.push_back(motionView_);
-    if (hasExpectedDepth_) fbViews.push_back(expectedDepthView_);
+    if (hasMotionVectors_ || hasExpectedDepth_) fbViews.push_back(auxView_);
+    if (hasForegroundCoverage_) fbViews.push_back(fgView_);
     fbViews.push_back(depthView_);
 
     VkFramebufferCreateInfo fbInfo = {};
@@ -728,11 +739,11 @@ void SplatRenderer::createPipelines(VulkanContext& ctx, const std::string& shade
     blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
-    // out_motion/out_depth (docs/lux-4d-spec.md section 3) use the SAME
-    // premultiplied-alpha blend equation as out_color, duplicated per
-    // attachment, so overlapping splats blend to the correct
-    // visibility-weighted average for free.
-    uint32_t numColorAttachments = 1 + (hasMotionVectors_ ? 1 : 0) + (hasExpectedDepth_ ? 1 : 0);
+    // out_aux (docs/lux-4d-spec.md section 3, packed mv/depth/fg) uses the
+    // SAME premultiplied-alpha blend equation as out_color, so overlapping
+    // splats blend to the correct visibility-weighted average for free.
+    uint32_t numColorAttachments = 1 + ((hasMotionVectors_ || hasExpectedDepth_) ? 1 : 0)
+        + (hasForegroundCoverage_ ? 1 : 0);
     std::vector<VkPipelineColorBlendAttachmentState> blendAttachments(numColorAttachments, blendAttachment);
 
     VkPipelineColorBlendStateCreateInfo colorBlending = {};
@@ -2195,8 +2206,8 @@ void SplatRenderer::render(VulkanContext& ctx) {
     } else {
         rpBegin.renderPass = renderPass_;
         rpBegin.framebuffer = framebuffer_;
-        // Order matches createFramebuffer(): color, [motion], [expected_depth], depth_test.
-        // Motion/expected-depth clear to 0 -- "0 where nothing was drawn" per
+        // Order matches createFramebuffer(): color, [out_aux], [out_fg], depth_test.
+        // out_aux/out_fg clear to 0 -- "0 where nothing was drawn" per
         // docs/lux-4d-spec.md section 3. Color's alpha is cleared to 0 (not
         // the usual opaque-black 1.0) whenever the DLSS outputs are enabled:
         // the host needs color.a to be a genuine "how much splat coverage
@@ -2207,11 +2218,11 @@ void SplatRenderer::render(VulkanContext& ctx) {
         // Non-DLSS pipelines are unaffected (alpha stays 1, unchanged).
         clearValues.push_back(VkClearValue{});
         clearValues.back().color = {{0.0f, 0.0f, 0.0f, (hasMotionVectors_ || hasExpectedDepth_) ? 0.0f : 1.0f}};
-        if (hasMotionVectors_) {
+        if (hasMotionVectors_ || hasExpectedDepth_) {
             clearValues.push_back(VkClearValue{});
             clearValues.back().color = {{0.0f, 0.0f, 0.0f, 0.0f}};
         }
-        if (hasExpectedDepth_) {
+        if (hasForegroundCoverage_) {
             clearValues.push_back(VkClearValue{});
             clearValues.back().color = {{0.0f, 0.0f, 0.0f, 0.0f}};
         }
@@ -2589,14 +2600,14 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     // Image views
     if (colorView_ != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, colorView_, nullptr);
     if (depthView_ != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, depthView_, nullptr);
-    if (motionView_ != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, motionView_, nullptr);
-    if (expectedDepthView_ != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, expectedDepthView_, nullptr);
+    if (auxView_ != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, auxView_, nullptr);
+    if (fgView_ != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, fgView_, nullptr);
 
     // Images (VMA)
     if (colorImage_ != VK_NULL_HANDLE) vmaDestroyImage(ctx.allocator, colorImage_, colorAlloc_);
     if (depthImage_ != VK_NULL_HANDLE) vmaDestroyImage(ctx.allocator, depthImage_, depthAlloc_);
-    if (motionImage_ != VK_NULL_HANDLE) vmaDestroyImage(ctx.allocator, motionImage_, motionAlloc_);
-    if (expectedDepthImage_ != VK_NULL_HANDLE) vmaDestroyImage(ctx.allocator, expectedDepthImage_, expectedDepthAlloc_);
+    if (auxImage_ != VK_NULL_HANDLE) vmaDestroyImage(ctx.allocator, auxImage_, auxAlloc_);
+    if (fgImage_ != VK_NULL_HANDLE) vmaDestroyImage(ctx.allocator, fgImage_, fgAlloc_);
 
     // Pipelines
     if (computePipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(ctx.device, computePipeline_, nullptr);
@@ -2685,10 +2696,10 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     depthView_ = VK_NULL_HANDLE;
     colorImage_ = VK_NULL_HANDLE;
     depthImage_ = VK_NULL_HANDLE;
-    motionView_ = VK_NULL_HANDLE;
-    expectedDepthView_ = VK_NULL_HANDLE;
-    motionImage_ = VK_NULL_HANDLE;
-    expectedDepthImage_ = VK_NULL_HANDLE;
+    auxView_ = VK_NULL_HANDLE;
+    auxImage_ = VK_NULL_HANDLE;
+    fgView_ = VK_NULL_HANDLE;
+    fgImage_ = VK_NULL_HANDLE;
     hasMotionVectors_ = false;
     hasExpectedDepth_ = false;
     hasForegroundCoverage_ = false;

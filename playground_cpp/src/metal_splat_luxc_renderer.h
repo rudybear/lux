@@ -161,19 +161,50 @@ public:
     // (unlike MetalSplatRenderer, which always computes both). ---
     bool hasMotionVectors() const { return hasMotionVectors_; }
     bool hasExpectedDepth() const { return hasExpectedDepth_; }
-    // Packed into getExpectedDepthTexture()'s .g channel -- no separate
-    // texture/attachment (see SPECIFICATION.md 12.8's foreground_coverage entry).
+    // True when compiled with foreground_coverage: true -- a SEPARATE
+    // texture/attachment, getFgTexture() below (see its comment for why it
+    // can't share getAuxTexture()'s lanes).
     bool hasForegroundCoverage() const { return hasForegroundCoverage_; }
     void setJitter(float jitterXPixels, float jitterYPixels);
 
-    MTL::Texture* getMotionTexture() const { return motionTarget_; }
-    MTL::Texture* getExpectedDepthTexture() const { return expectedDepthTarget_; }
-    // RGBA32Float here (4 floats/pixel: x=depth*alpha, y/z unused, w=alpha)
-    // vs. MetalSplatRenderer's RG32Float (2 floats/pixel) -- this backend's
-    // fragment shader needs the real 4th-component alpha for hardware
-    // blending (commit 1445ec3's out_depth fix); the hand-written path
-    // blends manually and never needed it.
-    static constexpr uint32_t kExpectedDepthChannels = 4;
+    // Packed DLSS aux texture (bench/lux_perf_ablation.md task 2): ONE
+    // RGBA32Float texture carrying (mv.x*alpha, mv.y*alpha, depth*alpha,
+    // alpha) -- replaces the earlier two-texture (motionTarget_ RGBA32Float,
+    // expectedDepthTarget_ RGBA32Float, each with an always-0 `.z`) design
+    // with one that packs 3 real values with ZERO wasted lanes (2->1
+    // texture, 32B/px->16B/px, whenever foreground_coverage is off). `.w`
+    // MUST be the genuine per-fragment alpha, not a repurposed data
+    // channel -- see luxc/expansion/splat_expander.py's out_aux comment
+    // for why: Metal's fixed-function alpha blend (same semantics as
+    // Vulkan's SRC_ALPHA/ONE_MINUS_SRC_ALPHA here) reads "source alpha"
+    // from THIS texture's own 4th output component specifically, so
+    // anything else there corrupts the GPU-side blend accumulation itself
+    // (measured: a real 10-50x MV/depth error on the juggle DLSS scene
+    // from an earlier version of this design that packed `fg*alpha` into
+    // `.w` instead and tried to un-premultiply via getOutputTexture()'s
+    // alpha afterward -- NOT a valid precision tradeoff, a genuine
+    // correctness bug). Stays RGBA32Float, not RGBA16Float: also measured,
+    // downgrading this texture to half-float reproduces the same class of
+    // catastrophic error even with the alpha bug fixed, since premultiplied
+    // mv/depth values (unlike color's own [0,1]-bounded channels) are not
+    // magnitude-bounded and compound half-float blend rounding badly over
+    // many overlapping low-alpha splats. Valid whenever hasMotionVectors()
+    // || hasExpectedDepth().
+    MTL::Texture* getAuxTexture() const { return auxTarget_; }
+    static constexpr uint32_t kAuxChannels = 4;
+
+    // Second, smaller texture for foreground_coverage (only allocated when
+    // hasForegroundCoverage()): (fg*alpha, 0, 0, alpha). Can't share
+    // getAuxTexture()'s lanes -- those 3 non-alpha lanes are already
+    // mv.xy/depth, and `.w` must independently stay genuine alpha in
+    // EVERY blended texture, not just one (see getAuxTexture()'s comment).
+    // RGBA16Float, not RGBA32Float: fg (like alpha itself) is bounded to
+    // [0,1] -- the same magnitude-boundedness that keeps color's own
+    // RGBA16Float blend accumulation safe applies here too (measured: no
+    // precision regression vs. RGBA32Float on the same scene), unlike
+    // getAuxTexture()'s mv/depth values which are NOT magnitude-bounded.
+    MTL::Texture* getFgTexture() const { return fgTarget_; }
+    static constexpr uint32_t kFgChannels = 4;
 
     // The luxc-compiled vertex shader (splat_expander.py's
     // _build_vertex_body) maps screen.y = (ndc.y*0.5+0.5)*H directly --
@@ -220,8 +251,13 @@ private:
     // Offscreen render targets (same formats as MetalSplatRenderer).
     MTL::Texture* colorTarget_ = nullptr;
     MTL::Texture* depthTarget_ = nullptr;
-    MTL::Texture* motionTarget_ = nullptr;
-    MTL::Texture* expectedDepthTarget_ = nullptr;
+    // Packed RGBA32Float attachment (mv.x*a, mv.y*a, depth*a, a) -- see
+    // getAuxTexture()'s comment (NOT RGBA16Float -- measured precision
+    // failure).
+    MTL::Texture* auxTarget_ = nullptr;
+    // Second, smaller RGBA16Float attachment (fg*a, 0, 0, a) -- only
+    // allocated when hasForegroundCoverage_ -- see getFgTexture()'s comment.
+    MTL::Texture* fgTarget_ = nullptr;
 
     // Transpiled compute (preprocess) + render (vert/frag) + morph shaders.
     TranspiledShader compShader_;

@@ -28,6 +28,7 @@
 #include <memory>
 #include <filesystem>
 #include <algorithm>
+#include <type_traits>
 #include <cstring>
 #include <stdexcept>
 #include <chrono>
@@ -663,62 +664,126 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
         std::string colorPath = opts.outputAuxPrefix + "_color.png";
         MetalScreenshot::saveTextureToPNG(ctx, splatR->getOutputTexture(), w, h, colorPath);
 
+        std::vector<float> colorF32;
         {
             auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getOutputTexture(), w, h, 8);
             std::vector<uint8_t> unusedRgba8;
-            auto colorF32 = DlssIO::convertRgba16fColorAttachment(raw, w, h, unusedRgba8);
+            colorF32 = DlssIO::convertRgba16fColorAttachment(raw, w, h, unusedRgba8);
             DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_color.npy", colorF32, {h, w, 4});
         }
 
-        if (splatR->hasExpectedDepth()) {
-            // MetalSplatRenderer's expected-depth target is RG32Float (2
-            // floats/pixel: depth*alpha, alpha); MetalSplatLuxcRenderer's is
-            // RGBA32Float (4 floats/pixel: depth*alpha, unused, unused,
-            // alpha -- commit 1445ec3's out_depth fix, needed for hardware
-            // alpha blending) -- kExpectedDepthChannels tells us which, and
-            // alpha is always the LAST channel either way.
-            constexpr uint32_t C = Renderer::kExpectedDepthChannels;
-            auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getExpectedDepthTexture(), w, h, C * 4);
-            std::vector<float> chans(static_cast<size_t>(w) * h * C);
-            std::memcpy(chans.data(), raw.data(), raw.size());
-            std::vector<float> depthPremul(static_cast<size_t>(w) * h);
-            std::vector<float> depthAlpha(static_cast<size_t>(w) * h);
-            for (size_t i = 0; i < depthPremul.size(); ++i) {
-                depthPremul[i] = chans[i * C + 0];
-                depthAlpha[i] = chans[i * C + (C - 1)];
-            }
-            auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
-            DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_depth.npy", depth, {h, w});
-            DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png", depth, w, h, 1);
-
-            // foreground_coverage packs into out_depth's .g channel (index 1
-            // of 4 -- only the luxc backend has C==4 / this flag true at all,
-            // see MetalSplatLuxcRenderer::kExpectedDepthChannels), same
-            // alpha (.w, the last of C channels) as depth.
-            if (splatR->hasForegroundCoverage()) {
-                std::vector<float> fgPremul(static_cast<size_t>(w) * h);
-                for (size_t i = 0; i < fgPremul.size(); ++i) {
-                    fgPremul[i] = chans[i * C + 1];
+        // MetalSplatRenderer (hand-written "hand" backend) and
+        // MetalSplatLuxcRenderer (luxc-compiled backend) diverge here:
+        // MetalSplatLuxcRenderer packs mv/depth into an RGBA32Float out_aux
+        // texture (bench/lux_perf_ablation.md task 2) with GENUINE alpha
+        // in its own `.w` (required for correct hardware blend
+        // accumulation -- un-premultiplying via out_color's alpha instead
+        // was tried and is a real, measured correctness bug, not a valid
+        // shortcut, see getAuxTexture()'s header comment) and, only when
+        // foreground_coverage is set, a SEPARATE RGBA16Float out_fg
+        // texture (fg*alpha, alpha) that can't share out_aux's lanes.
+        // MetalSplatRenderer still uses its original two-texture (RG32Float
+        // motion, R32Float/RG32Float depth) design, each carrying its own
+        // alpha. `if constexpr` keeps this shared template working for
+        // both without forcing MetalSplatRenderer onto the new layout (out
+        // of scope for task 2 -- only splat_renderer.cpp/
+        // metal_splat_luxc_renderer.cpp were asked to change).
+        if constexpr (std::is_same_v<Renderer, MetalSplatLuxcRenderer>) {
+            if (splatR->hasMotionVectors() || splatR->hasExpectedDepth()) {
+                constexpr uint32_t C = Renderer::kAuxChannels;
+                auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getAuxTexture(), w, h, C * 4);
+                std::vector<float> auxF32(static_cast<size_t>(w) * h * C);
+                std::memcpy(auxF32.data(), raw.data(), raw.size());
+                std::vector<float> auxAlpha(static_cast<size_t>(w) * h);
+                for (size_t i = 0; i < auxAlpha.size(); ++i) {
+                    auxAlpha[i] = auxF32[i * C + 3];
                 }
-                auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, depthAlpha, w, h, 1);
-                DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_fg.npy", fg, {h, w});
-                DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_fg_preview.png", fg, w, h, 1);
+                if (splatR->hasExpectedDepth()) {
+                    std::vector<float> depthPremul(static_cast<size_t>(w) * h);
+                    for (size_t i = 0; i < depthPremul.size(); ++i) {
+                        depthPremul[i] = auxF32[i * C + 2];
+                    }
+                    auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, auxAlpha, w, h, 1);
+                    DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_depth.npy", depth, {h, w});
+                    DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png", depth, w, h, 1);
+
+                    // foreground_coverage: a SEPARATE out_fg texture
+                    // (RGBA16Float, fg*alpha at .x, alpha at .w).
+                    if (splatR->hasForegroundCoverage()) {
+                        constexpr uint32_t FC = Renderer::kFgChannels;
+                        auto rawFg = MetalScreenshot::readTextureRaw(ctx, splatR->getFgTexture(), w, h, FC * 2);
+                        std::vector<float> fgF32(static_cast<size_t>(w) * h * FC);
+                        for (size_t i = 0; i < fgF32.size(); ++i) {
+                            uint16_t half;
+                            std::memcpy(&half, rawFg.data() + i * 2, 2);
+                            fgF32[i] = DlssIO::halfToFloat(half);
+                        }
+                        std::vector<float> fgPremul(static_cast<size_t>(w) * h);
+                        std::vector<float> fgAlpha(static_cast<size_t>(w) * h);
+                        for (size_t i = 0; i < fgPremul.size(); ++i) {
+                            fgPremul[i] = fgF32[i * FC + 0];
+                            fgAlpha[i] = fgF32[i * FC + 3];
+                        }
+                        auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, fgAlpha, w, h, 1);
+                        DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_fg.npy", fg, {h, w});
+                        DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_fg_preview.png", fg, w, h, 1);
+                    }
+                }
+                if (splatR->hasMotionVectors()) {
+                    std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
+                    for (size_t i = 0; i < auxAlpha.size(); ++i) {
+                        mvPremul[i * 2 + 0] = auxF32[i * C + 0];
+                        mvPremul[i * 2 + 1] = auxF32[i * C + 1];
+                    }
+                    auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, auxAlpha, w, h, 2);
+                    DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_mv.npy", mv, {h, w, 2});
+                    DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_mv_preview.png", mv, w, h, 2);
+                }
             }
-        }
-        if (splatR->hasMotionVectors()) {
-            auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getMotionTexture(), w, h, 16);
-            std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
-            std::memcpy(rgba.data(), raw.data(), raw.size());
-            std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
-            std::vector<float> mvAlpha(static_cast<size_t>(w) * h);
-            for (size_t i = 0; i < mvAlpha.size(); ++i) {
-                mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
-                mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
-                mvAlpha[i] = rgba[i * 4 + 3];
+        } else {
+            if (splatR->hasExpectedDepth()) {
+                // MetalSplatRenderer's expected-depth target is RG32Float (2
+                // floats/pixel: depth*alpha, alpha); alpha is always the
+                // LAST channel.
+                constexpr uint32_t C = Renderer::kExpectedDepthChannels;
+                auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getExpectedDepthTexture(), w, h, C * 4);
+                std::vector<float> chans(static_cast<size_t>(w) * h * C);
+                std::memcpy(chans.data(), raw.data(), raw.size());
+                std::vector<float> depthPremul(static_cast<size_t>(w) * h);
+                std::vector<float> depthAlpha(static_cast<size_t>(w) * h);
+                for (size_t i = 0; i < depthPremul.size(); ++i) {
+                    depthPremul[i] = chans[i * C + 0];
+                    depthAlpha[i] = chans[i * C + (C - 1)];
+                }
+                auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
+                DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_depth.npy", depth, {h, w});
+                DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_depth_preview.png", depth, w, h, 1);
+
+                if (splatR->hasForegroundCoverage()) {
+                    std::vector<float> fgPremul(static_cast<size_t>(w) * h);
+                    for (size_t i = 0; i < fgPremul.size(); ++i) {
+                        fgPremul[i] = chans[i * C + 1];
+                    }
+                    auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, depthAlpha, w, h, 1);
+                    DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_fg.npy", fg, {h, w});
+                    DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_fg_preview.png", fg, w, h, 1);
+                }
             }
-            auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
-            DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_mv.npy", mv, {h, w, 2});
-            DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_mv_preview.png", mv, w, h, 2);
+            if (splatR->hasMotionVectors()) {
+                auto raw = MetalScreenshot::readTextureRaw(ctx, splatR->getMotionTexture(), w, h, 16);
+                std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
+                std::memcpy(rgba.data(), raw.data(), raw.size());
+                std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
+                std::vector<float> mvAlpha(static_cast<size_t>(w) * h);
+                for (size_t i = 0; i < mvAlpha.size(); ++i) {
+                    mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
+                    mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
+                    mvAlpha[i] = rgba[i * 4 + 3];
+                }
+                auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
+                DlssIO::writeNpyFloat32(opts.outputAuxPrefix + "_mv.npy", mv, {h, w, 2});
+                DlssIO::writeNormalizedPreviewPNG(opts.outputAuxPrefix + "_mv_preview.png", mv, w, h, 2);
+            }
         }
         std::cout << "[metal] Wrote aux dumps: " << opts.outputAuxPrefix
                   << "_{color.png,color.npy,depth.npy,mv.npy"

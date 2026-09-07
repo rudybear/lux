@@ -95,26 +95,34 @@ void MetalSplatLuxcRenderer::createRenderTargets(MetalContext& ctx) {
     depthTarget_ = ctx.newTexture(depthDesc);
     depthTarget_->setLabel(NS::String::string("SplatDepthLuxc", NS::UTF8StringEncoding));
 
-    if (hasMotionVectors_) {
-        auto* mvDesc = MTL::TextureDescriptor::texture2DDescriptor(
+    // Packed RGBA32Float `out_aux` attachment (bench/lux_perf_ablation.md
+    // task 2): (mv.x*alpha, mv.y*alpha, depth*alpha, alpha) -- replaces the
+    // earlier two-texture (RGBA32Float each, each with an always-0 `.z`)
+    // motionTarget_/expectedDepthTarget_ design with one that packs 3 real
+    // values with ZERO wasted lanes; see getAuxTexture()'s header comment
+    // and luxc/expansion/splat_expander.py's out_aux comment. `.w` MUST
+    // stay genuine alpha (required for correct hardware blend
+    // accumulation) and this texture MUST stay RGBA32Float, not
+    // RGBA16Float -- see getAuxTexture()'s comment for the measured
+    // precision failure that ruled the RGBA16Float variant out.
+    if (hasMotionVectors_ || hasExpectedDepth_) {
+        auto* auxDesc = MTL::TextureDescriptor::texture2DDescriptor(
             MTL::PixelFormatRGBA32Float, width_, height_, false);
-        mvDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
-        mvDesc->setStorageMode(MTL::StorageModePrivate);
-        motionTarget_ = ctx.newTexture(mvDesc);
-        motionTarget_->setLabel(NS::String::string("SplatMotionLuxc", NS::UTF8StringEncoding));
+        auxDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+        auxDesc->setStorageMode(MTL::StorageModePrivate);
+        auxTarget_ = ctx.newTexture(auxDesc);
+        auxTarget_->setLabel(NS::String::string("SplatAuxLuxc", NS::UTF8StringEncoding));
     }
-    if (hasExpectedDepth_) {
-        // RGBA32Float, not RG32Float (unlike MetalSplatRenderer's manually-
-        // blended 2-channel target): the luxc-compiled fragment shader
-        // outputs a genuine vec4 (x=depth*alpha, y/z unused, w=alpha) --
-        // exactly commit 1445ec3's out_depth fix -- so hardware blending's
-        // ONE_MINUS_SRC_ALPHA factor has a real 4th component to read.
-        auto* edDesc = MTL::TextureDescriptor::texture2DDescriptor(
-            MTL::PixelFormatRGBA32Float, width_, height_, false);
-        edDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
-        edDesc->setStorageMode(MTL::StorageModePrivate);
-        expectedDepthTarget_ = ctx.newTexture(edDesc);
-        expectedDepthTarget_->setLabel(NS::String::string("SplatExpectedDepthLuxc", NS::UTF8StringEncoding));
+    // Second, smaller RGBA16Float `out_fg` attachment (fg*alpha, 0, 0,
+    // alpha) -- see getFgTexture()'s comment for why this can't share
+    // out_aux's lanes.
+    if (hasForegroundCoverage_) {
+        auto* fgDesc = MTL::TextureDescriptor::texture2DDescriptor(
+            MTL::PixelFormatRGBA16Float, width_, height_, false);
+        fgDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+        fgDesc->setStorageMode(MTL::StorageModePrivate);
+        fgTarget_ = ctx.newTexture(fgDesc);
+        fgTarget_->setLabel(NS::String::string("SplatFgLuxc", NS::UTF8StringEncoding));
     }
 }
 
@@ -168,27 +176,33 @@ void MetalSplatLuxcRenderer::createPipelines(MetalContext& ctx) {
     // render targets (verified by this backend's own MV/depth parity
     // numbers) -- MetalSplatRenderer's comment may reflect older hardware
     // or a since-resolved driver limitation.
-    if (hasMotionVectors_) {
-        auto* motionAtt = pipeDesc->colorAttachments()->object(1);
-        motionAtt->setPixelFormat(MTL::PixelFormatRGBA32Float);
-        motionAtt->setBlendingEnabled(true);
-        motionAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
-        motionAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
-        motionAtt->setRgbBlendOperation(MTL::BlendOperationAdd);
-        motionAtt->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
-        motionAtt->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
-        motionAtt->setAlphaBlendOperation(MTL::BlendOperationAdd);
+    // out_aux (packed mv.x/mv.y/depth/alpha, bench/lux_perf_ablation.md
+    // task 2) and out_fg (fg/alpha, second attachment) use the SAME
+    // hardware premultiplied-alpha blend as out_color -- each attachment's
+    // own `.w` independently drives its own blend decay, so each needs
+    // this blend state set up on it directly.
+    uint32_t nextColorSlot = 1;
+    if (hasMotionVectors_ || hasExpectedDepth_) {
+        auto* auxAtt = pipeDesc->colorAttachments()->object(nextColorSlot++);
+        auxAtt->setPixelFormat(MTL::PixelFormatRGBA32Float);
+        auxAtt->setBlendingEnabled(true);
+        auxAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
+        auxAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        auxAtt->setRgbBlendOperation(MTL::BlendOperationAdd);
+        auxAtt->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
+        auxAtt->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        auxAtt->setAlphaBlendOperation(MTL::BlendOperationAdd);
     }
-    if (hasExpectedDepth_) {
-        auto* depthOutAtt = pipeDesc->colorAttachments()->object(hasMotionVectors_ ? 2 : 1);
-        depthOutAtt->setPixelFormat(MTL::PixelFormatRGBA32Float);
-        depthOutAtt->setBlendingEnabled(true);
-        depthOutAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
-        depthOutAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
-        depthOutAtt->setRgbBlendOperation(MTL::BlendOperationAdd);
-        depthOutAtt->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
-        depthOutAtt->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
-        depthOutAtt->setAlphaBlendOperation(MTL::BlendOperationAdd);
+    if (hasForegroundCoverage_) {
+        auto* fgAtt = pipeDesc->colorAttachments()->object(nextColorSlot++);
+        fgAtt->setPixelFormat(MTL::PixelFormatRGBA16Float);
+        fgAtt->setBlendingEnabled(true);
+        fgAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
+        fgAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        fgAtt->setRgbBlendOperation(MTL::BlendOperationAdd);
+        fgAtt->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
+        fgAtt->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        fgAtt->setAlphaBlendOperation(MTL::BlendOperationAdd);
     }
 
     pipeDesc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
@@ -822,20 +836,20 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
     float clearA = (hasMotionVectors_ || hasExpectedDepth_) ? 0.0f : 1.0f;
     colorAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, clearA));
 
-    uint32_t nextColorIdx = 1;
-    if (hasMotionVectors_) {
-        auto* motionAtt = rpDesc->colorAttachments()->object(nextColorIdx++);
-        motionAtt->setTexture(motionTarget_);
-        motionAtt->setLoadAction(MTL::LoadActionClear);
-        motionAtt->setStoreAction(MTL::StoreActionStore);
-        motionAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 0.0));
+    uint32_t nextRpSlot = 1;
+    if (hasMotionVectors_ || hasExpectedDepth_) {
+        auto* auxAtt = rpDesc->colorAttachments()->object(nextRpSlot++);
+        auxAtt->setTexture(auxTarget_);
+        auxAtt->setLoadAction(MTL::LoadActionClear);
+        auxAtt->setStoreAction(MTL::StoreActionStore);
+        auxAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 0.0));
     }
-    if (hasExpectedDepth_) {
-        auto* depthOutAtt = rpDesc->colorAttachments()->object(nextColorIdx++);
-        depthOutAtt->setTexture(expectedDepthTarget_);
-        depthOutAtt->setLoadAction(MTL::LoadActionClear);
-        depthOutAtt->setStoreAction(MTL::StoreActionStore);
-        depthOutAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 0.0));
+    if (hasForegroundCoverage_) {
+        auto* fgAtt = rpDesc->colorAttachments()->object(nextRpSlot++);
+        fgAtt->setTexture(fgTarget_);
+        fgAtt->setLoadAction(MTL::LoadActionClear);
+        fgAtt->setStoreAction(MTL::StoreActionStore);
+        fgAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 0.0));
     }
 
     auto* depthAtt = rpDesc->depthAttachment();
