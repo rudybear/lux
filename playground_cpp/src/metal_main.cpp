@@ -10,6 +10,8 @@
 #include "dlss_io.h"
 #include "metal_reconstruct_runner.h"
 #include "metal_unet_runner.h"
+#include "metal_live_reconstruct.h"
+#include "orbit_camera.h"
 #include "reflected_pipeline.h"
 #include "scene_light.h"
 #include "camera.h"
@@ -235,6 +237,47 @@ struct CLIOptions {
     // MetalSplatLuxcRenderer::setColorFormat8BitExperiment()'s comment).
     // Default false = unchanged RGBA16Float colour-only behavior.
     bool colorFormat8Bit = false;
+
+    // --live-bench <N>: headless benchmark of the SAME per-frame live-
+    // inference chain playground_ios/Source/SplatView.mm runs in
+    // Reconstruction mode (MetalLiveReconstruct: proxy render -> net input
+    // assembly -> MPSGraph UNet -> reconstruct-with-memory), driven by the
+    // identical orbit camera (LiveOrbitCamera, orbit_camera.h) -- so this
+    // number is directly comparable to the iPad's own on-device log. 0
+    // (default) = disabled. Independent of --scene/--pipeline/--width/
+    // --height (which drive the generic splat/mesh code paths above) --
+    // uses its own --live-* flags instead, since it needs a proxy AND a
+    // target resolution plus the exported UNet/memory-head/texture asset
+    // bundle, not a single scene+pipeline+resolution.
+    int liveBenchFrames = 0;
+    // Sibling-repo asset bundle (mobiledlss/demo/ios_assets/, playground_ios's
+    // own bundled resources -- see the Xcode project's ../../mobiledlss/
+    // demo/ios_assets/... file references): texture.npy/unet_weights.*/
+    // memory_head.npz live under exported/, bg_sphere.npy and the scene
+    // .glb directly under this dir. Relative default assumes CWD ==
+    // lux-4dgs repo root (matches every other relative path this binary
+    // already reads, e.g. "examples/..." -- and tests/test_dlss_outputs.py's
+    // own subprocess cwd=REPO_ROOT convention).
+    std::string liveAssetsDir = "../mobiledlss/demo/ios_assets";
+    // Defaults to <liveAssetsDir>/juggle_p0.8_stride4.glb (the pruned
+    // proxy/reconstruction scene -- same one SplatView.mm's kSceneAssetName
+    // loads) when left empty.
+    std::string liveSceneSource;
+    std::string livePipeline = "examples/gaussian_splat_dlss";
+    uint32_t liveProxyW = 480, liveProxyH = 270;
+    uint32_t liveTargetW = 960, liveTargetH = 540;
+
+    // --live-psnr <N>: N-frame continuous Reconstruction-vs-Target PSNR
+    // gate (the Mac-side counterpart of playground_ios/Source/SplatView.mm's
+    // LUX_PSNR_FRAMES on-device capture -- same orbit camera, same "no
+    // history reset, continuous from frame 0" convention) -- verifies the
+    // shared MetalLiveReconstruct port numerically, independent of any
+    // iPad. Target mode's own unpruned scene (kSceneAssetNameFullTarget's
+    // iOS rationale: Target must NOT render the pruned scene the network
+    // reconstructs *toward*, or the reference itself is missing 80% of the
+    // background). 0 (default) = disabled.
+    int livePsnrFrames = 0;
+    std::string liveTargetSceneSource;  // defaults to <assets-dir>/juggle_full_stride4.glb
 };
 
 static void printUsage(const char* program) {
@@ -266,6 +309,20 @@ static void printUsage(const char* program) {
               << "                         real MTLCommandBuffer GPU timestamps (splat + --splat-backend luxc only)\n"
               << "  --bench-orbit-deg <D>  Camera yaw degrees advanced per bench frame (default 0.5)\n"
               << "  --bench-sort-schedule <everyN> <deg>  Opt into sort scheduling during --bench\n"
+              << "  --live-bench <N>       Headless bench of the live-inference chain (proxy render +\n"
+              << "                         net input assembly + MPSGraph UNet + reconstruct-with-memory) --\n"
+              << "                         the same chain playground_ios/Source/SplatView.mm runs, driven\n"
+              << "                         by the identical orbit camera. Reports fused CPU/GPU ms + fps and\n"
+              << "                         a per-stage GPU breakdown.\n"
+              << "  --live-assets-dir <DIR> exported/{texture.npy,unet_weights.*,memory_head.npz} +\n"
+              << "                         bg_sphere.npy + the scene .glb (default: ../mobiledlss/demo/ios_assets)\n"
+              << "  --live-scene <PATH>    Override the --live-bench scene .glb (default: <assets-dir>/juggle_p0.8_stride4.glb)\n"
+              << "  --live-pipeline <BASE> Override the --live-bench compiled splat pipeline (default: examples/gaussian_splat_dlss)\n"
+              << "  --live-psnr <N>        N-frame continuous Reconstruction-vs-Target PSNR gate (Mac-side\n"
+              << "                         counterpart of SplatView.mm's LUX_PSNR_FRAMES) -- verifies the\n"
+              << "                         shared live-inference port numerically.\n"
+              << "  --live-target-scene <PATH>  Override the --live-psnr Target-mode (unpruned) scene .glb\n"
+              << "                         (default: <assets-dir>/juggle_full_stride4.glb)\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -381,6 +438,18 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.unetOutput = argv[++i];
         } else if (arg == "--unet-kernel-dir" && i + 1 < argc) {
             opts.unetKernelDir = argv[++i];
+        } else if (arg == "--live-bench" && i + 1 < argc) {
+            opts.liveBenchFrames = std::stoi(argv[++i]);
+        } else if (arg == "--live-assets-dir" && i + 1 < argc) {
+            opts.liveAssetsDir = argv[++i];
+        } else if (arg == "--live-scene" && i + 1 < argc) {
+            opts.liveSceneSource = argv[++i];
+        } else if (arg == "--live-pipeline" && i + 1 < argc) {
+            opts.livePipeline = argv[++i];
+        } else if (arg == "--live-psnr" && i + 1 < argc) {
+            opts.livePsnrFrames = std::stoi(argv[++i]);
+        } else if (arg == "--live-target-scene" && i + 1 < argc) {
+            opts.liveTargetSceneSource = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
             opts.shaderBaseExplicit = true;
@@ -391,7 +460,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
         }
     }
 
-    if (!opts.reconstructDumpDir.empty() || !opts.unetInput.empty() || !opts.dumpBgFeaturesDir.empty()) {
+    if (!opts.reconstructDumpDir.empty() || !opts.unetInput.empty() || !opts.dumpBgFeaturesDir.empty() ||
+        opts.liveBenchFrames > 0 || opts.livePsnrFrames > 0) {
         return opts;
     }
 
@@ -630,6 +700,337 @@ static void runSplatBench(MetalSplatLuxcRenderer& splatR, MetalContext& ctx,
     std::cout << "[bench]   sort_gpu_ms       median=" << sortMed << " p90=" << sortP90 << std::endl;
     std::cout << "[bench]   draw_gpu_ms       median=" << drawMed << " p90=" << drawP90 << std::endl;
     std::cout << "[bench]   split_total_gpu_ms median=" << totMed << " p90=" << totP90 << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// --live-bench N: headless benchmark of the SAME per-frame live-inference
+// chain playground_ios/Source/SplatView.mm runs in Reconstruction mode
+// (MetalLiveReconstruct: proxy render -> net input assembly -> MPSGraph
+// UNet -> reconstruct-with-memory), driven by the identical orbit camera
+// (LiveOrbitCamera, orbit_camera.h) at the identical proxy/target
+// resolutions -- so this Mac number is directly comparable to the iPad's
+// own on-device log. Self-contained (own MetalContext/MetalSceneManager,
+// like runReconstructDumpMetal/runUnetDumpMetal), independent of the
+// generic --scene/--pipeline splat/mesh code paths above.
+// --------------------------------------------------------------------------
+
+static int runLiveBenchMetal(const CLIOptions& opts) {
+    MetalContext ctx;
+    ctx.initHeadless();
+
+    std::string sceneSource =
+        opts.liveSceneSource.empty() ? (opts.liveAssetsDir + "/juggle_p0.8_stride4.glb") : opts.liveSceneSource;
+
+    MetalSceneManager scene;
+    scene.loadScene(sceneSource);
+    if (!scene.hasSplatData()) {
+        std::cerr << "[live-bench] scene has no KHR_gaussian_splatting data: " << sceneSource << std::endl;
+        return 1;
+    }
+
+    MetalLiveReconstruct live;
+    MetalLiveReconstruct::InitParams params;
+    params.shaderBase = opts.livePipeline;
+    params.proxyW = opts.liveProxyW;
+    params.proxyH = opts.liveProxyH;
+    params.targetW = opts.liveTargetW;
+    params.targetH = opts.liveTargetH;
+    params.paramStride = 2;
+    params.hiddenChannels = 8;
+    params.textureNpyPath = opts.liveAssetsDir + "/exported/texture.npy";
+    params.bgSphereNpyPath = opts.liveAssetsDir + "/bg_sphere.npy";
+    params.unetWeightsBinPath = opts.liveAssetsDir + "/exported/unet_weights.fp16.bin";
+    params.unetLayersTxtPath = opts.liveAssetsDir + "/exported/unet_weights.layers.txt";
+    params.memoryHeadNpzPath = opts.liveAssetsDir + "/exported/memory_head.npz";
+    // NOT the amortized (4, 2.0f) sort schedule bench/lux_perf_ablation.md
+    // validated for a camera-orbit-only STATIC scene: --live-psnr measured
+    // it badly breaking reconstruction quality on THIS dynamic (actor-
+    // motion) scene -- periodic ~15dB collapses on 3 of every 4 frames
+    // (17.8dB vs a stable ~33dB with every-frame sort). The schedule's
+    // view-change threshold only re-sorts on CAMERA rotation, with no
+    // signal for the scene content itself moving -- exactly what reorders
+    // back-to-front blend order here even with zero camera motion. Left at
+    // the exactness-preserving default (see MetalLiveReconstruct::
+    // InitParams's own comment) so these numbers reflect the actually
+    // shippable (quality-correct) configuration, not a broken-but-fast one.
+
+    auto tInit0 = std::chrono::steady_clock::now();
+    live.init(ctx, scene.getSplatData(), params);
+    auto tInit1 = std::chrono::steady_clock::now();
+    std::cout << "[live-bench] init: " << std::chrono::duration<double, std::milli>(tInit1 - tInit0).count()
+              << "ms, netRes=" << live.getNetW() << "x" << live.getNetH()
+              << " splats=" << scene.getSplatData().num_splats << std::endl;
+
+    auto buildFrameInputs = [&](int frame) -> MetalLiveReconstruct::FrameInputs {
+        MetalLiveReconstruct::FrameInputs in;
+        int prevFrame = frame > 0 ? frame - 1 : 0;
+        auto toCamFrame = [](const LiveOrbitCamera::Result& r) {
+            return MetalLiveReconstruct::CameraFrame{r.eye, r.r, r.u, r.f, r.viewGl, r.proj, r.fx, r.fy};
+        };
+        in.proxyCur = toCamFrame(
+            LiveOrbitCamera::compute(frame, live.getProxyW(), live.getProxyH(), MetalSplatLuxcRenderer::kMetalYConvention));
+        in.proxyPrev = toCamFrame(LiveOrbitCamera::compute(prevFrame, live.getProxyW(), live.getProxyH(),
+                                                            MetalSplatLuxcRenderer::kMetalYConvention));
+        in.targetCur = toCamFrame(LiveOrbitCamera::compute(frame, live.getTargetW(), live.getTargetH(),
+                                                            MetalSplatLuxcRenderer::kMetalYConvention));
+        bool hasMotion = live.proxyRenderer().hasMotion();
+        in.morphTimeCur = hasMotion ? live.proxyRenderer().frameToTime(frame) : 0.0f;
+        in.morphTimePrev = hasMotion ? live.proxyRenderer().frameToTime(prevFrame) : 0.0f;
+        float jxTarget, jyTarget;
+        LiveOrbitCamera::taaJitterTargetPx(frame, /*period=*/16, jxTarget, jyTarget);
+        float scaleP = static_cast<float>(live.getProxyW()) / static_cast<float>(live.getTargetW());
+        in.jitterTargetX = jxTarget;
+        in.jitterTargetY = jyTarget;
+        in.jitterProxyX = jxTarget * scaleP;
+        in.jitterProxyY = jyTarget * scaleP;
+        return in;
+    };
+
+    // Every frame gets its OWN autoreleasepool (matches playground_ios/
+    // Source/SplatView.mm's -tick: convention exactly): ctx.beginCommandBuffer()
+    // (MTLCommandQueue.commandBuffer) returns an AUTORELEASED command buffer
+    // with no explicit retain (see MetalContext::beginCommandBuffer()), and
+    // MPSGraphUNet::encode() creates a bunch of short-lived MPSGraph
+    // objects of its own inside its own inner @autoreleasepool -- both need
+    // a live pool somewhere on the stack for the whole frame, which nothing
+    // upstream of this early-return CLI mode otherwise provides (unlike the
+    // generic scene/mesh code paths below, which run inside main()'s own
+    // long-lived top-level pool). Without this, the very first frame
+    // reliably crashes (EXC_BAD_ACCESS in objc_msgSend) once the UNet
+    // stage's own inner pool drains and frees the command buffer object
+    // out from under the still-in-progress frame.
+    const int kWarmup = 10;
+    for (int i = 0; i < kWarmup; ++i) {
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        auto in = buildFrameInputs(i);
+        auto* cmdBuf = ctx.beginCommandBuffer();
+        auto* cur = live.encodeFrame(ctx, cmdBuf, in);
+        cur->commit();
+        cur->waitUntilCompleted();
+        cur->release();  // balances MPSGraphUNet::encode()'s extra retain -- see its own doc comment.
+        pool->release();
+    }
+
+    // Fused (production) path: one command buffer/frame, zero inter-stage
+    // host waits -- exactly what SplatView.mm's Reconstruction mode does.
+    std::vector<double> gpuTotalMs, cpuWallMs;
+    gpuTotalMs.reserve(static_cast<size_t>(opts.liveBenchFrames));
+    cpuWallMs.reserve(static_cast<size_t>(opts.liveBenchFrames));
+    for (int i = 0; i < opts.liveBenchFrames; ++i) {
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        auto in = buildFrameInputs(kWarmup + i);
+        auto t0 = std::chrono::steady_clock::now();
+        auto* cmdBuf = ctx.beginCommandBuffer();
+        auto* cur = live.encodeFrame(ctx, cmdBuf, in);
+        cur->commit();
+        cur->waitUntilCompleted();
+        auto t1 = std::chrono::steady_clock::now();
+        cpuWallMs.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        // See MetalLiveReconstruct::gpuMsAcrossPossibleSplit()'s own comment:
+        // `cur`'s own GPUStartTime()/GPUEndTime() alone can badly
+        // under-report the frame's real GPU cost whenever MPSGraph's UNet
+        // internally commitAndContinue-split the command buffer.
+        gpuTotalMs.push_back(MetalLiveReconstruct::gpuMsAcrossPossibleSplit(cmdBuf, cur));
+        cur->release();  // balances MPSGraphUNet::encode()'s extra retain -- see its own doc comment.
+        pool->release();
+    }
+
+    double gpuMedian, gpuP90, cpuMedian, cpuP90;
+    computeMedianP90(gpuTotalMs, gpuMedian, gpuP90);
+    computeMedianP90(cpuWallMs, cpuMedian, cpuP90);
+
+    // Per-stage GPU breakdown (own-cmdbuf-per-stage diagnostic path,
+    // encodeFrameProfiled()) -- continues the SAME history state (no
+    // resetHistory()); fewer frames since each pays 3 extra CPU<->GPU round
+    // trips vs. the fused path above.
+    const int kProfiledFrames = std::min(opts.liveBenchFrames, 30);
+    std::vector<double> proxyMs, inputMs, netMs, reconMs, splitTotalMs;
+    for (int i = 0; i < kProfiledFrames; ++i) {
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        auto in = buildFrameInputs(kWarmup + opts.liveBenchFrames + i);
+        auto r = live.encodeFrameProfiled(ctx, in);
+        proxyMs.push_back(r.proxyGpuMs);
+        inputMs.push_back(r.inputGpuMs);
+        netMs.push_back(r.netGpuMs);
+        reconMs.push_back(r.reconGpuMs);
+        splitTotalMs.push_back(r.totalGpuMs);
+        pool->release();
+    }
+    double proxyMed, proxyP90, inputMed, inputP90, netMed, netP90, reconMed, reconP90, splitMed, splitP90;
+    computeMedianP90(proxyMs, proxyMed, proxyP90);
+    computeMedianP90(inputMs, inputMed, inputP90);
+    computeMedianP90(netMs, netMed, netP90);
+    computeMedianP90(reconMs, reconMed, reconP90);
+    computeMedianP90(splitTotalMs, splitMed, splitP90);
+
+    std::cout << "[live-bench] ===== RESULTS (proxy " << live.getProxyW() << "x" << live.getProxyH()
+              << " -> target " << live.getTargetW() << "x" << live.getTargetH() << ", net " << live.getNetW()
+              << "x" << live.getNetH() << ", " << opts.liveBenchFrames << " frames, " << kWarmup
+              << " warmup) =====" << std::endl;
+    std::cout << "[live-bench] fused_total_gpu_ms   median=" << gpuMedian << " p90=" << gpuP90 << std::endl;
+    std::cout << "[live-bench] cpu_wall_ms          median=" << cpuMedian << " p90=" << cpuP90 << "  ("
+              << (cpuMedian > 0.0 ? 1000.0 / cpuMedian : 0.0) << " fps)" << std::endl;
+    std::cout << "[live-bench] stage_split (own-cmdbuf-per-stage, " << kProfiledFrames
+              << " frames, includes extra CPU<->GPU sync overhead not present in fused_total):" << std::endl;
+    std::cout << "[live-bench]   proxy_gpu_ms       median=" << proxyMed << " p90=" << proxyP90 << std::endl;
+    std::cout << "[live-bench]   input_gpu_ms       median=" << inputMed << " p90=" << inputP90 << std::endl;
+    std::cout << "[live-bench]   net_gpu_ms         median=" << netMed << " p90=" << netP90 << std::endl;
+    std::cout << "[live-bench]   recon_gpu_ms       median=" << reconMed << " p90=" << reconP90 << std::endl;
+    std::cout << "[live-bench]   split_total_gpu_ms median=" << splitMed << " p90=" << splitP90 << std::endl;
+
+    return 0;
+}
+
+// RGB-only PSNR (alpha ignored) -- matches playground_ios/Source/SplatView.mm's
+// psnrRgb()/mobiledlss/scripts/eval_rollout.py::_psnr_frame's convention:
+// mse = mean((pred-target)**2) over RGB, psnr = 10*log10(1/mse). `pred`/
+// `target` are both [h,w,4] float32, un-premultiplied.
+static float psnrRgb(const std::vector<float>& pred, const std::vector<float>& target, uint32_t w, uint32_t h) {
+    double se = 0.0;
+    size_t n = static_cast<size_t>(w) * h;
+    for (size_t i = 0; i < n; i++) {
+        for (int c = 0; c < 3; c++) {
+            double d = static_cast<double>(pred[i * 4 + c]) - static_cast<double>(target[i * 4 + c]);
+            se += d * d;
+        }
+    }
+    double mse = se / static_cast<double>(n * 3);
+    if (mse <= 0.0) return INFINITY;
+    return static_cast<float>(10.0 * std::log10(1.0 / mse));
+}
+
+// --------------------------------------------------------------------------
+// --live-psnr N: N-frame continuous Reconstruction-vs-Target PSNR gate --
+// the Mac-side counterpart of playground_ios/Source/SplatView.mm's
+// LUX_PSNR_FRAMES on-device capture. Runs the SAME MetalLiveReconstruct
+// chain --live-bench does (continuous from frame 0, no history reset) PLUS
+// a second, separate full-res MetalSplatLuxcRenderer against Target mode's
+// own UNPRUNED scene (see CLIOptions::liveTargetSceneSource's comment),
+// and reports RGB PSNR of the reconstruction against that Target reference
+// every frame -- self-contained, own MetalContext, like runLiveBenchMetal.
+// --------------------------------------------------------------------------
+
+static int runLivePsnrMetal(const CLIOptions& opts) {
+    MetalContext ctx;
+    ctx.initHeadless();
+
+    std::string proxySceneSource =
+        opts.liveSceneSource.empty() ? (opts.liveAssetsDir + "/juggle_p0.8_stride4.glb") : opts.liveSceneSource;
+    std::string targetSceneSource = opts.liveTargetSceneSource.empty()
+                                         ? (opts.liveAssetsDir + "/juggle_full_stride4.glb")
+                                         : opts.liveTargetSceneSource;
+
+    MetalSceneManager sceneProxy, sceneTarget;
+    sceneProxy.loadScene(proxySceneSource);
+    sceneTarget.loadScene(targetSceneSource);
+    if (!sceneProxy.hasSplatData() || !sceneTarget.hasSplatData()) {
+        std::cerr << "[live-psnr] scene has no KHR_gaussian_splatting data" << std::endl;
+        return 1;
+    }
+
+    MetalLiveReconstruct live;
+    MetalLiveReconstruct::InitParams params;
+    params.shaderBase = opts.livePipeline;
+    params.proxyW = opts.liveProxyW;
+    params.proxyH = opts.liveProxyH;
+    params.targetW = opts.liveTargetW;
+    params.targetH = opts.liveTargetH;
+    params.paramStride = 2;
+    params.hiddenChannels = 8;
+    params.textureNpyPath = opts.liveAssetsDir + "/exported/texture.npy";
+    params.bgSphereNpyPath = opts.liveAssetsDir + "/bg_sphere.npy";
+    params.unetWeightsBinPath = opts.liveAssetsDir + "/exported/unet_weights.fp16.bin";
+    params.unetLayersTxtPath = opts.liveAssetsDir + "/exported/unet_weights.layers.txt";
+    params.memoryHeadNpzPath = opts.liveAssetsDir + "/exported/memory_head.npz";
+    // NOT (4, 2.0f) here, unlike --live-bench: measured via THIS flag
+    // (--live-psnr) to badly break reconstruction quality on this DYNAMIC
+    // (actor-motion) scene -- periodic ~15dB collapses on 3 of every 4
+    // frames (17.8dB vs a stable ~33dB with every-frame sort), not the
+    // "ZERO measured pixel difference" bench/lux_perf_ablation.md's
+    // ablation found for a camera-orbit-only STATIC scene. The schedule's
+    // view-change threshold only re-sorts on CAMERA rotation; it has no
+    // signal for the SCENE CONTENT itself moving (splats translating
+    // relative to each other frame to frame), which is exactly what
+    // reorders back-to-front blend order here even with zero camera
+    // motion. Left at the exactness-preserving default (see
+    // MetalLiveReconstruct::InitParams's own comment) until the schedule
+    // itself gets a content-motion-aware trigger.
+    live.init(ctx, sceneProxy.getSplatData(), params);
+
+    // Target mode: same luxc pipeline, full (unpruned) scene, full target
+    // resolution, no jitter -- mirrors SplatView.mm's _splatRTarget exactly.
+    // Same finding as above applies to Target's own display quality --
+    // left un-scheduled (exactness-preserving default, no explicit
+    // setSortSchedule() call) rather than reproducing the same bug.
+    MetalSplatLuxcRenderer target;
+    target.init(ctx, sceneTarget.getSplatData(), opts.livePipeline, opts.liveTargetW, opts.liveTargetH);
+
+    std::cout << "[live-psnr] proxy splats=" << sceneProxy.getSplatData().num_splats
+              << " target splats=" << sceneTarget.getSplatData().num_splats
+              << " netRes=" << live.getNetW() << "x" << live.getNetH() << std::endl;
+
+    std::vector<float> psnrLog;
+    for (int frame = 0; frame < opts.livePsnrFrames; ++frame) {
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        int prevFrame = frame > 0 ? frame - 1 : 0;
+        auto toCamFrame = [](const LiveOrbitCamera::Result& r) {
+            return MetalLiveReconstruct::CameraFrame{r.eye, r.r, r.u, r.f, r.viewGl, r.proj, r.fx, r.fy};
+        };
+        MetalLiveReconstruct::FrameInputs in;
+        in.proxyCur = toCamFrame(LiveOrbitCamera::compute(frame, live.getProxyW(), live.getProxyH(),
+                                                           MetalSplatLuxcRenderer::kMetalYConvention));
+        in.proxyPrev = toCamFrame(LiveOrbitCamera::compute(prevFrame, live.getProxyW(), live.getProxyH(),
+                                                            MetalSplatLuxcRenderer::kMetalYConvention));
+        LiveOrbitCamera::Result targetCamRaw = LiveOrbitCamera::compute(
+            frame, live.getTargetW(), live.getTargetH(), MetalSplatLuxcRenderer::kMetalYConvention);
+        in.targetCur = toCamFrame(targetCamRaw);
+        bool hasMotion = live.proxyRenderer().hasMotion();
+        in.morphTimeCur = hasMotion ? live.proxyRenderer().frameToTime(frame) : 0.0f;
+        in.morphTimePrev = hasMotion ? live.proxyRenderer().frameToTime(prevFrame) : 0.0f;
+        float jxTarget, jyTarget;
+        LiveOrbitCamera::taaJitterTargetPx(frame, /*period=*/16, jxTarget, jyTarget);
+        float scaleP = static_cast<float>(live.getProxyW()) / static_cast<float>(live.getTargetW());
+        in.jitterTargetX = jxTarget;
+        in.jitterTargetY = jyTarget;
+        in.jitterProxyX = jxTarget * scaleP;
+        in.jitterProxyY = jyTarget * scaleP;
+
+        auto* cmdBuf = ctx.beginCommandBuffer();
+        auto* cur = live.encodeFrame(ctx, cmdBuf, in);
+        cur->commit();
+        cur->waitUntilCompleted();
+        cur->release();
+
+        // Target reference: ground truth, no jitter, own morph evaluation.
+        target.updateCameraExplicit(targetCamRaw.eye, targetCamRaw.viewGl, targetCamRaw.proj, targetCamRaw.fx,
+                                     targetCamRaw.fy);
+        target.setJitter(0.0f, 0.0f);
+        if (target.hasMotion()) target.setMorphTime(in.morphTimeCur);
+        target.render(ctx);
+
+        std::vector<uint8_t> unusedRgba8;
+        auto reconRaw =
+            MetalScreenshot::readTextureRaw(ctx, live.getReconOutputTexture(), live.getTargetW(), live.getTargetH(), 8);
+        auto reconF32 = DlssIO::convertRgba16fColorAttachment(reconRaw, live.getTargetW(), live.getTargetH(), unusedRgba8);
+        auto targetRaw =
+            MetalScreenshot::readTextureRaw(ctx, target.getOutputTexture(), live.getTargetW(), live.getTargetH(), 8);
+        auto targetF32 = DlssIO::convertRgba16fColorAttachment(targetRaw, live.getTargetW(), live.getTargetH(), unusedRgba8);
+
+        float psnr = psnrRgb(reconF32, targetF32, live.getTargetW(), live.getTargetH());
+        psnrLog.push_back(psnr);
+        std::cout << "[live-psnr] frame=" << (frame + 1) << "/" << opts.livePsnrFrames << " psnr_recon_db=" << psnr
+                  << std::endl;
+        pool->release();
+    }
+
+    if (!psnrLog.empty()) {
+        double sum = 0.0;
+        for (float v : psnrLog) sum += v;
+        std::cout << "[live-psnr] COMPLETE. mean=" << (sum / psnrLog.size()) << "dB last=" << psnrLog.back()
+                  << "dB (" << psnrLog.size() << " frames)" << std::endl;
+    }
+
+    return 0;
 }
 
 // --------------------------------------------------------------------------
@@ -1649,6 +2050,14 @@ int main(int argc, char* argv[]) {
     if (!opts.unetInput.empty()) {
         return runUnetDumpMetal(opts.unetInput, opts.unetWeights, opts.unetManifest,
                                  opts.unetOutput, opts.unetKernelDir);
+    }
+
+    if (opts.liveBenchFrames > 0) {
+        return runLiveBenchMetal(opts);
+    }
+
+    if (opts.livePsnrFrames > 0) {
+        return runLivePsnrMetal(opts);
     }
 
     if (opts.shaderBase.empty()) {

@@ -199,6 +199,19 @@ if(APPLE)
         src/metal_screenshot.cpp
         src/metal_reconstruct_runner.cpp
         src/metal_unet_runner.cpp
+        # Live-inference chain (shared with playground_ios/Source/SplatView.mm --
+        # see metal_live_reconstruct.h): proxy render -> net input assembly ->
+        # MPSGraph UNet -> reconstruct-with-memory, fused into one command
+        # buffer per frame. net_input_assembly.mm/mps_graph_unet.mm/
+        # live_reconstruct_pass.mm are ObjC++ (the first two only for
+        # @available/no other reason than matching metal_bridge.mm's
+        # convention; mps_graph_unet.mm additionally needs MPSGraph, which has
+        # no metal-cpp binding).
+        src/orbit_camera.cpp
+        src/net_input_assembly.mm
+        src/mps_graph_unet.mm
+        src/live_reconstruct_pass.mm
+        src/metal_live_reconstruct.cpp
         # Shared files (no Vulkan deps)
         src/gltf_loader.cpp
         src/meshlet.cpp
@@ -219,6 +232,14 @@ if(APPLE)
 
     # Mark .mm files as ObjC++
     set_source_files_properties(src/metal_bridge.mm PROPERTIES
+        LANGUAGE OBJCXX
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+    set_source_files_properties(
+        src/net_input_assembly.mm
+        src/mps_graph_unet.mm
+        src/live_reconstruct_pass.mm
+        PROPERTIES
         LANGUAGE OBJCXX
         COMPILE_FLAGS "-fobjc-arc"
     )
@@ -269,6 +290,8 @@ if(APPLE)
         "-framework AppKit"
         "-framework IOKit"
         "-framework CoreVideo"
+        "-framework MetalPerformanceShaders"
+        "-framework MetalPerformanceShadersGraph"
     )
 
     target_compile_options(lux-playground-metal PRIVATE
