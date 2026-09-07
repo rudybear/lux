@@ -43,6 +43,7 @@
 #include "splat_renderer.h"
 #include "dlss_io.h"
 #include "android_vulkan_context.h"
+#include "input_assembly.h"
 
 #define LOG_TAG "lux_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -123,6 +124,14 @@ struct OrbitFrame {
     glm::mat4 viewGl;
     glm::mat4 proj;
     float fx, fy;
+    // World-space camera basis (right, up/down, forward) -- Stage 3's input
+    // assembly needs these directly for its bg-sphere UV ray math
+    // (mobiledlss/datagen/camera.py::sphere_uv's `dirs_cam @ c2w[:3,:3].T`):
+    // buildCvViewRowMajor's local r/u/f ARE exactly camera-to-world's
+    // rotation columns (its rows are world->camera, so world->camera's
+    // transpose -- i.e. camera->world -- has r/u/f as columns), so no
+    // separate camera-to-world matrix construction is needed.
+    glm::vec3 rAxis, uAxis, fAxis;
 };
 
 // Actor/action center for THIS scene (juggle_p0.8_stride4.glb), taken
@@ -153,7 +162,12 @@ OrbitFrame computeOrbitFrame(float frameIndex, uint32_t width, uint32_t height) 
     glm::mat4 proj = DlssIO::buildIntrinsicsProjection(fx, fy, cx, cy,
                                                         static_cast<float>(width), static_cast<float>(height),
                                                         0.01f, 100.0f);
-    return {eye, viewGl, proj, fx, fy};
+
+    // Same r/u/f the view matrix itself was built from (see buildCvViewRowMajor).
+    glm::vec3 f = glm::normalize(center - eye);
+    glm::vec3 r = glm::normalize(glm::cross(-upWorld, f));
+    glm::vec3 u = glm::cross(f, r);
+    return {eye, viewGl, proj, fx, fy, r, u, f};
 }
 
 struct AppState {
@@ -169,6 +183,15 @@ struct AppState {
     // GPU-resident copy of the splat buffers/pipelines at a different
     // resolution, entirely separate from SceneManager's Target renderer.
     std::unique_ptr<SplatRenderer> proxyRenderer;
+
+    // Stage 3: assembles ParamPredUNet's 26-channel input tensor from the
+    // proxy renderer's per-frame attachments (docs/rendering-engines.md).
+    // param_stride=2, hidden=8 match the checkpoint this demo targets
+    // (expY_mem3_juggle_p0.8_ps2.pt -- task brief's "State" section).
+    InputAssembly inputAssembly;
+    static constexpr uint32_t kParamStride = 2;
+    static constexpr uint32_t kHiddenChannels = 8;
+
     DemoMode mode = DemoMode::Proxy;
     // Auto-cycle Proxy/Target every kModeSwitchFrames frames so a single run
     // captures a TIMING window for both resolutions (see the DemoMode
@@ -260,6 +283,15 @@ void initRenderer(AppState* state) {
         state->proxyRenderer->init(state->ctx, state->scene.getGltfScene().splat_data,
                                     shaderBase, kProxyWidth, kProxyHeight);
         state->proxyRenderer->setGpuTimingEnabled(state->ctx, true);
+
+        // Stage 3: input-assembly GLSL compute pipeline (assets pushed by
+        // push_assets.sh: assets/texture.npy, assets/bg_sphere.npy,
+        // shaders_ia/input_assembly_{unpremul_depth,assemble}.comp.spv).
+        state->inputAssembly.init(state->ctx, base + "/assets/texture.npy", base + "/assets/bg_sphere.npy",
+                                   kProxyWidth, kProxyHeight, AppState::kParamStride, AppState::kHiddenChannels,
+                                   base + "/shaders_ia");
+        LOGI("InputAssembly initialized: net=%ux%u channels=%u",
+             state->inputAssembly.getNetW(), state->inputAssembly.getNetH(), state->inputAssembly.getChannels());
 
         // NOTE: deliberately NOT using scene.getAutoTarget()/getAutoEye()
         // here -- SceneManager::computeAutoCamera frames the WHOLE scene's
@@ -479,6 +511,23 @@ void renderFrame(AppState* state) {
     splatR->render(ctx);
     double renderMs = msSince(tRender);
 
+    // --- Stage 3: input assembly, proxy-mode frames only (Target mode has
+    // no jitter/history contract to feed the network -- it exists purely
+    // as this demo's ground-truth comparison target, per DemoMode's
+    // comment). hiddenIn=nullptr until Stage 5 wires the real recurrent
+    // state through; every frame still runs the full pass (not just the
+    // dump frame) so its own timing shows up in profiling passes later.
+    if (isProxy) {
+        float cx = static_cast<float>(kProxyWidth) * 0.5f, cy = static_cast<float>(kProxyHeight) * 0.5f;
+        state->inputAssembly.run(ctx, splatR->getOutputImage(), splatR->getExpectedDepthImage(),
+                                  splatR->getMotionImage(), kProxyWidth, kProxyHeight, nullptr,
+                                  frame.eye.x, frame.eye.y, frame.eye.z,
+                                  frame.rAxis.x, frame.rAxis.y, frame.rAxis.z,
+                                  frame.uAxis.x, frame.uAxis.y, frame.uAxis.z,
+                                  frame.fAxis.x, frame.fAxis.y, frame.fAxis.z,
+                                  frame.fx, frame.fy, cx, cy, jitterPxX, jitterPxY);
+    }
+
     // --- Stage 2 validation dump: one fixed proxy frame, diffed against
     // the Mac Vulkan CLI with the same camera/jitter/morph-time (see
     // dumpProxyDebugFrame's comment above). frame 30 is well past the
@@ -521,8 +570,21 @@ void renderFrame(AppState* state) {
     // for ANY continuously-run SplatRenderer, or specific to the
     // proxyRenderer_ this app constructs directly from splat_data.
     constexpr int kDumpFrameTarget = 181;
+    // Stage 3 validation needs frame (kDumpFrame - 1)'s proxy depth too
+    // (disocclusion_mask's "previous frame" input) -- dumped under its own
+    // tag so it doesn't disturb the existing frame-30 comparison.
+    if (isProxy && state->frameCounter == kDumpFrame - 1) {
+        dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", "proxy_prev", state->frameCounter, morphT, jitterPxX, jitterPxY);
+    }
     if (isProxy && state->frameCounter == kDumpFrame) {
         dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", "proxy", state->frameCounter, morphT, jitterPxX, jitterPxY);
+        // Stage 3 validation: dump the packed 26-ch input tensor for the
+        // SAME frame, to diff against mobiledlss.train.model.build_input
+        // fed the Mac CLI's dumped proxy color/depth/mv for this frame.
+        state->inputAssembly.dumpToNpy(basePath(state) + "/dump/android_input_tensor.npy");
+        LOGI("DUMP input_tensor: %s/dump/android_input_tensor.npy (net=%ux%u ch=%u)",
+             basePath(state).c_str(), state->inputAssembly.getNetW(), state->inputAssembly.getNetH(),
+             state->inputAssembly.getChannels());
     } else if (!isProxy && state->frameCounter == kDumpFrameTarget) {
         dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", "target", state->frameCounter, morphT, jitterPxX, jitterPxY);
     }

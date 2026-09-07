@@ -1,0 +1,38 @@
+#version 450
+// Stage 3 (mobile-DLSS Android live demo, docs/rendering-engines.md): the
+// first of two GLSL compute passes that port playground_ios/Source/
+// NetInputAssembly.mm's `unpremul_depth` MSL kernel + build_input's caller
+// contract to GLSL, hand-written and compiled via the NDK's glslc (not
+// luxc -- see input_assembly.cpp's header comment).
+//
+// Un-premultiplies this frame's proxy-resolution expected-depth attachment
+// (SplatRenderer's out_depth: RGBA32_SFLOAT, x=depth*alpha, w=alpha -- see
+// splat_renderer.h's getExpectedDepthFormat comment) into a plain R32F
+// buffer. Written to one side of input_assembly.cpp's depth ping-pong pair
+// so next frame's disocclusion pass can read *this* frame's depth as
+// "previous".
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer DepthRaw {
+    vec4 data[];  // x = depth*alpha, y/z unused, w = alpha
+} depthRaw;
+
+layout(std430, binding = 1) writeonly buffer CurDepth {
+    float data[];
+} curDepth;
+
+layout(push_constant) uniform PC {
+    uint width;
+    uint height;
+} pc;
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.width || gid.y >= pc.height) return;
+    uint idx = gid.y * pc.width + gid.x;
+    vec4 raw = depthRaw.data[idx];
+    float a = raw.w;
+    float depth = (a > 1e-6) ? (raw.x / a) : 0.0;
+    curDepth.data[idx] = depth;
+}

@@ -49,5 +49,14 @@ done
 echo "=== pushing pruned scene (juggle_p0.8_stride4.glb, ~136MB) ==="
 push_one "$MOBILEDLSS_ROOT/demo/ios_assets/juggle_p0.8_stride4.glb" "scene/juggle_p0.8_stride4.glb"
 
+echo "=== pushing Stage 3 input-assembly GLSL shaders (glslc-compiled by build.sh step [0/7]) ==="
+for f in input_assembly_unpremul_depth input_assembly_assemble; do
+    push_one "$LUX_ROOT/playground_android/build/shaders_ia/$f.comp.spv" "shaders_ia/$f.comp.spv"
+done
+
+echo "=== pushing Stage 3 scene-memory assets (texture.npy, bg_sphere.npy) ==="
+push_one "$MOBILEDLSS_ROOT/demo/ios_assets/exported/texture.npy" "assets/texture.npy"
+push_one "$MOBILEDLSS_ROOT/demo/ios_assets/bg_sphere.npy" "assets/bg_sphere.npy"
+
 echo "done. Remote layout (internal files dir):"
 "$ADB" shell run-as "$PKG" find files -type f

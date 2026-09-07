@@ -33,14 +33,21 @@ OUT_APK_ALIGNED="$BUILD_DIR/lux_playground.aligned.apk"
 OUT_APK="$BUILD_DIR/lux_playground.apk"
 KEYSTORE="$BUILD_DIR/debug.keystore"
 
-echo "=== [1/6] cmake configure (NDK r$(basename "$NDK" | grep -o '[0-9.]*' || true)) ==="
+GLSLC="$NDK/shader-tools/darwin-x86_64/glslc"
+echo "=== [0/7] compile GLSL input-assembly shaders (glslc, Stage 3) ==="
+mkdir -p "$BUILD_DIR/shaders_ia"
+for f in input_assembly_unpremul_depth input_assembly_assemble; do
+    "$GLSLC" --target-env=vulkan1.1 -O -o "$BUILD_DIR/shaders_ia/$f.comp.spv" "$SRC_DIR/shaders_glsl/$f.comp"
+done
+
+echo "=== [1/7] cmake configure (NDK r$(basename "$NDK" | grep -o '[0-9.]*' || true)) ==="
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI="$ABI" \
     -DANDROID_PLATFORM="android-$API_LEVEL" \
     -DCMAKE_BUILD_TYPE=Release
 
-echo "=== [2/6] cmake build ==="
+echo "=== [2/7] cmake build ==="
 cmake --build "$BUILD_DIR" -j"$(sysctl -n hw.ncpu)"
 
 SO_PATH="$BUILD_DIR/liblux_android.so"
@@ -50,7 +57,7 @@ if [ ! -f "$SO_PATH" ]; then
 fi
 echo "built: $SO_PATH ($(du -h "$SO_PATH" | cut -f1))"
 
-echo "=== [3/6] stage APK contents ==="
+echo "=== [3/7] stage APK contents ==="
 rm -rf "$APK_STAGE"
 mkdir -p "$APK_STAGE/lib/$ABI"
 cp "$SO_PATH" "$APK_STAGE/lib/$ABI/liblux_android.so"
@@ -65,7 +72,7 @@ else
     echo "warning: libc++_shared.so not found at $CXX_SHARED" >&2
 fi
 
-echo "=== [4/6] aapt2 compile+link (no gradle) ==="
+echo "=== [4/7] aapt2 compile+link (no gradle) ==="
 mkdir -p "$BUILD_DIR/aapt2_compiled"
 "$BUILD_TOOLS/aapt2" link \
     -o "$OUT_APK_UNSIGNED" \
@@ -76,10 +83,10 @@ mkdir -p "$BUILD_DIR/aapt2_compiled"
 # Add native libs into the linked APK (aapt2 link only handles manifest+resources).
 cd "$APK_STAGE" && zip -q -r "$OUT_APK_UNSIGNED" lib && cd "$SRC_DIR"
 
-echo "=== [5/6] zipalign ==="
+echo "=== [5/7] zipalign ==="
 "$BUILD_TOOLS/zipalign" -f -p 4 "$OUT_APK_UNSIGNED" "$OUT_APK_ALIGNED"
 
-echo "=== [6/6] sign (debug keystore) ==="
+echo "=== [6/7] sign (debug keystore) ==="
 if [ ! -f "$KEYSTORE" ]; then
     "$JAVA_HOME/bin/keytool" -genkeypair -v -keystore "$KEYSTORE" \
         -alias androiddebugkey -storepass android -keypass android \

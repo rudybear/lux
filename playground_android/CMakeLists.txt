@@ -58,6 +58,7 @@ add_library(lux_android SHARED
     "${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c"
     src/android_main.cpp
     src/android_vulkan_context.cpp
+    src/input_assembly.cpp
 
     # --- Reused-by-reference lux Vulkan splat pipeline (playground_cpp/src) ---
     "${PGCPP}/src/splat_renderer.cpp"
