@@ -773,6 +773,31 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
             splatR->setPreviousCameraExplicit(prevViewGl, prevProj);
             std::cout << "[metal] --camera-json-prev applied" << std::endl;
         }
+    } else {
+        // Regression fix: headless one-shot splat renders with no
+        // --camera-json previously left the camera at whatever the
+        // renderer's own default-constructed view/projection matrices
+        // were (MetalSplatLuxcRenderer: identity glm::mat4 for both --
+        // see its header's viewMatrix_/projMatrix_ member defaults) --
+        // an identity view+projection does NOT frame the scene, so the
+        // splat quads project outside the NDC cube and get frustum-culled
+        // entirely, producing a blank (all-zero) image. --bench (and the
+        // interactive GLFW path) both already set a real camera from the
+        // scene's own auto-computed bounding-box eye/target/up/far before
+        // their first render() call, which is why this gap was invisible
+        // there; --camera-json also fixed it for callers that pass one
+        // (e.g. mobiledlss's verify_lux_vs_gsplat.py). Plain
+        // `--pipeline examples/gaussian_splat_dlss --frame N` with no
+        // other camera flag had no fallback at all. Match Vulkan's
+        // main.cpp (syncSplatCamera lambda / SplatRenderer's own internal
+        // splat-bounding-box default) by applying the same scene auto-
+        // camera used by --bench/interactive here too.
+        float aspect = static_cast<float>(opts.width) / static_cast<float>(opts.height);
+        splatR->updateCamera(scene.getAutoEye(), scene.getAutoTarget(), scene.getAutoUp(),
+                              glm::radians(45.0f), aspect, 0.1f, scene.getAutoFar());
+        std::cout << "[metal] No --camera-json given: using scene auto-camera "
+                  << "(eye=" << scene.getAutoEye().x << "," << scene.getAutoEye().y << ","
+                  << scene.getAutoEye().z << ")" << std::endl;
     }
 
     // --- Motion vectors: real previous-time morph evaluation ---

@@ -668,3 +668,80 @@ class TestPreviousMorphTime:
         assert static_max < 0.5, f"isolated static gaussians should show ~0 mv, got {static_max}"
         assert moving_max > 1.0, f"moving gaussians should show real mv, got {moving_max}"
         assert moving_max > 10 * max(static_max, 1e-6)
+
+
+# ===========================================================================
+# Regression: one-shot headless CLI render with NO --camera-json must not
+# be blank.
+#
+# Real bug found and fixed (bench/lux_perf_ablation.md's Mac Metal parity
+# session, mobiledlss): the shared runSplatBranch() in metal_main.cpp only
+# set a real camera when --camera-json was given (or implicitly, via
+# --bench's own orbit-camera setup, or the interactive GLFW path's initial
+# auto-camera pose) -- a plain headless one-shot render with no camera flag
+# at all (e.g. `--pipeline examples/gaussian_splat_dlss --frame 40`, the
+# exact form a user ran) left MetalSplatLuxcRenderer's/MetalSplatRenderer's
+# view/projection matrices at their default-constructed identity glm::mat4,
+# which does not frame the scene -- every splat quad projects outside the
+# NDC cube and gets frustum-culled, producing an all-black/all-zero image
+# with otherwise completely normal-looking timing output (no error, no
+# warning), which is what made this so easy to miss. Fixed by applying the
+# scene's own auto-computed bounding-box camera (scene.getAutoEye()/
+# getAutoTarget()/getAutoUp()/getAutoFar(), the same one --bench and
+# --interactive already used) whenever --camera-json is absent, mirroring
+# Vulkan's main.cpp (syncSplatCamera / SplatRenderer's internal
+# splat-bounding-box default).
+# ===========================================================================
+
+class TestNoCameraJsonNotBlank:
+    def test_one_shot_render_without_camera_json_is_not_blank(self, tmp_path):
+        """The specific regression: no --camera-json, no --bench, no
+        --interactive -- just a plain one-shot splat render, exactly what
+        docs/*.md's own usage examples show, and exactly the form a user
+        ran that surfaced this bug. Must produce real image content
+        (non-zero mean AND non-zero std -- catches both an all-black frame
+        from a mis-framed/culled camera and a solid-color frame from e.g.
+        a stuck clear-only render).
+
+        Metal-only (not parametrized over `binary`/both backends): the
+        reported regression was Metal-specific (MetalSplatLuxcRenderer's/
+        MetalSplatRenderer's view/projection default to identity
+        glm::mat4 with no internal fallback -- see metal_main.cpp's fix).
+        Vulkan's SplatRenderer already computes its own internal
+        splat-bounding-box default camera at init() and was not part of
+        this regression for real (non-degenerate) scenes -- confirmed by
+        directly re-running the exact reported repro command
+        (juggle_p0.8_stride4.glb, examples/gaussian_splat_dlss, --frame 40,
+        --sort view_depth) against the Vulkan binary, which rendered
+        correctly (non-blank) both before and after this fix. (A
+        DIFFERENT, narrower Vulkan-side bug was found while developing
+        this test: a very small/tightly-clustered synthetic splat cloud
+        with no --camera-json renders solid white on Vulkan, not black --
+        likely a degenerate near/far or NaN in SplatRenderer's own
+        bounding-box auto-camera for near-zero extents. Not the reported
+        regression and not fixed here; flagged as a separate follow-up.)
+        """
+        if not METAL_BIN.exists():
+            pytest.skip("lux-playground-metal not built")
+
+        width, height = 128, 128
+        glb_path = tmp_path / "splats.glb"
+        # A handful of splats spread around the origin (not all coincident)
+        # so a correctly-framed auto-camera renders visible, non-uniform
+        # content; scale/opacity chosen generously so this isn't sensitive
+        # to exactly where the auto-camera ends up.
+        _write_splats_glb(glb_path,
+                           [(0.0, 0.0, 0.0), (0.3, 0.15, -0.1), (-0.25, -0.1, 0.15)],
+                           scale=0.18, opacity=0.95)
+
+        out_path = tmp_path / "out.png"
+        _run(str(METAL_BIN), ["--scene", str(glb_path), "--pipeline", PIPELINE_BASE,
+                               "--headless", "--width", str(width), "--height", str(height),
+                               "--output", str(out_path)])
+
+        arr = np.asarray(Image.open(out_path).convert("RGB"), dtype=np.float64)
+        assert arr.std() > 1.0, (
+            f"one-shot CLI render with no --camera-json produced a blank/uniform "
+            f"image (mean={arr.mean():.3f}, std={arr.std():.3f}) -- the auto-camera "
+            f"fallback regressed")
+        assert arr.mean() > 0.0, "one-shot CLI render with no --camera-json is all-black"
