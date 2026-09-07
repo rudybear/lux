@@ -51,6 +51,17 @@ public:
              glm::vec3 rAxis, glm::vec3 uAxis, glm::vec3 fAxis, float fx, float fy,
              float cx, float cy, float jitterProxyX, float jitterProxyY);
 
+    // fg channel source (mobiledlss/train/model.py::build_input's proxy_fg):
+    // NOT proxy alpha -- measured to collapse the model from 36.4 to 24.3dB
+    // (the net reads "alpha coverage" as "moving actor here, distrust
+    // history/memory" everywhere alpha>0, not just where the actor truly
+    // is). Defaults to kFgSourceConstantZero (background) until lux's
+    // gaussian_splat_dlss ships a real per-pixel foreground_coverage output;
+    // switch to kFgSourceExpectedDepthG once that output's channel is
+    // confirmed (packed into the expected-depth attachment's .g component).
+    enum FgSource : uint32_t { kFgSourceConstantZero = 0, kFgSourceExpectedDepthG = 1 };
+    void setFgSource(FgSource src) { fgSource_ = src; }
+
     MTL::Buffer* getOutputBuffer() const { return outputBuffer_; }
 
     // Exposed for B4's reconstruct pass, which needs its own proxy-resolution
@@ -89,5 +100,6 @@ private:
 
     uint32_t proxyW_ = 0, proxyH_ = 0, paramStride_ = 1, hiddenChannels_ = 0;
     uint32_t depthAlphaOffset_ = 1;
+    uint32_t fgSource_ = kFgSourceConstantZero;
     uint32_t netW_ = 0, netH_ = 0;
 };

@@ -22,7 +22,7 @@ struct InputAssemblyUniforms {
     float bgRadius, mvScale, jitterX, jitterY;
     uint32_t proxyW, proxyH, netW, netH;
     uint32_t paramStride, hiddenChannels, texW, texH;
-    uint32_t firstFrame, texChannels, _pad1, _pad2;
+    uint32_t firstFrame, texChannels, fgSource, _pad2;  // fgSource: 0=const 0 (interim), 1=expected-depth .g
 };
 
 static const char* kUnpremulDepthMSL = R"(
@@ -61,7 +61,7 @@ struct InputAssemblyUniforms {
     float bgRadius, mvScale, jitterX, jitterY;
     uint proxyW, proxyH, netW, netH;
     uint paramStride, hiddenChannels, texW, texH;
-    uint firstFrame, texChannels, _pad1, _pad2;
+    uint firstFrame, texChannels, fgSource, _pad2;
 };
 
 // mobiledlss.train.scene_texture.SceneTexture.forward's exact sampling
@@ -143,7 +143,16 @@ kernel void assemble_net_input(
             float ca = colorRaw.a;
             float3 rgb = (ca > 1e-6) ? (colorRaw.rgb / ca) : float3(0.0);
             colorSum += rgb;
-            fgSum += ca;
+
+            float4 depthRaw = depthTex.read(pgid);
+            // fg (foreground/actor coverage): NOT proxy alpha (measured to collapse the
+            // model 36.4->24.3dB -- the net reads "alpha coverage" as "moving actor here,
+            // distrust history/memory" everywhere, not just the actor). Once lux's
+            // gaussian_splat_dlss ships a real per-pixel foreground_coverage output
+            // (packed into the expected-depth attachment's .g channel), read it from
+            // there; until it lands, constant 0 (background) is the documented interim.
+            float fgVal = (u.fgSource == 1) ? depthRaw.y : 0.0;
+            fgSum += fgVal;
 
             float depthVal = curUnpremulDepth.read(pgid).x;
             depthSum += depthVal;
@@ -367,6 +376,10 @@ void NetInputAssembly::run(MetalContext& ctx, MTL::Texture* currColorTex, MTL::T
         u.texW = texW_; u.texH = texH_;
         u.firstFrame = firstFrame_ ? 1 : 0;
         u.texChannels = texChannels_;
+        // fg: constant 0 until lux's foreground_coverage output lands in the
+        // expected-depth attachment's .g channel (kFgSourceExpectedDepthG) --
+        // see NetInputAssembly.h.
+        u.fgSource = fgSource_;
 
         MTL::Buffer* hidden = hiddenIn ? hiddenIn : zeroHiddenBuffer_;
 
