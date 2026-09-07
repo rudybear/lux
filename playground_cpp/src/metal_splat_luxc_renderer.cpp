@@ -277,6 +277,7 @@ void MetalSplatLuxcRenderer::createBuffers(MetalContext& ctx, const GaussianSpla
 
     size_t vec4Size = numSplats_ * 4 * sizeof(float);
     projCenterBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
+    projAxesBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
     projConicBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
     projColorBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
     visibleCountBuffer_ = ctx.newBuffer(std::max<size_t>(4, sizeof(uint32_t)), MTL::ResourceStorageModeShared);
@@ -667,12 +668,13 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
         trySetBuffer(enc, compShader_, opacityBuffer_, 3);
         trySetBuffer(enc, compShader_, shBuffer_, 4);
         trySetBuffer(enc, compShader_, projCenterBuffer_, 5);
-        trySetBuffer(enc, compShader_, projConicBuffer_, 6);
-        trySetBuffer(enc, compShader_, projColorBuffer_, 7);
-        trySetBuffer(enc, compShader_, sortKeysBuffer_, 8);
-        trySetBuffer(enc, compShader_, sortedIndicesBuffer_, 9);
-        trySetBuffer(enc, compShader_, visibleCountBuffer_, 10);
-        uint32_t nextBinding = 11;
+        trySetBuffer(enc, compShader_, projAxesBuffer_, 6);
+        trySetBuffer(enc, compShader_, projConicBuffer_, 7);
+        trySetBuffer(enc, compShader_, projColorBuffer_, 8);
+        trySetBuffer(enc, compShader_, sortKeysBuffer_, 9);
+        trySetBuffer(enc, compShader_, sortedIndicesBuffer_, 10);
+        trySetBuffer(enc, compShader_, visibleCountBuffer_, 11);
+        uint32_t nextBinding = 12;
         if (hasMotionVectors_) {
             trySetBuffer(enc, compShader_, prevPosBuffer_, nextBinding++);
             trySetBuffer(enc, compShader_, projMvBuffer_, nextBinding++);
@@ -863,10 +865,11 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
     // (splat_expander.py's fragment reflection is empty) -- only the
     // vertex stage pulls from buffers.
     trySetVertexBuffer(enc, vertShader_, projCenterBuffer_, 0);
-    trySetVertexBuffer(enc, vertShader_, projConicBuffer_, 1);
-    trySetVertexBuffer(enc, vertShader_, projColorBuffer_, 2);
-    trySetVertexBuffer(enc, vertShader_, sortedIndicesBuffer_, 3);
-    uint32_t vNext = 4;
+    trySetVertexBuffer(enc, vertShader_, projAxesBuffer_, 1);
+    trySetVertexBuffer(enc, vertShader_, projConicBuffer_, 2);
+    trySetVertexBuffer(enc, vertShader_, projColorBuffer_, 3);
+    trySetVertexBuffer(enc, vertShader_, sortedIndicesBuffer_, 4);
+    uint32_t vNext = 5;
     if (hasMotionVectors_) trySetVertexBuffer(enc, vertShader_, projMvBuffer_, vNext++);
     if (hasExpectedDepth_) trySetVertexBuffer(enc, vertShader_, projDepthBuffer_, vNext++);
     if (hasForegroundCoverage_) trySetVertexBuffer(enc, vertShader_, projForegroundBuffer_, vNext++);

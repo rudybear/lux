@@ -257,6 +257,9 @@ private:
 
     // Projected output buffers (written by preprocess compute, read by sort/render).
     MTL::Buffer* projCenterBuffer_ = nullptr;
+    // Oriented-quad half-axis vectors (major.xy, minor.xy) -- see
+    // splat_expander.py's "Oriented quads" note.
+    MTL::Buffer* projAxesBuffer_ = nullptr;
     MTL::Buffer* projConicBuffer_ = nullptr;
     MTL::Buffer* projColorBuffer_ = nullptr;
     MTL::Buffer* projMvBuffer_ = nullptr;
