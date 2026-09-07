@@ -81,6 +81,18 @@ public:
     // True iff the *next* run() call will be the first one.
     bool isNextFrameFirst() const { return firstFrame_; }
 
+    // Forces the next run() to be treated as the very first one again (full
+    // disocclusion, no real depth history) -- for a display-mode switch back
+    // into Reconstruction after skipping frames (per-mode gating means the
+    // depth ping-pong history in depthPing_ may be many real frames stale,
+    // not just one frame old, so the ordinary disocclusion-vs-previous-depth
+    // check would compare against a wrong/unrelated frame).
+    void reset() {
+        depthPingIndex_ = 0;
+        firstFrame_ = true;
+        wasFirstFrame_ = true;
+    }
+
 private:
     MetalContext* ctx_ = nullptr;
     MTL::ComputePipelineState* unpremulPipeline_ = nullptr;

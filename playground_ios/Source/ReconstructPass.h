@@ -48,6 +48,24 @@ public:
 
     MTL::Buffer* getHiddenInputBuffer() const { return hiddenInputBuffer_; }
 
+    // For the frame-10 "everything reconstruct consumes" validation dump
+    // (reproducing the step in PyTorch): the *history* this frame's run()
+    // is about to read -- i.e. last frame's own composited output/hidden,
+    // BEFORE run() flips pingIndex_. Call before run(), not after.
+    MTL::Texture* getPrevColorTexture() const { return prevColor_[pingIndex_]; }
+    MTL::Buffer* getPrevHiddenBuffer() const { return prevHidden_[pingIndex_]; }
+
+    // Forces the next prepareHiddenInput()/run() pair to be treated as the
+    // very first frame again (zero hidden, no warp/blend history) -- pair
+    // with NetInputAssembly::reset() when re-entering Reconstruction display
+    // mode after frames were skipped under per-mode gating, so blend3 never
+    // mixes today's frame against prevColor_/prevHidden_ left over from a
+    // stale (many-real-frames-old) orbit position.
+    void reset() {
+        pingIndex_ = 0;
+        firstRun_ = true;
+    }
+
     // Runs the whole reconstruct pass for one frame, writing into `outColorTex`
     // (any writable texture -- the caller's drawable, or an offscreen target
     // for PSNR/dump purposes). `curDepthTex`/`prevDepthTex`:
