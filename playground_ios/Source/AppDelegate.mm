@@ -20,7 +20,20 @@
     self.window.rootViewController = vc;
     [self.window makeKeyAndVisible];
 
+    // Keep the screen awake while this demo is in the foreground -- the
+    // device's own Auto-Lock setting isn't honored reliably (Low Power Mode
+    // forces a short timeout), which was interrupting on-device fps runs.
+    // This only disables the idle timer; it does not change
+    // suspend/terminate behavior when the app is backgrounded.
+    [UIApplication sharedApplication].idleTimerDisabled = YES;
+
     return YES;
+}
+
+- (void)applicationDidBecomeActive:(UIApplication *)application {
+    // Re-assert on every foreground transition -- UIKit resets
+    // idleTimerDisabled to NO when the app resigns active/backgrounds.
+    [UIApplication sharedApplication].idleTimerDisabled = YES;
 }
 
 @end
