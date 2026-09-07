@@ -565,7 +565,27 @@ class SpvGenerator:
                 lines.append(f'OpMemberName {bms_id} {i} "{fname}"')
 
         # Decorations
-        lines.extend(self.decorations)
+        #
+        # Dedupe exact-duplicate decoration lines before emission. This
+        # matters specifically for RelaxedPrecision (bench/lux_perf_ablation.md
+        # task 2, precision-qualifier experiment): `--auto-type relaxed` can
+        # decorate the SAME SPIR-V result id twice when two different Lux
+        # variable names fold to the same SSA value id (e.g. a reused/CSE'd
+        # intermediate referenced from two `let` statements the precision
+        # classifier both marked fp16) -- legal to want, but
+        # `OpDecorate %id RelaxedPrecision` appearing twice for one id fails
+        # spirv-val ("decorated with RelaxedPrecision multiple times is not
+        # allowed"), which previously made `--auto-type relaxed` fail outright
+        # on the gaussian-splat preprocess compute shader. A single
+        # order-preserving, first-occurrence dedup here is safe for every
+        # decoration kind (two byte-identical `OpDecorate`/`OpMemberDecorate`
+        # lines are always redundant with each other -- distinct members/
+        # targets always produce distinct lines), not just RelaxedPrecision.
+        seen_decorations: set[str] = set()
+        for decoration_line in self.decorations:
+            if decoration_line not in seen_decorations:
+                seen_decorations.add(decoration_line)
+                lines.append(decoration_line)
 
         # Type + constant declarations (unified, dependency-ordered)
         lines.extend(self.reg.emit_declarations())
