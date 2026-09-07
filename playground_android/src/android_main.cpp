@@ -261,9 +261,9 @@ struct AppState {
     // resolution, entirely separate from SceneManager's Target renderer.
     std::unique_ptr<SplatRenderer> proxyRenderer;
 
-    // Full-scene Target switch (queued follow-up, docs/rendering-engines.md):
-    // Target mode currently renders the SAME pruned scene (juggle_p0.8_
-    // stride4.glb) `scene`/`proxyRenderer` both come from, which makes it a
+    // Full-scene Target switch (docs/rendering-engines.md task 2 -- "Bug A"):
+    // Target mode used to render the SAME pruned scene (juggle_p0.8_
+    // stride4.glb) `scene`/`proxyRenderer` both come from, which made it a
     // biased PSNR reference for Reconstruction/Bicubic -- Reconstruction
     // restores the pruned-away background from its scene-memory texture, so
     // scoring it against a Target missing ~80% of that background measured
@@ -276,8 +276,27 @@ struct AppState {
     // full_scene_target.txt marker file (cwd-relative, same convention as
     // force_gpu_net/gpu_net_config.txt) so it stays OFF (old single-pruned-
     // scene behavior, fullSceneTargetRenderer left null) until the 149MB
-    // asset is actually pushed and the marker deliberately dropped --
-    // NEITHER has happened yet, this is prep only.
+    // asset is pushed and the marker deliberately dropped (push_full_scene.sh).
+    //
+    // VALIDATED on-device (task 2): this selection logic (here and at its
+    // sibling in the Stage 5 capture block below) was already correct when
+    // written -- the bug was operational, not a code bug: an earlier session
+    // pushed juggle_full_stride4.glb but never dropped the marker, so
+    // useFullSceneTarget silently stayed false and the reported 28.6dB
+    // Reconstruction PSNR was against the wrong (pruned) reference the whole
+    // time. Dropping the marker (no rebuild needed) and re-running the
+    // 16-frame capture confirmed: target_color_f{t}.npy now differs from the
+    // pruned-scene capture (md5 mismatch on every frame; mean abs diff
+    // ~0.024-0.025 over the whole [0,1] RGB frame, consistent with restoring
+    // the ~80% background juggle_p0.8_stride4.glb prunes away) and the
+    // corrected PSNR sequence is Bicubic 23.62dB mean (matches the ~24dB
+    // expectation) and Reconstruction climbing 13.34dB (frame 0, cold from
+    // only 16 warmup frames) to 29.37dB (frame 15) -- still short of the
+    // ~33dB full-ceiling expectation because 16 frames of warmup isn't
+    // enough for the scene-memory background to converge from zero; task 3's
+    // 96-frame rollout (AppState::reconWindowFrames) shows it keeps
+    // climbing smoothly past 30dB with no ceiling reached by frame 145 (the
+    // longest window run so far), not a still-biased reference.
     std::unique_ptr<SplatRenderer> fullSceneTargetRenderer;
     bool useFullSceneTarget = false;
 
