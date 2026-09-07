@@ -382,11 +382,51 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
     render pass.
 
     Output buffers:
-        projected_center -- (x_ndc, y_ndc, depth, radius)
+        projected_center -- (x_ndc, y_ndc, depth, major_extent) -- the .w
+                       component is the SAME opacity-tight, screen-size-
+                       clamped extent along the covariance's LARGER
+                       eigenvector that used to be the (axis-aligned quad)
+                       radius; kept for frustum-culling margin / debug.
+        projected_axes   -- (major.x, major.y, minor.x, minor.y): the two
+                       half-axis vectors of the oriented screen-space
+                       quad, each `t*sqrt(lambda)*eigenvector` along the
+                       projected 2D covariance's own eigenvectors (see
+                       "Oriented quads" below) -- replaces the old
+                       axis-aligned `radius`-only quad.
         projected_conic  -- upper triangle of inverse 2D covariance
         projected_color  -- evaluated SH color + opacity
         sort_keys        -- depth value for radix sort
         visible_count    -- atomic counter (incremented per visible splat)
+
+    Oriented quads (perf; bench/lux_perf_ablation.md in mobiledlss,
+    "Variant A"): the old vertex-stage quad was an AXIS-ALIGNED square
+    sized by the covariance's single larger eigenvalue (`radius =
+    t*sqrt(lambda_max)`), even though most splats are anisotropic
+    (elongated) -- wasting fill-rate/overdraw on the corners of the square
+    that lie outside the actual elongated ellipse. This computes the 2D
+    covariance's eigenVECTORS too (eigenvalues were already computed for
+    `radius`) via the standard symmetric-2x2 rotation-angle formula --
+    `theta = 0.5*atan2(2*cov01, cov00-cov11)` diagonalizes the matrix, so
+    `e1=(cos theta, sin theta)` is the eigenvector for the LARGER
+    eigenvalue (lambda_max) and `e2=(-sin theta, cos theta)` (perpendicular
+    by construction) is the eigenvector for the smaller one (lambda_min;
+    guaranteed > 0 here since `det = lambda_max*lambda_min` was already
+    checked `> 0` by the degenerate-ellipse cull above) -- and emits
+    `major = t*sqrt(lambda_max)*e1`, `minor = t*sqrt(lambda_min)*e2`
+    (`t` = the existing opacity-tight extent) instead of the scalar
+    radius. The vertex stage then offsets each corner by
+    `quad_x*major + quad_y*minor` (an oriented rectangle exactly
+    circumscribing the covariance ellipse at extent `t`) instead of
+    `vec2(quad_x,quad_y)*radius` (an axis-aligned square). The FRAGMENT
+    stage is unchanged -- it evaluates the same conic/Gaussian formula
+    against `frag_offset` regardless of which shape produced it, so pixel
+    output is bit-identical except for fragments the smaller oriented
+    quad no longer rasterizes at all (which would have been discarded by
+    the existing `alpha < alpha_min` check anyway, exactly like the
+    opacity-tight-extent fix above). Measured ~2.4x area-weighted overdraw
+    reduction on the reference scene (mobiledlss's ablation, using the
+    real per-splat covariance/opacity data with the same screen-size
+    clamp applied to both variants).
     """
     stage = StageBlock(stage_type="compute")
 
@@ -402,6 +442,7 @@ def _build_preprocess_stage(config: dict) -> StageBlock:
 
     # --- Output storage buffers ---
     stage.storage_buffers.append(StorageBufferDecl("projected_center", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("projected_axes", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("projected_conic", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("projected_color", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("sort_keys", "uint"))
@@ -488,6 +529,7 @@ def _cull_writes(config: dict | None = None) -> list:
     zero4 = _ctor("vec4", [_lit("0.0"), _lit("0.0"), _lit("0.0"), _lit("0.0")])
     writes = [
         _assign_idx("projected_center", _ref("gid"), zero4),
+        _assign_idx("projected_axes", _ref("gid"), zero4),
         _assign_idx("projected_conic", _ref("gid"), zero4),
         _assign_idx("projected_color", _ref("gid"), zero4),
         _assign_idx("sort_keys", _ref("gid"), _uint_lit("4294967295")),
@@ -819,19 +861,53 @@ def _build_preprocess_body(config: dict) -> list:
         ])])))
     body.append(_let("lambda_max", "scalar",
         _binop("+", _ref("mid"), _ref("half_diff"))))
+    # lambda_min = mid - half_diff. Always > 0 here: det = lambda_max *
+    # lambda_min was already checked > 0 (degenerate-ellipse cull above),
+    # and lambda_max > 0 (trace mid > 0 since dilation adds a positive
+    # constant to both diagonal entries), so lambda_min = det/lambda_max > 0.
+    body.append(_let("lambda_min", "scalar",
+        _binop("-", _ref("mid"), _ref("half_diff"))))
     body.append(_let("sigma_t_raw", "scalar",
         _call("sqrt", [_binop("*", _lit("2.0"),
                                _call("log", [_binop("/", _ref("opacity"), _lit(config["alpha_min"]))]))])))
     body.append(_let("sigma_t", "scalar",
         _call("min", [_ref("sigma_t_raw"), _lit("3.0")])))
+
+    # --- Oriented quad: covariance eigenvectors (see class docstring's
+    # "Oriented quads" note). theta diagonalizes the symmetric 2x2
+    # covariance; e1 = eigenvector for lambda_max, e2 (perpendicular) =
+    # eigenvector for lambda_min.
+    body.append(_let("eig_theta", "scalar",
+        _binop("*", _lit("0.5"),
+               _call("atan", [_binop("*", _lit("2.0"), _ref("cov2d_01")),
+                               _binop("-", _ref("cov2d_00f"), _ref("cov2d_11f"))]))))
+    body.append(_let("eig_cos", "scalar", _call("cos", [_ref("eig_theta")])))
+    body.append(_let("eig_sin", "scalar", _call("sin", [_ref("eig_theta")])))
+
     body.append(_let("raw_radius", "scalar",
         _call("ceil", [_binop("*", _ref("sigma_t"),
                                _call("sqrt", [_ref("lambda_max")]))])))
-    # Clamp radius to screen size (prevents excessively large quads)
+    # Clamp radius to screen size (prevents excessively large quads) --
+    # `radius` is now the major-axis (larger eigenvector) extent; kept
+    # under this name since it's still written to projected_center.w for
+    # frustum-culling margin (below) exactly as before.
     body.append(_let("radius", "scalar",
         _call("min", [_ref("raw_radius"),
                _call("max", [_swizzle(_push_field("screen_size"), "x"),
                               _swizzle(_push_field("screen_size"), "y")])])))
+    body.append(_let("raw_minor", "scalar",
+        _call("ceil", [_binop("*", _ref("sigma_t"),
+                               _call("sqrt", [_ref("lambda_min")]))])))
+    body.append(_let("minor_len", "scalar",
+        _call("min", [_ref("raw_minor"),
+               _call("max", [_swizzle(_push_field("screen_size"), "x"),
+                              _swizzle(_push_field("screen_size"), "y")])])))
+    body.append(_let("major_vec", "vec2",
+        _ctor("vec2", [_binop("*", _ref("eig_cos"), _ref("radius")),
+                        _binop("*", _ref("eig_sin"), _ref("radius"))])))
+    body.append(_let("minor_vec", "vec2",
+        _ctor("vec2", [_binop("*", _neg(_ref("eig_sin")), _ref("minor_len")),
+                        _binop("*", _ref("eig_cos"), _ref("minor_len"))])))
 
     # --- Project center to NDC ---
     # let clip_pos = push.proj_matrix * vec4(view_pos, 1.0);
@@ -934,6 +1010,10 @@ def _build_preprocess_body(config: dict) -> list:
     # --- Write output buffers ---
     body.append(_assign_idx("projected_center", _ref("gid"),
         _ctor("vec4", [_ref("ndc_x"), _ref("ndc_y"), _ref("ndc_z"), _ref("radius")])))
+
+    body.append(_assign_idx("projected_axes", _ref("gid"),
+        _ctor("vec4", [_swizzle(_ref("major_vec"), "x"), _swizzle(_ref("major_vec"), "y"),
+                        _swizzle(_ref("minor_vec"), "x"), _swizzle(_ref("minor_vec"), "y")])))
 
     body.append(_assign_idx("projected_conic", _ref("gid"),
         _ctor("vec4", [_ref("conic_x"), _ref("conic_y"), _ref("conic_z"), _ref("opacity")])))
@@ -1174,7 +1254,10 @@ def _build_vertex_stage(config: dict) -> StageBlock:
     visible splat.
 
     Inputs (storage buffers from the preprocess pass):
-        projected_center -- (ndc_x, ndc_y, depth, radius)
+        projected_center -- (ndc_x, ndc_y, depth, major_extent)
+        projected_axes   -- (major.x, major.y, minor.x, minor.y): oriented
+                       quad half-axis vectors (see the preprocess stage's
+                       "Oriented quads" docstring note)
         projected_conic  -- (inv_cov_a, inv_cov_b, inv_cov_c, opacity)
         projected_color  -- (r, g, b, opacity)
         sorted_indices   -- indirection table from radix sort
@@ -1193,6 +1276,7 @@ def _build_vertex_stage(config: dict) -> StageBlock:
 
     # --- Storage buffers (read-only) ---
     stage.storage_buffers.append(StorageBufferDecl("projected_center", "vec4"))
+    stage.storage_buffers.append(StorageBufferDecl("projected_axes", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("projected_conic", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("projected_color", "vec4"))
     stage.storage_buffers.append(StorageBufferDecl("sorted_indices", "uint"))
@@ -1245,6 +1329,8 @@ def _build_vertex_body(config: dict) -> list:
     # --- Read projected data ---
     body.append(_let("center_data", "vec4",
         _idx("projected_center", _ref("splat_idx"))))
+    body.append(_let("axes_data", "vec4",
+        _idx("projected_axes", _ref("splat_idx"))))
     body.append(_let("conic_data", "vec4",
         _idx("projected_conic", _ref("splat_idx"))))
     body.append(_let("color_data", "vec4",
@@ -1266,6 +1352,10 @@ def _build_vertex_body(config: dict) -> list:
         _swizzle(_ref("center_data"), "z")))
     body.append(_let("radius", "scalar",
         _swizzle(_ref("center_data"), "w")))
+    body.append(_let("major_vec", "vec2",
+        _swizzle(_ref("axes_data"), "xy")))
+    body.append(_let("minor_vec", "vec2",
+        _swizzle(_ref("axes_data"), "zw")))
 
     # --- Build quad corners (6 vertices → 2 triangles) ---
     # Vertex order: 0,1,2 and 3,4,5 forming a quad
@@ -1437,13 +1527,14 @@ def _build_vertex_body(config: dict) -> list:
     body.append(_let("quad_y", "scalar",
         _binop("-", _binop("*", _ref("oy_flag"), _lit("2.0")), _lit("1.0"))))
 
-    # --- Compute eigenvalues from conic to get splat extent ---
-    # We already have the radius packed in center_data.w, so use that directly.
-    # offset = vec2(quad_x, quad_y) * radius
+    # --- Oriented quad offset (see preprocess stage's docstring note) ---
+    # offset = quad_x*major + quad_y*minor -- an oriented rectangle exactly
+    # circumscribing the covariance ellipse at the opacity-tight extent,
+    # instead of the old axis-aligned vec2(quad_x,quad_y)*radius square.
     body.append(_let("offset", "vec2",
-        _binop("*",
-            _ctor("vec2", [_ref("quad_x"), _ref("quad_y")]),
-            _ref("radius"))))
+        _binop("+",
+            _binop("*", _ref("major_vec"), _ref("quad_x")),
+            _binop("*", _ref("minor_vec"), _ref("quad_y")))))
 
     # Screen-pixel center from NDC:
     # pixel_center = (ndc_center * 0.5 + 0.5) * screen_size

@@ -42,7 +42,7 @@
       {
         "binding": 1,
         "type": "storage_buffer",
-        "name": "projected_conic",
+        "name": "projected_axes",
         "element_type": "vec4",
         "stage_flags": [
           "vertex"
@@ -51,7 +51,7 @@
       {
         "binding": 2,
         "type": "storage_buffer",
-        "name": "projected_color",
+        "name": "projected_conic",
         "element_type": "vec4",
         "stage_flags": [
           "vertex"
@@ -59,6 +59,15 @@
       },
       {
         "binding": 3,
+        "type": "storage_buffer",
+        "name": "projected_color",
+        "element_type": "vec4",
+        "stage_flags": [
+          "vertex"
+        ]
+      },
+      {
+        "binding": 4,
         "type": "storage_buffer",
         "name": "sorted_indices",
         "element_type": "uint",
@@ -103,8 +112,8 @@
     "splat_name": "GaussianCloud"
   },
   "performance_hints": {
-    "instruction_count": 185,
-    "alu_ops": 25,
+    "instruction_count": 199,
+    "alu_ops": 27,
     "texture_samples": 0,
     "branches": 0,
     "function_calls": 0,

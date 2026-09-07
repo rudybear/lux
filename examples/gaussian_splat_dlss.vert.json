@@ -57,7 +57,7 @@
       {
         "binding": 1,
         "type": "storage_buffer",
-        "name": "projected_conic",
+        "name": "projected_axes",
         "element_type": "vec4",
         "stage_flags": [
           "vertex"
@@ -66,7 +66,7 @@
       {
         "binding": 2,
         "type": "storage_buffer",
-        "name": "projected_color",
+        "name": "projected_conic",
         "element_type": "vec4",
         "stage_flags": [
           "vertex"
@@ -75,6 +75,15 @@
       {
         "binding": 3,
         "type": "storage_buffer",
+        "name": "projected_color",
+        "element_type": "vec4",
+        "stage_flags": [
+          "vertex"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "storage_buffer",
         "name": "sorted_indices",
         "element_type": "uint",
         "stage_flags": [
@@ -82,7 +91,7 @@
         ]
       },
       {
-        "binding": 4,
+        "binding": 5,
         "type": "storage_buffer",
         "name": "projected_mv",
         "element_type": "vec2",
@@ -91,7 +100,7 @@
         ]
       },
       {
-        "binding": 5,
+        "binding": 6,
         "type": "storage_buffer",
         "name": "projected_depth",
         "element_type": "scalar",
@@ -100,7 +109,7 @@
         ]
       },
       {
-        "binding": 6,
+        "binding": 7,
         "type": "storage_buffer",
         "name": "projected_foreground",
         "element_type": "scalar",
@@ -145,8 +154,8 @@
     "splat_name": "DlssGaussianCloud"
   },
   "performance_hints": {
-    "instruction_count": 240,
-    "alu_ops": 25,
+    "instruction_count": 254,
+    "alu_ops": 27,
     "texture_samples": 0,
     "branches": 0,
     "function_calls": 0,

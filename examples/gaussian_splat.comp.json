@@ -66,7 +66,7 @@
       {
         "binding": 6,
         "type": "storage_buffer",
-        "name": "projected_conic",
+        "name": "projected_axes",
         "element_type": "vec4",
         "stage_flags": [
           "compute"
@@ -75,7 +75,7 @@
       {
         "binding": 7,
         "type": "storage_buffer",
-        "name": "projected_color",
+        "name": "projected_conic",
         "element_type": "vec4",
         "stage_flags": [
           "compute"
@@ -84,6 +84,15 @@
       {
         "binding": 8,
         "type": "storage_buffer",
+        "name": "projected_color",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 9,
+        "type": "storage_buffer",
         "name": "sort_keys",
         "element_type": "uint",
         "stage_flags": [
@@ -91,7 +100,7 @@
         ]
       },
       {
-        "binding": 9,
+        "binding": 10,
         "type": "storage_buffer",
         "name": "sorted_indices",
         "element_type": "uint",
@@ -100,7 +109,7 @@
         ]
       },
       {
-        "binding": 10,
+        "binding": 11,
         "type": "storage_buffer",
         "name": "visible_count",
         "element_type": "uint",
@@ -205,6 +214,7 @@
     ],
     "output_buffers": [
       "projected_center",
+      "projected_axes",
       "projected_conic",
       "projected_color",
       "sort_keys",
@@ -212,8 +222,8 @@
     ]
   },
   "performance_hints": {
-    "instruction_count": 565,
-    "alu_ops": 166,
+    "instruction_count": 606,
+    "alu_ops": 176,
     "texture_samples": 0,
     "branches": 5,
     "function_calls": 0,
