@@ -4,6 +4,12 @@
 #include <string>
 #include <vector>
 
+// Forward-declared opaque type for the LiteRT Next GPU backend (net_runner_
+// litert.h/.cpp) -- NetRunner only needs a pointer to it, so this header
+// doesn't have to include any LiteRT headers or force every TU that
+// includes net_runner.h to see them.
+struct LiteRtNetRunnerImpl;
+
 // Stage 4 of the mobile-DLSS Android live demo (docs/rendering-engines.md):
 // runs mobiledlss/train/export.py::export_tflite_pooled_input's exported
 // ParamPredUNet (demo/ios_assets/exported/unet_ps2_mem_pooled.tflite --
@@ -77,6 +83,19 @@ public:
 private:
     struct Impl;
     Impl* impl_ = nullptr;
+
+    // LiteRT Next GPU backend (net_runner_litert.h/.cpp): the default
+    // backend as of the LiteRT-Next-GPU-path task (docs/rendering-
+    // engines.md) -- ~15-18ms median end-to-end on this device vs XNNPACK's
+    // ~37-44ms, same fp16-weight-quantization-level accuracy. init() tries
+    // this first; on ANY failure (accelerator unavailable, compile error,
+    // ...) it falls back to the XNNPACK Impl above, exactly like the old
+    // force_gpu_net TFLite-GPU-delegate fallback used to. A `xnnpack_net`
+    // marker file (cwd-relative, same convention as force_gpu_net/
+    // gpu_net_config.txt) forces the XNNPACK path even when LiteRT GPU is
+    // available, for A/B comparison.
+    LiteRtNetRunnerImpl* litertImpl_ = nullptr;
+    bool useLiteRt_ = false;
 
     uint32_t netW_ = 0, netH_ = 0, paramStride_ = 1, hiddenChannels_ = 0, texChannels_ = 0;
     uint32_t inputChannels_ = 0;  // netTensor26ch's channel count (10 + hiddenChannels_ + texChannels_)

@@ -1,4 +1,5 @@
 #include "net_runner.h"
+#include "net_runner_litert.h"
 
 #include <tensorflow/lite/c/c_api.h>
 #include <tensorflow/lite/delegates/gpu/delegate.h>
@@ -37,6 +38,10 @@ struct NetRunner::Impl {
 };
 
 NetRunner::~NetRunner() {
+    if (litertImpl_) {
+        LiteRtNetRunner_Destroy(litertImpl_);
+        litertImpl_ = nullptr;
+    }
     if (!impl_) return;
     if (impl_->interpreter) TfLiteInterpreterDelete(impl_->interpreter);
     if (impl_->gpuDelegate) TfLiteGpuDelegateV2Delete(impl_->gpuDelegate);
@@ -48,7 +53,6 @@ NetRunner::~NetRunner() {
 
 void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
                       uint32_t paramStride, uint32_t hiddenChannels, uint32_t texChannels) {
-    impl_ = new Impl();
     netW_ = netW;
     netH_ = netH;
     paramStride_ = paramStride;
@@ -59,6 +63,32 @@ void NetRunner::init(const std::string& modelPath, uint32_t netW, uint32_t netH,
     // hidden(hidden) -- matches export_tflite_pooled_input's in_ch exactly.
     inputChannels_ = 10u + hiddenChannels_ + texChannels_;
 
+    // LiteRT Next GPU backend (net_runner_litert.h/.cpp) is the default now
+    // -- see net_runner.h's litertImpl_ comment. `xnnpack_net` (cwd-relative
+    // marker file, presence-only, same convention as force_gpu_net) forces
+    // the old TFLite-C-API/XNNPACK path below instead, e.g. for A/B timing
+    // comparisons or if a future device/driver regresses the LiteRT path.
+    FILE* xnnpackMarker = fopen("xnnpack_net", "r");
+    bool forceXnnpack = (xnnpackMarker != nullptr);
+    if (xnnpackMarker) fclose(xnnpackMarker);
+
+    if (!forceXnnpack) {
+        litertImpl_ = LiteRtNetRunner_Create(modelPath, netW_, netH_, inputChannels_, &outputChannels_);
+        if (litertImpl_) {
+            useLiteRt_ = true;
+            gpuDelegateActive_ = true;  // LiteRT Next's GPU accelerator, not the old TFLite GPU delegate
+            bufOutput_.resize(static_cast<size_t>(netW_) * netH_ * outputChannels_);
+            bufPooled_.resize(static_cast<size_t>(netW_) * netH_ * inputChannels_);
+            LOGI("NetRunner: using LiteRT Next GPU backend (model=%s output_channels=%u)",
+                 modelPath.c_str(), outputChannels_);
+            return;
+        }
+        LOGE("NetRunner: LiteRT Next GPU backend failed to initialize, falling back to XNNPACK (CPU)");
+    } else {
+        LOGI("NetRunner: xnnpack_net marker present, forcing the XNNPACK (CPU) backend");
+    }
+
+    impl_ = new Impl();
     impl_->model = TfLiteModelCreateFromFile(modelPath.c_str());
     if (!impl_->model) throw std::runtime_error("NetRunner: TfLiteModelCreateFromFile failed: " + modelPath);
 
@@ -261,6 +291,15 @@ const float* NetRunner::run(const float* netTensor26ch, const float* hiddenInNet
         toUpload = bufPooled_.data();
     }
     timings.adapterMs = msSince(tAdapter);
+
+    if (useLiteRt_) {
+        LiteRtNetRunnerTimingsMs t{};
+        const float* out = LiteRtNetRunner_Run(litertImpl_, toUpload, t);
+        timings.uploadMs = t.uploadMs;
+        timings.inferMs = t.inferMs;
+        timings.downloadMs = t.downloadMs;
+        return out;
+    }
 
     auto tUpload = std::chrono::high_resolution_clock::now();
     TfLiteTensor* inputTensor = TfLiteInterpreterGetInputTensor(impl_->interpreter, impl_->idxInput);

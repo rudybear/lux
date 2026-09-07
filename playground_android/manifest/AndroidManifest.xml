@@ -12,6 +12,25 @@
         android:hasCode="false"
         android:label="Lux Playground"
         android:debuggable="true">
+        <!-- LiteRT Next GPU path (docs/rendering-engines.md): apps targeting
+             Android S+ (API 31+, we target 35) must explicitly declare any
+             vendor-provided native library they dlopen(), or the linker
+             namespace hides it and dlopen() silently fails: exactly what
+             was happening here (libLiteRt.so's GPU accelerator plugin fell
+             back from OpenCL to OpenGL with "OpenCL not supported on this
+             platform", even though `adb shell` run standalone binaries, a
+             different unrestricted linker namespace, load the SAME device
+             OpenCL driver fine). Copied verbatim from the
+             com.google.ai.edge.litert:litert:2.1.6 AAR's own
+             AndroidManifest.xml (Gradle merges these into any app that
+             depends on the AAR automatically; this hand built manifest has
+             no Gradle merge step, so they're vendored here instead).
+             libOpenCL-pixel.so is this exact device's (Pixel 9 Pro XL)
+             vendor OpenCL driver name. -->
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL-car.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL-pixel.so" android:required="false" />
+        <uses-native-library android:name="libvndksupport.so" android:required="false" />
         <activity
             android:name="android.app.NativeActivity"
             android:label="Lux Playground"

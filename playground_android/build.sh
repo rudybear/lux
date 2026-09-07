@@ -79,6 +79,14 @@ fi
 cp "$SRC_DIR/third_party/tflite/lib/$ABI/libtensorflowlite_jni.so" "$APK_STAGE/lib/$ABI/libtensorflowlite_jni.so"
 cp "$SRC_DIR/third_party/tflite/lib/$ABI/libtensorflowlite_gpu_jni.so" "$APK_STAGE/lib/$ABI/libtensorflowlite_gpu_jni.so"
 
+# LiteRT Next GPU path: libLiteRt.so (linked directly, see CMakeLists.txt)
+# plus libLiteRtClGlAccelerator.so, which libLiteRt.so dlopen()s by bare
+# filename at CompiledModel-create time -- must ship alongside it in this
+# same lib/<ABI>/ directory (not linked at build time) for that dlopen to
+# resolve inside the installed APK's native library search path.
+cp "$SRC_DIR/third_party/litert/lib/$ABI/libLiteRt.so" "$APK_STAGE/lib/$ABI/libLiteRt.so"
+cp "$SRC_DIR/third_party/litert/lib/$ABI/libLiteRtClGlAccelerator.so" "$APK_STAGE/lib/$ABI/libLiteRtClGlAccelerator.so"
+
 echo "=== [4/7] aapt2 compile+link (no gradle) ==="
 mkdir -p "$BUILD_DIR/aapt2_compiled"
 "$BUILD_TOOLS/aapt2" link \

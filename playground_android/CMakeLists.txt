@@ -83,6 +83,28 @@ add_library(tflite_gpu_delegate SHARED IMPORTED)
 set_target_properties(tflite_gpu_delegate PROPERTIES
     IMPORTED_LOCATION "${TFLITE_DIR}/lib/arm64-v8a/libtensorflowlite_gpu_jni.so")
 
+# LiteRT Next GPU path (docs/rendering-engines.md's LiteRT-Next-GPU-path
+# task): C API headers + arm64-v8a .so's vendored under third_party/litert/
+# from the com.google.ai.edge.litert:{litert,litert-api}:2.1.6 AARs (Maven
+# Central) -- 2.2.0 crashes natively on the target Pixel 9 Pro XL, verified
+# separately (mobiledlss/bench/android_net) before this integration, so
+# 2.1.6 is pinned deliberately, not just "whatever was newest". Only
+# litert-extract/jni/arm64-v8a/libLiteRt.so (the C API runtime -- exports
+# LiteRtCreateCompiledModel etc, confirmed via `llvm-nm -D`) and
+# libLiteRtClGlAccelerator.so (the GPU/OpenCL-GL accelerator plugin,
+# dynamically dlopen()'d BY libLiteRt.so at CompiledModel-create time by
+# bare filename -- must ship alongside it in the same lib/arm64-v8a/
+# directory, not linked directly) are needed; litert-api's own
+# liblitert_jni.so is the Kotlin/JNI bridge and isn't used from native code.
+# Headers are the litert/c (+build_common) subtree of the upstream
+# google-ai-edge/LiteRT source tree at the 2.1.6 release, pruned to just the
+# .h files actually needed to build clean against this prebuilt library
+# (source/test/build-system files from that tree are not vendored).
+set(LITERT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/litert")
+add_library(litert_c SHARED IMPORTED)
+set_target_properties(litert_c PROPERTIES
+    IMPORTED_LOCATION "${LITERT_DIR}/lib/arm64-v8a/libLiteRt.so")
+
 add_library(lux_android SHARED
     # --- Android glue / this directory ---
     "${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c"
@@ -90,6 +112,7 @@ add_library(lux_android SHARED
     src/android_vulkan_context.cpp
     src/input_assembly.cpp
     src/net_runner.cpp
+    src/net_runner_litert.cpp
     src/reconstruct_pass.cpp
     src/gpu_probe.cpp
 
@@ -113,6 +136,7 @@ target_include_directories(lux_android PRIVATE
     "${DEPS_DIR}/glm-src"
     "${DEPS_DIR}/vulkanmemoryallocator-src/include"
     "${TFLITE_DIR}/include"
+    "${LITERT_DIR}/include"
 )
 
 target_compile_definitions(lux_android PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
@@ -126,6 +150,9 @@ target_link_libraries(lux_android PRIVATE
     log
     tflite_c
     tflite_gpu_delegate
+    litert_c
+    EGL
+    GLESv3
 )
 
 set_target_properties(lux_android PROPERTIES
