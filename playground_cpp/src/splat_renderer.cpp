@@ -2051,10 +2051,28 @@ void SplatRenderer::render(VulkanContext& ctx) {
     // showed 0 failures after this change vs. a consistent ~30-50% failure
     // rate before it). This costs an extra CPU-GPU round trip per frame,
     // paid only when motion vectors are enabled.
+    //
+    // mobile-DLSS Android live demo, Task 2 (Reconstruction-mode time
+    // budget, docs/rendering-engines.md): guarded to __APPLE__ (MoltenVK's
+    // Vulkan-over-Metal translation is only ever in play on Apple/iOS/
+    // macOS builds of this shared file -- Android and other real-Vulkan-
+    // driver desktop targets were never the platform the flakiness above
+    // was observed on) since it's pure overhead there: on a conformant
+    // Vulkan driver (measured: Pixel 9 Pro XL / Mali-G715) the
+    // ALL_COMMANDS_BIT barrier immediately before the render pass (see its
+    // own comment a little further down) already correctly orders the
+    // preprocess dispatch's projected_mv write before the vertex shader's
+    // read, without needing a full queue drain + command-buffer restart in
+    // between -- this mid-render vkQueueWaitIdle was costing an extra
+    // CPU-GPU round trip on every hasMotionVectors_ frame (i.e. every
+    // Proxy/Bicubic/Reconstruction/Target frame in this demo) for a bug
+    // this platform never had.
+#if defined(__APPLE__)
     if (hasMotionVectors_) {
         ctx.endSingleTimeCommands(cmd);
         cmd = ctx.beginSingleTimeCommands();
     }
+#endif
 
     // --- Motion vectors: carry history forward for the NEXT frame ---
     // Preprocess has now consumed this frame's prevPosBuffer_/prev camera
