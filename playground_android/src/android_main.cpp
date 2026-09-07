@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -63,13 +64,85 @@ constexpr uint32_t kHeight = 540;
 constexpr uint32_t kProxyWidth = 480;
 constexpr uint32_t kProxyHeight = 270;
 
-// Which SplatRenderer instance's output gets blitted to the swapchain this
-// frame. Only PROXY and TARGET exist as of Stage 2; Stage 6 adds BICUBIC
-// (upsample of the proxy colour, no net) and RECONSTRUCTION (proxy + net +
-// reconstruct pass) and wires this to a tap-to-cycle input handler instead
-// of the time-based auto-cycle Stage 2 uses below (so both breakdowns show
-// up in one logcat capture without needing touch input yet).
-enum class DemoMode { Proxy, Target };
+// Which image gets blitted to the swapchain this frame. Stage 6
+// (docs/rendering-engines.md): tap-to-cycle Proxy -> Bicubic ->
+// Reconstruction -> Target -> Proxy (any ACTION_UP touch event advances
+// one step, see onInputEvent()). Proxy/Bicubic/Reconstruction all drive
+// the SAME jittered proxyRenderer_ + InputAssembly + NetRunner pipeline
+// (see renderFrame()'s `usesProxyRenderer`) and differ only in what's
+// displayed: Proxy blits the raw 480x270 proxy colour (hardware-upscaled
+// by the swapchain blit's own VK_FILTER_LINEAR); Bicubic does a real
+// Catmull-Rom bicubic upsample to target res on the CPU (bicubicUpsample2x)
+// -- the classic non-ML upsample baseline DLSS-style demos compare
+// against; Reconstruction runs the full net + reconstruct-with-memory
+// pass per displayed frame (via reconstruct_pass.h's runReconstructDump,
+// reused from Stage 5, over a fresh 1-frame dump directory each call --
+// simple and correct, at real disk-I/O + full-GPU-drain cost per stage,
+// not latency-optimized here). Target renders the full-res unjittered
+// scene directly, independent of the proxy pipeline entirely.
+enum class DemoMode { Proxy, Bicubic, Reconstruction, Target };
+
+DemoMode nextDemoMode(DemoMode m) {
+    switch (m) {
+        case DemoMode::Proxy: return DemoMode::Bicubic;
+        case DemoMode::Bicubic: return DemoMode::Reconstruction;
+        case DemoMode::Reconstruction: return DemoMode::Target;
+        case DemoMode::Target: return DemoMode::Proxy;
+    }
+    return DemoMode::Proxy;
+}
+
+const char* demoModeName(DemoMode m) {
+    switch (m) {
+        case DemoMode::Proxy: return "PROXY";
+        case DemoMode::Bicubic: return "BICUBIC";
+        case DemoMode::Reconstruction: return "RECONSTRUCTION";
+        case DemoMode::Target: return "TARGET";
+    }
+    return "?";
+}
+
+// Stage 6: real Catmull-Rom bicubic upsample (the classic non-ML baseline),
+// CPU-side -- `src` is [srcH,srcW,3] (readColorRgb's output convention),
+// clamped at the borders. Not restricted to an exact integer scale factor
+// (dstW/dstH need not be 2x srcW/srcH) even though this demo only ever
+// calls it at exactly 2x (proxy 480x270 -> target 960x540).
+std::vector<float> bicubicUpsample2x(const std::vector<float>& src, uint32_t srcW, uint32_t srcH,
+                                      uint32_t dstW, uint32_t dstH) {
+    auto catmullRom = [](float p0, float p1, float p2, float p3, float t) {
+        float t2 = t * t, t3 = t2 * t;
+        return 0.5f * ((2.0f * p1) + (-p0 + p2) * t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+                       (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+    };
+    auto tap = [&](int x, int y, int c) -> float {
+        x = std::clamp(x, 0, static_cast<int>(srcW) - 1);
+        y = std::clamp(y, 0, static_cast<int>(srcH) - 1);
+        return src[(static_cast<size_t>(y) * srcW + x) * 3 + c];
+    };
+    std::vector<float> out(static_cast<size_t>(dstW) * dstH * 3);
+    float sx = static_cast<float>(srcW) / static_cast<float>(dstW);
+    float sy = static_cast<float>(srcH) / static_cast<float>(dstH);
+    for (uint32_t dy = 0; dy < dstH; dy++) {
+        float fy = (dy + 0.5f) * sy - 0.5f;
+        int y1 = static_cast<int>(std::floor(fy));
+        float ty = fy - y1;
+        for (uint32_t dx = 0; dx < dstW; dx++) {
+            float fx = (dx + 0.5f) * sx - 0.5f;
+            int x1 = static_cast<int>(std::floor(fx));
+            float tx = fx - x1;
+            for (int c = 0; c < 3; c++) {
+                float rows[4];
+                for (int r = -1; r <= 2; r++) {
+                    rows[r + 1] = catmullRom(tap(x1 - 1, y1 + r, c), tap(x1, y1 + r, c),
+                                              tap(x1 + 1, y1 + r, c), tap(x1 + 2, y1 + r, c), tx);
+                }
+                float v = catmullRom(rows[0], rows[1], rows[2], rows[3], ty);
+                out[(static_cast<size_t>(dy) * dstW + dx) * 3 + c] = std::clamp(v, 0.0f, 1.0f);
+            }
+        }
+    }
+    return out;
+}
 
 // Halton(2,3) TAA jitter, exactly mirroring mobiledlss/datagen/camera.py::
 // halton/taa_jitter: 1-indexed low-discrepancy sequence, period 16, output
@@ -211,20 +284,31 @@ struct AppState {
     // bit-for-bit). kNetWarmupStart..kReconWindowStart gives the recurrent
     // hidden state 16 frames to leave its zero-initial condition before the
     // 16-frame capture window [kReconWindowStart, +kReconWindowFrames)
-    // that's actually dumped and reconstructed/compared -- both ranges stay
-    // inside the auto-cycle's first Proxy segment (frames [0,180), see
-    // DemoMode's kModeSwitchFrames) so `isProxy` is guaranteed true
-    // throughout without touching the display auto-cycle at all.
+    // that's actually dumped and reconstructed/compared -- the app starts
+    // in DemoMode::Proxy and only advances on a tap (Stage 6), so both
+    // ranges see `isProxy` (== mode != Target) true throughout by default,
+    // with no auto-cycle to coordinate against.
     static constexpr int kNetWarmupStart = 34;
     static constexpr int kReconWindowStart = 50;
     static constexpr int kReconWindowFrames = 16;
     bool stage5Done = false;
 
     DemoMode mode = DemoMode::Proxy;
-    // Auto-cycle Proxy/Target every kModeSwitchFrames frames so a single run
-    // captures a TIMING window for both resolutions (see the DemoMode
-    // comment above -- Stage 6 replaces this with tap-to-cycle).
-    static constexpr int kModeSwitchFrames = 180;
+    // Stage 6: tap-to-cycle (see onInputEvent()) sets this from the input
+    // thread/callback; renderFrame() consumes+clears it at the top of the
+    // next frame it renders (single-threaded render loop, no lock needed --
+    // android_native_app_glue's ALooper_pollOnce/source->process() and
+    // renderFrame() both run on the same thread, see android_main()).
+    bool pendingModeAdvance = false;
+
+    // Stage 6: persistent target-res (960x540) RGBA32F image Bicubic/
+    // Reconstruction modes upload their CPU-computed colour into before
+    // blitting to the swapchain (see uploadRgbToDisplayImage/
+    // blitImageToSwapchain below) -- neither mode has its result as a
+    // ready-made VkImage the way Proxy/Target's own SplatRenderer output
+    // already is.
+    VkImage displayImage = VK_NULL_HANDLE;
+    VmaAllocation displayAlloc = VK_NULL_HANDLE;
 
     VkSemaphore imageAvailableSem = VK_NULL_HANDLE;
     VkSemaphore renderFinishedSem = VK_NULL_HANDLE;
@@ -377,6 +461,24 @@ void initRenderer(AppState* state) {
         // kJuggleActorCenter, matching generate_juggle_camera.py exactly.
         LOGI("Splat renderer initialized: %ux%u, actor center=(%.3f,%.3f,%.3f) radius=%.3f",
              kWidth, kHeight, kJuggleActorCenter.x, kJuggleActorCenter.y, kJuggleActorCenter.z, kOrbitRadius);
+
+        // Stage 6: persistent target-res display image for Bicubic/
+        // Reconstruction modes (see AppState::displayImage's comment).
+        {
+            VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            imgInfo.imageType = VK_IMAGE_TYPE_2D;
+            imgInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+            imgInfo.extent = {kWidth, kHeight, 1};
+            imgInfo.mipLevels = 1;
+            imgInfo.arrayLayers = 1;
+            imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+            imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VmaAllocationCreateInfo allocInfo{};
+            allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+            vmaCreateImage(state->ctx.allocator, &imgInfo, &allocInfo, &state->displayImage, &state->displayAlloc, nullptr);
+        }
 
         VkSemaphoreCreateInfo semInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         vkCreateSemaphore(state->ctx.device, &semInfo, nullptr, &state->imageAvailableSem);
@@ -609,6 +711,183 @@ std::vector<float> readMvProxy(VulkanContext& ctx, SplatRenderer* splatR) {
     return DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
 }
 
+// Stage 6: uploads a CPU-side [h,w,3] RGB buffer (Bicubic's or
+// Reconstruction's result) into AppState::displayImage, leaving it in
+// TRANSFER_SRC_OPTIMAL (ready for blitImageToSwapchain below). One-shot
+// synchronous staging-buffer upload -- correctness/simplicity over
+// per-frame latency, matching every other new Stage 3-5 GPU path in this
+// file.
+void uploadRgbToDisplayImage(VulkanContext& ctx, VkImage image, const std::vector<float>& rgb, uint32_t w, uint32_t h) {
+    std::vector<float> rgba(static_cast<size_t>(w) * h * 4, 1.0f);
+    for (size_t i = 0; i < static_cast<size_t>(w) * h; i++) {
+        rgba[i * 4 + 0] = rgb[i * 3 + 0];
+        rgba[i * 4 + 1] = rgb[i * 3 + 1];
+        rgba[i * 4 + 2] = rgb[i * 3 + 2];
+    }
+    VkDeviceSize sizeBytes = rgba.size() * sizeof(float);
+    VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufInfo.size = sizeBytes;
+    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+    allocInfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    VkBuffer stagingBuffer;
+    VmaAllocation stagingAlloc;
+    vmaCreateBuffer(ctx.allocator, &bufInfo, &allocInfo, &stagingBuffer, &stagingAlloc, nullptr);
+    void* mapped = nullptr;
+    vmaMapMemory(ctx.allocator, stagingAlloc, &mapped);
+    memcpy(mapped, rgba.data(), sizeBytes);
+    vmaUnmapMemory(ctx.allocator, stagingAlloc);
+
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    VkImageMemoryBarrier toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDst.image = image;
+    toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    toDst.srcAccessMask = 0;
+    toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {w, h, 1};
+    vkCmdCopyBufferToImage(cmd, stagingBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    VkImageMemoryBarrier toSrc = toDst;
+    toSrc.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSrc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &toSrc);
+    ctx.endSingleTimeCommands(cmd);
+
+    vmaDestroyBuffer(ctx.allocator, stagingBuffer, stagingAlloc);
+}
+
+// Stage 6: generic version of SplatRenderer::blitToSwapchain -- same
+// barrier/blit pattern (see splat_renderer.cpp), parameterized on an
+// arbitrary source VkImage (already TRANSFER_SRC_OPTIMAL) instead of a
+// SplatRenderer's own colorImage_, since Bicubic/Reconstruction display
+// AppState::displayImage rather than any SplatRenderer's output.
+void blitImageToSwapchain(VkCommandBuffer cmd, VkImage srcImage, uint32_t srcW, uint32_t srcH,
+                           VkImage swapImage, VkExtent2D extent) {
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = swapImage;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkImageBlit blitRegion{};
+    blitRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blitRegion.srcOffsets[1] = {static_cast<int32_t>(srcW), static_cast<int32_t>(srcH), 1};
+    blitRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blitRegion.dstOffsets[1] = {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1};
+    vkCmdBlitImage(cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  1, &blitRegion, VK_FILTER_LINEAR);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = 0;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+// Stage 6: runs the Reconstruction mode's full net + reconstruct-with-
+// memory pass for exactly ONE frame (fresh 1-frame dump dir each call --
+// see DemoMode's header comment) and returns its [kHeight,kWidth,3]
+// output cropped from the pass's own padded 960x544 (same crop Stage 5's
+// PSNR comparison uses). Reuses the SAME NetRunner hidden-state feedback
+// (state->hiddenState) the Stage 5 warmup/capture window already
+// established -- calling this repeatedly (every displayed frame while in
+// Reconstruction mode) keeps that recurrence live and running.
+std::vector<float> runReconstructionModeFrame(AppState* state, VulkanContext& ctx, SplatRenderer* splatR,
+                                               const OrbitFrame& frame, float jitterTargetX, float jitterTargetY) {
+    NetRunner::RunTimingsMs t{};
+    const float* hiddenPtr = state->hiddenState.empty() ? nullptr : state->hiddenState.data();
+    const float* out = state->netRunner.run(state->inputAssembly.getOutputHostPtr(), hiddenPtr, t);
+    uint32_t netW = state->inputAssembly.getNetW(), netH = state->inputAssembly.getNetH();
+    uint32_t outCh = state->netRunner.getOutputChannels();
+    uint32_t hiddenCh = AppState::kHiddenChannels;
+    state->hiddenState.assign(static_cast<size_t>(netW) * netH * hiddenCh, 0.0f);
+    for (size_t p = 0; p < static_cast<size_t>(netW) * netH; p++) {
+        memcpy(&state->hiddenState[p * hiddenCh], &out[p * outCh + (outCh - hiddenCh)], hiddenCh * sizeof(float));
+    }
+
+    std::string dumpDir = basePath(state) + "/live_recon_dump_1f";
+    static bool staticsCopied = false;
+    if (!staticsCopied) {
+        mkdir(dumpDir.c_str(), 0755);
+        copyFile(basePath(state) + "/assets/bg_sphere.npy", dumpDir + "/bg_sphere.npy");
+        copyFile(basePath(state) + "/assets/texture.npy", dumpDir + "/texture.npy");
+        copyFile(basePath(state) + "/assets/memory_head.npz", dumpDir + "/memory_head.npz");
+        staticsCopied = true;
+    }
+    uint32_t paddedProxyH = netH * AppState::kParamStride;
+    uint32_t targetW = kWidth, targetH = paddedProxyH * 2;
+    writeMetaJson(dumpDir + "/meta.json", 2, 4, AppState::kParamStride, hiddenCh, kProxyWidth, paddedProxyH,
+                  targetW, targetH, netW, netH, /*numFrames=*/1, AppState::kTexChannels, 16, 512, 256);
+
+    auto colorProxy = readColorRgb(ctx, splatR);
+    auto colorPadded = padRowsReplicate(colorProxy, kProxyHeight, kProxyWidth, 3, paddedProxyH);
+    DlssIO::writeNpyFloat32(dumpDir + "/proxy_color_f0.npy", colorPadded, {paddedProxyH, kProxyWidth, 3});
+    auto mvProxy = readMvProxy(ctx, splatR);
+    auto mvPadded = padRowsReplicate(mvProxy, kProxyHeight, kProxyWidth, 2, paddedProxyH);
+    DlssIO::writeNpyFloat32(dumpDir + "/mv_proxy_f0.npy", mvPadded, {paddedProxyH, kProxyWidth, 2});
+    std::vector<float> jitterArr = {jitterTargetX, jitterTargetY};
+    DlssIO::writeNpyFloat32(dumpDir + "/jitter_f0.npy", jitterArr, {2});
+    std::vector<float> packed(out, out + static_cast<size_t>(netW) * netH * outCh);
+    DlssIO::writeNpyFloat32(dumpDir + "/packed_params_f0.npy", packed, {netH, netW, outCh});
+
+    const float* netTensor = state->inputAssembly.getOutputHostPtr();
+    uint32_t ch26 = state->inputAssembly.getChannels();
+    std::vector<float> disoccTarget(static_cast<size_t>(targetW) * targetH);
+    uint32_t upFactor = AppState::kParamStride * 2;
+    for (uint32_t y = 0; y < targetH; y++) {
+        uint32_t gy = std::min(y / upFactor, netH - 1);
+        for (uint32_t x = 0; x < targetW; x++) {
+            uint32_t gx = std::min(x / upFactor, netW - 1);
+            disoccTarget[static_cast<size_t>(y) * targetW + x] = netTensor[(static_cast<size_t>(gy) * netW + gx) * ch26 + 6];
+        }
+    }
+    DlssIO::writeNpyFloat32(dumpDir + "/disocc_f0.npy", disoccTarget, {targetH, targetW});
+
+    OrbitFrame reconTargetFrame = computeOrbitFrame(static_cast<float>(state->frameCounter), targetW, targetH);
+    std::vector<float> kParams = {reconTargetFrame.fx, reconTargetFrame.fy, targetW * 0.5f, targetH * 0.5f};
+    DlssIO::writeNpyFloat32(dumpDir + "/k_params_f0.npy", kParams, {4});
+    std::vector<float> camToWorld(16, 0.0f);
+    camToWorld[0] = reconTargetFrame.rAxis.x; camToWorld[1] = reconTargetFrame.uAxis.x; camToWorld[2] = reconTargetFrame.fAxis.x; camToWorld[3] = reconTargetFrame.eye.x;
+    camToWorld[4] = reconTargetFrame.rAxis.y; camToWorld[5] = reconTargetFrame.uAxis.y; camToWorld[6] = reconTargetFrame.fAxis.y; camToWorld[7] = reconTargetFrame.eye.y;
+    camToWorld[8] = reconTargetFrame.rAxis.z; camToWorld[9] = reconTargetFrame.uAxis.z; camToWorld[10] = reconTargetFrame.fAxis.z; camToWorld[11] = reconTargetFrame.eye.z;
+    camToWorld[15] = 1.0f;
+    DlssIO::writeNpyFloat32(dumpDir + "/cam_to_world_f0.npy", camToWorld, {4, 4});
+
+    std::string outDir = basePath(state) + "/live_recon_out_1f";
+    int rc = runReconstructDump(ctx, dumpDir, outDir, basePath(state) + "/examples/reconstruct_mem_ps2");
+    if (rc != 0) {
+        LOGE("Reconstruction mode: runReconstructDump failed (rc=%d)", rc);
+        return std::vector<float>(static_cast<size_t>(kWidth) * kHeight * 3, 0.0f);
+    }
+    DlssIO::NpyArray outArr = DlssIO::readNpyFloat32(outDir + "/out_f0.npy");  // [targetH,targetW,3]
+    std::vector<float> cropped(static_cast<size_t>(kWidth) * kHeight * 3);
+    for (uint32_t y = 0; y < kHeight; y++) {
+        memcpy(&cropped[static_cast<size_t>(y) * kWidth * 3], &outArr.data[static_cast<size_t>(y) * targetW * 3],
+               static_cast<size_t>(kWidth) * 3 * sizeof(float));
+    }
+    return cropped;
+}
+
 void renderFrame(AppState* state) {
     if (!state->vulkanReady) return;
     VulkanContext& ctx = state->ctx;
@@ -641,21 +920,23 @@ void renderFrame(AppState* state) {
     }
     vkResetFences(ctx.device, 1, &state->inFlightFence);
 
-    // --- Stage 2: time-based Proxy/Target auto-cycle (see DemoMode comment) ---
-    DemoMode newMode = ((state->frameCounter / AppState::kModeSwitchFrames) % 2 == 0)
-                            ? DemoMode::Proxy : DemoMode::Target;
-    if (newMode != state->mode) {
-        state->mode = newMode;
+    // --- Stage 6: tap-to-cycle (see onInputEvent()); no auto-cycle ---
+    if (state->pendingModeAdvance) {
+        state->pendingModeAdvance = false;
+        state->mode = nextDemoMode(state->mode);
         // Don't mix a partial window's samples across the mode switch --
-        // the two modes use different renderers/resolutions entirely.
+        // different modes use different renderers/resolutions/code paths.
         state->timingFrameCount = 0;
         state->sumCpuWaitFenceMs = state->sumCpuRenderMs = state->sumCpuBlitPresentMs = state->sumCpuFrameMs = 0.0;
         state->sumGpuPreprocessMs = state->sumGpuSortMs = state->sumGpuDrawMs = 0.0;
         state->gpuTimingValidFrames = 0;
-        LOGI("mode switch -> %s", state->mode == DemoMode::Proxy ? "PROXY (480x270, jittered)" : "TARGET (960x540, unjittered)");
+        LOGI("mode switch -> %s", demoModeName(state->mode));
     }
 
-    bool isProxy = (state->mode == DemoMode::Proxy);
+    // Proxy/Bicubic/Reconstruction all drive the same jittered proxy
+    // pipeline (InputAssembly + NetRunner); only Target renders the
+    // separate full-res unjittered scene -- see DemoMode's comment.
+    bool isProxy = (state->mode != DemoMode::Target);
     SplatRenderer* splatR = isProxy ? state->proxyRenderer.get() : state->scene.getSplatRenderer();
     uint32_t activeW = isProxy ? kProxyWidth : kWidth;
     uint32_t activeH = isProxy ? kProxyHeight : kHeight;
@@ -911,9 +1192,36 @@ void renderFrame(AppState* state) {
         dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", "target", state->frameCounter, morphT, jitterPxX, jitterPxY);
     }
 
+    // --- Stage 6: Bicubic/Reconstruction produce their displayed image on
+    // the CPU/via a separate dump-and-reconstruct round trip (see
+    // bicubicUpsample2x/runReconstructionModeFrame above), then upload it
+    // into AppState::displayImage for the blit below; Proxy/Target blit
+    // straight from their own SplatRenderer's colorImage_, unchanged.
+    double stage6Ms = 0.0;
+    if (state->mode == DemoMode::Bicubic) {
+        auto tS6 = std::chrono::high_resolution_clock::now();
+        auto colorProxy = readColorRgb(ctx, splatR);
+        auto upsampled = bicubicUpsample2x(colorProxy, kProxyWidth, kProxyHeight, kWidth, kHeight);
+        uploadRgbToDisplayImage(ctx, state->displayImage, upsampled, kWidth, kHeight);
+        stage6Ms = msSince(tS6);
+    } else if (state->mode == DemoMode::Reconstruction) {
+        auto tS6 = std::chrono::high_resolution_clock::now();
+        auto reconColor = runReconstructionModeFrame(state, ctx, splatR, frame, jitterTargetX, jitterTargetY);
+        uploadRgbToDisplayImage(ctx, state->displayImage, reconColor, kWidth, kHeight);
+        stage6Ms = msSince(tS6);
+    }
+    if (stage6Ms > 0.0) {
+        LOGI("Stage6 %s frame render: %.1fms", demoModeName(state->mode), stage6Ms);
+    }
+
     auto tBlit = std::chrono::high_resolution_clock::now();
     state->blitCmd = ctx.beginSingleTimeCommands();
-    splatR->blitToSwapchain(ctx, state->blitCmd, ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
+    if (state->mode == DemoMode::Bicubic || state->mode == DemoMode::Reconstruction) {
+        blitImageToSwapchain(state->blitCmd, state->displayImage, kWidth, kHeight,
+                              ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
+    } else {
+        splatR->blitToSwapchain(ctx, state->blitCmd, ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
+    }
     vkEndCommandBuffer(state->blitCmd);
 
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -983,9 +1291,7 @@ void renderFrame(AppState* state) {
              "gpu_valid_frames=%d/%d | sync_stalls_per_frame: outer_vkWaitForFences=1 "
              "inner_vkQueueWaitIdle=%d (splat_renderer.cpp render(): 1 after preprocess [MV drain, "
              "hasMotionVectors=%d] + 1 final submit)",
-             state->mode == DemoMode::Proxy ? "PROXY" : "TARGET",
-             state->mode == DemoMode::Proxy ? kProxyWidth : kWidth,
-             state->mode == DemoMode::Proxy ? kProxyHeight : kHeight,
+             demoModeName(state->mode), activeW, activeH,
              n, state->sumCpuWaitFenceMs / n, state->sumCpuRenderMs / n,
              state->sumCpuBlitPresentMs / n, state->sumCpuFrameMs / n,
              state->sumGpuPreprocessMs / gn, state->sumGpuSortMs / gn, state->sumGpuDrawMs / gn,
@@ -1018,8 +1324,29 @@ void cleanupRenderer(AppState* state) {
     if (state->inFlightFence) vkDestroyFence(state->ctx.device, state->inFlightFence, nullptr);
     if (state->scene.getSplatRenderer()) state->scene.getSplatRenderer()->cleanup(state->ctx);
     if (state->proxyRenderer) { state->proxyRenderer->cleanup(state->ctx); state->proxyRenderer.reset(); }
+    if (state->displayImage) vmaDestroyImage(state->ctx.allocator, state->displayImage, state->displayAlloc);
     AndroidVulkan::cleanup(state->ctx);
     state->vulkanReady = false;
+}
+
+// Stage 6: tap-to-cycle input handler (android_native_app_glue's
+// AInputQueue-backed callback, set as app->onInputEvent below). Any
+// ACTION_UP motion event is treated as a tap (no drag/swipe
+// discrimination -- a deliberate simplification given this demo's only
+// interaction is "advance the mode"; `adb shell input tap X Y` drives the
+// same path for scripted testing). Sets a flag consumed at the top of the
+// next renderFrame() -- both this callback and renderFrame() run on the
+// same thread (see android_main()'s loop), so no synchronization is needed.
+int32_t onInputEvent(struct android_app* app, AInputEvent* event) {
+    AppState* state = static_cast<AppState*>(app->userData);
+    if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION) {
+        int32_t action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
+        if (action == AMOTION_EVENT_ACTION_UP) {
+            state->pendingModeAdvance = true;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void onAppCmd(struct android_app* app, int32_t cmd) {
@@ -1047,6 +1374,7 @@ void android_main(struct android_app* app) {
     state.app = app;
     app->userData = &state;
     app->onAppCmd = onAppCmd;
+    app->onInputEvent = onInputEvent;
 
     while (true) {
         int events;
