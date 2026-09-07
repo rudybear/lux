@@ -1535,64 +1535,33 @@ def _build_vertex_body(config: dict) -> list:
     body.append(_let("t_minor", "scalar",
         _swizzle(_ref("extent_data"), "y")))
 
-    # --- Build quad corners (6 vertices → 2 triangles) ---
-    # Vertex order: 0,1,2 and 3,4,5 forming a quad
-    # Map vertex_index to quad offset:
-    #   0 → (-1,-1), 1 → (1,-1), 2 → (-1,1)
-    #   3 → (-1,1),  4 → (1,-1), 5 → (1,1)
-    # We use integer math: ox = (vert_id % 2) * 2 - 1, sign logic
-
-    # Just use modular arithmetic with floor division:
-    # Convert uint vert_id to float via multiply by 1.0
+    # --- Build quad corners (indexed 4-vertex quad; perf, bench/
+    # lux_perf_ablation.md's "root-causing the remaining 1080p/1440p
+    # per-fragment gap" follow-up (5)): hosts draw this pipeline with an
+    # INDEXED draw (index buffer `{0,1,2, 2,1,3}` over 4 unique vertices
+    # per instance, `drawIndexedPrimitives`/`vkCmdDrawIndexed`) instead of
+    # 6 non-indexed vertices -- 4 vertex-shader invocations/splat instead
+    # of 6 (33% fewer; matches MetalSplatter's own indexed layout). With
+    # indexing, `vertex_index` only ever takes the 4 UNIQUE corner values
+    # {0,1,2,3} (the GPU's post-transform cache reuses the vertex-shader
+    # result for repeated index-buffer entries within a draw), so the
+    # quad-corner mapping collapses to a simple 2-bit decode instead of
+    # the old 6-vertex/2-triangle lookup:
+    #   idx: 0 → BL(-1,-1)   1 → BR(1,-1)   2 → TL(-1,1)   3 → TR(1,1)
+    # quad_x = idx mod 2 (bit 0), quad_y = floor(idx/2) (bit 1), each
+    # mapped from {0,1} to {-1,1}. The index buffer {0,1,2, 2,1,3} draws
+    # triangles (BL,BR,TL) and (TL,BR,TR) -- the exact same two triangles/
+    # winding the old 6-vertex layout drew.
     body.append(_let("fv", "scalar",
         _binop("*", _ref("vert_id"), _lit("1.0"))))
-
-    # Triangle index (0 or 1) and corner within triangle (0, 1, 2)
-    body.append(_let("tri", "scalar",
-        _call("floor", [_binop("/", _ref("fv"), _lit("3.0"))])))
-    body.append(_let("corner", "scalar",
-        _binop("-", _ref("fv"), _binop("*", _ref("tri"), _lit("3.0")))))
-
-    # Offset x: tri0: {-1,1,-1}[corner], tri1: {-1,1,1}[corner]
-    # = (corner == 1 || (tri == 1 && corner == 2)) ? 1 : -1
-    # For corner==1: step(0.5,c)*step(c,1.5) = [c>=0.5 && c<=1.5] = 1.0 when c=1
-    body.append(_let("is_c1", "scalar",
-        _binop("*",
-            _call("step", [_lit("0.5"), _ref("corner")]),
-            _call("step", [_ref("corner"), _lit("1.5")]))))
-
-    # For tri==1 && corner==2: step(0.5,tri)*step(1.5,corner)
-    body.append(_let("is_t1c2", "scalar",
-        _binop("*",
-            _call("step", [_lit("0.5"), _ref("tri")]),
-            _call("step", [_lit("1.5"), _ref("corner")]))))
-
-    # OR via inclusion-exclusion: a+b-a*b
-    body.append(_let("ox_flag", "scalar",
-        _binop("-",
-            _binop("+", _ref("is_c1"), _ref("is_t1c2")),
-            _binop("*", _ref("is_c1"), _ref("is_t1c2")))))
+    body.append(_let("half_idx", "scalar",
+        _call("floor", [_binop("*", _ref("fv"), _lit("0.5"))])))
+    body.append(_let("bit0", "scalar",
+        _binop("-", _ref("fv"), _binop("*", _ref("half_idx"), _lit("2.0")))))
     body.append(_let("quad_x", "scalar",
-        _binop("-", _binop("*", _ref("ox_flag"), _lit("2.0")), _lit("1.0"))))
-
-    # Offset y: tri0: {-1,-1,1}[corner], tri1: {1,-1,1}[corner]
-    # = (corner == 2 || (tri == 1 && corner == 0)) ? 1 : -1
-    body.append(_let("is_c2", "scalar",
-        _call("step", [_lit("1.5"), _ref("corner")])))
-
-    # is_c0 = 1.0 - step(0.5, corner): 1 when corner==0, else 0.
-    body.append(_let("is_c0", "scalar",
-        _binop("-", _lit("1.0"), _call("step", [_lit("0.5"), _ref("corner")]))))
-
-    body.append(_let("is_t1c0", "scalar",
-        _binop("*", _call("step", [_lit("0.5"), _ref("tri")]), _ref("is_c0"))))
-
-    body.append(_let("oy_flag", "scalar",
-        _binop("-",
-            _binop("+", _ref("is_c2"), _ref("is_t1c0")),
-            _binop("*", _ref("is_c2"), _ref("is_t1c0")))))
+        _binop("-", _binop("*", _ref("bit0"), _lit("2.0")), _lit("1.0"))))
     body.append(_let("quad_y", "scalar",
-        _binop("-", _binop("*", _ref("oy_flag"), _lit("2.0")), _lit("1.0"))))
+        _binop("-", _binop("*", _ref("half_idx"), _lit("2.0")), _lit("1.0"))))
 
     # --- Oriented quad offset (see preprocess stage's docstring note) ---
     # offset = quad_x*major + quad_y*minor -- an oriented rectangle exactly

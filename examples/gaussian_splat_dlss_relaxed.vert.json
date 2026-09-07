@@ -144,8 +144,8 @@
     "splat_name": "DlssGaussianCloudRelaxed"
   },
   "performance_hints": {
-    "instruction_count": 248,
-    "alu_ops": 29,
+    "instruction_count": 231,
+    "alu_ops": 18,
     "texture_samples": 0,
     "branches": 0,
     "function_calls": 0,

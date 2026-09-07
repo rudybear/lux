@@ -306,6 +306,15 @@ void MetalSplatLuxcRenderer::createBuffers(MetalContext& ctx, const GaussianSpla
     }
     shBuffer_->setLabel(NS::String::string("SplatSH0Luxc", NS::UTF8StringEncoding));
 
+    // Quad index buffer (perf; see metal_splat_luxc_renderer.h's
+    // quadIndexBuffer_ comment): constant content, independent of
+    // numSplats_ -- created once here regardless of scene data.
+    {
+        static const uint16_t kQuadIndices[6] = {0, 1, 2, 2, 1, 3};
+        quadIndexBuffer_ = ctx.newBuffer(kQuadIndices, sizeof(kQuadIndices), MTL::ResourceStorageModeShared);
+        quadIndexBuffer_->setLabel(NS::String::string("SplatQuadIndicesLuxc", NS::UTF8StringEncoding));
+    }
+
     size_t vec4Size = numSplats_ * 4 * sizeof(float);
     projCenterBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
     projAxesBuffer_ = ctx.newBuffer(vec4Size, MTL::ResourceStorageModeShared);
@@ -984,7 +993,12 @@ void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* 
     if (fragShader_.pushConstantBufferIndex != UINT32_MAX)
         enc->setFragmentBytes(&renderPush, sizeof(renderPush), fragShader_.pushConstantBufferIndex);
 
-    enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(6), NS::UInteger(numSplats_));
+    // Indexed instanced draw: 6 indices over 4 unique vertices (quad) x
+    // numSplats instances (perf; see metal_splat_luxc_renderer.h's
+    // quadIndexBuffer_ comment / splat_expander.py's quad-corner comment)
+    // -- 4 vertex-shader invocations/splat instead of the old non-indexed 6.
+    enc->drawIndexedPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(6), MTL::IndexTypeUInt16,
+                                quadIndexBuffer_, NS::UInteger(0), NS::UInteger(numSplats_));
     enc->endEncoding();
     rpDesc->release();
     lastRenderMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
@@ -1266,7 +1280,12 @@ void MetalSplatLuxcRenderer::renderProfiled(MetalContext& ctx, double* preproces
         enc->setVertexBytes(&renderPush, sizeof(renderPush), vertShader_.pushConstantBufferIndex);
     if (fragShader_.pushConstantBufferIndex != UINT32_MAX)
         enc->setFragmentBytes(&renderPush, sizeof(renderPush), fragShader_.pushConstantBufferIndex);
-    enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(6), NS::UInteger(numSplats_));
+    // Indexed instanced draw: 6 indices over 4 unique vertices (quad) x
+    // numSplats instances (perf; see metal_splat_luxc_renderer.h's
+    // quadIndexBuffer_ comment / splat_expander.py's quad-corner comment)
+    // -- 4 vertex-shader invocations/splat instead of the old non-indexed 6.
+    enc->drawIndexedPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(6), MTL::IndexTypeUInt16,
+                                quadIndexBuffer_, NS::UInteger(0), NS::UInteger(numSplats_));
     enc->endEncoding();
     rpDesc->release();
     cmdBuf3->commit();

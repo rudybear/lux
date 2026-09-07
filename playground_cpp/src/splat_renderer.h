@@ -374,6 +374,15 @@ private:
     VkBuffer sortKeysBuffer_ = VK_NULL_HANDLE;      VmaAllocation sortKeysAlloc_ = VK_NULL_HANDLE;
     VkBuffer sortedIndicesBuffer_ = VK_NULL_HANDLE;  VmaAllocation sortedIndicesAlloc_ = VK_NULL_HANDLE;
 
+    // Quad index buffer (perf; bench/lux_perf_ablation.md's per-fragment-
+    // gap follow-up (5)): a single, constant `{0,1,2, 2,1,3}` uint16
+    // index buffer shared by every instance -- draws the splat's 4-unique-
+    // vertex oriented quad (see splat_expander.py's `_build_vertex_body`
+    // quad-corner comment) with 4 vertex-shader invocations/splat instead
+    // of the old non-indexed 6 (33% fewer). Content never changes, so
+    // this is created once in createBuffers() and reused for every draw.
+    VkBuffer quadIndexBuffer_ = VK_NULL_HANDLE;  VmaAllocation quadIndexAlloc_ = VK_NULL_HANDLE;
+
     // Visible count (atomic counter)
     VkBuffer visibleCountBuffer_ = VK_NULL_HANDLE;  VmaAllocation visibleCountAlloc_ = VK_NULL_HANDLE;
 

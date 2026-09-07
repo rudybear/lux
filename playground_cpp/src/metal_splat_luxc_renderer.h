@@ -424,6 +424,12 @@ private:
     MTL::Buffer* foregroundBuffer_ = nullptr;
     MTL::Buffer* projForegroundBuffer_ = nullptr;
 
+    // Quad index buffer (perf; bench/lux_perf_ablation.md's per-fragment-
+    // gap follow-up (5); see splat_renderer.h's identical Vulkan comment):
+    // constant `{0,1,2, 2,1,3}` uint16 content, created once and reused
+    // for every draw via `drawIndexedPrimitives`.
+    MTL::Buffer* quadIndexBuffer_ = nullptr;
+
     // Sort keys/values, ping-pong buffer B + radix-sort scratch (histogram,
     // partition sums) -- see splat_renderer.cpp's identical buffer set.
     MTL::Buffer* sortKeysBuffer_ = nullptr;       // A

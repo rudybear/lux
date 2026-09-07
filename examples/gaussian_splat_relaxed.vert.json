@@ -102,8 +102,8 @@
     "splat_name": "GaussianCloudRelaxed"
   },
   "performance_hints": {
-    "instruction_count": 193,
-    "alu_ops": 29,
+    "instruction_count": 176,
+    "alu_ops": 18,
     "texture_samples": 0,
     "branches": 0,
     "function_calls": 0,

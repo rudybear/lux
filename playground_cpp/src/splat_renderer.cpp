@@ -956,6 +956,19 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     // (docs/lux-4d-spec.md section 3).
     VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
+    // Quad index buffer (perf; see splat_renderer.h's quadIndexBuffer_
+    // comment): constant content, independent of numSplats_/scene data --
+    // created once here regardless of which scene is loaded.
+    {
+        static const uint16_t kQuadIndices[6] = {0, 1, 2, 2, 1, 3};
+        // Host-visible (CPU_TO_GPU), like posBuffer_/rotBuffer_/etc. below --
+        // simplest correct option for a tiny (12-byte), read-only, upload-
+        // once buffer; no staging-buffer machinery needed.
+        createVmaBuffer(ctx.allocator, sizeof(kQuadIndices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                        VMA_MEMORY_USAGE_CPU_TO_GPU, quadIndexBuffer_, quadIndexAlloc_);
+        uploadVmaBuffer(ctx.allocator, quadIndexAlloc_, kQuadIndices, sizeof(kQuadIndices));
+    }
+
     // Input buffers (CPU-visible for upload)
     // Positions: loader stores as vec4 (x,y,z,1) already
     const auto& pos4 = data.positions;  // already numSplats * 4 floats
@@ -2316,8 +2329,12 @@ void SplatRenderer::render(VulkanContext& ctx) {
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(renderPush), &renderPush);
 
-    // Instanced draw: 6 vertices (quad) x numSplats instances
-    vkCmdDraw(cmd, 6, numSplats_, 0, 0);
+    // Indexed instanced draw: 6 indices over 4 unique vertices (quad) x
+    // numSplats instances (perf; see splat_renderer.h's quadIndexBuffer_
+    // comment / splat_expander.py's quad-corner comment) -- 4 vertex-
+    // shader invocations/splat instead of the old non-indexed 6.
+    vkCmdBindIndexBuffer(cmd, quadIndexBuffer_, 0, VK_INDEX_TYPE_UINT16);
+    vkCmdDrawIndexed(cmd, 6, numSplats_, 0, 0, 0);
 
     vkCmdEndRenderPass(cmd);
 
@@ -2704,6 +2721,7 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     }
     prevPosBuffer_ = VK_NULL_HANDLE;
     prevPosOwned_ = false;
+    destroyVmaBuffer(ctx.allocator, quadIndexBuffer_, quadIndexAlloc_);
     destroyVmaBuffer(ctx.allocator, sortKeysBuffer_, sortKeysAlloc_);
     destroyVmaBuffer(ctx.allocator, sortedIndicesBuffer_, sortedIndicesAlloc_);
     destroyVmaBuffer(ctx.allocator, visibleCountBuffer_, visibleCountAlloc_);

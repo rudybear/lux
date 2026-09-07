@@ -115,8 +115,15 @@ pub struct GaussianSplatRenderer {
 
     // GPU buffers (projected output)
     proj_center_buffer: GpuBuffer,
-    proj_conic_buffer: GpuBuffer,
+    proj_extent_buffer: GpuBuffer,
     proj_color_buffer: GpuBuffer,
+
+    // Quad index buffer (perf; bench/lux_perf_ablation.md's per-fragment-
+    // gap follow-up (5); see the C++ hosts' identical comment): constant
+    // `{0,1,2, 2,1,3}` u16 content, created once and reused for every draw
+    // via `cmd_draw_indexed` -- 4 vertex-shader invocations/splat instead
+    // of the old non-indexed 6.
+    quad_index_buffer: GpuBuffer,
 
     // Sort buffers (buffer A = primary)
     sort_keys_buffer: GpuBuffer,
@@ -243,7 +250,7 @@ impl GaussianSplatRenderer {
 
         // --- Descriptor set layouts ---
         // Compute bindings: 4 input (pos,rot,scale,opacity) + N SH buffers + 6 output
-        // Output: proj_center, proj_conic, proj_color, sort_keys, sorted_indices, visible_count
+        // Output: proj_center, proj_extent, proj_color, sort_keys, sorted_indices, visible_count
         let num_sh_buffers = splat_data.sh_coefficients.len().max(1) as u32;
         let num_compute_bindings = 4 + num_sh_buffers + 6;
         let compute_set_layout = Self::create_compute_set_layout(&device, num_compute_bindings)?;
@@ -448,6 +455,17 @@ impl GaussianSplatRenderer {
         // --- Upload splat data to GPU buffers ---
         let n = num_splats as usize;
 
+        // Quad index buffer (perf; see the quad_index_buffer field
+        // comment): constant content, independent of n/scene data.
+        let quad_index_buffer = {
+            let indices: [u16; 6] = [0, 1, 2, 2, 1, 3];
+            scene_manager::create_buffer_with_data(
+                &device, ctx.allocator_mut(),
+                bytemuck::cast_slice(&indices),
+                vk::BufferUsageFlags::INDEX_BUFFER, "quad_indices",
+            )?
+        };
+
         // Positions (already vec4)
         let pos_buffer = scene_manager::create_buffer_with_data(
             &device, ctx.allocator_mut(),
@@ -498,10 +516,10 @@ impl GaussianSplatRenderer {
             &vec![0u8; n * 4 * 4],
             vk::BufferUsageFlags::STORAGE_BUFFER, "proj_centers",
         )?;
-        let proj_conic_buffer = scene_manager::create_buffer_with_data(
+        let proj_extent_buffer = scene_manager::create_buffer_with_data(
             &device, ctx.allocator_mut(),
             &vec![0u8; n * 4 * 4],
-            vk::BufferUsageFlags::STORAGE_BUFFER, "proj_conics",
+            vk::BufferUsageFlags::STORAGE_BUFFER, "proj_extents",
         )?;
         let proj_color_buffer = scene_manager::create_buffer_with_data(
             &device, ctx.allocator_mut(),
@@ -593,10 +611,10 @@ impl GaussianSplatRenderer {
         }
 
         // Output buffers start after SH buffers
-        // Order: proj_center, proj_conic, proj_color, sort_keys, sorted_indices, visible_count
+        // Order: proj_center, proj_extent, proj_color, sort_keys, sorted_indices, visible_count
         let out_base = 4 + num_sh_buffers;
         write_ssbo(compute_desc_set, out_base, proj_center_buffer.buffer, (n * 4 * 4) as u64);
-        write_ssbo(compute_desc_set, out_base + 1, proj_conic_buffer.buffer, (n * 4 * 4) as u64);
+        write_ssbo(compute_desc_set, out_base + 1, proj_extent_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(compute_desc_set, out_base + 2, proj_color_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(compute_desc_set, out_base + 3, sort_keys_buffer.buffer, (n * 4) as u64);
         write_ssbo(compute_desc_set, out_base + 4, sorted_indices_buffer.buffer, (n * 4) as u64);
@@ -604,7 +622,7 @@ impl GaussianSplatRenderer {
 
         // Render set bindings 0-3
         write_ssbo(render_desc_set, 0, proj_center_buffer.buffer, (n * 4 * 4) as u64);
-        write_ssbo(render_desc_set, 1, proj_conic_buffer.buffer, (n * 4 * 4) as u64);
+        write_ssbo(render_desc_set, 1, proj_extent_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(render_desc_set, 2, proj_color_buffer.buffer, (n * 4 * 4) as u64);
         write_ssbo(render_desc_set, 3, sorted_indices_buffer.buffer, (n * 4) as u64);
 
@@ -758,8 +776,9 @@ impl GaussianSplatRenderer {
             opacity_buffer,
             sh_buffers,
             proj_center_buffer,
-            proj_conic_buffer,
+            proj_extent_buffer,
             proj_color_buffer,
+            quad_index_buffer,
             sort_keys_buffer,
             sorted_indices_buffer,
             visible_count_buffer,
@@ -1533,19 +1552,19 @@ impl GaussianSplatRenderer {
             }
         }
 
-        // --- proj_conic (vec4 per splat) ---
-        if let Some(ref alloc) = self.proj_conic_buffer.allocation {
+        // --- proj_extent (t_major, t_minor, 0, 0 per splat) ---
+        if let Some(ref alloc) = self.proj_extent_buffer.allocation {
             if let Some(mapped) = alloc.mapped_slice() {
                 let floats: &[f32] = bytemuck::cast_slice(&mapped[..entries * 16]);
                 for i in 0..entries {
                     let base = i * 4;
                     info!(
-                        "DEBUG proj_conic[{}]: ({:.6}, {:.6}, {:.6}, {:.6})",
+                        "DEBUG proj_extent[{}]: ({:.6}, {:.6}, {:.6}, {:.6})",
                         i, floats[base], floats[base + 1], floats[base + 2], floats[base + 3]
                     );
                 }
             } else {
-                info!("DEBUG proj_conic_buffer: not mapped");
+                info!("DEBUG proj_extent_buffer: not mapped");
             }
         }
 
@@ -1650,8 +1669,9 @@ impl GaussianSplatRenderer {
         for buf in &mut self.sh_buffers {
             buf.destroy(&device, ctx.allocator_mut());
         }
+        self.quad_index_buffer.destroy(&device, ctx.allocator_mut());
         self.proj_center_buffer.destroy(&device, ctx.allocator_mut());
-        self.proj_conic_buffer.destroy(&device, ctx.allocator_mut());
+        self.proj_extent_buffer.destroy(&device, ctx.allocator_mut());
         self.proj_color_buffer.destroy(&device, ctx.allocator_mut());
         self.sort_keys_buffer.destroy(&device, ctx.allocator_mut());
         self.sorted_indices_buffer.destroy(&device, ctx.allocator_mut());
@@ -1896,8 +1916,14 @@ impl Renderer for GaussianSplatRenderer {
                 0, bytemuck::bytes_of(&render_push),
             );
 
-            // 6 vertices (quad) x numSplats instances
-            ctx.device.cmd_draw(cmd, 6, self.num_splats, 0, 0);
+            // Indexed instanced draw: 6 indices over 4 unique vertices
+            // (quad) x numSplats instances (perf; see quad_index_buffer
+            // field comment) -- 4 vertex-shader invocations/splat instead
+            // of the old non-indexed 6.
+            ctx.device.cmd_bind_index_buffer(
+                cmd, self.quad_index_buffer.buffer, 0, vk::IndexType::UINT16,
+            );
+            ctx.device.cmd_draw_indexed(cmd, 6, self.num_splats, 0, 0, 0);
 
             ctx.device.cmd_end_render_pass(cmd);
         }
