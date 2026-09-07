@@ -23,13 +23,17 @@
 
 #include <android_native_app_glue.h>
 #include <android/log.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -224,6 +228,7 @@ void initRenderer(AppState* state) {
     } else {
         LOGI("chdir to %s", base.c_str());
     }
+    mkdir((base + "/dump").c_str(), 0755);  // Stage 2 validation dump target (dumpProxyDebugFrame)
 
     try {
         AndroidVulkan::init(state->ctx, state->app->window, false);
@@ -287,6 +292,113 @@ inline double msSince(std::chrono::high_resolution_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
 }
 
+// --------------------------------------------------------------------------
+// Stage 2 validation: one-shot proxy-frame dump (colour/MV/depth), to be
+// diffed against the Mac Vulkan CLI (playground_cpp/build/lux-playground
+// --output-aux) run with the same --camera-json/--camera-json-prev/--time/
+// --time-prev/--jitter. New code, entirely local to this file -- not a
+// copy of playground_cpp/src/screenshot.cpp's Screenshot::readImageRaw()
+// (same ~30-line vkCmdCopyImageToBuffer-via-staging-buffer pattern, just
+// inlined here) to avoid pulling that translation unit's
+// stbi_write_png() reference into the Android link (nothing else in this
+// app's CMakeLists defines STB_IMAGE_WRITE_IMPLEMENTATION, unlike the
+// desktop CLI's vulkan_context.cpp, which Android doesn't compile). Reuses
+// DlssIO::convertRgba16fColorAttachment / unpremultiplyByAlpha /
+// writeNpyFloat32 by reference (dlss_io.cpp is already in the Android
+// CMakeLists) so the on-disk format is byte-for-byte the same code path
+// the Mac CLI's --output-aux uses.
+// --------------------------------------------------------------------------
+
+std::vector<uint8_t> readImageRawAndroid(VulkanContext& ctx, VkImage image,
+                                          uint32_t width, uint32_t height,
+                                          uint32_t bytesPerPixel, VkImageLayout currentLayout) {
+    VkDeviceSize imageSize = static_cast<VkDeviceSize>(width) * height * bytesPerPixel;
+
+    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufferInfo.size = imageSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+    allocInfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+    VkBuffer stagingBuffer;
+    VmaAllocation stagingAllocation;
+    if (vmaCreateBuffer(ctx.allocator, &bufferInfo, &allocInfo, &stagingBuffer, &stagingAllocation, nullptr) != VK_SUCCESS) {
+        throw std::runtime_error("readImageRawAndroid: failed to create staging buffer");
+    }
+
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    if (currentLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = currentLayout;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingBuffer, 1, &region);
+    ctx.endSingleTimeCommands(cmd);
+
+    void* mapped = nullptr;
+    vmaMapMemory(ctx.allocator, stagingAllocation, &mapped);
+    std::vector<uint8_t> pixels(imageSize);
+    memcpy(pixels.data(), mapped, imageSize);
+    vmaUnmapMemory(ctx.allocator, stagingAllocation);
+    vmaDestroyBuffer(ctx.allocator, stagingBuffer, stagingAllocation);
+    return pixels;
+}
+
+void dumpProxyDebugFrame(VulkanContext& ctx, SplatRenderer* splatR, const std::string& outDir,
+                          int frameIndex, float t, float jx, float jy) {
+    uint32_t w = splatR->getWidth(), h = splatR->getHeight();
+    LOGI("DUMP frame=%d t=%.6f jitter=(%.6f,%.6f) size=%ux%u dir=%s",
+         frameIndex, t, jx, jy, w, h, outDir.c_str());
+
+    auto rawColor = readImageRawAndroid(ctx, splatR->getOutputImage(), w, h, 8,
+                                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    std::vector<uint8_t> unusedRgba8;
+    auto colorF32 = DlssIO::convertRgba16fColorAttachment(rawColor, w, h, unusedRgba8);
+    DlssIO::writeNpyFloat32(outDir + "/android_proxy_color.npy", colorF32, {h, w, 4});
+
+    if (splatR->hasExpectedDepth()) {
+        auto raw = readImageRawAndroid(ctx, splatR->getExpectedDepthImage(), w, h, 16,
+                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
+        memcpy(rgba.data(), raw.data(), raw.size());
+        std::vector<float> depthPremul(static_cast<size_t>(w) * h), depthAlpha(static_cast<size_t>(w) * h);
+        for (size_t i = 0; i < depthPremul.size(); ++i) {
+            depthPremul[i] = rgba[i * 4 + 0];
+            depthAlpha[i] = rgba[i * 4 + 3];
+        }
+        auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
+        DlssIO::writeNpyFloat32(outDir + "/android_proxy_depth.npy", depth, {h, w});
+    }
+    if (splatR->hasMotionVectors()) {
+        auto raw = readImageRawAndroid(ctx, splatR->getMotionImage(), w, h, 16,
+                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
+        memcpy(rgba.data(), raw.data(), raw.size());
+        std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2), mvAlpha(static_cast<size_t>(w) * h);
+        for (size_t i = 0; i < mvAlpha.size(); ++i) {
+            mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
+            mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
+            mvAlpha[i] = rgba[i * 4 + 3];
+        }
+        auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
+        DlssIO::writeNpyFloat32(outDir + "/android_proxy_mv.npy", mv, {h, w, 2});
+    }
+    LOGI("DUMP done: %s/android_proxy_{color,depth,mv}.npy", outDir.c_str());
+}
+
 void renderFrame(AppState* state) {
     if (!state->vulkanReady) return;
     VulkanContext& ctx = state->ctx;
@@ -348,20 +460,63 @@ void renderFrame(AppState* state) {
     // view/proj SplatRenderer::render() already carries forward for motion
     // vectors -- see setJitter()'s header comment). Target mode is never
     // jittered (setJitter defaults to 0,0 and is never called on it).
+    float jitterPxX = 0.0f, jitterPxY = 0.0f;
     if (isProxy) {
         glm::vec2 jTarget = taaJitterTargetPixels(state->frameCounter);
         float scale = static_cast<float>(kProxyWidth) / static_cast<float>(kWidth);  // 0.5
-        splatR->setJitter(jTarget.x * scale, jTarget.y * scale);
+        jitterPxX = jTarget.x * scale;
+        jitterPxY = jTarget.y * scale;
+        splatR->setJitter(jitterPxX, jitterPxY);
     }
 
+    float morphT = 0.0f;
     if (splatR->hasMotion()) {
-        float t = std::fmod(state->frameCounter * (1.0f / 30.0f), std::max(splatR->animationDuration(), 0.001f));
-        splatR->setMorphTime(t);
+        morphT = std::fmod(state->frameCounter * (1.0f / 30.0f), std::max(splatR->animationDuration(), 0.001f));
+        splatR->setMorphTime(morphT);
     }
 
     auto tRender = std::chrono::high_resolution_clock::now();
     splatR->render(ctx);
     double renderMs = msSince(tRender);
+
+    // --- Stage 2 validation dump: one fixed proxy frame, diffed against
+    // the Mac Vulkan CLI with the same camera/jitter/morph-time (see
+    // dumpProxyDebugFrame's comment above). frame 30 is well past the
+    // orbit's start (0.6deg/frame) and the scene's motion, so both MV and
+    // colour carry real signal, not the degenerate all-zero first frame.
+    //
+    // VALIDATION RESULT (frames 1, 3, and 30 all checked against
+    // playground_cpp/build/lux-playground --output-aux with matching
+    // --camera-json/--camera-json-prev/--time/--time-prev/--jitter):
+    // colour and expected-depth match closely (mean abs diff ~0.0016 and
+    // ~1e-6 respectively -- consistent with ordinary cross-GPU float
+    // rounding). Motion vectors do NOT match -- Android's mv is 3-6 orders
+    // of magnitude too large (e.g. frame 30: max |mv| ~5.0e6 vs the Mac
+    // CLI's ~8.6, over essentially the whole image, including
+    // fully-opaque/high-confidence pixels) EVEN AT FRAME 1, the very first
+    // frame with nonzero motion right after the firstMvFrame_ seed -- so
+    // this is not slow numerical drift across many frames. Since
+    // out_depth is computed by the exact same preprocess dispatch +
+    // fragment shader and matches essentially exactly, the current-frame
+    // camera/position math is provably correct; the bug is isolated to
+    // whatever feeds "previous" camera/position into that dispatch when
+    // it's populated by SplatRenderer::render()'s automatic per-frame
+    // carry-forward (prevViewMatrix_/prevProjMatrixUnjittered_/
+    // prevPosBuffer_), as opposed to the one-shot
+    // setPreviousCameraExplicit()/seedPreviousMorphTime() path the
+    // existing lux-4dgs tests (test_dlss_outputs.py) exercise instead --
+    // this app may be the first continuous multi-frame (30+ render() calls
+    // in one process) exerciser of that carry-forward path. NOT
+    // (confirmed) Android/Mali-specific: not re-tested against the desktop
+    // CLI's own interactive GLFW loop (playground_cpp/src/main.cpp) in
+    // this pass. This blocks trusting motion vectors in Stage 3's 26-ch
+    // input assembly and especially Stage 5's warp/reprojection until
+    // root-caused -- flagged to the task owner rather than guessed at
+    // further here.
+    constexpr int kDumpFrame = 30;
+    if (isProxy && state->frameCounter == kDumpFrame) {
+        dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", state->frameCounter, morphT, jitterPxX, jitterPxY);
+    }
 
     auto tBlit = std::chrono::high_resolution_clock::now();
     state->blitCmd = ctx.beginSingleTimeCommands();
