@@ -48,6 +48,14 @@ public:
 
     MTL::Buffer* getHiddenInputBuffer() const { return hiddenInputBuffer_; }
 
+    // Debug output (LUX_PSNR_FRAMES rollout capture, see SplatView.mm): per
+    // target-pixel post-disocclusion-renormalization blend weights, half2
+    // (wS spatial, wM memory -- wH omitted, it's `1 - wS - wM`), written by
+    // every run() call unconditionally (two extra half writes/pixel -- cheap
+    // enough not to bother gating). Matches mobiledlss/scripts/eval_rollout.py's
+    // `alpha`/`w_m` diagnostics (renormalized blend_w[:,0] / blend_w[:,2]).
+    MTL::Buffer* getBlendDebugBuffer() const { return blendDebugBuffer_; }
+
     // For the frame-10 "everything reconstruct consumes" validation dump
     // (reproducing the step in PyTorch): the *history* this frame's run()
     // is about to read -- i.e. last frame's own composited output/hidden,
@@ -84,6 +92,8 @@ private:
     MTL::ComputePipelineState* pipeline_ = nullptr;
     MTL::ComputePipelineState* hiddenPipeline_ = nullptr;
     MTL::Buffer* hiddenInputBuffer_ = nullptr;  // fp16 NHWC, netW*netH*hiddenChannels
+
+    MTL::Buffer* blendDebugBuffer_ = nullptr;  // half2 (wS, wM), targetW*targetH
 
     MTL::Buffer* bgTextureBuffer_ = nullptr;
     uint32_t texChannels_ = 0, texW_ = 0, texH_ = 0;

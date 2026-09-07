@@ -196,6 +196,41 @@ static DisplayMode startModeFromEnvironment() {
     return DisplayModeReconstruction;
 }
 
+// Reads an int env var (or -Key launch argument via NSUserDefaults, same
+// convention as LUX_START_MODE above), falling back to `def` if unset/empty.
+static int intFromEnvironment(NSString *key, int def) {
+    NSString *val = [[NSProcessInfo processInfo].environment objectForKey:key];
+    if (!val.length) val = [[NSUserDefaults standardUserDefaults] stringForKey:key];
+    if (!val.length) return def;
+    return [val intValue];
+}
+
+// LUX_PSNR_FRAMES (task spec, mobiledlss/reports/rollout_drift.md follow-up):
+// length of a continuous, un-windowed Reconstruction-vs-Target/Bicubic-vs-
+// Target PSNR capture, in frames -- 0 (default) disables it entirely (no
+// extra Target-mode render, no extra readbacks, same behavior as before this
+// feature existed). Unlike the existing 16-frame seq dump (dumpSeqFrame,
+// which needs 2-3 separate app launches -- one per display mode -- and an
+// offline Python PSNR pass), this computes PSNR ON-DEVICE every captured
+// frame by *also* running the Target full-res pass and a Bicubic reference
+// upscale alongside the normal Reconstruction chain, without ever touching
+// _netInput/_reconstruct's history/reset state -- LUX_START_MODE stays
+// Reconstruction the whole time, so the recurrence really is continuous.
+static int psnrFramesFromEnvironment() {
+    int n = intFromEnvironment(@"LUX_PSNR_FRAMES", 0);
+    return n > 0 ? n : 0;
+}
+
+// LUX_PSNR_START_FRAME: orbit frame index the capture window begins at ("a
+// few frames after launch" per the task spec -- default 4). History/hidden
+// state is real and continuous from frame 0 regardless (Reconstruction mode
+// runs the full chain every frame from launch) -- this only delays when
+// logging starts, e.g. to skip the very first jitter-cycle frames.
+static int psnrStartFrameFromEnvironment() {
+    int n = intFromEnvironment(@"LUX_PSNR_START_FRAME", 4);
+    return n >= 0 ? n : 4;
+}
+
 // Nearest/bilinear 2x upscale of the proxy colour texture straight into the
 // drawable -- un-premultiplies alpha (the proxy render is premultiplied),
 // forces alpha=1 (opaque display). "Bicubic" mode currently uses this same
@@ -274,6 +309,25 @@ static std::vector<float> readTextureAsFloats(MetalContext &ctx, MTL::Texture *t
     return out;
 }
 
+// RGB-only PSNR (alpha, index 3 of each pixel's 4 floats, is ignored --
+// matches mobiledlss/scripts/eval_rollout.py::_psnr_frame's convention of
+// comparing 3-channel RGB tensors: mse = mean((pred-target)**2) over RGB,
+// psnr = 10*log10(1/mse)). `pred`/`target` are both [h,w,4] float32,
+// un-premultiplied (DlssIO::convertRgba16fColorAttachment's output).
+static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &target, uint32_t w, uint32_t h) {
+    double se = 0.0;
+    size_t n = static_cast<size_t>(w) * h;
+    for (size_t i = 0; i < n; i++) {
+        for (int c = 0; c < 3; c++) {
+            double d = static_cast<double>(pred[i * 4 + c]) - static_cast<double>(target[i * 4 + c]);
+            se += d * d;
+        }
+    }
+    double mse = se / static_cast<double>(n * 3);
+    if (mse <= 0.0) return INFINITY;
+    return static_cast<float>(10.0 * std::log10(1.0 / mse));
+}
+
 @interface SplatView () {
     MetalContext _ctx;
     MetalSceneManager _scene;        // pruned (kSceneAssetName) -- proxy/reconstruction
@@ -313,6 +367,15 @@ static std::vector<float> readTextureAsFloats(MetalContext &ctx, MTL::Texture *t
     BOOL _proxyDumped;
     BOOL _proxyDumped2;  // frame kProxyDumpFrame+1 -- flicker/order-stability check (f7fde2c single-command-buffer change)
     BOOL _seqDumped[16];  // 16-frame orbit PSNR test: one-shot per-frame-index dump (Target run vs Reconstruction run, separate app launches)
+
+    // LUX_PSNR_FRAMES: continuous, un-windowed on-device PSNR rollout
+    // capture (see psnrFramesFromEnvironment()/-capturePsnrFrame:...).
+    int _psnrFrames;        // 0 = disabled
+    int _psnrStartFrame;
+    MTL::Texture *_psnrBicubicTex;  // scratch target-res RGBA16Float, Bicubic-vs-Target reference
+    std::vector<int> _psnrLogFrame;
+    std::vector<float> _psnrLogRecon, _psnrLogBicubic, _psnrLogAlpha, _psnrLogWm, _psnrLogHiddenRms;
+    BOOL _psnrDone;
 }
 @property(nonatomic, strong) CADisplayLink *displayLink;
 @property(nonatomic, strong) UILabel *hudLabel;
@@ -341,6 +404,20 @@ static std::vector<float> readTextureAsFloats(MetalContext &ctx, MTL::Texture *t
         _lastDisplayMode = static_cast<DisplayMode>(-1);
         _lastTickTime = 0.0;
         NSLog(@"[SplatView] start mode: %s", kDisplayModeNames[_displayMode]);
+
+        _psnrFrames = psnrFramesFromEnvironment();
+        _psnrStartFrame = psnrStartFrameFromEnvironment();
+        _psnrDone = NO;
+        if (_psnrFrames > 0) {
+            _psnrLogFrame.reserve(_psnrFrames);
+            _psnrLogRecon.reserve(_psnrFrames);
+            _psnrLogBicubic.reserve(_psnrFrames);
+            _psnrLogAlpha.reserve(_psnrFrames);
+            _psnrLogWm.reserve(_psnrFrames);
+            _psnrLogHiddenRms.reserve(_psnrFrames);
+            NSLog(@"[SplatView] LUX_PSNR_FRAMES=%d starting at frame %d (continuous, no history reset)",
+                  _psnrFrames, _psnrStartFrame);
+        }
 
         CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
         // All display paths write RGBA16Float into the drawable: the
@@ -567,6 +644,19 @@ static std::vector<float> readTextureAsFloats(MetalContext &ctx, MTL::Texture *t
             reconDesc->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
             reconDesc->setStorageMode(MTL::StorageModePrivate);
             _reconOutputTex = _ctx.newTexture(reconDesc);
+
+            if (_psnrFrames > 0) {
+                // LUX_PSNR_FRAMES: scratch target-res texture the Bicubic
+                // reference (upscale_proxy, bilinear=1) writes into every
+                // captured frame -- same kernel/convention as the Bicubic
+                // display mode, just offscreen so it doesn't fight
+                // Reconstruction for the drawable.
+                auto *bicubicDesc =
+                    MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA16Float, kTargetW, kTargetH, false);
+                bicubicDesc->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
+                bicubicDesc->setStorageMode(MTL::StorageModePrivate);
+                _psnrBicubicTex = _ctx.newTexture(bicubicDesc);
+            }
         }
 
         if (_splatRTarget->hasMotion()) {
@@ -802,6 +892,18 @@ static std::vector<float> readTextureAsFloats(MetalContext &ctx, MTL::Texture *t
         CFTimeInterval tp4 = CACurrentMediaTime();
         _msRecon = (tp4 - tp3) * 1000.0;
 
+        // LUX_PSNR_FRAMES: continuous rollout PSNR capture -- runs entirely
+        // inside the normal Reconstruction branch (no display-mode switch,
+        // no _netInput.reset()/_reconstruct.reset()), so the recurrent
+        // history stays exactly as continuous as it is in every other mode.
+        // The extra Target full-res render + Bicubic upscale below are the
+        // ONLY things this feature adds to the frame; both are read back to
+        // CPU purely for the PSNR/RMS math, never fed back into the chain.
+        if (_psnrFrames > 0 && _frame >= _psnrStartFrame && _frame < _psnrStartFrame + _psnrFrames) {
+            [self capturePsnrFrame:_frame eyeCur:teyeCur rCur:trCur uCur:tuCur fCur:tfCur viewCur:tviewCur
+                            projCur:tprojCur fxCur:tfxCur fyCur:tfyCur tCur:tCur];
+        }
+
         if (_frame < 16 && !_seqDumped[_frame]) {
             _seqDumped[_frame] = YES;
             [self dumpSeqFrame:_reconOutputTex tag:@"reconseq" frame:_frame];
@@ -903,7 +1005,13 @@ static std::vector<float> readTextureAsFloats(MetalContext &ctx, MTL::Texture *t
 
     // Auto-dump a screenshot every ~3s too (no UI-automation tap injection
     // available over devicectl -- see -handleTap: for the interactive path).
-    if (_frame % (int)(kSimFps * 3.0f) == 0) {
+    // Suppressed during a LUX_PSNR_FRAMES capture window: it's an extra
+    // synchronous GPU readback right in the middle of the very rollout being
+    // measured -- one of the task's own bisection hypotheses for what an
+    // app-side decay bug could be, so keep it out of the capture entirely
+    // rather than risk it being a confound.
+    BOOL psnrWindowActive = _psnrFrames > 0 && _frame >= _psnrStartFrame && _frame < _psnrStartFrame + _psnrFrames;
+    if (!psnrWindowActive && _frame % (int)(kSimFps * 3.0f) == 0) {
         _wantScreenshot = YES;
     }
 
@@ -1176,6 +1284,161 @@ static std::vector<float> readTextureAsFloats(MetalContext &ctx, MTL::Texture *t
     } catch (const std::exception &e) {
         NSLog(@"[SplatView] seq dump (%s f%d) failed: %s", tag.UTF8String, frame, e.what());
     }
+}
+
+// LUX_PSNR_FRAMES (task spec): runs the Target full-res pass (same camera/
+// morph convention as the DisplayModeTarget branch, just offscreen into
+// _splatRTarget's own output texture -- never touches the drawable, never
+// mutates any Reconstruction-chain state) and a Bicubic reference upscale of
+// this frame's already-computed proxy colour (same upscale_proxy kernel/
+// convention as the Bicubic display mode, into the offscreen
+// _psnrBicubicTex), then reads all three target-res textures back to CPU
+// (readTextureRaw + convertRgba16fColorAttachment -- same un-premultiply
+// convention as dumpSeqFrame, works for both _splatRTarget's premultiplied
+// output and _reconOutputTex's already-straight one) and logs/records PSNR
+// + the mean blend alpha/w_m + hidden-state RMS for this frame. Called from
+// -tick: strictly AFTER _reconstruct.run() for this frame, so
+// _reconstruct.getBlendDebugBuffer()/getPrevHiddenBuffer() both read what
+// run() just wrote (see ReconstructPass.h's getPrevHiddenBuffer() doc for
+// the before-vs-after pingIndex_ distinction).
+- (void)capturePsnrFrame:(int)frame eyeCur:(glm::vec3)eyeCur rCur:(glm::vec3)rCur uCur:(glm::vec3)uCur
+                    fCur:(glm::vec3)fCur viewCur:(glm::mat4)viewCur projCur:(glm::mat4)projCur
+                   fxCur:(float)fxCur fyCur:(float)fyCur tCur:(float)tCur {
+    try {
+        // --- Target (full-res, offscreen). ---
+        _splatRTarget->updateCameraExplicit(eyeCur, viewCur, projCur, fxCur, fyCur);
+        _splatRTarget->setJitter(0.0f, 0.0f);
+        if (_splatRTarget->hasMotion()) {
+            _splatRTarget->setMorphTime(tCur);
+        }
+        @autoreleasepool {
+            NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
+            _splatRTarget->render(_ctx);
+            pool->release();
+        }
+
+        // --- Bicubic reference: upscale_proxy(bilinear=1, 2x) from this
+        // frame's own proxy colour into the offscreen scratch texture. ---
+        {
+            auto *cmdBuf = _ctx.beginCommandBuffer();
+            auto *enc = cmdBuf->computeCommandEncoder();
+            enc->setComputePipelineState(_upscalePipeline);
+            enc->setTexture(_splatRProxy->getOutputTexture(), 0);
+            enc->setTexture(_psnrBicubicTex, 1);
+            uint32_t bilinear = 1;
+            std::array<float, 2> scale = {static_cast<float>(kTargetW) / static_cast<float>(kProxyW),
+                                           static_cast<float>(kTargetH) / static_cast<float>(kProxyH)};
+            enc->setBytes(&bilinear, sizeof(bilinear), 0);
+            enc->setBytes(scale.data(), sizeof(float) * 2, 1);
+            MTL::Size grid(kTargetW, kTargetH, 1);
+            NS::UInteger tew = _upscalePipeline->threadExecutionWidth();
+            NS::UInteger maxT = _upscalePipeline->maxTotalThreadsPerThreadgroup();
+            NS::UInteger th = maxT / tew;
+            if (th == 0) th = 1;
+            enc->dispatchThreads(grid, MTL::Size(tew, th, 1));
+            enc->endEncoding();
+            cmdBuf->commit();
+            cmdBuf->waitUntilCompleted();
+        }
+
+        // --- Readback + PSNR. ---
+        std::vector<uint8_t> unusedRgba8;
+        auto targetRaw = MetalScreenshot::readTextureRaw(_ctx, _splatRTarget->getOutputTexture(), kTargetW, kTargetH, 8);
+        auto targetF32 = DlssIO::convertRgba16fColorAttachment(targetRaw, kTargetW, kTargetH, unusedRgba8);
+        auto reconRaw = MetalScreenshot::readTextureRaw(_ctx, _reconOutputTex, kTargetW, kTargetH, 8);
+        auto reconF32 = DlssIO::convertRgba16fColorAttachment(reconRaw, kTargetW, kTargetH, unusedRgba8);
+        auto bicubicRaw = MetalScreenshot::readTextureRaw(_ctx, _psnrBicubicTex, kTargetW, kTargetH, 8);
+        auto bicubicF32 = DlssIO::convertRgba16fColorAttachment(bicubicRaw, kTargetW, kTargetH, unusedRgba8);
+
+        float psnrRecon = psnrRgb(reconF32, targetF32, kTargetW, kTargetH);
+        float psnrBicubic = psnrRgb(bicubicF32, targetF32, kTargetW, kTargetH);
+
+        // --- Mean blend alpha (wS) / w_m (wM), post-disocclusion-renorm. ---
+        double sumAlpha = 0.0, sumWm = 0.0;
+        {
+            const uint16_t *half = static_cast<const uint16_t *>(_reconstruct.getBlendDebugBuffer()->contents());
+            size_t n = static_cast<size_t>(kTargetW) * kTargetH;
+            for (size_t i = 0; i < n; i++) {
+                sumAlpha += DlssIO::halfToFloat(half[i * 2 + 0]);
+                sumWm += DlssIO::halfToFloat(half[i * 2 + 1]);
+            }
+        }
+        float meanAlpha = static_cast<float>(sumAlpha / static_cast<double>(kTargetW) / static_cast<double>(kTargetH));
+        float meanWm = static_cast<float>(sumWm / static_cast<double>(kTargetW) / static_cast<double>(kTargetH));
+
+        // --- Hidden-state RMS (target-res raw hidden state just written by
+        // this frame's run()). ---
+        float hiddenRms;
+        {
+            uint32_t hiddenChannels = _unet.getHiddenChannels();
+            const uint16_t *half = static_cast<const uint16_t *>(_reconstruct.getPrevHiddenBuffer()->contents());
+            size_t n = static_cast<size_t>(kTargetW) * kTargetH * hiddenChannels;
+            double sumSq = 0.0;
+            for (size_t i = 0; i < n; i++) {
+                float v = DlssIO::halfToFloat(half[i]);
+                sumSq += static_cast<double>(v) * v;
+            }
+            hiddenRms = static_cast<float>(std::sqrt(sumSq / static_cast<double>(n)));
+        }
+
+        int relIdx = frame - _psnrStartFrame + 1;  // 1-indexed within the capture window
+        _psnrLogFrame.push_back(relIdx);
+        _psnrLogRecon.push_back(psnrRecon);
+        _psnrLogBicubic.push_back(psnrBicubic);
+        _psnrLogAlpha.push_back(meanAlpha);
+        _psnrLogWm.push_back(meanWm);
+        _psnrLogHiddenRms.push_back(hiddenRms);
+
+        NSLog(@"[SplatView] PSNR frame=%d/%d recon=%.2fdB bicubic=%.2fdB alpha=%.4f w_m=%.4f hiddenRMS=%.4f",
+              relIdx, _psnrFrames, psnrRecon, psnrBicubic, meanAlpha, meanWm, hiddenRms);
+
+        if (relIdx == _psnrFrames && !_psnrDone) {
+            _psnrDone = YES;
+            [self finishPsnrCapture];
+        }
+    } catch (const std::exception &e) {
+        NSLog(@"[SplatView] PSNR capture (frame %d) failed: %s", frame, e.what());
+    }
+}
+
+// Writes <Documents>/psnr_rollout_<N>.csv (frame,psnr_recon_db,psnr_bicubic_db,
+// mean_alpha,mean_w_m,hidden_rms -- one row per captured frame, 1-indexed)
+// and logs a one-line summary at the task's own report frames (1,4,8,16,24,
+// 32,48,64,96).
+- (void)finishPsnrCapture {
+    NSArray<NSString *> *docPaths =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *outPath = [docPaths.firstObject
+        stringByAppendingPathComponent:[NSString stringWithFormat:@"psnr_rollout_%d.csv", _psnrFrames]];
+    NSMutableString *csv =
+        [NSMutableString stringWithString:@"frame,psnr_recon_db,psnr_bicubic_db,mean_alpha,mean_w_m,hidden_rms\n"];
+    for (size_t i = 0; i < _psnrLogFrame.size(); i++) {
+        [csv appendFormat:@"%d,%.4f,%.4f,%.6f,%.6f,%.6f\n", _psnrLogFrame[i], _psnrLogRecon[i], _psnrLogBicubic[i],
+                           _psnrLogAlpha[i], _psnrLogWm[i], _psnrLogHiddenRms[i]];
+    }
+    NSError *werr = nil;
+    [csv writeToFile:outPath atomically:YES encoding:NSUTF8StringEncoding error:&werr];
+    if (werr) {
+        NSLog(@"[SplatView] PSNR capture: failed to write %@: %@", outPath, werr);
+    } else {
+        NSLog(@"[SplatView] PSNR capture: wrote %@ (%lu frames)", outPath, (unsigned long)_psnrLogFrame.size());
+    }
+
+    static const int kReportFrames[] = {1, 4, 8, 16, 24, 32, 48, 64, 96};
+    NSMutableString *reconSummary = [NSMutableString string];
+    NSMutableString *bicubicSummary = [NSMutableString string];
+    for (int rf : kReportFrames) {
+        if (rf > _psnrFrames) continue;
+        size_t idx = static_cast<size_t>(rf - 1);
+        if (idx >= _psnrLogFrame.size()) continue;
+        [reconSummary appendFormat:@"f%d=%.2f ", rf, _psnrLogRecon[idx]];
+        [bicubicSummary appendFormat:@"f%d=%.2f ", rf, _psnrLogBicubic[idx]];
+    }
+    NSLog(@"[SplatView] PSNR capture COMPLETE. recon dB: %@", reconSummary);
+    NSLog(@"[SplatView] PSNR capture COMPLETE. bicubic dB: %@", bicubicSummary);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.hudLabel.text = [self.hudLabel.text stringByAppendingString:@"\n[PSNR rollout capture complete]"];
+    });
 }
 
 - (void)saveScreenshotFromTexture:(MTL::Texture *)texture {

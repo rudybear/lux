@@ -126,6 +126,7 @@ kernel void reconstruct_frame(
     device const float* fc2w [[buffer(4)]], device const float* fc2b [[buffer(5)]],
     device half* hiddenNewOut [[buffer(6)]],        // NHWC, targetW*targetH*hiddenChannels
     constant ReconUniforms& u [[buffer(7)]],
+    device half* blendDebugOut [[buffer(8)]],       // half2 (wS, wM) per pixel -- rollout-PSNR diagnostics
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.targetW || gid.y >= u.targetH) return;
@@ -253,6 +254,9 @@ kernel void reconstruct_frame(
     float3 outRgb = wS * spatial + wH * warped + wM * memory;
 
     outColor.write(float4(outRgb, 1.0), gid);
+    uint dbgBase = (Y * u.targetW + X) * 2;
+    blendDebugOut[dbgBase + 0] = half(wS);
+    blendDebugOut[dbgBase + 1] = half(wM);
 }
 )";
 
@@ -281,6 +285,7 @@ ReconstructPass::~ReconstructPass() {
     if (pipeline_) pipeline_->release();
     if (hiddenPipeline_) hiddenPipeline_->release();
     if (bgTextureBuffer_) bgTextureBuffer_->release();
+    if (blendDebugBuffer_) blendDebugBuffer_->release();
     if (fc1w_) fc1w_->release();
     if (fc1b_) fc1b_->release();
     if (fc2w_) fc2w_->release();
@@ -333,6 +338,8 @@ void ReconstructPass::init(MetalContext& ctx, const std::string& textureNpyPath,
     }
     hiddenInputBuffer_ = ctx.newBuffer(static_cast<size_t>(netW) * netH * hiddenChannels * sizeof(uint16_t),
                                         MTL::ResourceStorageModeShared);
+    blendDebugBuffer_ = ctx.newBuffer(static_cast<size_t>(targetW) * targetH * 2 * sizeof(uint16_t),
+                                       MTL::ResourceStorageModeShared);
     pingIndex_ = 0;
     firstRun_ = true;
 }
@@ -407,6 +414,7 @@ void ReconstructPass::run(MetalContext& ctx, MTL::Texture* proxyColorTex, MTL::T
     enc->setBuffer(fc2b_, 0, 5);
     enc->setBuffer(prevHidden_[nextIndex], 0, 6);
     enc->setBytes(&u, sizeof(u), 7);
+    enc->setBuffer(blendDebugBuffer_, 0, 8);
     MTL::Size grid(targetW_, targetH_, 1);
     NS::UInteger tew = pipeline_->threadExecutionWidth();
     NS::UInteger th = pipeline_->maxTotalThreadsPerThreadgroup() / tew;
