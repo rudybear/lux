@@ -137,6 +137,39 @@ SplatRenderer::~SplatRenderer() {
 }
 
 // --------------------------------------------------------------------------
+// GPU timestamp-query profiling (mobile-DLSS Android live demo, Stage 1)
+// --------------------------------------------------------------------------
+
+void SplatRenderer::setGpuTimingEnabled(VulkanContext& ctx, bool enabled) {
+    if (enabled == gpuTimingEnabled_) return;
+    if (enabled) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(ctx.physicalDevice, &props);
+        timestampPeriodNs_ = props.limits.timestampPeriod;
+        if (timestampPeriodNs_ <= 0.0) {
+            // Device reports no usable timestamp period (spec allows 0 to
+            // mean "unsupported" on some implementations) -- leave disabled
+            // rather than divide by zero below.
+            return;
+        }
+        VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = 4;
+        if (vkCreateQueryPool(ctx.device, &qpci, nullptr, &timestampPool_) != VK_SUCCESS) {
+            return;
+        }
+        gpuTimingEnabled_ = true;
+    } else {
+        if (timestampPool_ != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(ctx.device);
+            vkDestroyQueryPool(ctx.device, timestampPool_, nullptr);
+            timestampPool_ = VK_NULL_HANDLE;
+        }
+        gpuTimingEnabled_ = false;
+    }
+}
+
+// --------------------------------------------------------------------------
 // Offscreen render target (VMA)
 // --------------------------------------------------------------------------
 
@@ -1631,6 +1664,11 @@ void SplatRenderer::render(VulkanContext& ctx) {
 
     VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
 
+    if (gpuTimingEnabled_) {
+        vkCmdResetQueryPool(cmd, timestampPool_, 0, 4);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool_, 0);
+    }
+
     // --- Motion vectors: seed history on the very first frame so mv == 0 ---
     // (docs/lux-4d-spec.md section 3). Seeding here (not at construction)
     // means it doesn't matter how many updateCamera()/setMorphTime() calls
@@ -1782,6 +1820,10 @@ void SplatRenderer::render(VulkanContext& ctx) {
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 
+    if (gpuTimingEnabled_) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampPool_, 1);
+    }
+
     // Fully drain the queue here when motion vectors are enabled.
     //
     // This preprocess compute dispatch writes projected_mv (among other
@@ -1912,6 +1954,10 @@ void SplatRenderer::render(VulkanContext& ctx) {
     // After 4 passes (even count), sorted results are in buffer A
     // (sortKeysBuffer_, sortedIndicesBuffer_) which is what render reads.
 
+    if (gpuTimingEnabled_) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampPool_, 2);
+    }
+
     // Barrier: sort compute -> vertex/fragment shader reads.
     //
     // srcStageMask=ALL_COMMANDS (not just COMPUTE_SHADER_BIT) is deliberate:
@@ -2022,8 +2068,26 @@ void SplatRenderer::render(VulkanContext& ctx) {
 
     vkCmdEndRenderPass(cmd);
 
+    if (gpuTimingEnabled_) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool_, 3);
+    }
+
     // Submit and wait
     ctx.endSingleTimeCommands(cmd);
+
+    if (gpuTimingEnabled_) {
+        uint64_t ts[4] = {};
+        VkResult qr = vkGetQueryPoolResults(ctx.device, timestampPool_, 0, 4, sizeof(ts), ts, sizeof(uint64_t),
+                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (qr == VK_SUCCESS) {
+            lastGpuTimings_.preprocessMs = static_cast<double>(ts[1] - ts[0]) * timestampPeriodNs_ * 1e-6;
+            lastGpuTimings_.sortMs = static_cast<double>(ts[2] - ts[1]) * timestampPeriodNs_ * 1e-6;
+            lastGpuTimings_.drawMs = static_cast<double>(ts[3] - ts[2]) * timestampPeriodNs_ * 1e-6;
+            lastGpuTimings_.valid = true;
+        } else {
+            lastGpuTimings_.valid = false;
+        }
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -2320,6 +2384,11 @@ void SplatRenderer::preloadDepth(VulkanContext& ctx, VkImage srcDepthImage,
 
 void SplatRenderer::cleanup(VulkanContext& ctx) {
     vkDeviceWaitIdle(ctx.device);
+
+    if (timestampPool_ != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(ctx.device, timestampPool_, nullptr);
+        timestampPool_ = VK_NULL_HANDLE;
+    }
 
     // Framebuffer and render pass
     if (framebufferLoadDepth_ != VK_NULL_HANDLE) vkDestroyFramebuffer(ctx.device, framebufferLoadDepth_, nullptr);

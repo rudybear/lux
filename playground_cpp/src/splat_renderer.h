@@ -97,6 +97,27 @@ public:
 
     void render(VulkanContext& ctx);
 
+    // --- Optional GPU timestamp-query profiling (mobile-DLSS Android live
+    // demo, Stage 1 "timing breakdown" -- docs/rendering-engines.md). Off by
+    // default (zero query-pool overhead when disabled, so desktop CLI /
+    // existing callers are unaffected). When enabled, render() writes 4
+    // timestamps into an internal VkQueryPool: [0] frame start (top of
+    // pipe), [1] end of the preprocess compute dispatch (before the radix
+    // sort), [2] end of the radix sort (before the render pass), [3] end of
+    // the draw (after vkCmdEndRenderPass) -- and lastGpuTimingsMs() converts
+    // the deltas to milliseconds once render() returns (already
+    // GPU-synchronous via endSingleTimeCommands, so results are always
+    // ready by then). Call setGpuTimingEnabled() once after init().
+    struct GpuTimingsMs {
+        double preprocessMs = 0.0;  // [0]->[1]
+        double sortMs = 0.0;        // [1]->[2] (includes the MoltenVK-only MV
+                                     // queue-drain round trip when hasMotionVectors_)
+        double drawMs = 0.0;        // [2]->[3]
+        bool valid = false;
+    };
+    void setGpuTimingEnabled(VulkanContext& ctx, bool enabled);
+    GpuTimingsMs lastGpuTimingsMs() const { return lastGpuTimings_; }
+
     void blitToSwapchain(VulkanContext& ctx, VkCommandBuffer cmd,
                          VkImage swapImage, VkExtent2D extent);
 
@@ -258,6 +279,12 @@ private:
     bool prevPosOwned_ = false;
     uint32_t shDegree_ = 0;        // scene's actual SH degree (for push constant)
     uint32_t shaderShDegree_ = 0;  // shader's compiled SH degree (for descriptor layout)
+
+    // --- GPU timestamp-query profiling (see setGpuTimingEnabled() above) ---
+    VkQueryPool timestampPool_ = VK_NULL_HANDLE;
+    bool gpuTimingEnabled_ = false;
+    double timestampPeriodNs_ = 1.0;
+    GpuTimingsMs lastGpuTimings_;
 
     // Helpers
     void createOffscreenTarget(VulkanContext& ctx);

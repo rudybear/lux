@@ -133,6 +133,23 @@ struct AppState {
     float lastFps = 0.0f;
 
     bool initFailed = false;
+
+    // --- Stage 1 timing breakdown (docs/rendering-engines.md "Android
+    // live-rendering demo") -- CPU wall-clock per phase (ms) accumulated
+    // over a 60-frame window, plus the GPU timestamp-query breakdown from
+    // SplatRenderer::lastGpuTimingsMs() (preprocess/sort/draw), logged
+    // together every ~60 frames via LOGI so `adb logcat -d | grep TIMING`
+    // gives a periodic snapshot without a blocking logcat stream.
+    static constexpr int kTimingWindowFrames = 60;
+    int timingFrameCount = 0;
+    double sumCpuWaitFenceMs = 0.0;   // vkWaitForFences (outer loop, waits for prior frame's blit+present)
+    double sumCpuRenderMs = 0.0;      // wall time of splatR->render() (preprocess+sort+draw, incl. its 2 internal vkQueueWaitIdle round trips)
+    double sumCpuBlitPresentMs = 0.0; // blit cmd record+submit+vkQueuePresentKHR (does not itself block)
+    double sumCpuFrameMs = 0.0;       // total renderFrame() wall time
+    double sumGpuPreprocessMs = 0.0;
+    double sumGpuSortMs = 0.0;
+    double sumGpuDrawMs = 0.0;
+    int gpuTimingValidFrames = 0;
 };
 
 std::string basePath(AppState* state) {
@@ -178,6 +195,7 @@ void initRenderer(AppState* state) {
 
         std::string shaderBase = base + "/examples/gaussian_splat_dlss";
         state->scene.initSplatRenderer(state->ctx, shaderBase, kWidth, kHeight);
+        state->scene.getSplatRenderer()->setGpuTimingEnabled(state->ctx, true);
 
         // NOTE: deliberately NOT using scene.getAutoTarget()/getAutoEye()
         // here -- SceneManager::computeAutoCamera frames the WHOLE scene's
@@ -205,11 +223,20 @@ void initRenderer(AppState* state) {
     }
 }
 
+// Stage 1 helper: milliseconds between two high_resolution_clock points.
+inline double msSince(std::chrono::high_resolution_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+}
+
 void renderFrame(AppState* state) {
     if (!state->vulkanReady) return;
     VulkanContext& ctx = state->ctx;
 
+    auto tFrameStart = std::chrono::high_resolution_clock::now();
+
+    auto tWaitFence = std::chrono::high_resolution_clock::now();
     vkWaitForFences(ctx.device, 1, &state->inFlightFence, VK_TRUE, UINT64_MAX);
+    double waitFenceMs = msSince(tWaitFence);
     if (state->blitCmd != VK_NULL_HANDLE) {
         vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &state->blitCmd);
         state->blitCmd = VK_NULL_HANDLE;
@@ -243,8 +270,11 @@ void renderFrame(AppState* state) {
         splatR->setMorphTime(t);
     }
 
+    auto tRender = std::chrono::high_resolution_clock::now();
     splatR->render(ctx);
+    double renderMs = msSince(tRender);
 
+    auto tBlit = std::chrono::high_resolution_clock::now();
     state->blitCmd = ctx.beginSingleTimeCommands();
     splatR->blitToSwapchain(ctx, state->blitCmd, ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
     vkEndCommandBuffer(state->blitCmd);
@@ -267,13 +297,64 @@ void renderFrame(AppState* state) {
     presentInfo.pSwapchains = &ctx.swapchain;
     presentInfo.pImageIndices = &imageIndex;
     VkResult presentResult = vkQueuePresentKHR(ctx.graphicsQueue, &presentInfo);
-    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
+    // NOTE: only recreate on OUT_OF_DATE, not SUBOPTIMAL -- this app
+    // deliberately forces preTransform=IDENTITY at swapchain-creation time
+    // (AndroidVulkan::createSwapchain, see the c1539ff pre-rotation fix)
+    // while the device's surface capabilities report currentTransform=0x2
+    // (ROTATE_90) for this orientation, so vkQueuePresentKHR legitimately
+    // returns VK_SUBOPTIMAL_KHR on every single frame forever (the spec's
+    // definition of "suboptimal" is exactly this: presentation still
+    // succeeds correctly, just not through the ideal/most-efficient
+    // compositor path). Treating that as "must recreate" like OUT_OF_DATE
+    // caused a full vkDeviceWaitIdle + imageview/swapchain
+    // destroy-and-recreate cycle EVERY frame -- confirmed via the Stage 1
+    // timing breakdown (docs/rendering-engines.md) to cost ~30ms/frame
+    // (~25% of the ~120ms frame budget) for zero benefit, since the very
+    // next present is suboptimal again regardless. Real resizes/rotations
+    // still get caught by the VK_ERROR_OUT_OF_DATE_KHR paths (both here and
+    // in the vkAcquireNextImageKHR check above).
+    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR) {
         vkDeviceWaitIdle(ctx.device);
         for (auto& iv : ctx.swapchainImageViews) vkDestroyImageView(ctx.device, iv, nullptr);
         ctx.swapchainImageViews.clear();
         vkDestroySwapchainKHR(ctx.device, ctx.swapchain, nullptr);
         ctx.swapchain = VK_NULL_HANDLE;
         AndroidVulkan::createSwapchain(ctx, kWidth, kHeight);
+    }
+
+    double blitPresentMs = msSince(tBlit) - 0.0;  // encode+submit+present call (non-blocking; actual GPU blit cost is hidden behind next frame's wait-fence)
+    double frameMs = msSince(tFrameStart);
+
+    // --- Stage 1 timing breakdown accounting ---
+    state->sumCpuWaitFenceMs += waitFenceMs;
+    state->sumCpuRenderMs += renderMs;
+    state->sumCpuBlitPresentMs += blitPresentMs;
+    state->sumCpuFrameMs += frameMs;
+    SplatRenderer::GpuTimingsMs gt = splatR->lastGpuTimingsMs();
+    if (gt.valid) {
+        state->sumGpuPreprocessMs += gt.preprocessMs;
+        state->sumGpuSortMs += gt.sortMs;
+        state->sumGpuDrawMs += gt.drawMs;
+        state->gpuTimingValidFrames++;
+    }
+    state->timingFrameCount++;
+    if (state->timingFrameCount >= AppState::kTimingWindowFrames) {
+        int n = state->timingFrameCount;
+        int gn = std::max(state->gpuTimingValidFrames, 1);
+        LOGI("TIMING avg-over-%d-frames (ms): cpu_wait_fence=%.2f cpu_render(preprocess+sort+draw)=%.2f "
+             "cpu_blit_present=%.2f cpu_frame_total=%.2f | gpu_preprocess=%.2f gpu_sort=%.2f gpu_draw=%.2f "
+             "gpu_valid_frames=%d/%d | sync_stalls_per_frame: outer_vkWaitForFences=1 "
+             "inner_vkQueueWaitIdle=%d (splat_renderer.cpp render(): 1 after preprocess [MV drain, "
+             "hasMotionVectors=%d] + 1 final submit)",
+             n, state->sumCpuWaitFenceMs / n, state->sumCpuRenderMs / n,
+             state->sumCpuBlitPresentMs / n, state->sumCpuFrameMs / n,
+             state->sumGpuPreprocessMs / gn, state->sumGpuSortMs / gn, state->sumGpuDrawMs / gn,
+             state->gpuTimingValidFrames, n,
+             splatR->hasMotionVectors() ? 2 : 1, splatR->hasMotionVectors() ? 1 : 0);
+        state->timingFrameCount = 0;
+        state->sumCpuWaitFenceMs = state->sumCpuRenderMs = state->sumCpuBlitPresentMs = state->sumCpuFrameMs = 0.0;
+        state->sumGpuPreprocessMs = state->sumGpuSortMs = state->sumGpuDrawMs = 0.0;
+        state->gpuTimingValidFrames = 0;
     }
 
     state->frameCounter++;
