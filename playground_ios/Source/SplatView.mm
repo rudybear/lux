@@ -47,12 +47,11 @@
 // B1 update (per coordinator): the luxc-transpiled splat backend
 // (metal_splat_luxc_renderer.*) is now at parity with Vulkan/gsplat (commit
 // 08cfe8e: 51.3dB vs gsplat, 83.7dB vs Vulkan) and is the network's actual
-// training-time renderer, so the proxy pass uses it instead of the
-// hand-written path. Flip this typedef (+ the two backend-specific spots
-// marked below: init()'s extra shaderBase arg, kMetalYConvention,
-// kExpectedDepthChannels -- all already backend-agnostic via this alias/
-// the class's own static constants) back to MetalSplatRenderer as a
-// fallback if the luxc path ever regresses.
+// training-time renderer, so both the proxy pass and Target mode use it
+// (the hand-written MetalSplatRenderer path was removed entirely -- see
+// 80e33f4). getAuxTexture()/getFgTexture() (lux 6ed0334's packed DLSS
+// attachment layout) are MetalSplatLuxcRenderer-only, so this alias is no
+// longer a drop-in fallback point the way it once was.
 using ProxyRenderer = MetalSplatLuxcRenderer;
 
 // --- Scene-specific constants (demo/data/scene_meta.json for
@@ -248,6 +247,31 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
     const int i = (frame % period) + 1;
     jxOut = haltonSeq(i, 2) - 0.5f;
     jyOut = haltonSeq(i, 3) - 0.5f;
+}
+
+// Reads a texture back and returns it as plain floats, regardless of the
+// texture's actual storage precision. lux is about to add an
+// `aux_precision: half` compiled variant of getAuxTexture() (RGBA16Float,
+// currently RGBA32Float) -- CPU-side dump code that hardcodes 4
+// bytes/component (float32) would silently misread that as garbage once
+// that lands. The on-GPU consumers (NetInputAssembly.mm's
+// `texture2d<float, access::read>` kernel args) already don't have this
+// problem -- Metal converts any pixel format to float on read regardless of
+// storage -- so only this CPU readback path needs to stay format-agnostic.
+// Queries `tex->pixelFormat()` rather than assuming a fixed format.
+static std::vector<float> readTextureAsFloats(MetalContext &ctx, MTL::Texture *tex, uint32_t w, uint32_t h,
+                                               uint32_t channels) {
+    bool isHalf = (tex->pixelFormat() == MTL::PixelFormatRGBA16Float);
+    uint32_t bytesPerComponent = isHalf ? 2 : 4;
+    auto raw = MetalScreenshot::readTextureRaw(ctx, tex, w, h, channels * bytesPerComponent);
+    std::vector<float> out(static_cast<size_t>(w) * h * channels);
+    if (isHalf) {
+        const uint16_t *half = reinterpret_cast<const uint16_t *>(raw.data());
+        for (size_t i = 0; i < out.size(); i++) out[i] = DlssIO::halfToFloat(half[i]);
+    } else {
+        std::memcpy(out.data(), raw.data(), raw.size());
+    }
+    return out;
 }
 
 @interface SplatView () {
@@ -449,18 +473,21 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
             *errorOut = "bundle resource not found: texture.npy / bg_sphere.npy";
             return NO;
         }
+        // lux 6ed0334 merged the DLSS aux attachments (out_motion/out_depth ->
+        // one packed out_aux, foreground_coverage -> its own out_fg) -- no more
+        // depthAlphaOffset param, see NetInputAssembly.h/.mm.
         _netInput.init(_ctx, std::string(texPath.UTF8String), std::string(spherePath.UTF8String),
-                        kProxyW, kProxyH, /*paramStride=*/2, /*hiddenChannels=*/8,
-                        /*depthAlphaOffset=*/ProxyRenderer::kExpectedDepthChannels - 1);
+                        kProxyW, kProxyH, /*paramStride=*/2, /*hiddenChannels=*/8);
         // lux's foreground_coverage output has landed (examples/gaussian_splat_dlss.lux's
         // `foreground_coverage: true`, compiled fresh from a clean HEAD worktree into
         // playground_ios/CompiledShaders/ -- see the Xcode project's examples/shaders
         // folder references) -- switch off the const-0 interim now that a real per-pixel
-        // actor mask is available (NetInputAssembly.mm un-premultiplies it by the same
-        // alpha as depth, matching metal_main.cpp's --output-aux _fg.npy convention).
+        // actor mask is available (NetInputAssembly.mm un-premultiplies it by the fg
+        // attachment's own alpha, matching metal_main.cpp's --output-aux _fg.npy
+        // convention -- lux 6ed0334 moved fg to its own out_fg attachment).
         if (_splatRProxy->hasForegroundCoverage()) {
-            _netInput.setFgSource(NetInputAssembly::kFgSourceExpectedDepthG);
-            NSLog(@"[SplatView] fg source: expected-depth .g (real foreground_coverage)");
+            _netInput.setFgSource(NetInputAssembly::kFgSourceFgTexture);
+            NSLog(@"[SplatView] fg source: separate fg attachment (real foreground_coverage)");
         } else {
             NSLog(@"[SplatView] WARNING: compiled pipeline has no foreground_coverage -- fg stays const 0");
         }
@@ -701,14 +728,22 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
 
         // B4 step 0 (must run BEFORE B2/B3 this frame): warp+downsample last
         // frame's raw hidden state into this frame's net-res hidden_in.
+        // lux 6ed0334: getMotionTexture()/getExpectedDepthTexture() are gone,
+        // replaced by one packed getAuxTexture() (mv.x*a, mv.y*a, depth*a, a)
+        // -- both prepareHiddenInput (mv only) and netInput.run (mv + depth,
+        // via the separate unpremul pass inside NetInputAssembly::run) now
+        // read from it.
         BOOL isFirstReconFrame = _netInput.isNextFrameFirst();
-        _reconstruct.prepareHiddenInput(_ctx, _splatRProxy->getMotionTexture(), isFirstReconFrame,
+        _reconstruct.prepareHiddenInput(_ctx, _splatRProxy->getAuxTexture(), isFirstReconFrame,
                                          _reconstruct.getHiddenInputBuffer());
 
         // B2: assemble the 26-ch net input from this frame's proxy DLSS
-        // attachments (hidden_in from B4's recurrence above).
-        _netInput.run(_ctx, _splatRProxy->getOutputTexture(), _splatRProxy->getExpectedDepthTexture(),
-                      _splatRProxy->getMotionTexture(), _reconstruct.getHiddenInputBuffer(),
+        // attachments (hidden_in from B4's recurrence above). fg comes from
+        // its own getFgTexture() (nullptr when !hasForegroundCoverage() --
+        // NetInputAssembly::run() falls back to a dummy binding for that case).
+        _netInput.run(_ctx, _splatRProxy->getOutputTexture(), _splatRProxy->getAuxTexture(),
+                      _splatRProxy->hasForegroundCoverage() ? _splatRProxy->getFgTexture() : nullptr,
+                      _reconstruct.getHiddenInputBuffer(),
                       peyeCur, prCur, puCur, pfCur, pfxCur, pfyCur,
                       0.5f * kProxyW, 0.5f * kProxyH, jxProxy, jyProxy);
         CFTimeInterval tp2 = CACurrentMediaTime();
@@ -745,7 +780,7 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
             [self dumpReconInputsWithPrevDepth:prevDepth jitterTargetX:jxTarget jitterTargetY:jyTarget];
         }
 
-        _reconstruct.run(_ctx, _splatRProxy->getOutputTexture(), _splatRProxy->getMotionTexture(), curDepth,
+        _reconstruct.run(_ctx, _splatRProxy->getOutputTexture(), _splatRProxy->getAuxTexture(), curDepth,
                           prevDepth, wasFirst, _unetOutputBuffer, _reconOutputTex, teyeCur, trCur, tuCur, tfCur,
                           tfxCur, tfyCur, 0.5f * kTargetW, 0.5f * kTargetH, jxTarget, jyTarget);
         CFTimeInterval tp4 = CACurrentMediaTime();
@@ -918,37 +953,56 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
             DlssIO::writeNpyFloat32(p + "_color.npy", colorF32, {h, w, 4});
         }
 
-        if (_splatRProxy->hasExpectedDepth()) {
-            constexpr uint32_t C = ProxyRenderer::kExpectedDepthChannels;  // luxc: 4 (RGBA32Float)
-            auto raw = MetalScreenshot::readTextureRaw(_ctx, _splatRProxy->getExpectedDepthTexture(), w, h, C * 4);
-            std::vector<float> chans(static_cast<size_t>(w) * h * C);
-            std::memcpy(chans.data(), raw.data(), raw.size());
-            std::vector<float> depthPremul(static_cast<size_t>(w) * h);
-            std::vector<float> depthAlpha(static_cast<size_t>(w) * h);
-            for (size_t i = 0; i < depthPremul.size(); ++i) {
-                depthPremul[i] = chans[i * C + 0];
-                depthAlpha[i] = chans[i * C + (C - 1)];
+        // lux 6ed0334: depth AND mv now share one packed getAuxTexture()
+        // (mv.x*a, mv.y*a, depth*a, a) -- one read produces both dumps, each
+        // channel un-premultiplied by THIS texture's own alpha (.w, index 3),
+        // exactly metal_main.cpp's --output-aux convention (docs/
+        // rendering-engines.md). readTextureAsFloats() is precision-agnostic
+        // (RGBA32Float today; an `aux_precision: half` RGBA16Float variant is
+        // expected soon -- see its own comment).
+        if (_splatRProxy->hasExpectedDepth() || _splatRProxy->hasMotionVectors()) {
+            constexpr uint32_t C = ProxyRenderer::kAuxChannels;  // 4
+            std::vector<float> chans = readTextureAsFloats(_ctx, _splatRProxy->getAuxTexture(), w, h, C);
+            std::vector<float> auxAlpha(static_cast<size_t>(w) * h);
+            for (size_t i = 0; i < auxAlpha.size(); ++i) auxAlpha[i] = chans[i * C + 3];
+
+            if (_splatRProxy->hasExpectedDepth()) {
+                std::vector<float> depthPremul(static_cast<size_t>(w) * h);
+                for (size_t i = 0; i < depthPremul.size(); ++i) depthPremul[i] = chans[i * C + 2];
+                auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, auxAlpha, w, h, 1);
+                DlssIO::writeNpyFloat32(p + "_depth.npy", depth, {h, w});
             }
-            auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
-            DlssIO::writeNpyFloat32(p + "_depth.npy", depth, {h, w});
+
+            if (_splatRProxy->hasMotionVectors()) {
+                std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
+                for (size_t i = 0; i < auxAlpha.size(); ++i) {
+                    mvPremul[i * 2 + 0] = chans[i * C + 0];
+                    mvPremul[i * 2 + 1] = chans[i * C + 1];
+                }
+                auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, auxAlpha, w, h, 2);
+                DlssIO::writeNpyFloat32(p + "_mv.npy", mv, {h, w, 2});
+            }
         }
 
-        if (_splatRProxy->hasMotionVectors()) {
-            auto raw = MetalScreenshot::readTextureRaw(_ctx, _splatRProxy->getMotionTexture(), w, h, 16);
-            std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
-            std::memcpy(rgba.data(), raw.data(), raw.size());
-            std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
-            std::vector<float> mvAlpha(static_cast<size_t>(w) * h);
-            for (size_t i = 0; i < mvAlpha.size(); ++i) {
-                mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
-                mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
-                mvAlpha[i] = rgba[i * 4 + 3];
+        // fg: a separate attachment (fg*alpha, 0, 0, alpha) -- own alpha, own
+        // un-premultiply, independent of the aux texture above. RGBA16Float
+        // today (kept safe per getFgTexture()'s own comment: fg is [0,1]-
+        // bounded like alpha itself), but read format-agnostically anyway.
+        if (_splatRProxy->hasForegroundCoverage()) {
+            const uint32_t C = _splatRProxy->getFgChannels();  // always 4 -- lux 5d5630c made this a
+                                                                // runtime accessor (was kFgChannels)
+            std::vector<float> chans = readTextureAsFloats(_ctx, _splatRProxy->getFgTexture(), w, h, C);
+            std::vector<float> fgPremul(static_cast<size_t>(w) * h);
+            std::vector<float> fgAlpha(static_cast<size_t>(w) * h);
+            for (size_t i = 0; i < fgPremul.size(); ++i) {
+                fgPremul[i] = chans[i * C + 0];
+                fgAlpha[i] = chans[i * C + 3];
             }
-            auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
-            DlssIO::writeNpyFloat32(p + "_mv.npy", mv, {h, w, 2});
+            auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, fgAlpha, w, h, 1);
+            DlssIO::writeNpyFloat32(p + "_fg.npy", fg, {h, w});
         }
 
-        NSLog(@"[SplatView] B1 dump written: %@_{color.png,color.npy,depth.npy,mv.npy}", prefix);
+        NSLog(@"[SplatView] B1 dump written: %@_{color.png,color.npy,depth.npy,mv.npy,fg.npy}", prefix);
         dispatch_async(dispatch_get_main_queue(), ^{
             self.hudLabel.text = [self.hudLabel.text stringByAppendingString:@"\n[B1 proxy dump saved]"];
         });

@@ -25,18 +25,20 @@ struct InputAssemblyUniforms {
     uint32_t firstFrame, texChannels, fgSource, _pad2;  // fgSource: 0=const 0 (interim), 1=expected-depth .g
 };
 
+// lux 6ed0334 (bench/lux_perf_ablation.md task 2): depth now lives at aux.z
+// (was depthTex.x pre-merge), alpha always at aux.w -- a fixed layout, no
+// longer backend/format-dependent, so no more alphaOffset param.
 static const char* kUnpremulDepthMSL = R"(
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void unpremul_depth(texture2d<float, access::read> depthTex [[texture(0)]],
+kernel void unpremul_depth(texture2d<float, access::read> auxTex [[texture(0)]],
                             texture2d<float, access::write> outTex [[texture(1)]],
-                            constant uint& alphaOffset [[buffer(0)]],
                             uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= depthTex.get_width() || gid.y >= depthTex.get_height()) return;
-    float4 raw = depthTex.read(gid);  // premul at .x; alpha at .y (RG32F) or .w (RGBA32F)
-    float a = (alphaOffset == 1) ? raw.y : raw.w;
-    float depth = (a > 1e-6) ? (raw.x / a) : 0.0;
+    if (gid.x >= auxTex.get_width() || gid.y >= auxTex.get_height()) return;
+    float4 raw = auxTex.read(gid);  // (mv.x*a, mv.y*a, depth*a, a)
+    float a = raw.w;
+    float depth = (a > 1e-6) ? (raw.z / a) : 0.0;
     outTex.write(float4(depth, 0.0, 0.0, 0.0), gid);
 }
 )";
@@ -108,8 +110,8 @@ static float sampleDepthZeroPad(texture2d<float, access::sample> tex, uint w, ui
 
 kernel void assemble_net_input(
     texture2d<float, access::read> colorTex [[texture(0)]],   // RGBA16Float, premultiplied
-    texture2d<float, access::read> depthTex [[texture(1)]],   // RG32Float: depth*a, a
-    texture2d<float, access::read> motionTex [[texture(2)]],  // RGBA32Float: mv*a, 0, 0, a
+    texture2d<float, access::read> auxTex [[texture(1)]],     // RGBA32Float: mv.x*a, mv.y*a, depth*a, a (lux 6ed0334)
+    texture2d<float, access::read> fgTex [[texture(2)]],       // RGBA16Float: fg*a, 0, 0, a (own alpha; may be a dummy when !fgSource)
     texture2d<float, access::read> curUnpremulDepth [[texture(3)]],   // R32Float
     texture2d<float, access::sample> prevUnpremulDepth [[texture(4)]], // R32Float
     device const float* bgTexture [[buffer(0)]],
@@ -144,32 +146,36 @@ kernel void assemble_net_input(
             float3 rgb = (ca > 1e-6) ? (colorRaw.rgb / ca) : float3(0.0);
             colorSum += rgb;
 
-            float4 depthRaw = depthTex.read(pgid);
             // fg (foreground/actor coverage): NOT proxy alpha (measured to collapse the
             // model 36.4->24.3dB -- the net reads "alpha coverage" as "moving actor here,
             // distrust history/memory" everywhere, not just the actor). lux's
-            // gaussian_splat_dlss now ships a real per-pixel foreground_coverage output,
-            // packed into the expected-depth attachment's .g channel -- alpha-WEIGHTED
-            // (premultiplied) exactly like .r's depth, so it needs the same
-            // divide-by-alpha un-premultiply metal_main.cpp's --output-aux _fg.npy dump
-            // does (fgPremul / depthAlpha, both from the same RGBA32Float attachment) --
-            // NOT a raw read, which would silently read low everywhere alpha < 1 (thin/
-            // edge/translucent coverage). depthRaw.w is that same alpha (the last of the
-            // 4 channels, matching depth's own premultiply convention). Constant 0
-            // (background) remains the interim when fgSource is the const-zero default.
+            // gaussian_splat_dlss ships a real per-pixel foreground_coverage output in a
+            // SEPARATE attachment (fgTex, RGBA16Float: fg*alpha, 0, 0, alpha -- lux
+            // 6ed0334 moved this out of the aux attachment's .g entirely, since every
+            // blended attachment's .w must stay genuine per-fragment alpha for correct
+            // GPU accumulation, leaving no spare non-alpha lane to share). Un-premultiply
+            // by fgTex's OWN alpha (.w), not auxTex's -- NOT a raw read, which would
+            // silently read low everywhere alpha < 1 (thin/edge/translucent coverage).
+            // Constant 0 (background) remains the interim when fgSource is the
+            // const-zero default (e.g. a pipeline compiled without foreground_coverage).
             float fgVal = 0.0;
             if (u.fgSource == 1) {
-                float fgAlpha = depthRaw.w;
-                fgVal = (fgAlpha > 1e-6) ? (depthRaw.y / fgAlpha) : 0.0;
+                float4 fgRaw = fgTex.read(pgid);
+                float fgAlpha = fgRaw.w;
+                fgVal = (fgAlpha > 1e-6) ? (fgRaw.x / fgAlpha) : 0.0;
             }
             fgSum += fgVal;
 
             float depthVal = curUnpremulDepth.read(pgid).x;
             depthSum += depthVal;
 
-            float4 motionRaw = motionTex.read(pgid);
-            float ma = motionRaw.a;
-            float2 mv = (ma > 1e-6) ? (motionRaw.xy / ma) : float2(0.0);
+            // mv + depth now share one packed attachment (auxTex: mv.x*a, mv.y*a,
+            // depth*a, a) -- lux 6ed0334. depth itself comes from curUnpremulDepth
+            // (the separate unpremul pass above, run once per frame); only mv is read
+            // directly here, un-premultiplied by auxTex's own alpha.
+            float4 auxRaw = auxTex.read(pgid);
+            float ma = auxRaw.w;
+            float2 mv = (ma > 1e-6) ? (auxRaw.xy / ma) : float2(0.0);
             mvSum += mv;
 
             // --- disocclusion_mask (motion.py) ---
@@ -291,13 +297,12 @@ NetInputAssembly::~NetInputAssembly() {
 
 void NetInputAssembly::init(MetalContext& ctx, const std::string& textureNpyPath,
                              const std::string& bgSphereNpyPath, uint32_t proxyW, uint32_t proxyH,
-                             uint32_t paramStride, uint32_t hiddenChannels, uint32_t depthAlphaOffset) {
+                             uint32_t paramStride, uint32_t hiddenChannels) {
     ctx_ = &ctx;
     proxyW_ = proxyW;
     proxyH_ = proxyH;
     paramStride_ = paramStride;
     hiddenChannels_ = hiddenChannels;
-    depthAlphaOffset_ = depthAlphaOffset;
     // mobiledlss.train.export._PaddedExportModel: replicate-pad proxy h/w up to a
     // multiple of 8*paramStride before box-pooling, so the network always runs at a
     // multiple-of-8 resolution (e.g. 480x270, ps=2 -> pad proxy to 480x272 -> net 240x136).
@@ -342,22 +347,28 @@ void NetInputAssembly::init(MetalContext& ctx, const std::string& textureNpyPath
     std::memset(zeroHiddenBuffer_->contents(), 0, static_cast<size_t>(netW_) * netH_ * hiddenChannels_ * sizeof(uint16_t));
 }
 
-void NetInputAssembly::run(MetalContext& ctx, MTL::Texture* currColorTex, MTL::Texture* currDepthTex,
-                            MTL::Texture* currMotionTex, MTL::Buffer* hiddenIn, glm::vec3 eye,
+void NetInputAssembly::run(MetalContext& ctx, MTL::Texture* currColorTex, MTL::Texture* currAuxTex,
+                            MTL::Texture* currFgTex, MTL::Buffer* hiddenIn, glm::vec3 eye,
                             glm::vec3 rAxis, glm::vec3 uAxis, glm::vec3 fAxis, float fx, float fy,
                             float cx, float cy, float jitterProxyX, float jitterProxyY) {
     MTL::Texture* curDepth = depthPing_[depthPingIndex_];
     MTL::Texture* prevDepth = depthPing_[1 - depthPingIndex_];
+    // assemble_net_input's fgTex argument is only actually READ when
+    // fgSource_==kFgSourceFgTexture (guarded in the shader), but Metal still
+    // wants a validly-typed texture bound at every argument the function
+    // declares -- fall back to currAuxTex (same texture2d<float> family,
+    // different pixel format is fine for a binding-only, never-sampled slot)
+    // when the caller has no real fg attachment (!hasForegroundCoverage()).
+    MTL::Texture* fgTexOrDummy = currFgTex ? currFgTex : currAuxTex;
 
     auto* cmdBuf = ctx.beginCommandBuffer();
 
-    // Pass 1: un-premultiply this frame's proxy depth into curDepth.
+    // Pass 1: un-premultiply this frame's proxy depth (now aux.z) into curDepth.
     {
         auto* enc = cmdBuf->computeCommandEncoder();
         enc->setComputePipelineState(unpremulPipeline_);
-        enc->setTexture(currDepthTex, 0);
+        enc->setTexture(currAuxTex, 0);
         enc->setTexture(curDepth, 1);
-        enc->setBytes(&depthAlphaOffset_, sizeof(depthAlphaOffset_), 0);
         MTL::Size grid(proxyW_, proxyH_, 1);
         NS::UInteger tew = unpremulPipeline_->threadExecutionWidth();
         NS::UInteger maxT = unpremulPipeline_->maxTotalThreadsPerThreadgroup();
@@ -386,9 +397,7 @@ void NetInputAssembly::run(MetalContext& ctx, MTL::Texture* currColorTex, MTL::T
         u.texW = texW_; u.texH = texH_;
         u.firstFrame = firstFrame_ ? 1 : 0;
         u.texChannels = texChannels_;
-        // fg: constant 0 until lux's foreground_coverage output lands in the
-        // expected-depth attachment's .g channel (kFgSourceExpectedDepthG) --
-        // see NetInputAssembly.h.
+        // fg source -- see NetInputAssembly.h's FgSource comment.
         u.fgSource = fgSource_;
 
         MTL::Buffer* hidden = hiddenIn ? hiddenIn : zeroHiddenBuffer_;
@@ -396,8 +405,8 @@ void NetInputAssembly::run(MetalContext& ctx, MTL::Texture* currColorTex, MTL::T
         auto* enc = cmdBuf->computeCommandEncoder();
         enc->setComputePipelineState(assemblePipeline_);
         enc->setTexture(currColorTex, 0);
-        enc->setTexture(currDepthTex, 1);
-        enc->setTexture(currMotionTex, 2);
+        enc->setTexture(currAuxTex, 1);
+        enc->setTexture(fgTexOrDummy, 2);
         enc->setTexture(curDepth, 3);
         enc->setTexture(prevDepth, 4);
         enc->setBuffer(bgTextureBuffer_, 0, 0);

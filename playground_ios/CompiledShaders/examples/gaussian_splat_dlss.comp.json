@@ -66,7 +66,7 @@
       {
         "binding": 6,
         "type": "storage_buffer",
-        "name": "projected_conic",
+        "name": "projected_axes",
         "element_type": "vec4",
         "stage_flags": [
           "compute"
@@ -75,7 +75,7 @@
       {
         "binding": 7,
         "type": "storage_buffer",
-        "name": "projected_color",
+        "name": "projected_conic",
         "element_type": "vec4",
         "stage_flags": [
           "compute"
@@ -84,8 +84,8 @@
       {
         "binding": 8,
         "type": "storage_buffer",
-        "name": "sort_keys",
-        "element_type": "uint",
+        "name": "projected_color",
+        "element_type": "vec4",
         "stage_flags": [
           "compute"
         ]
@@ -93,7 +93,7 @@
       {
         "binding": 9,
         "type": "storage_buffer",
-        "name": "sorted_indices",
+        "name": "sort_keys",
         "element_type": "uint",
         "stage_flags": [
           "compute"
@@ -102,7 +102,7 @@
       {
         "binding": 10,
         "type": "storage_buffer",
-        "name": "visible_count",
+        "name": "sorted_indices",
         "element_type": "uint",
         "stage_flags": [
           "compute"
@@ -111,6 +111,15 @@
       {
         "binding": 11,
         "type": "storage_buffer",
+        "name": "visible_count",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 12,
+        "type": "storage_buffer",
         "name": "splat_prev_pos",
         "element_type": "vec4",
         "stage_flags": [
@@ -118,7 +127,7 @@
         ]
       },
       {
-        "binding": 12,
+        "binding": 13,
         "type": "storage_buffer",
         "name": "projected_mv",
         "element_type": "vec2",
@@ -127,7 +136,7 @@
         ]
       },
       {
-        "binding": 13,
+        "binding": 14,
         "type": "storage_buffer",
         "name": "prev_camera_mats",
         "element_type": "mat4",
@@ -136,7 +145,7 @@
         ]
       },
       {
-        "binding": 14,
+        "binding": 15,
         "type": "storage_buffer",
         "name": "projected_depth",
         "element_type": "scalar",
@@ -145,7 +154,7 @@
         ]
       },
       {
-        "binding": 15,
+        "binding": 16,
         "type": "storage_buffer",
         "name": "splat_foreground",
         "element_type": "scalar",
@@ -154,7 +163,7 @@
         ]
       },
       {
-        "binding": 16,
+        "binding": 17,
         "type": "storage_buffer",
         "name": "projected_foreground",
         "element_type": "scalar",
@@ -245,6 +254,7 @@
     "motion_vectors": true,
     "expected_depth": true,
     "foreground_coverage": true,
+    "aux_precision": "half",
     "workgroup_size": [
       256,
       1,
@@ -261,6 +271,7 @@
     ],
     "output_buffers": [
       "projected_center",
+      "projected_axes",
       "projected_conic",
       "projected_color",
       "sort_keys",
@@ -271,8 +282,8 @@
     ]
   },
   "performance_hints": {
-    "instruction_count": 684,
-    "alu_ops": 175,
+    "instruction_count": 725,
+    "alu_ops": 185,
     "texture_samples": 0,
     "branches": 5,
     "function_calls": 0,

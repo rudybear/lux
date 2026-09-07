@@ -22,7 +22,7 @@ struct HiddenUniforms {
 };
 
 kernel void warp_downsample_hidden(
-    texture2d<float, access::read> proxyMotion [[texture(0)]],   // RGBA32Float: mv*a,0,0,a (proxy px)
+    texture2d<float, access::read> proxyMotion [[texture(0)]],   // RGBA32Float: mv.x*a, mv.y*a, depth*a, a (lux 6ed0334's packed out_aux; only .xy/.w read here)
     texture2d<float, access::sample> prevHiddenR [[texture(1)]],   // unused placeholder (keep binding count stable)
     device const half* prevHidden [[buffer(0)]],   // NHWC, targetW*targetH*hiddenChannels
     device half* hiddenOut [[buffer(1)]],          // NHWC, netW*netH*hiddenChannels
@@ -115,7 +115,7 @@ static void sampleBgTex(device const float* tex, uint texW, uint texH, uint texC
 
 kernel void reconstruct_frame(
     texture2d<float, access::read> proxyColor [[texture(0)]],    // RGBA16Float premul
-    texture2d<float, access::read> proxyMotion [[texture(1)]],   // RGBA32Float: mv*a,0,0,a
+    texture2d<float, access::read> proxyMotion [[texture(1)]],   // RGBA32Float: mv.x*a, mv.y*a, depth*a, a (out_aux; only .xy/.w read here)
     texture2d<float, access::read> curDepth [[texture(2)]],      // R32Float, unpremul (proxy)
     texture2d<float, access::sample> prevDepth [[texture(3)]],   // R32Float, unpremul (proxy)
     texture2d<float, access::sample> prevColor [[texture(4)]],   // RGBA16Float, target res

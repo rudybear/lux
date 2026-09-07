@@ -24,13 +24,11 @@ public:
 
     // `textureNpyPath`/`bgSphereNpyPath`: exported/texture.npy ([C,H,W] float32)
     // and bg_sphere.npy ([cx,cy,cz,r] float32), read via DlssIO::readNpyFloat32.
-    // `depthAlphaOffset`: index of the alpha component in the proxy renderer's
-    // expected-depth texture (MetalSplatRenderer's RG32Float -> 1;
-    // MetalSplatLuxcRenderer's RGBA32Float -> 3; i.e. kExpectedDepthChannels-1
-    // for either backend) -- premultiplied depth is always at index 0.
+    // No more depthAlphaOffset param (lux 6ed0334 -- see run()'s comment):
+    // the packed aux/fg attachment layout is now fixed, not backend-dependent.
     void init(MetalContext& ctx, const std::string& textureNpyPath,
               const std::string& bgSphereNpyPath, uint32_t proxyW, uint32_t proxyH,
-              uint32_t paramStride, uint32_t hiddenChannels, uint32_t depthAlphaOffset);
+              uint32_t paramStride, uint32_t hiddenChannels);
 
     // Net resolution is the *padded* one (mobiledlss.train.export._PaddedExportModel's
     // convention: proxy h/w replicate-padded up to a multiple of 8*paramStride before
@@ -46,8 +44,22 @@ public:
     // into getOutputBuffer(). `hiddenIn` (NHWC, netW*netH*hiddenChannels
     // fp16 values) may be null, in which case hidden channels are written
     // as zero (B2's validation config -- see SplatView.mm).
-    void run(MetalContext& ctx, MTL::Texture* currColorTex, MTL::Texture* currDepthTex,
-             MTL::Texture* currMotionTex, MTL::Buffer* hiddenIn, glm::vec3 eye,
+    //
+    // `currAuxTex`: MetalSplatLuxcRenderer::getAuxTexture() (lux 6ed0334 --
+    // bench/lux_perf_ablation.md task 2) -- ONE RGBA32Float texture packing
+    // (mv.x*alpha, mv.y*alpha, depth*alpha, alpha), replacing the earlier
+    // separate getMotionTexture()/getExpectedDepthTexture() pair. `.w` is
+    // this attachment's OWN genuine alpha -- un-premultiply mv/depth by it,
+    // same convention as color's own `.a`.
+    // `currFgTex`: MetalSplatLuxcRenderer::getFgTexture() (RGBA16Float:
+    // fg*alpha, 0, 0, alpha) -- a SEPARATE attachment (can't share
+    // currAuxTex's spare lanes -- see getFgTexture()'s own comment for why),
+    // valid whenever hasForegroundCoverage(); un-premultiply fg by THIS
+    // texture's own `.w`, not currAuxTex's. May be null when
+    // !hasForegroundCoverage() (fg then stays whatever setFgSource()
+    // selects, ignoring this texture).
+    void run(MetalContext& ctx, MTL::Texture* currColorTex, MTL::Texture* currAuxTex,
+             MTL::Texture* currFgTex, MTL::Buffer* hiddenIn, glm::vec3 eye,
              glm::vec3 rAxis, glm::vec3 uAxis, glm::vec3 fAxis, float fx, float fy,
              float cx, float cy, float jitterProxyX, float jitterProxyY);
 
@@ -55,11 +67,14 @@ public:
     // NOT proxy alpha -- measured to collapse the model from 36.4 to 24.3dB
     // (the net reads "alpha coverage" as "moving actor here, distrust
     // history/memory" everywhere alpha>0, not just where the actor truly
-    // is). Defaults to kFgSourceConstantZero (background) until lux's
-    // gaussian_splat_dlss ships a real per-pixel foreground_coverage output;
-    // switch to kFgSourceExpectedDepthG once that output's channel is
-    // confirmed (packed into the expected-depth attachment's .g component).
-    enum FgSource : uint32_t { kFgSourceConstantZero = 0, kFgSourceExpectedDepthG = 1 };
+    // is). kFgSourceFgTexture reads lux's real per-pixel foreground_coverage
+    // output from currFgTex (run()'s own param -- a separate RGBA16Float
+    // attachment as of lux 6ed0334, previously packed into the
+    // expected-depth attachment's .g component pre-6ed0334, hence this
+    // enumerator's rename from kFgSourceExpectedDepthG). kFgSourceConstantZero
+    // (background) is the fallback for a pipeline compiled without
+    // foreground_coverage.
+    enum FgSource : uint32_t { kFgSourceConstantZero = 0, kFgSourceFgTexture = 1 };
     void setFgSource(FgSource src) { fgSource_ = src; }
 
     MTL::Buffer* getOutputBuffer() const { return outputBuffer_; }
@@ -111,7 +126,6 @@ private:
     MTL::Buffer* zeroHiddenBuffer_ = nullptr;
 
     uint32_t proxyW_ = 0, proxyH_ = 0, paramStride_ = 1, hiddenChannels_ = 0;
-    uint32_t depthAlphaOffset_ = 1;
     uint32_t fgSource_ = kFgSourceConstantZero;
     uint32_t netW_ = 0, netH_ = 0;
 };

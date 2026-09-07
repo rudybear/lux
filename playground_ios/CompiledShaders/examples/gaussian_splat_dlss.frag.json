@@ -49,12 +49,12 @@
       "location": 0
     },
     {
-      "name": "out_motion",
+      "name": "out_aux",
       "type": "vec4",
       "location": 1
     },
     {
-      "name": "out_depth",
+      "name": "out_fg",
       "type": "vec4",
       "location": 2
     }
