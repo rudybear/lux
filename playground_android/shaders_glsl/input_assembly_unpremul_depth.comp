@@ -5,27 +5,48 @@
 // contract to GLSL, hand-written and compiled via the NDK's glslc (not
 // luxc -- see input_assembly.cpp's header comment).
 //
-// Un-premultiplies this frame's proxy-resolution expected-depth attachment
-// (SplatRenderer's out_depth: RGBA32_SFLOAT, x=depth*alpha, y=fg*alpha
-// (foreground_coverage, same alpha as depth -- SPECIFICATION.md 12.8 /
-// splat_renderer.h's getExpectedDepthFormat comment / playground_cpp/src/
-// main.cpp's --output-aux _fg.npy path), z unused, w=alpha) into two plain
-// R32F buffers. Depth is written to one side of input_assembly.cpp's depth
+// lux commit 6ed0334 ("splat: merge DLSS aux attachments") repacked
+// SplatRenderer's DLSS outputs: the old separate out_motion/out_depth
+// RGBA32F attachments are gone, replaced by one packed `out_aux`
+// (RGBA32F: x=mv.x*alpha, y=mv.y*alpha, z=depth*alpha, w=alpha -- `.w` is
+// the GENUINE per-fragment alpha, required for correct hardware blend
+// accumulation, NOT out_color's alpha -- see splat_renderer.h's
+// getAuxImage() comment / playground_android_perf/src/android_main.cpp's
+// dumpProxyDebugFrame(), the validated reference this shader's math
+// mirrors) plus a separate, smaller `out_fg` (RGBA16F: x=fg*alpha, y/z
+// unused, w=alpha -- foreground_coverage can't share out_aux's lanes,
+// same reason: it needs its OWN genuine alpha for hardware blending).
+//
+// Un-premultiplies this frame's proxy-resolution aux depth (from AuxRaw.z,
+// AuxRaw's own alpha) and fg (from FgRaw.x, FgRaw's own SEPARATE alpha --
+// the two attachments accumulate independently, so each must be
+// un-premultiplied by its own .w, not a shared one) into two plain R32F
+// buffers. Depth is written to one side of input_assembly.cpp's depth
 // ping-pong pair so next frame's disocclusion pass can read *this* frame's
 // depth as "previous"; fg has no history requirement (build_input pools
 // only the current frame's fg) so it is a single non-ping-ponged buffer.
+// Motion vectors are NOT unpremultiplied here -- input_assembly_assemble.
+// comp's unpremulMotion() still does that per-tap, straight from AuxRaw
+// (bound there too), same as it always read from the old MotionRaw buffer.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(std430, binding = 0) readonly buffer DepthRaw {
-    vec4 data[];  // x = depth*alpha, y = fg*alpha, z unused, w = alpha
-} depthRaw;
+layout(std430, binding = 0) readonly buffer AuxRaw {
+    vec4 data[];  // x = mv.x*alpha, y = mv.y*alpha, z = depth*alpha, w = alpha
+} auxRaw;
 
-layout(std430, binding = 1) writeonly buffer CurDepth {
+// RGBA16_SFLOAT texels, 2 uint32 per texel (same unpackHalf2x16 convention
+// as input_assembly_assemble.comp's ColorRaw): data[idx*2+0] packs (fg, 0),
+// data[idx*2+1] packs (0, alpha).
+layout(std430, binding = 1) readonly buffer FgRaw {
+    uint data[];
+} fgRaw;
+
+layout(std430, binding = 2) writeonly buffer CurDepth {
     float data[];
 } curDepth;
 
-layout(std430, binding = 2) writeonly buffer CurFg {
+layout(std430, binding = 3) writeonly buffer CurFg {
     float data[];
 } curFg;
 
@@ -38,10 +59,17 @@ void main() {
     uvec2 gid = gl_GlobalInvocationID.xy;
     if (gid.x >= pc.width || gid.y >= pc.height) return;
     uint idx = gid.y * pc.width + gid.x;
-    vec4 raw = depthRaw.data[idx];
-    float a = raw.w;
-    float depth = (a > 1e-6) ? (raw.x / a) : 0.0;
-    float fg = (a > 1e-6) ? (raw.y / a) : 0.0;
+
+    vec4 aux = auxRaw.data[idx];
+    float auxAlpha = aux.w;
+    float depth = (auxAlpha > 1e-6) ? (aux.z / auxAlpha) : 0.0;
+
+    uint f0 = fgRaw.data[idx * 2u + 0u];
+    uint f1 = fgRaw.data[idx * 2u + 1u];
+    float fgPremul = unpackHalf2x16(f0).x;
+    float fgAlpha = unpackHalf2x16(f1).y;
+    float fg = (fgAlpha > 1e-6) ? (fgPremul / fgAlpha) : 0.0;
+
     curDepth.data[idx] = depth;
     curFg.data[idx] = fg;
 }

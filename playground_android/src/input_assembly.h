@@ -43,10 +43,21 @@ public:
     // proxy h/w replicate-padded up to a multiple of 8*paramStride before
     // box-pooling, so the network always runs at a multiple-of-8 resolution
     // (proxy 480x270, paramStride=2 -> net 240x136, not "true" 240x135).
+    // auxFormat/fgFormat: SplatRenderer::getAuxFormat()/getFgFormat() --
+    // defaulted to their current values (RGBA32F/RGBA16F) so existing call
+    // sites don't need updating; only used to SIZE the raw-texel storage
+    // buffers (see input_assembly.cpp's bytesPerTexel()) -- the GLSL unpack
+    // paths in shaders_glsl/input_assembly_*.comp still hardcode those same
+    // two formats' byte layouts, so passing anything else here would size
+    // the buffer correctly but still be interpreted wrong on the shader
+    // side (bytesPerTexel() throws on any other format instead of silently
+    // doing that).
     void init(VulkanContext& ctx, const std::string& textureNpyPath,
               const std::string& bgSphereNpyPath, uint32_t proxyW, uint32_t proxyH,
               uint32_t paramStride, uint32_t hiddenChannels,
-              const std::string& shaderDir);
+              const std::string& shaderDir,
+              VkFormat auxFormat = VK_FORMAT_R32G32B32A32_SFLOAT,
+              VkFormat fgFormat = VK_FORMAT_R16G16B16A16_SFLOAT);
 
     uint32_t getNetW() const { return netW_; }
     uint32_t getNetH() const { return netH_; }
@@ -59,8 +70,11 @@ public:
     // distrust history/memory" everywhere alpha>0, not just where the
     // actor truly is). run() always requests kFgSourceExpectedDepthG now
     // that gaussian_splat_dlss's foreground_coverage output is wired
-    // (unpremul_depth.comp's CurFg buffer, read via out_depth's .g channel
-    // -- see input_assembly.cpp/the .comp sources); kFgSourceConstantZero
+    // (unpremul_depth.comp's CurFg buffer -- originally read via out_depth's
+    // .g channel, now via the separate out_fg attachment lux commit 6ed0334
+    // introduced; the enum name predates that repacking and is kept
+    // unchanged since its MEANING -- "real per-pixel fg, not constant 0" --
+    // hasn't -- see input_assembly.cpp/the .comp sources); kFgSourceConstantZero
     // is kept only as the pre-foreground-coverage fallback value.
     enum FgSource : uint32_t { kFgSourceConstantZero = 0, kFgSourceExpectedDepthG = 1 };
 
@@ -68,26 +82,29 @@ public:
     // run() call -- CPU wall-clock only (these are all synchronous
     // beginSingleTimeCommands()/endSingleTimeCommands() round trips, i.e.
     // full queue drains, so CPU wall time here already includes GPU
-    // execution + submit/wait overhead; readbackMs's 3 vkCmdCopyImageToBuffer
+    // execution + submit/wait overhead; readbackMs's 2 vkCmdCopyImageToBuffer
     // calls have no compute work at all, so they isolate pure copy+drain
     // cost).
     struct Timings {
-        double readbackMs = 0.0;  // 3x copyImageToBuffer (color/depth/motion -> storage buffers)
-        double computeMs = 0.0;   // unpremul_depth + assemble compute dispatches
+        double readbackMs = 0.0;  // 3x copyImageToBuffer (color/aux/fg -> storage buffers)
+        double computeMs = 0.0;   // unpremul + assemble compute dispatches
     };
 
     // Runs both passes for one frame: (1) un-premultiply this frame's proxy
-    // depth into the ping-pong buffer, (2) assemble the packed fp32 NHWC
-    // tensor into getOutputHostPtr(). `colorImage`/`depthImage`/`motionImage`
-    // are the proxy SplatRenderer's raw attachments (already in
-    // TRANSFER_SRC_OPTIMAL after render()); `hiddenIn` may be null (zero
-    // hidden state -- Stage 3/4 validation config; Stage 5 feeds the real
-    // recurrent state). eye/rAxis/uAxis/fAxis are world-space camera
-    // position/right/up(down)/forward axes (see android_main.cpp's
-    // buildCvViewRowMajor -- its r/u/f ARE these axes directly, no camera-
-    // to-world matrix construction needed). `outTimings` (optional) receives
-    // this call's breakdown for task 2's profiling.
-    void run(VulkanContext& ctx, VkImage colorImage, VkImage depthImage, VkImage motionImage,
+    // depth+fg into the ping-pong/current buffers, (2) assemble the packed
+    // fp32 NHWC tensor into getOutputHostPtr(). `colorImage`/`auxImage`/
+    // `fgImage` are the proxy SplatRenderer's raw attachments (already in
+    // TRANSFER_SRC_OPTIMAL after render()) -- lux commit 6ed0334 packed the
+    // old separate motion/depth attachments into one `auxImage`
+    // (SplatRenderer::getAuxImage(), RGBA32F: x=mv.x*a, y=mv.y*a, z=depth*a,
+    // w=a) plus a separate `fgImage` (getFgImage(), RGBA16F: x=fg*a, w=a);
+    // `hiddenIn` may be null (zero hidden state -- Stage 3/4 validation
+    // config; Stage 5 feeds the real recurrent state). eye/rAxis/uAxis/fAxis
+    // are world-space camera position/right/up(down)/forward axes (see
+    // android_main.cpp's buildCvViewRowMajor -- its r/u/f ARE these axes
+    // directly, no camera-to-world matrix construction needed). `outTimings`
+    // (optional) receives this call's breakdown for task 2's profiling.
+    void run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage, VkImage fgImage,
              uint32_t proxyW, uint32_t proxyH, const float* hiddenIn,
              float eyeX, float eyeY, float eyeZ,
              float rX, float rY, float rZ, float uX, float uY, float uZ,

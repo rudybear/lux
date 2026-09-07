@@ -115,6 +115,25 @@ void writeDescriptorSet(VkDevice device, VkDescriptorSet set, const std::vector<
 // into a persistent storage buffer (no separate staging buffer / host
 // round-trip -- the destination buffer IS host-visible/coherent already,
 // see createBuffer's VMA_MEMORY_USAGE_CPU_TO_GPU).
+// Task-4-follow-up note (docs/rendering-engines.md, "keep the readback code
+// format-agnostic"): sizes a raw-texel storage buffer from the SOURCE
+// image's own VkFormat rather than a hardcoded byte count, so bAuxRaw/
+// bFgRaw's *allocation* tracks SplatRenderer::getAuxFormat()/getFgFormat()
+// automatically if a future commit changes them (e.g. the fp16 out_aux
+// variant flagged as possibly following this one) -- only the formats
+// actually read by the two .comp shaders below are supported; anything
+// else throws rather than silently mis-sizing/mis-packing the buffer the
+// GLSL side still assumes a specific byte layout for.
+uint32_t bytesPerTexel(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
+        default:
+            throw std::runtime_error("input_assembly: unsupported VkFormat for a raw-texel storage buffer "
+                                      "(only RGBA32F/RGBA16F are wired into the GLSL unpack paths)");
+    }
+}
+
 void copyImageToBuffer(VulkanContext& ctx, VkImage image, VkBuffer buffer,
                         uint32_t width, uint32_t height) {
     VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
@@ -166,8 +185,11 @@ struct InputAssembly::Impl {
     VkDescriptorPool pool = VK_NULL_HANDLE;
     VkDescriptorSet unpremulSet = VK_NULL_HANDLE, assembleSet = VK_NULL_HANDLE;
 
-    VkBuffer bColorRaw = VK_NULL_HANDLE, bMotionRaw = VK_NULL_HANDLE, bDepthRaw = VK_NULL_HANDLE;
-    VmaAllocation aColorRaw{}, aMotionRaw{}, aDepthRaw{};
+    // lux 6ed0334 merged the old separate motion/depth RGBA32F attachments
+    // into one packed aux attachment (x=mv.x*a, y=mv.y*a, z=depth*a, w=a);
+    // bFgRaw is the NEW separate out_fg attachment (RGBA16F, x=fg*a, w=a).
+    VkBuffer bColorRaw = VK_NULL_HANDLE, bAuxRaw = VK_NULL_HANDLE, bFgRaw = VK_NULL_HANDLE;
+    VmaAllocation aColorRaw{}, aAuxRaw{}, aFgRaw{};
 
     VkBuffer bDepthPing[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VmaAllocation aDepthPing[2]{};
@@ -210,8 +232,8 @@ InputAssembly::~InputAssembly() {
         if (impl_->mappedDepthPing[0]) vmaUnmapMemory(alloc, impl_->aDepthPing[0]);
         if (impl_->mappedDepthPing[1]) vmaUnmapMemory(alloc, impl_->aDepthPing[1]);
         if (impl_->bColorRaw) vmaDestroyBuffer(alloc, impl_->bColorRaw, impl_->aColorRaw);
-        if (impl_->bMotionRaw) vmaDestroyBuffer(alloc, impl_->bMotionRaw, impl_->aMotionRaw);
-        if (impl_->bDepthRaw) vmaDestroyBuffer(alloc, impl_->bDepthRaw, impl_->aDepthRaw);
+        if (impl_->bAuxRaw) vmaDestroyBuffer(alloc, impl_->bAuxRaw, impl_->aAuxRaw);
+        if (impl_->bFgRaw) vmaDestroyBuffer(alloc, impl_->bFgRaw, impl_->aFgRaw);
         if (impl_->bDepthPing[0]) vmaDestroyBuffer(alloc, impl_->bDepthPing[0], impl_->aDepthPing[0]);
         if (impl_->bDepthPing[1]) vmaDestroyBuffer(alloc, impl_->bDepthPing[1], impl_->aDepthPing[1]);
         if (impl_->bFgCur) vmaDestroyBuffer(alloc, impl_->bFgCur, impl_->aFgCur);
@@ -225,7 +247,7 @@ InputAssembly::~InputAssembly() {
 void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
                           const std::string& bgSphereNpyPath, uint32_t proxyW, uint32_t proxyH,
                           uint32_t paramStride, uint32_t hiddenChannels,
-                          const std::string& shaderDir) {
+                          const std::string& shaderDir, VkFormat auxFormat, VkFormat fgFormat) {
     impl_ = new Impl();
     impl_->ctx = &ctx;
     proxyW_ = proxyW;
@@ -260,12 +282,12 @@ void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
     impl_->bColorRaw = createBuffer(alloc, proxyN * 8,  // RGBA16_SFLOAT = 8B/texel
                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                      impl_->aColorRaw);
-    impl_->bMotionRaw = createBuffer(alloc, proxyN * 16,  // RGBA32_SFLOAT = 16B/texel
-                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                      impl_->aMotionRaw);
-    impl_->bDepthRaw = createBuffer(alloc, proxyN * 16,
-                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                     impl_->aDepthRaw);
+    impl_->bAuxRaw = createBuffer(alloc, proxyN * bytesPerTexel(auxFormat),
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   impl_->aAuxRaw);
+    impl_->bFgRaw = createBuffer(alloc, proxyN * bytesPerTexel(fgFormat),
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                  impl_->aFgRaw);
     for (int i = 0; i < 2; i++) {
         impl_->bDepthPing[i] = createBuffer(alloc, proxyN * sizeof(float),
                                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, impl_->aDepthPing[i]);
@@ -289,7 +311,7 @@ void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
     vmaMapMemory(alloc, impl_->aOutput, &impl_->mappedOutput);
 
     // --- pipelines ---
-    impl_->unpremulLayout = makeSetLayout(ctx.device, 3);
+    impl_->unpremulLayout = makeSetLayout(ctx.device, 4);
     impl_->assembleLayout = makeSetLayout(ctx.device, 8);
     impl_->unpremulPL = makePipelineLayout(ctx.device, impl_->unpremulLayout, sizeof(UnpremulPush));
     impl_->assemblePL = makePipelineLayout(ctx.device, impl_->assembleLayout, sizeof(AssemblePush));
@@ -298,7 +320,7 @@ void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
     impl_->assemblePipe = makeComputePipeline(ctx.device, impl_->assemblePL,
                                                shaderDir + "/input_assembly_assemble.comp.spv");
 
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 + 8};
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 + 8};
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 2;
     poolInfo.poolSizeCount = 1;
@@ -315,16 +337,17 @@ void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
     impl_->unpremulSet = sets[0];
     impl_->assembleSet = sets[1];
 
-    writeDescriptorSet(ctx.device, impl_->unpremulSet, {impl_->bDepthRaw, impl_->bDepthPing[0], impl_->bFgCur});
+    writeDescriptorSet(ctx.device, impl_->unpremulSet,
+                        {impl_->bAuxRaw, impl_->bFgRaw, impl_->bDepthPing[0], impl_->bFgCur});
     // assembleSet bindings 2/3 (curDepth/prevDepth) are rewritten per-frame
     // in run() (ping-pong swap) -- initial wiring here just needs valid
     // buffers bound so the descriptor set is complete from the start.
     writeDescriptorSet(ctx.device, impl_->assembleSet,
-                        {impl_->bColorRaw, impl_->bMotionRaw, impl_->bDepthPing[0], impl_->bDepthPing[1],
+                        {impl_->bColorRaw, impl_->bAuxRaw, impl_->bDepthPing[0], impl_->bDepthPing[1],
                          impl_->bTexture, impl_->bZeroHidden, impl_->bFgCur, impl_->bOutput});
 }
 
-void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage depthImage, VkImage motionImage,
+void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage, VkImage fgImage,
                          uint32_t proxyW, uint32_t proxyH, const float* hiddenIn,
                          float eyeX, float eyeY, float eyeZ,
                          float rX, float rY, float rZ, float uX, float uY, float uZ,
@@ -333,19 +356,20 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage depthIma
                          float jitterProxyX, float jitterProxyY, Timings* outTimings) {
     auto tReadback = std::chrono::high_resolution_clock::now();
     copyImageToBuffer(ctx, colorImage, impl_->bColorRaw, proxyW, proxyH);
-    copyImageToBuffer(ctx, depthImage, impl_->bDepthRaw, proxyW, proxyH);
-    copyImageToBuffer(ctx, motionImage, impl_->bMotionRaw, proxyW, proxyH);
+    copyImageToBuffer(ctx, auxImage, impl_->bAuxRaw, proxyW, proxyH);
+    copyImageToBuffer(ctx, fgImage, impl_->bFgRaw, proxyW, proxyH);
     double readbackMs = msSince(tReadback);
 
     auto tCompute = std::chrono::high_resolution_clock::now();
     int curIdx = impl_->depthPingIndex;
     int prevIdx = 1 - curIdx;
 
-    // Pass 1: unpremultiply this frame's depth into the "current" ping side,
-    // and this frame's foreground coverage (out_depth's .g channel) into
+    // Pass 1: unpremultiply this frame's depth (from the packed aux
+    // attachment's .z/.w) into the "current" ping side, and this frame's
+    // foreground coverage (from the separate fg attachment's .x/.w) into
     // bFgCur (no ping-pong -- see its declaration comment).
     writeDescriptorSet(ctx.device, impl_->unpremulSet,
-                        {impl_->bDepthRaw, impl_->bDepthPing[curIdx], impl_->bFgCur});
+                        {impl_->bAuxRaw, impl_->bFgRaw, impl_->bDepthPing[curIdx], impl_->bFgCur});
     UnpremulPush upPush{proxyW, proxyH};
     uint32_t gx = (proxyW + 15) / 16, gy = (proxyH + 15) / 16;
     dispatchOne(ctx, impl_->unpremulPipe, impl_->unpremulPL, impl_->unpremulSet, &upPush, sizeof(upPush), gx, gy);
@@ -357,7 +381,7 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage depthIma
         uploadFloats(ctx.allocator, impl_->aZeroHidden, std::vector<float>(hiddenIn, hiddenIn + hiddenN));
     }
     writeDescriptorSet(ctx.device, impl_->assembleSet,
-                        {impl_->bColorRaw, impl_->bMotionRaw, impl_->bDepthPing[curIdx], impl_->bDepthPing[prevIdx],
+                        {impl_->bColorRaw, impl_->bAuxRaw, impl_->bDepthPing[curIdx], impl_->bDepthPing[prevIdx],
                          impl_->bTexture, hiddenBuf, impl_->bFgCur, impl_->bOutput});
 
     AssemblePush push{};

@@ -26,8 +26,15 @@ layout(std430, binding = 0) readonly buffer ColorRaw {
     uint data[];
 } colorRaw;
 
-layout(std430, binding = 1) readonly buffer MotionRaw {
-    vec4 data[];  // xy = mv*alpha (backward, proxy px), w = alpha
+// lux 6ed0334 merged the old separate MotionRaw/DepthRaw RGBA32F
+// attachments into one packed out_aux (x=mv.x*alpha, y=mv.y*alpha,
+// z=depth*alpha, w=alpha) -- this binding is now that same buffer
+// (input_assembly.cpp's bAuxRaw), read here for its x/y/w lanes exactly as
+// MotionRaw's used to be (.z/depth is pass 1's job, see
+// input_assembly_unpremul_depth.comp); unpremulMotion() below is
+// byte-for-byte unchanged.
+layout(std430, binding = 1) readonly buffer AuxRaw {
+    vec4 data[];  // x = mv.x*alpha, y = mv.y*alpha, z = depth*alpha (unused here), w = alpha
 } motionRaw;
 
 layout(std430, binding = 2) readonly buffer CurDepth {

@@ -712,45 +712,63 @@ void dumpProxyDebugFrame(VulkanContext& ctx, SplatRenderer* splatR, const std::s
     auto colorF32 = DlssIO::convertRgba16fColorAttachment(rawColor, w, h, unusedRgba8);
     DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_color.npy", colorF32, {h, w, 4});
 
-    if (splatR->hasExpectedDepth()) {
-        auto raw = readImageRawAndroid(ctx, splatR->getExpectedDepthImage(), w, h, 16,
-                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
-        memcpy(rgba.data(), raw.data(), raw.size());
-        std::vector<float> depthPremul(static_cast<size_t>(w) * h), depthAlpha(static_cast<size_t>(w) * h);
-        for (size_t i = 0; i < depthPremul.size(); ++i) {
-            depthPremul[i] = rgba[i * 4 + 0];
-            depthAlpha[i] = rgba[i * 4 + 3];
+    // lux 6ed0334 ("splat: merge DLSS aux attachments") repacked the old
+    // separate out_motion/out_depth RGBA32F attachments into one packed
+    // out_aux (x=mv.x*alpha, y=mv.y*alpha, z=depth*alpha, w=alpha -- `.w` is
+    // the GENUINE per-fragment alpha required for correct hardware blend
+    // accumulation, NOT out_color's alpha, see splat_renderer.h's
+    // getAuxImage() comment) plus a separate, smaller out_fg (RGBA16F,
+    // x=fg*alpha, w=alpha -- its OWN alpha, independent accumulation from
+    // out_aux's). Pattern validated bit-exact against the pre-packing
+    // baseline in playground_android_perf/src/android_main.cpp's identical
+    // dumpProxyDebugFrame() (docs/rendering-engines.md's migration note).
+    if (splatR->hasMotionVectors() || splatR->hasExpectedDepth()) {
+        auto rawAux = readImageRawAndroid(ctx, splatR->getAuxImage(), w, h, 16,
+                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        std::vector<float> auxF32(static_cast<size_t>(w) * h * 4);
+        memcpy(auxF32.data(), rawAux.data(), rawAux.size());
+        std::vector<float> auxAlpha(static_cast<size_t>(w) * h);
+        for (size_t i = 0; i < auxAlpha.size(); ++i) {
+            auxAlpha[i] = auxF32[i * 4 + 3];
         }
-        auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, depthAlpha, w, h, 1);
-        DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_depth.npy", depth, {h, w});
-
-        // foreground_coverage packs into out_depth's .g channel (index 1),
-        // same alpha (.w) as depth -- see SPECIFICATION.md 12.8 /
-        // playground_cpp/src/main.cpp's --output-aux _fg.npy path (identical
-        // extraction, reused here for Stage-3 fg validation).
-        if (splatR->hasForegroundCoverage()) {
-            std::vector<float> fgPremul(static_cast<size_t>(w) * h);
-            for (size_t i = 0; i < fgPremul.size(); ++i) {
-                fgPremul[i] = rgba[i * 4 + 1];
+        if (splatR->hasExpectedDepth()) {
+            std::vector<float> depthPremul(static_cast<size_t>(w) * h);
+            for (size_t i = 0; i < depthPremul.size(); ++i) {
+                depthPremul[i] = auxF32[i * 4 + 2];
             }
-            auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, depthAlpha, w, h, 1);
-            DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_fg.npy", fg, {h, w});
+            auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, auxAlpha, w, h, 1);
+            DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_depth.npy", depth, {h, w});
+
+            // foreground_coverage: a SEPARATE out_fg attachment now (RGBA16F,
+            // fg*alpha at .x, alpha at .w) -- can't share out_aux's lanes,
+            // see splat_renderer.h's getFgImage() comment.
+            if (splatR->hasForegroundCoverage()) {
+                auto rawFg = readImageRawAndroid(ctx, splatR->getFgImage(), w, h, 8,
+                                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                std::vector<float> fgF32(static_cast<size_t>(w) * h * 4);
+                for (size_t i = 0; i < fgF32.size(); ++i) {
+                    uint16_t half;
+                    memcpy(&half, rawFg.data() + i * 2, 2);
+                    fgF32[i] = DlssIO::halfToFloat(half);
+                }
+                std::vector<float> fgPremul(static_cast<size_t>(w) * h), fgAlpha(static_cast<size_t>(w) * h);
+                for (size_t i = 0; i < fgPremul.size(); ++i) {
+                    fgPremul[i] = fgF32[i * 4 + 0];
+                    fgAlpha[i] = fgF32[i * 4 + 3];
+                }
+                auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, fgAlpha, w, h, 1);
+                DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_fg.npy", fg, {h, w});
+            }
         }
-    }
-    if (splatR->hasMotionVectors()) {
-        auto raw = readImageRawAndroid(ctx, splatR->getMotionImage(), w, h, 16,
-                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
-        memcpy(rgba.data(), raw.data(), raw.size());
-        std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2), mvAlpha(static_cast<size_t>(w) * h);
-        for (size_t i = 0; i < mvAlpha.size(); ++i) {
-            mvPremul[i * 2 + 0] = rgba[i * 4 + 0];
-            mvPremul[i * 2 + 1] = rgba[i * 4 + 1];
-            mvAlpha[i] = rgba[i * 4 + 3];
+        if (splatR->hasMotionVectors()) {
+            std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
+            for (size_t i = 0; i < auxAlpha.size(); ++i) {
+                mvPremul[i * 2 + 0] = auxF32[i * 4 + 0];
+                mvPremul[i * 2 + 1] = auxF32[i * 4 + 1];
+            }
+            auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, auxAlpha, w, h, 2);
+            DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_mv.npy", mv, {h, w, 2});
         }
-        auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, mvAlpha, w, h, 2);
-        DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_mv.npy", mv, {h, w, 2});
     }
     LOGI("DUMP done: %s/android_%s_{color,depth,mv}.npy", outDir.c_str(), tag.c_str());
 }
@@ -778,9 +796,11 @@ std::vector<float> readColorRgb(VulkanContext& ctx, SplatRenderer* splatR) {
 // Stage 5: proxy_h,proxy_w-resolution un-premultiplied MV (backward, jitter
 // -free -- SplatRenderer's out_motion is always jitter-free by construction,
 // see setJitter()'s header comment), matching mv_proxy_f{t}.npy's contract.
+// lux 6ed0334 packed mv into the shared out_aux attachment (.xy, alpha at
+// .w) -- see dumpProxyDebugFrame's identical extraction.
 std::vector<float> readMvProxy(VulkanContext& ctx, SplatRenderer* splatR) {
     uint32_t w = splatR->getWidth(), h = splatR->getHeight();
-    auto raw = readImageRawAndroid(ctx, splatR->getMotionImage(), w, h, 16, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    auto raw = readImageRawAndroid(ctx, splatR->getAuxImage(), w, h, 16, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
     memcpy(rgba.data(), raw.data(), raw.size());
     std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2), mvAlpha(static_cast<size_t>(w) * h);
@@ -1086,8 +1106,8 @@ void renderFrame(AppState* state) {
     // dump frame) so its own timing shows up in profiling passes later.
     if (isProxy) {
         float cx = static_cast<float>(kProxyWidth) * 0.5f, cy = static_cast<float>(kProxyHeight) * 0.5f;
-        state->inputAssembly.run(ctx, splatR->getOutputImage(), splatR->getExpectedDepthImage(),
-                                  splatR->getMotionImage(), kProxyWidth, kProxyHeight, nullptr,
+        state->inputAssembly.run(ctx, splatR->getOutputImage(), splatR->getAuxImage(),
+                                  splatR->getFgImage(), kProxyWidth, kProxyHeight, nullptr,
                                   frame.eye.x, frame.eye.y, frame.eye.z,
                                   frame.rAxis.x, frame.rAxis.y, frame.rAxis.z,
                                   frame.uAxis.x, frame.uAxis.y, frame.uAxis.z,
