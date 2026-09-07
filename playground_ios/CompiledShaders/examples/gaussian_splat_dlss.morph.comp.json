@@ -1,0 +1,211 @@
+{
+  "version": 1,
+  "source": "gaussian_splat_dlss.lux",
+  "stage": "compute",
+  "execution_model": "GLCompute",
+  "features": {},
+  "feature_suffix": "",
+  "inputs": [],
+  "outputs": [],
+  "descriptor_sets": {
+    "0": [
+      {
+        "binding": 0,
+        "type": "storage_buffer",
+        "name": "splat_base_pos",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 1,
+        "type": "storage_buffer",
+        "name": "splat_base_rot",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 2,
+        "type": "storage_buffer",
+        "name": "splat_base_sh0",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 3,
+        "type": "storage_buffer",
+        "name": "morph_index",
+        "element_type": "uint",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 4,
+        "type": "storage_buffer",
+        "name": "morph_delta_pos_lo",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 5,
+        "type": "storage_buffer",
+        "name": "morph_delta_rot_lo",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 6,
+        "type": "storage_buffer",
+        "name": "morph_delta_sh0_lo",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 7,
+        "type": "storage_buffer",
+        "name": "morph_delta_pos_hi",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 8,
+        "type": "storage_buffer",
+        "name": "morph_delta_rot_hi",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 9,
+        "type": "storage_buffer",
+        "name": "morph_delta_sh0_hi",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 10,
+        "type": "storage_buffer",
+        "name": "splat_pos",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 11,
+        "type": "storage_buffer",
+        "name": "splat_rot",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      },
+      {
+        "binding": 12,
+        "type": "storage_buffer",
+        "name": "splat_sh0",
+        "element_type": "vec4",
+        "stage_flags": [
+          "compute"
+        ]
+      }
+    ]
+  },
+  "push_constants": [
+    {
+      "name": "push",
+      "fields": [
+        {
+          "name": "segment_offset",
+          "type": "uint",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "segment_count",
+          "type": "uint",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "weight_lo",
+          "type": "scalar",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "weight_hi",
+          "type": "scalar",
+          "offset": 12,
+          "size": 4
+        }
+      ],
+      "size": 16,
+      "stage_flags": [
+        "compute"
+      ]
+    }
+  ],
+  "vertex_attributes": [],
+  "vertex_stride": 0,
+  "compute": {
+    "workgroup_size": [
+      256,
+      1,
+      1
+    ]
+  },
+  "gaussian_splatting_morph": {
+    "splat_name": "DlssGaussianCloud",
+    "role": "morph_apply",
+    "workgroup_size": [
+      256,
+      1,
+      1
+    ],
+    "base_buffers": [
+      "splat_base_pos",
+      "splat_base_rot",
+      "splat_base_sh0"
+    ],
+    "delta_buffers": [
+      "morph_index",
+      "morph_delta_pos_lo",
+      "morph_delta_rot_lo",
+      "morph_delta_sh0_lo",
+      "morph_delta_pos_hi",
+      "morph_delta_rot_hi",
+      "morph_delta_sh0_hi"
+    ],
+    "output_buffers": [
+      "splat_pos",
+      "splat_rot",
+      "splat_sh0"
+    ]
+  },
+  "performance_hints": {
+    "instruction_count": 249,
+    "alu_ops": 14,
+    "texture_samples": 0,
+    "branches": 1,
+    "function_calls": 0,
+    "vgpr_estimate": "high"
+  }
+}

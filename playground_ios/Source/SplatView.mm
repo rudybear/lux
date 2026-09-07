@@ -421,6 +421,18 @@ static void taaJitterTargetPx(int frame, int period, float &jxOut, float &jyOut)
         _netInput.init(_ctx, std::string(texPath.UTF8String), std::string(spherePath.UTF8String),
                         kProxyW, kProxyH, /*paramStride=*/2, /*hiddenChannels=*/8,
                         /*depthAlphaOffset=*/ProxyRenderer::kExpectedDepthChannels - 1);
+        // lux's foreground_coverage output has landed (examples/gaussian_splat_dlss.lux's
+        // `foreground_coverage: true`, compiled fresh from a clean HEAD worktree into
+        // playground_ios/CompiledShaders/ -- see the Xcode project's examples/shaders
+        // folder references) -- switch off the const-0 interim now that a real per-pixel
+        // actor mask is available (NetInputAssembly.mm un-premultiplies it by the same
+        // alpha as depth, matching metal_main.cpp's --output-aux _fg.npy convention).
+        if (_splatRProxy->hasForegroundCoverage()) {
+            _netInput.setFgSource(NetInputAssembly::kFgSourceExpectedDepthG);
+            NSLog(@"[SplatView] fg source: expected-depth .g (real foreground_coverage)");
+        } else {
+            NSLog(@"[SplatView] WARNING: compiled pipeline has no foreground_coverage -- fg stays const 0");
+        }
 
         // B3: MPSGraph ParamPredUNet port, running at NetInputAssembly's own
         // (already-padded, multiple-of-8) net resolution.

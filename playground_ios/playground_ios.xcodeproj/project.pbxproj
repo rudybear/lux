@@ -86,8 +86,8 @@
 		7FC88A7D33F04AD7869C2A3A /* unet_weights.layers.txt */ = {isa = PBXFileReference; lastKnownFileType = file; name = unet_weights.layers.txt; path = ../../mobiledlss/demo/ios_assets/exported/unet_weights.layers.txt; sourceTree = "<group>"; };
 		53E6C4130DA74B3194B60F7F /* memory_head.npz */ = {isa = PBXFileReference; lastKnownFileType = file; name = memory_head.npz; path = ../../mobiledlss/demo/ios_assets/exported/memory_head.npz; sourceTree = "<group>"; };
 		9FE5F1AE0D8C4E79B59F1D71 /* bg_sphere.npy */ = {isa = PBXFileReference; lastKnownFileType = file; name = bg_sphere.npy; path = ../../mobiledlss/demo/ios_assets/bg_sphere.npy; sourceTree = "<group>"; };
-		3B685382008E46EDA539E98B /* examples */ = {isa = PBXFileReference; lastKnownFileType = folder; name = examples; path = ../examples; sourceTree = "<group>"; };
-		52183A2E70764308B5E16630 /* shaders */ = {isa = PBXFileReference; lastKnownFileType = folder; name = shaders; path = ../shaders; sourceTree = "<group>"; };
+		3B685382008E46EDA539E98B /* examples */ = {isa = PBXFileReference; lastKnownFileType = folder; name = examples; path = CompiledShaders/examples; sourceTree = "<group>"; };
+		52183A2E70764308B5E16630 /* shaders */ = {isa = PBXFileReference; lastKnownFileType = folder; name = shaders; path = CompiledShaders/shaders; sourceTree = "<group>"; };
 		4CC367C2359F4C2DAAF258FF /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		49DF897390D34A87951D074F /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		0B073FD805C04E97BFCBA7B3 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };

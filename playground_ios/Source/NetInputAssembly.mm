@@ -147,11 +147,21 @@ kernel void assemble_net_input(
             float4 depthRaw = depthTex.read(pgid);
             // fg (foreground/actor coverage): NOT proxy alpha (measured to collapse the
             // model 36.4->24.3dB -- the net reads "alpha coverage" as "moving actor here,
-            // distrust history/memory" everywhere, not just the actor). Once lux's
-            // gaussian_splat_dlss ships a real per-pixel foreground_coverage output
-            // (packed into the expected-depth attachment's .g channel), read it from
-            // there; until it lands, constant 0 (background) is the documented interim.
-            float fgVal = (u.fgSource == 1) ? depthRaw.y : 0.0;
+            // distrust history/memory" everywhere, not just the actor). lux's
+            // gaussian_splat_dlss now ships a real per-pixel foreground_coverage output,
+            // packed into the expected-depth attachment's .g channel -- alpha-WEIGHTED
+            // (premultiplied) exactly like .r's depth, so it needs the same
+            // divide-by-alpha un-premultiply metal_main.cpp's --output-aux _fg.npy dump
+            // does (fgPremul / depthAlpha, both from the same RGBA32Float attachment) --
+            // NOT a raw read, which would silently read low everywhere alpha < 1 (thin/
+            // edge/translucent coverage). depthRaw.w is that same alpha (the last of the
+            // 4 channels, matching depth's own premultiply convention). Constant 0
+            // (background) remains the interim when fgSource is the const-zero default.
+            float fgVal = 0.0;
+            if (u.fgSource == 1) {
+                float fgAlpha = depthRaw.w;
+                fgVal = (fgAlpha > 1e-6) ? (depthRaw.y / fgAlpha) : 0.0;
+            }
             fgSum += fgVal;
 
             float depthVal = curUnpremulDepth.read(pgid).x;
