@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <algorithm>
 
 struct VulkanContext;
 
@@ -122,6 +123,31 @@ public:
     void setGpuTimingEnabled(VulkanContext& ctx, bool enabled);
     GpuTimingsMs lastGpuTimingsMs() const { return lastGpuTimings_; }
 
+    // --- Sort scheduling (perf; bench/lux_perf_ablation.md in mobiledlss:
+    // the GPU radix sort is a flat ~5.7-7.1ms/frame cost regardless of
+    // scene, independent of whether the view actually changed enough to
+    // need a fresh back-to-front order). Default (everyNFrames=1,
+    // viewChangeThresholdDeg=0) is UNCHANGED, exactness-preserving
+    // behavior -- every render() call re-sorts, exactly as before this was
+    // added; this is what tests/mobiledlss parity checks/headless one-shot
+    // renders all still get, since a single render() call always has
+    // framesSinceSort_ == 0 (never skips) regardless of the schedule.
+    // Opt in via setSortSchedule() for a continuous multi-frame caller
+    // (interactive/live rendering) willing to trade briefly-stale
+    // back-to-front blend order (draw() still runs every frame against
+    // whatever sortedIndicesBuffer_ last held -- correctness of WHICH
+    // splats are visible is unaffected, since that's decided per-splat in
+    // preprocess/fragment, not by sort position) for amortized sort cost:
+    // a fresh sort runs when EITHER `framesSinceSort_ >= everyNFrames` OR
+    // the camera's view direction has rotated more than
+    // `viewChangeThresholdDeg` since the last real sort (whichever comes
+    // first), so a fast-panning camera still re-sorts promptly even under
+    // a large everyNFrames budget.
+    void setSortSchedule(uint32_t everyNFrames, float viewChangeThresholdDeg) {
+        sortEveryNFrames_ = std::max<uint32_t>(1, everyNFrames);
+        sortViewThresholdDeg_ = viewChangeThresholdDeg;
+    }
+
     void blitToSwapchain(VulkanContext& ctx, VkCommandBuffer cmd,
                          VkImage swapImage, VkExtent2D extent);
 
@@ -217,6 +243,10 @@ private:
 
     // Projected output buffers
     VkBuffer projCenterBuffer_ = VK_NULL_HANDLE;  VmaAllocation projCenterAlloc_ = VK_NULL_HANDLE;
+    // Oriented-quad half-axis vectors (major.xy, minor.xy), one vec4 per
+    // splat -- see splat_expander.py's "Oriented quads" note. Read by the
+    // vertex stage instead of the old scalar radius*(quad_x,quad_y) offset.
+    VkBuffer projAxesBuffer_ = VK_NULL_HANDLE;    VmaAllocation projAxesAlloc_ = VK_NULL_HANDLE;
     VkBuffer projConicBuffer_ = VK_NULL_HANDLE;   VmaAllocation projConicAlloc_ = VK_NULL_HANDLE;
     VkBuffer projColorBuffer_ = VK_NULL_HANDLE;   VmaAllocation projColorAlloc_ = VK_NULL_HANDLE;
     VkBuffer projMvBuffer_ = VK_NULL_HANDLE;      VmaAllocation projMvAlloc_ = VK_NULL_HANDLE;
@@ -281,6 +311,13 @@ private:
     float focalX_ = 256.0f;
     float focalY_ = 256.0f;
     float jitterX_ = 0.0f, jitterY_ = 0.0f;  // pixels
+
+    // Sort scheduling state (see setSortSchedule() above).
+    uint32_t sortEveryNFrames_ = 1;       // 1 = always sort (default, exactness-preserving)
+    float sortViewThresholdDeg_ = 0.0f;   // 0 = never trigger early on view change alone
+    uint32_t framesSinceSort_ = 0;
+    glm::vec3 lastSortedViewDir_{0.0f, 0.0f, -1.0f};
+    bool hasLastSortedView_ = false;
 
     // Previous-frame camera history for motion vectors (docs/lux-4d-spec.md
     // section 3). Seeded to equal the current frame's matrices on the first

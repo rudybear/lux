@@ -9,6 +9,7 @@
 #include <fstream>
 #include <filesystem>
 #include <cstdlib>
+#include <cmath>
 
 namespace fs = std::filesystem;
 
@@ -528,15 +529,15 @@ void SplatRenderer::createPipelines(VulkanContext& ctx, const std::string& shade
     VkDevice device = ctx.device;
     // --- Descriptor set layouts ---
 
-    // Compute: 4 input + N SH coefficients + 6 output SSBOs
-    // Output order: proj_center, proj_conic, proj_color, sort_keys, sorted_indices, visible_count
+    // Compute: 4 input + N SH coefficients + 7 output SSBOs
+    // Output order: proj_center, proj_axes, proj_conic, proj_color, sort_keys, sorted_indices, visible_count
     // + (motion_vectors) splat_prev_pos, projected_mv, prev_camera_mats
     // + (expected_depth) projected_depth
     // + (foreground_coverage) splat_foreground, projected_foreground,
     // appended in that order (matches splat_expander._build_preprocess_stage
     // exactly).
     uint32_t numShCoeffs = numShCoeffsForDegree(shaderShDegree_);
-    uint32_t numComputeBindings = 4 + numShCoeffs + 6
+    uint32_t numComputeBindings = 4 + numShCoeffs + 7
         + (hasMotionVectors_ ? 3 : 0) + (hasExpectedDepth_ ? 1 : 0)
         + (hasForegroundCoverage_ ? 2 : 0);
     std::vector<VkDescriptorSetLayoutBinding> computeBindings(numComputeBindings);
@@ -554,10 +555,10 @@ void SplatRenderer::createPipelines(VulkanContext& ctx, const std::string& shade
     computeLayoutInfo.pBindings = computeBindings.data();
     vkCreateDescriptorSetLayout(device, &computeLayoutInfo, nullptr, &computeSetLayout_);
 
-    // Render: 4 SSBOs (projected_centers, conics, colors, sorted_indices)
+    // Render: 5 SSBOs (projected_centers, axes, conics, colors, sorted_indices)
     // + (motion_vectors) projected_mv + (expected_depth) projected_depth
     // + (foreground_coverage) projected_foreground.
-    uint32_t numRenderBindings = 4 + (hasMotionVectors_ ? 1 : 0) + (hasExpectedDepth_ ? 1 : 0)
+    uint32_t numRenderBindings = 5 + (hasMotionVectors_ ? 1 : 0) + (hasExpectedDepth_ ? 1 : 0)
         + (hasForegroundCoverage_ ? 1 : 0);
     std::vector<VkDescriptorSetLayoutBinding> renderBindings(numRenderBindings);
     for (uint32_t i = 0; i < numRenderBindings; ++i) {
@@ -973,6 +974,8 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     createVmaBuffer(ctx.allocator, numSplats_ * 4 * sizeof(float), ssbo,
                     VMA_MEMORY_USAGE_GPU_ONLY, projCenterBuffer_, projCenterAlloc_);
     createVmaBuffer(ctx.allocator, numSplats_ * 4 * sizeof(float), ssbo,
+                    VMA_MEMORY_USAGE_GPU_ONLY, projAxesBuffer_, projAxesAlloc_);
+    createVmaBuffer(ctx.allocator, numSplats_ * 4 * sizeof(float), ssbo,
                     VMA_MEMORY_USAGE_GPU_ONLY, projConicBuffer_, projConicAlloc_);
     createVmaBuffer(ctx.allocator, numSplats_ * 4 * sizeof(float), ssbo,
                     VMA_MEMORY_USAGE_GPU_ONLY, projColorBuffer_, projColorAlloc_);
@@ -1109,17 +1112,18 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     }
 
     writeSSBO(computeDescSet_, outputBase + 0, projCenterBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(computeDescSet_, outputBase + 1, projConicBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(computeDescSet_, outputBase + 2, projColorBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(computeDescSet_, outputBase + 3, sortKeysBuffer_, numSplats_ * sizeof(uint32_t));
-    writeSSBO(computeDescSet_, outputBase + 4, sortedIndicesBuffer_, numSplats_ * sizeof(uint32_t));
-    writeSSBO(computeDescSet_, outputBase + 5, visibleCountBuffer_, sizeof(uint32_t));
+    writeSSBO(computeDescSet_, outputBase + 1, projAxesBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(computeDescSet_, outputBase + 2, projConicBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(computeDescSet_, outputBase + 3, projColorBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(computeDescSet_, outputBase + 4, sortKeysBuffer_, numSplats_ * sizeof(uint32_t));
+    writeSSBO(computeDescSet_, outputBase + 5, sortedIndicesBuffer_, numSplats_ * sizeof(uint32_t));
+    writeSSBO(computeDescSet_, outputBase + 6, visibleCountBuffer_, sizeof(uint32_t));
 
     // --- DLSS input-contract outputs (docs/lux-4d-spec.md section 3) ---
     // Appended after visible_count, matching splat_expander._build_preprocess_stage's
     // storage_buffers order exactly: [motion_vectors: splat_prev_pos, projected_mv,
     // prev_camera_mats] then [expected_depth: projected_depth].
-    uint32_t computeNextBinding = outputBase + 6;
+    uint32_t computeNextBinding = outputBase + 7;
     if (hasMotionVectors_) {
         writeSSBO(computeDescSet_, computeNextBinding++, prevPosBuffer_, numSplats_ * 4 * sizeof(float));
         writeSSBO(computeDescSet_, computeNextBinding++, projMvBuffer_, numSplats_ * 2 * sizeof(float));
@@ -1133,14 +1137,15 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
         writeSSBO(computeDescSet_, computeNextBinding++, projForegroundBuffer_, numSplats_ * sizeof(float));
     }
 
-    // Render set: projected_centers(0), conics(1), colors(2), sorted_indices(3)
+    // Render set: projected_centers(0), axes(1), conics(2), colors(3), sorted_indices(4)
     // + (motion_vectors) projected_mv + (expected_depth) projected_depth
     // + (foreground_coverage) projected_foreground.
     writeSSBO(renderDescSet_, 0, projCenterBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(renderDescSet_, 1, projConicBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(renderDescSet_, 2, projColorBuffer_, numSplats_ * 4 * sizeof(float));
-    writeSSBO(renderDescSet_, 3, sortedIndicesBuffer_, numSplats_ * sizeof(uint32_t));
-    uint32_t renderNextBinding = 4;
+    writeSSBO(renderDescSet_, 1, projAxesBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(renderDescSet_, 2, projConicBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(renderDescSet_, 3, projColorBuffer_, numSplats_ * 4 * sizeof(float));
+    writeSSBO(renderDescSet_, 4, sortedIndicesBuffer_, numSplats_ * sizeof(uint32_t));
+    uint32_t renderNextBinding = 5;
     if (hasMotionVectors_) {
         writeSSBO(renderDescSet_, renderNextBinding++, projMvBuffer_, numSplats_ * 2 * sizeof(float));
     }
@@ -2020,8 +2025,37 @@ void SplatRenderer::render(VulkanContext& ctx) {
         firstMvFrame_ = false;
     }
 
+    // --- Sort scheduling decision (see setSortSchedule()'s header comment) ---
+    bool needsSort = true;
+    if (sortEveryNFrames_ > 1 || sortViewThresholdDeg_ > 0.0f) {
+        glm::vec3 viewDir = glm::normalize(
+            -glm::vec3(viewMatrix_[0][2], viewMatrix_[1][2], viewMatrix_[2][2]));
+        bool viewChanged = true;
+        if (hasLastSortedView_ && sortViewThresholdDeg_ > 0.0f) {
+            float cosAngle = glm::clamp(glm::dot(viewDir, lastSortedViewDir_), -1.0f, 1.0f);
+            float angleDeg = glm::degrees(std::acos(cosAngle));
+            viewChanged = angleDeg >= sortViewThresholdDeg_;
+        }
+        bool budgetElapsed = framesSinceSort_ >= sortEveryNFrames_;
+        needsSort = !hasLastSortedView_ || budgetElapsed ||
+            (sortViewThresholdDeg_ > 0.0f && viewChanged);
+        if (needsSort) {
+            framesSinceSort_ = 0;
+            lastSortedViewDir_ = viewDir;
+            hasLastSortedView_ = true;
+        } else {
+            framesSinceSort_++;
+        }
+    }
+
     // --- GPU Radix Sort (4 passes, 8 bits per pass = 32-bit keys) ---
-    {
+    // Skipped entirely on frames the schedule above decides don't need a
+    // fresh order -- sortedIndicesBuffer_/sortKeysBuffer_ simply keep
+    // whatever the last real sort left in them (GPU_ONLY memory, never
+    // implicitly cleared). Splat VISIBILITY is unaffected either way (a
+    // per-splat decision made in preprocess/fragment, not by sort
+    // position) -- only back-to-front BLEND ORDER can be briefly stale.
+    if (needsSort) {
         static const uint32_t PREFIX_SUM_BLOCK_SIZE = 2048;
         uint32_t numElements = numSplats_;
         uint32_t numWg = sortNumWg_;
@@ -2592,6 +2626,7 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     destroyVmaBuffer(ctx.allocator, scaleBuffer_, scaleAlloc_);
     destroyVmaBuffer(ctx.allocator, opacityBuffer_, opacityAlloc_);
     destroyVmaBuffer(ctx.allocator, projCenterBuffer_, projCenterAlloc_);
+    destroyVmaBuffer(ctx.allocator, projAxesBuffer_, projAxesAlloc_);
     destroyVmaBuffer(ctx.allocator, projConicBuffer_, projConicAlloc_);
     destroyVmaBuffer(ctx.allocator, projColorBuffer_, projColorAlloc_);
     destroyVmaBuffer(ctx.allocator, projMvBuffer_, projMvAlloc_);
