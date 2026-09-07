@@ -83,15 +83,27 @@ public:
     enum FgSource : uint32_t { kFgSourceConstantZero = 0, kFgSourceExpectedDepthG = 1 };
 
     // Task 2 (Reconstruction-mode time budget) timing breakdown for one
-    // run() call -- CPU wall-clock only (these are all synchronous
-    // beginSingleTimeCommands()/endSingleTimeCommands() round trips, i.e.
-    // full queue drains, so CPU wall time here already includes GPU
-    // execution + submit/wait overhead; readbackMs's 2 vkCmdCopyImageToBuffer
-    // calls have no compute work at all, so they isolate pure copy+drain
-    // cost).
+    // run() call -- CPU wall-clock (readbackMs/computeMs) plus a real GPU
+    // timestamp span (gpuMs). GPU-pipelining task (docs/rendering-engines.md,
+    // "restructure the Reconstruction frame into a GPU-pipelined chain"):
+    // run() used to be 5 separate beginSingleTimeCommands()/
+    // endSingleTimeCommands() round trips (3x copyImageToBuffer + 2x
+    // dispatchOne, i.e. 5 full queue drains) -- readbackMs/computeMs's own
+    // header comments describe that old shape. It is now ONE command buffer
+    // (3 copies -> barrier -> unpremul dispatch -> barrier -> assemble
+    // dispatch, same pattern as reconstruct_pass.cpp's
+    // recordDispatchBarriered/GpuTimestampBracket) submitted once, so
+    // readbackMs/computeMs are now just CPU-side sub-splits of that ONE
+    // wall-clock span (recorded via std::chrono either side of the
+    // copy-record calls vs. the dispatch-record calls, not two separate
+    // drains any more) and gpuMs is the real GPU-timestamp delta
+    // (VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT..BOTTOM_OF_PIPE_BIT) bracketing the
+    // whole merged command buffer -- mirrors MetalLiveReconstruct::
+    // ProfiledResult::inputGpuMs on the Mac/iOS reference.
     struct Timings {
-        double readbackMs = 0.0;  // 3x copyImageToBuffer (color/aux/fg -> storage buffers)
-        double computeMs = 0.0;   // unpremul + assemble compute dispatches
+        double readbackMs = 0.0;  // CPU-side record time for the 3 copyImageToBuffer calls (no longer a separate drain)
+        double computeMs = 0.0;   // CPU-side record time for the unpremul + assemble dispatches, plus the one shared submit+wait
+        double gpuMs = 0.0;       // real GPU timestamp delta across the whole merged command buffer (copies + both dispatches)
     };
 
     // Runs both passes for one frame: (1) un-premultiply this frame's proxy
@@ -122,6 +134,29 @@ public:
     // run() fully drains the queue via ctx.endSingleTimeCommands()).
     const float* getOutputHostPtr() const;
     void dumpToNpy(const std::string& path) const;
+
+    // GPU-pipelining task: raw copied bytes off SplatRenderer::
+    // getOutputImage()/getAuxImage() this frame's run() call just pulled
+    // into bColorRaw/bAuxRaw (persistently host-mapped, same
+    // VMA_MEMORY_USAGE_CPU_TO_GPU/coherent buffers run()'s own compute
+    // passes read) -- valid immediately after run() returns, same
+    // convention as getOutputHostPtr(). Exists so a caller that ALSO needs
+    // these exact same image bytes for something else (android_main.cpp's
+    // Reconstruction-mode FrameInputs::proxyColor/mvProxy, previously
+    // built by its own separate readColorAndMvProxyCombined()
+    // copyImageToBuffer + vkQueueWaitIdle round trip) can read them
+    // straight out of run()'s own already-completed readback instead of
+    // paying for a second GPU copy of the identical image -- see
+    // android_main.cpp's unpremultiplyColorAndMvFromInputAssembly().
+    // getRawColorHostPtr(): RGBA16_SFLOAT, 8 bytes/texel (SplatRenderer's
+    // color attachment format is always RGBA16F). getRawAuxHostPtr():
+    // RGBA32F (16B/texel) or RGBA16F (8B/texel) per isAuxHalf() -- matches
+    // whatever VkFormat init()'s auxFormat param was given (query it from
+    // the SAME SplatRenderer, e.g. getAuxFormat(), for these bytes to mean
+    // anything).
+    const void* getRawColorHostPtr() const;
+    const void* getRawAuxHostPtr() const;
+    bool isAuxHalf() const { return auxIsHalf_; }
 
     // Proxy-res unpremultiplied depth this frame just wrote / the frame
     // before it -- for Stage 5's target-resolution disocclusion (its own

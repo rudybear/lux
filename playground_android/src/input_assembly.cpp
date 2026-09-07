@@ -134,24 +134,43 @@ uint32_t bytesPerTexel(VkFormat format) {
     }
 }
 
-void copyImageToBuffer(VulkanContext& ctx, VkImage image, VkBuffer buffer,
-                        uint32_t width, uint32_t height) {
-    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+// GPU-pipelining task (docs/rendering-engines.md, "restructure the
+// Reconstruction frame into a GPU-pipelined chain"): records into an
+// ALREADY-open command buffer -- no begin/end/submit of its own -- instead
+// of copyImageToBuffer's old fully-synchronous single-copy submission.
+// Same "record into caller cmd" shape as reconstruct_pass.cpp's
+// recordDispatchBarriered, used by InputAssembly::run() below to fold what
+// used to be 3 separate copyImageToBuffer() round trips into run()'s one
+// shared command buffer.
+void recordCopyImageToBuffer(VkCommandBuffer cmd, VkImage image, VkBuffer buffer,
+                              uint32_t width, uint32_t height) {
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {width, height, 1};
     vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
-    ctx.endSingleTimeCommands(cmd);
 }
 
-void dispatchOne(VulkanContext& ctx, VkPipeline pipeline, VkPipelineLayout layout, VkDescriptorSet set,
-                  const void* pushData, uint32_t pushSize, uint32_t groupsX, uint32_t groupsY) {
-    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+// Same idea as recordCopyImageToBuffer above, for the unpremul/assemble
+// compute dispatches -- records bind+push+dispatch into the caller's cmd,
+// then (optionally) a compute-to-compute VkMemoryBarrier so the next
+// dispatch in the same command buffer sees this one's writes. Mirrors
+// reconstruct_pass.cpp's recordDispatchBarriered exactly (one global
+// VkMemoryBarrier rather than per-buffer scoped barriers, for the same
+// "provably correct, buffer count doesn't justify finer scoping" reason
+// given there).
+void recordDispatch(VkCommandBuffer cmd, VkPipeline pipeline, VkPipelineLayout layout, VkDescriptorSet set,
+                     const void* pushData, uint32_t pushSize, uint32_t groupsX, uint32_t groupsY,
+                     bool barrierAfter) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
     if (pushSize > 0) vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, pushData);
     vkCmdDispatch(cmd, groupsX, groupsY, 1);
-    ctx.endSingleTimeCommands(cmd);
+    if (!barrierAfter) return;
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 // Must byte-match the GLSL push_constant block in
@@ -214,6 +233,22 @@ struct InputAssembly::Impl {
     VulkanContext* ctx = nullptr;
     void* mappedOutput = nullptr;
     void* mappedDepthPing[2] = {nullptr, nullptr};
+
+    // GPU-pipelining task: bColorRaw/bAuxRaw persistently mapped (like
+    // mappedOutput/mappedDepthPing above) so getRawColorHostPtr()/
+    // getRawAuxHostPtr() can hand callers this frame's already-copied
+    // bytes with no extra map/unmap or GPU work -- see input_assembly.h's
+    // comment on those accessors.
+    void* mappedColorRaw = nullptr;
+    void* mappedAuxRaw = nullptr;
+
+    // 2-slot GPU timestamp bracket around run()'s whole merged command
+    // buffer (3 copies + unpremul + assemble) -- same shape as
+    // reconstruct_pass.cpp's GpuTimestampBracket, duplicated locally
+    // rather than shared since it's a ~15-line struct and this file
+    // already avoids any dependency on reconstruct_pass.{h,cpp}.
+    VkQueryPool gpuTimestampPool = VK_NULL_HANDLE;
+    double timestampPeriodNs = 1.0;
 };
 
 InputAssembly::~InputAssembly() {
@@ -232,6 +267,9 @@ InputAssembly::~InputAssembly() {
         if (impl_->mappedOutput) vmaUnmapMemory(alloc, impl_->aOutput);
         if (impl_->mappedDepthPing[0]) vmaUnmapMemory(alloc, impl_->aDepthPing[0]);
         if (impl_->mappedDepthPing[1]) vmaUnmapMemory(alloc, impl_->aDepthPing[1]);
+        if (impl_->mappedColorRaw) vmaUnmapMemory(alloc, impl_->aColorRaw);
+        if (impl_->mappedAuxRaw) vmaUnmapMemory(alloc, impl_->aAuxRaw);
+        if (impl_->gpuTimestampPool) vkDestroyQueryPool(device, impl_->gpuTimestampPool, nullptr);
         if (impl_->bColorRaw) vmaDestroyBuffer(alloc, impl_->bColorRaw, impl_->aColorRaw);
         if (impl_->bAuxRaw) vmaDestroyBuffer(alloc, impl_->bAuxRaw, impl_->aAuxRaw);
         if (impl_->bFgRaw) vmaDestroyBuffer(alloc, impl_->bFgRaw, impl_->aFgRaw);
@@ -290,6 +328,22 @@ void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
     impl_->bFgRaw = createBuffer(alloc, proxyN * bytesPerTexel(fgFormat),
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                   impl_->aFgRaw);
+    // GPU-pipelining task: persistently map bColorRaw/bAuxRaw (like
+    // bOutput/bDepthPing below) so getRawColorHostPtr()/getRawAuxHostPtr()
+    // are free after run() -- see their header comments.
+    vmaMapMemory(alloc, impl_->aColorRaw, &impl_->mappedColorRaw);
+    vmaMapMemory(alloc, impl_->aAuxRaw, &impl_->mappedAuxRaw);
+
+    {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(ctx.physicalDevice, &props);
+        impl_->timestampPeriodNs = props.limits.timestampPeriod > 0.0 ? props.limits.timestampPeriod : 1.0;
+        VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = 2;
+        vkCreateQueryPool(ctx.device, &qpci, nullptr, &impl_->gpuTimestampPool);
+    }
+
     for (int i = 0; i < 2; i++) {
         impl_->bDepthPing[i] = createBuffer(alloc, proxyN * sizeof(float),
                                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, impl_->aDepthPing[i]);
@@ -356,27 +410,28 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage
                          float fX, float fY, float fZ,
                          float fx, float fy, float cx, float cy,
                          float jitterProxyX, float jitterProxyY, Timings* outTimings) {
-    auto tReadback = std::chrono::high_resolution_clock::now();
-    copyImageToBuffer(ctx, colorImage, impl_->bColorRaw, proxyW, proxyH);
-    copyImageToBuffer(ctx, auxImage, impl_->bAuxRaw, proxyW, proxyH);
-    copyImageToBuffer(ctx, fgImage, impl_->bFgRaw, proxyW, proxyH);
-    double readbackMs = msSince(tReadback);
-
-    auto tCompute = std::chrono::high_resolution_clock::now();
+    // GPU-pipelining task: everything below used to be 5 separate
+    // beginSingleTimeCommands()/endSingleTimeCommands() round trips (3x
+    // copyImageToBuffer + 2x dispatchOne, each its own vkQueueSubmit +
+    // vkQueueWaitIdle) -- now ONE command buffer (3 copies -> barrier ->
+    // unpremul -> barrier -> assemble), one submit, one wait, with a GPU
+    // timestamp pair bracketing the whole thing (same pattern
+    // reconstruct_pass.cpp's ReconstructLive::run() already proved out for
+    // its own 5-dispatch chain). Same copies, same descriptor sets, same
+    // push constants, same dispatches, same ordering -- only the
+    // submission granularity changed, so output is unchanged (frame dumps
+    // diff to fp16 noise vs. the pre-merge baseline).
     int curIdx = impl_->depthPingIndex;
     int prevIdx = 1 - curIdx;
 
-    // Pass 1: unpremultiply this frame's depth (from the packed aux
-    // attachment's .z/.w) into the "current" ping side, and this frame's
-    // foreground coverage (from the separate fg attachment's .x/.w) into
-    // bFgCur (no ping-pong -- see its declaration comment).
+    // Host-side setup that must happen BEFORE the command buffer below is
+    // submitted, but needs no GPU work of its own: descriptor set
+    // rewrites (vkUpdateDescriptorSets, not command-buffer-recorded) and
+    // hiddenIn's host memcpy into the coherent bZeroHidden buffer (the
+    // GPU will see it once the command buffer it's read from executes,
+    // same as before this merge -- ordering, not an extra sync point).
     writeDescriptorSet(ctx.device, impl_->unpremulSet,
                         {impl_->bAuxRaw, impl_->bFgRaw, impl_->bDepthPing[curIdx], impl_->bFgCur});
-    UnpremulPush upPush{proxyW, proxyH, auxIsHalf_ ? 1u : 0u};
-    uint32_t gx = (proxyW + 15) / 16, gy = (proxyH + 15) / 16;
-    dispatchOne(ctx, impl_->unpremulPipe, impl_->unpremulPL, impl_->unpremulSet, &upPush, sizeof(upPush), gx, gy);
-
-    // Pass 2: assemble. bindings 2/3 = curDepth (just written), prevDepth (last frame's).
     VkBuffer hiddenBuf = impl_->bZeroHidden;
     if (hiddenIn != nullptr) {
         const size_t hiddenN = static_cast<size_t>(netW_) * netH_ * hiddenChannels_;
@@ -386,6 +441,37 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage
                         {impl_->bColorRaw, impl_->bAuxRaw, impl_->bDepthPing[curIdx], impl_->bDepthPing[prevIdx],
                          impl_->bTexture, hiddenBuf, impl_->bFgCur, impl_->bOutput});
 
+    auto tReadback = std::chrono::high_resolution_clock::now();
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    vkCmdResetQueryPool(cmd, impl_->gpuTimestampPool, 0, 2);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, impl_->gpuTimestampPool, 0);
+
+    recordCopyImageToBuffer(cmd, colorImage, impl_->bColorRaw, proxyW, proxyH);
+    recordCopyImageToBuffer(cmd, auxImage, impl_->bAuxRaw, proxyW, proxyH);
+    recordCopyImageToBuffer(cmd, fgImage, impl_->bFgRaw, proxyW, proxyH);
+
+    // Transfer-write (the 3 copies) -> compute-read (unpremul's first
+    // dispatch reads bAuxRaw/bFgRaw) barrier -- one VkMemoryBarrier for all
+    // 3 destination buffers, same "not worth per-buffer scoping at this
+    // count" reasoning as recordDispatch's own compute-to-compute barrier.
+    VkMemoryBarrier toCompute{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    toCompute.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toCompute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          0, 1, &toCompute, 0, nullptr, 0, nullptr);
+    double readbackMs = msSince(tReadback);
+
+    auto tCompute = std::chrono::high_resolution_clock::now();
+    // Pass 1: unpremultiply this frame's depth (from the packed aux
+    // attachment's .z/.w) into the "current" ping side, and this frame's
+    // foreground coverage (from the separate fg attachment's .x/.w) into
+    // bFgCur (no ping-pong -- see its declaration comment).
+    UnpremulPush upPush{proxyW, proxyH, auxIsHalf_ ? 1u : 0u};
+    uint32_t gx = (proxyW + 15) / 16, gy = (proxyH + 15) / 16;
+    recordDispatch(cmd, impl_->unpremulPipe, impl_->unpremulPL, impl_->unpremulSet, &upPush, sizeof(upPush),
+                    gx, gy, /*barrierAfter=*/true);
+
+    // Pass 2: assemble. bindings 2/3 = curDepth (just written), prevDepth (last frame's).
     AssemblePush push{};
     push.eye[0] = eyeX; push.eye[1] = eyeY; push.eye[2] = eyeZ; push.eye[3] = 0;
     push.rAxis[0] = rX; push.rAxis[1] = rY; push.rAxis[2] = rZ; push.rAxis[3] = 0;
@@ -400,8 +486,23 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage
     push.flags[3] = auxIsHalf_ ? 1u : 0u;
 
     uint32_t ngx = (netW_ + 15) / 16, ngy = (netH_ + 15) / 16;
-    dispatchOne(ctx, impl_->assemblePipe, impl_->assemblePL, impl_->assembleSet, &push, sizeof(push), ngx, ngy);
+    recordDispatch(cmd, impl_->assemblePipe, impl_->assemblePL, impl_->assembleSet, &push, sizeof(push),
+                    ngx, ngy, /*barrierAfter=*/false);  // no barrier needed: the fence wait below (inside
+                                                         // endSingleTimeCommands) already guarantees bOutput
+                                                         // is complete-and-host-visible before getOutputHostPtr()
+                                                         // is read, same as reconstruct_pass.cpp's last dispatch.
+
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->gpuTimestampPool, 1);
+    ctx.endSingleTimeCommands(cmd);  // ONE submit + vkQueueWaitIdle for the whole merged chain
     double computeMs = msSince(tCompute);
+
+    double gpuMs = 0.0;
+    {
+        uint64_t ts[2] = {0, 0};
+        VkResult qr = vkGetQueryPoolResults(ctx.device, impl_->gpuTimestampPool, 0, 2, sizeof(ts), ts,
+                                             sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (qr == VK_SUCCESS) gpuMs = static_cast<double>(ts[1] - ts[0]) * impl_->timestampPeriodNs * 1e-6;
+    }
 
     wasFirstFrame_ = firstFrame_;
     impl_->depthPingIndex = prevIdx;
@@ -410,12 +511,16 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage
     if (outTimings != nullptr) {
         outTimings->readbackMs = readbackMs;
         outTimings->computeMs = computeMs;
+        outTimings->gpuMs = gpuMs;
     }
 }
 
 const float* InputAssembly::getOutputHostPtr() const {
     return static_cast<const float*>(impl_->mappedOutput);
 }
+
+const void* InputAssembly::getRawColorHostPtr() const { return impl_->mappedColorRaw; }
+const void* InputAssembly::getRawAuxHostPtr() const { return impl_->mappedAuxRaw; }
 
 void InputAssembly::dumpToNpy(const std::string& path) const {
     size_t n = static_cast<size_t>(netW_) * netH_ * getChannels();
