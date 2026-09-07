@@ -207,6 +207,29 @@ struct CLIOptions {
     std::string unetManifest;
     std::string unetOutput;
     std::string unetKernelDir = "examples";
+
+    // --bench <N>: steady-state GPU-timing bench mode (bench/
+    // lux_perf_ablation.md milestone 1 in mobiledlss). Splat scenes only
+    // (--splat-backend luxc). Renders a fixed warm-up, then N measured
+    // frames with a slowly orbiting camera, reporting median/p90 GPU ms
+    // (both the fused single-command-buffer total -- the number directly
+    // comparable to MetalSplatter's own gpuStartTime/gpuEndTime
+    // methodology -- and a separate stage-split diagnostic sub-run) plus
+    // CPU wall ms. 0 (default) = disabled, normal single-shot render.
+    int benchFrames = 0;
+    // Degrees of camera yaw advanced per measured frame (a "slowly
+    // orbiting camera" per the task spec -- enough to exercise the sort
+    // stage's view-change-triggered rescheduling without being a
+    // discontinuous camera jump between frames).
+    float benchOrbitDegPerFrame = 0.5f;
+    // Optional opt-in sort scheduling during the bench run (milestone 2(a):
+    // port of splat_renderer.h's Vulkan setSortSchedule() to Metal). 0 (the
+    // struct default below) means "don't call setSortSchedule() at all" --
+    // i.e. the exactness-preserving every-frame-sort default stays active,
+    // matching what a plain --bench run (no extra flags) measures.
+    bool benchSortSchedule = false;
+    uint32_t benchSortEveryNFrames = 4;
+    float benchSortViewThresholdDeg = 2.0f;
 };
 
 static void printUsage(const char* program) {
@@ -234,6 +257,10 @@ static void printUsage(const char* program) {
               << "                         this previous time into splat_prev_pos, so mv reflects real\n"
               << "                         actor motion too (default: camera-only mv)\n"
               << "  --sort <MODE>          camera_distance (default, Euclidean) or view_depth (gsplat's z)\n"
+              << "  --bench <N>            Steady-state GPU-timing bench: N frames, orbiting camera,\n"
+              << "                         real MTLCommandBuffer GPU timestamps (splat + --splat-backend luxc only)\n"
+              << "  --bench-orbit-deg <D>  Camera yaw degrees advanced per bench frame (default 0.5)\n"
+              << "  --bench-sort-schedule <everyN> <deg>  Opt into sort scheduling during --bench\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -304,6 +331,14 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.hasFramePrev = true;
         } else if (arg == "--dump-splat-buffers" && i + 1 < argc) {
             opts.dumpSplatBuffersPrefix = argv[++i];
+        } else if (arg == "--bench" && i + 1 < argc) {
+            opts.benchFrames = std::stoi(argv[++i]);
+        } else if (arg == "--bench-orbit-deg" && i + 1 < argc) {
+            opts.benchOrbitDegPerFrame = std::stof(argv[++i]);
+        } else if (arg == "--bench-sort-schedule" && i + 2 < argc) {
+            opts.benchSortSchedule = true;
+            opts.benchSortEveryNFrames = static_cast<uint32_t>(std::stoi(argv[++i]));
+            opts.benchSortViewThresholdDeg = std::stof(argv[++i]);
         } else if (arg == "--sort" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "view_depth") opts.sortByViewDepth = true;
@@ -491,6 +526,106 @@ static void setupSponzaLights(MetalSceneManager& scene) {
 }
 
 // --------------------------------------------------------------------------
+// --bench N: steady-state GPU-timing bench mode (bench/lux_perf_ablation.md
+// milestone 1 in mobiledlss). See CLIOptions::benchFrames's comment.
+// --------------------------------------------------------------------------
+
+static void computeMedianP90(std::vector<double> v, double& median, double& p90) {
+    if (v.empty()) { median = p90 = 0.0; return; }
+    std::sort(v.begin(), v.end());
+    size_t n = v.size();
+    median = (n % 2 == 0) ? 0.5 * (v[n / 2 - 1] + v[n / 2]) : v[n / 2];
+    size_t p90idx = std::min(n - 1, static_cast<size_t>(0.9 * static_cast<double>(n)));
+    p90 = v[p90idx];
+}
+
+// Runs the bench loop against a MetalSplatLuxcRenderer: a fixed warm-up,
+// then benchFrames measured frames with a slowly orbiting camera (reusing
+// the scene's own auto-computed eye/target/up/far, exactly like
+// --interactive's initial pose). Reports median/p90 of:
+//  - the fused single-command-buffer real GPU total (getLastGpuTotalMs(),
+//    directly comparable to MetalSplatter's own gpuStartTime/gpuEndTime
+//    methodology -- see bench/lux_perf_ablation.md in mobiledlss)
+//  - CPU wall time per render() call
+//  - a separate, smaller stage-split diagnostic sub-run (renderProfiled())
+static void runSplatBench(MetalSplatLuxcRenderer& splatR, MetalContext& ctx,
+                           MetalSceneManager& scene, const CLIOptions& opts) {
+    if (opts.benchSortSchedule) {
+        splatR.setSortSchedule(opts.benchSortEveryNFrames, opts.benchSortViewThresholdDeg);
+        std::cout << "[bench] sort schedule: every " << opts.benchSortEveryNFrames
+                  << " frames OR " << opts.benchSortViewThresholdDeg << " deg view change"
+                  << std::endl;
+    } else {
+        std::cout << "[bench] sort schedule: every frame (default, exactness-preserving)"
+                  << std::endl;
+    }
+
+    OrbitCamera orbit;
+    orbit.initFromAutoCamera(scene.getAutoEye(), scene.getAutoTarget(), scene.getAutoUp(),
+                              scene.getAutoFar());
+    float aspect = static_cast<float>(splatR.getWidth()) / static_cast<float>(splatR.getHeight());
+    float degPerFrame = opts.benchOrbitDegPerFrame;
+
+    auto setFrameCamera = [&](int frameIdx) {
+        orbit.yaw = glm::radians(degPerFrame) * static_cast<float>(frameIdx);
+        glm::vec3 eye = orbit.getEye();
+        splatR.updateCamera(eye, orbit.target, orbit.up, orbit.fovY, aspect,
+                             orbit.nearPlane, orbit.farPlane);
+    };
+
+    const int kWarmup = 10;
+    for (int i = 0; i < kWarmup; ++i) {
+        setFrameCamera(i);
+        splatR.render(ctx);
+    }
+
+    std::vector<double> gpuTotalMs, cpuWallMs;
+    gpuTotalMs.reserve(opts.benchFrames);
+    cpuWallMs.reserve(opts.benchFrames);
+    for (int i = 0; i < opts.benchFrames; ++i) {
+        setFrameCamera(kWarmup + i);
+        auto t0 = std::chrono::steady_clock::now();
+        splatR.render(ctx);
+        auto t1 = std::chrono::steady_clock::now();
+        cpuWallMs.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        gpuTotalMs.push_back(splatR.getLastGpuTotalMs());
+    }
+
+    double gpuMedian, gpuP90, cpuMedian, cpuP90;
+    computeMedianP90(gpuTotalMs, gpuMedian, gpuP90);
+    computeMedianP90(cpuWallMs, cpuMedian, cpuP90);
+
+    // Stage-split diagnostic sub-run: fewer frames (extra CPU<->GPU round
+    // trips per frame make this slower), same camera path continued from
+    // where the fused-total loop left off, same sort schedule.
+    const int kProfiledFrames = std::min(opts.benchFrames, 30);
+    std::vector<double> preMs, sortMs, drawMs, totalMs;
+    for (int i = 0; i < kProfiledFrames; ++i) {
+        setFrameCamera(kWarmup + opts.benchFrames + i);
+        double pre, srt, drw, tot;
+        splatR.renderProfiled(ctx, &pre, &srt, &drw, &tot);
+        preMs.push_back(pre); sortMs.push_back(srt); drawMs.push_back(drw); totalMs.push_back(tot);
+    }
+    double preMed, preP90, sortMed, sortP90, drawMed, drawP90, totMed, totP90;
+    computeMedianP90(preMs, preMed, preP90);
+    computeMedianP90(sortMs, sortMed, sortP90);
+    computeMedianP90(drawMs, drawMed, drawP90);
+    computeMedianP90(totalMs, totMed, totP90);
+
+    std::cout << "[bench] ===== RESULTS (" << splatR.getWidth() << "x" << splatR.getHeight()
+              << ", " << opts.benchFrames << " frames, " << kWarmup << " warmup) =====" << std::endl;
+    std::cout << "[bench] fused_total_gpu_ms median=" << gpuMedian << " p90=" << gpuP90 << std::endl;
+    std::cout << "[bench] cpu_wall_ms median=" << cpuMedian << " p90=" << cpuP90 << std::endl;
+    std::cout << "[bench] stage_split (own-cmdbuf-per-stage, " << kProfiledFrames
+              << " frames, includes extra CPU<->GPU sync overhead not present in fused_total):"
+              << std::endl;
+    std::cout << "[bench]   preprocess_gpu_ms median=" << preMed << " p90=" << preP90 << std::endl;
+    std::cout << "[bench]   sort_gpu_ms       median=" << sortMed << " p90=" << sortP90 << std::endl;
+    std::cout << "[bench]   draw_gpu_ms       median=" << drawMed << " p90=" << drawP90 << std::endl;
+    std::cout << "[bench]   split_total_gpu_ms median=" << totMed << " p90=" << totP90 << std::endl;
+}
+
+// --------------------------------------------------------------------------
 // Splat rendering (shared between --splat-backend hand and luxc): both
 // MetalSplatRenderer and MetalSplatLuxcRenderer expose the identical public
 // method surface (see metal_splat_luxc_renderer.h's class comment), so the
@@ -650,6 +785,15 @@ static int runSplatBranch(MetalContext& ctx, MetalSceneManager& scene, const CLI
 
     if (opts.jitterX != 0.0f || opts.jitterY != 0.0f) {
         splatR->setJitter(opts.jitterX, opts.jitterY);
+    }
+
+    if (opts.benchFrames > 0) {
+        if constexpr (std::is_same_v<Renderer, MetalSplatLuxcRenderer>) {
+            runSplatBench(*splatR, ctx, scene, opts);
+        } else {
+            std::cerr << "[error] --bench requires --splat-backend luxc" << std::endl;
+            return 1;
+        }
     }
 
     splatR->render(ctx);

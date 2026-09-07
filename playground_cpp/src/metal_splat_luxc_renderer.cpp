@@ -983,9 +983,286 @@ void MetalSplatLuxcRenderer::render(MetalContext& ctx) {
     cmdBuf->commit();
     cmdBuf->waitUntilCompleted();
     lastRenderMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
+    // Real GPU busy time for the WHOLE fused command buffer (preprocess +
+    // sort + draw) -- directly comparable to MetalSplatter's own
+    // commandBuffer.gpuStartTime/gpuEndTime methodology (bench/
+    // lux_perf_ablation.md in mobiledlss). Unlike lastPreprocessMs_/
+    // lastSortMs_/lastRenderMs_ above (CPU wall-clock deltas taken WHILE
+    // encoding, before this single commit()/waitUntilCompleted() at the
+    // very end of the function -- i.e. they mostly measure CPU encode
+    // time, not GPU execution time, in this fused-command-buffer design;
+    // only lastRenderMs_ happens to also include the real GPU wait since
+    // it's the stage after the only wait in the function), this is a true
+    // GPU timestamp, unaffected by CPU-side encode/dispatch overhead.
+    lastGpuTotalMs_ = (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
 
     std::cout << "[metal-luxc] render(): preprocess=" << lastPreprocessMs_ << "ms sort="
-              << lastSortMs_ << "ms render=" << lastRenderMs_ << "ms" << std::endl;
+              << lastSortMs_ << "ms render=" << lastRenderMs_ << "ms gpuTotal="
+              << lastGpuTotalMs_ << "ms" << std::endl;
+}
+
+// --------------------------------------------------------------------------
+// renderProfiled() -- bench-only stage-split GPU timing (see header
+// comment). Deliberate near-duplicate of render() above rather than a
+// shared refactor: render() is parity-critical (byte-for-byte pixel output
+// validated against Vulkan/gsplat by tests/mobiledlss's verify_lux_vs_
+// gsplat.py), so touching its exact command-buffer/encoder sequence for a
+// diagnostic feature was judged too risky. This function encodes the SAME
+// three stages but each into its OWN command buffer, waiting on each
+// before starting the next -- so GPUStartTime()/GPUEndTime() of each
+// buffer is a real, isolated per-stage GPU timestamp, at the cost of two
+// extra CPU<->GPU round trips per frame that the fused render() doesn't
+// pay. Honors the same setSortSchedule() state as render() (so a --bench
+// run profiling with scheduled sort shows the same amortized sort cost the
+// production path would see).
+// --------------------------------------------------------------------------
+void MetalSplatLuxcRenderer::renderProfiled(MetalContext& ctx, double* preprocessGpuMs,
+                                             double* sortGpuMs, double* drawGpuMs,
+                                             double* totalGpuMs) {
+    *preprocessGpuMs = *sortGpuMs = *drawGpuMs = *totalGpuMs = 0.0;
+    if (numSplats_ == 0) return;
+
+    if (hasMotionVectors_ && firstMvFrame_) {
+        prevViewMatrix_ = viewMatrix_;
+        prevProjMatrixUnjittered_ = projMatrixUnjittered_;
+        std::memcpy(prevPosBuffer_->contents(), hostPositions_.data(), hostPositions_.size() * sizeof(float));
+    }
+
+    struct ComputePush {
+        float view[16];
+        float proj[16];
+        float camPos[3];
+        float _pad0;
+        float screenW, screenH;
+        uint32_t numSplats;
+        float focalX;
+        float focalY;
+        int32_t shDegree;
+        float _pad1[2];
+    } push = {};
+    std::memcpy(push.view, &viewMatrix_[0][0], 64);
+    std::memcpy(push.proj, &projMatrix_[0][0], 64);
+    push.camPos[0] = camPos_.x; push.camPos[1] = camPos_.y; push.camPos[2] = camPos_.z;
+    push.screenW = static_cast<float>(width_);
+    push.screenH = static_cast<float>(height_);
+    push.numSplats = numSplats_;
+    push.focalX = focalX_;
+    push.focalY = focalY_;
+    push.shDegree = static_cast<int32_t>(shDegree_);
+    if (hasMotionVectors_) {
+        glm::mat4 prevCameraMats[2];
+        prevCameraMats[0] = projMatrixUnjittered_;
+        prevCameraMats[1] = prevProjMatrixUnjittered_ * prevViewMatrix_;
+        std::memcpy(prevCameraBuffer_->contents(), prevCameraMats, sizeof(prevCameraMats));
+    }
+
+    // --- Stage 1: preprocess (own command buffer) ---
+    MTL::CommandBuffer* cmdBuf1 = ctx.beginCommandBuffer();
+    {
+        auto* enc = cmdBuf1->computeCommandEncoder();
+        enc->setComputePipelineState(computePipeline_);
+        trySetBuffer(enc, compShader_, posBuffer_, 0);
+        trySetBuffer(enc, compShader_, rotBuffer_, 1);
+        trySetBuffer(enc, compShader_, scaleBuffer_, 2);
+        trySetBuffer(enc, compShader_, opacityBuffer_, 3);
+        trySetBuffer(enc, compShader_, shBuffer_, 4);
+        trySetBuffer(enc, compShader_, projCenterBuffer_, 5);
+        trySetBuffer(enc, compShader_, projAxesBuffer_, 6);
+        trySetBuffer(enc, compShader_, projConicBuffer_, 7);
+        trySetBuffer(enc, compShader_, projColorBuffer_, 8);
+        trySetBuffer(enc, compShader_, sortKeysBuffer_, 9);
+        trySetBuffer(enc, compShader_, sortedIndicesBuffer_, 10);
+        trySetBuffer(enc, compShader_, visibleCountBuffer_, 11);
+        uint32_t nextBinding = 12;
+        if (hasMotionVectors_) {
+            trySetBuffer(enc, compShader_, prevPosBuffer_, nextBinding++);
+            trySetBuffer(enc, compShader_, projMvBuffer_, nextBinding++);
+            trySetBuffer(enc, compShader_, prevCameraBuffer_, nextBinding++);
+        }
+        if (hasExpectedDepth_) {
+            trySetBuffer(enc, compShader_, projDepthBuffer_, nextBinding++);
+        }
+        if (hasForegroundCoverage_) {
+            trySetBuffer(enc, compShader_, foregroundBuffer_, nextBinding++);
+            trySetBuffer(enc, compShader_, projForegroundBuffer_, nextBinding++);
+        }
+        enc->setBytes(&push, sizeof(push), compShader_.pushConstantBufferIndex);
+        uint32_t groups = (numSplats_ + 255) / 256;
+        enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(256, 1, 1));
+        enc->endEncoding();
+    }
+    if (hasMotionVectors_) {
+        auto* posCopyBlit = cmdBuf1->blitCommandEncoder();
+        posCopyBlit->copyFromBuffer(posBuffer_, 0, prevPosBuffer_, 0, hostPositions_.size() * sizeof(float));
+        posCopyBlit->endEncoding();
+        prevViewMatrix_ = viewMatrix_;
+        prevProjMatrixUnjittered_ = projMatrixUnjittered_;
+        firstMvFrame_ = false;
+    }
+    cmdBuf1->commit();
+    cmdBuf1->waitUntilCompleted();
+    *preprocessGpuMs = (cmdBuf1->GPUEndTime() - cmdBuf1->GPUStartTime()) * 1000.0;
+
+    // --- Sort scheduling decision (identical to render()'s) ---
+    bool needsSort = true;
+    if (sortEveryNFrames_ > 1 || sortViewThresholdDeg_ > 0.0f) {
+        glm::vec3 viewDir = glm::normalize(
+            -glm::vec3(viewMatrix_[0][2], viewMatrix_[1][2], viewMatrix_[2][2]));
+        bool viewChanged = true;
+        if (hasLastSortedView_ && sortViewThresholdDeg_ > 0.0f) {
+            float cosAngle = glm::clamp(glm::dot(viewDir, lastSortedViewDir_), -1.0f, 1.0f);
+            float angleDeg = glm::degrees(std::acos(cosAngle));
+            viewChanged = angleDeg >= sortViewThresholdDeg_;
+        }
+        bool budgetElapsed = framesSinceSort_ >= sortEveryNFrames_;
+        needsSort = !hasLastSortedView_ || budgetElapsed ||
+            (sortViewThresholdDeg_ > 0.0f && viewChanged);
+        if (needsSort) {
+            framesSinceSort_ = 0;
+            lastSortedViewDir_ = viewDir;
+            hasLastSortedView_ = true;
+        } else {
+            framesSinceSort_++;
+        }
+    }
+
+    // --- Stage 2: sort (own command buffer, skipped per schedule) ---
+    if (needsSort) {
+        MTL::CommandBuffer* cmdBuf2 = ctx.beginCommandBuffer();
+        static const uint32_t PREFIX_SUM_BLOCK_SIZE = 2048;
+        uint32_t numElements = numSplats_;
+        uint32_t numWg = sortNumWg_;
+        uint32_t totalHistogram = 256 * numWg;
+        uint32_t numParts = (totalHistogram + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
+        struct SortPush { uint32_t numElements; uint32_t bitOffset; };
+        for (uint32_t pass = 0; pass < 4; ++pass) {
+            uint32_t bitOffset = pass * 8;
+            uint32_t ping = pass % 2;
+            MTL::Buffer* keysIn = ping == 0 ? sortKeysBuffer_ : sortKeysBBuffer_;
+            MTL::Buffer* keysOut = ping == 0 ? sortKeysBBuffer_ : sortKeysBuffer_;
+            MTL::Buffer* valsIn = ping == 0 ? sortedIndicesBuffer_ : sortValsBBuffer_;
+            MTL::Buffer* valsOut = ping == 0 ? sortValsBBuffer_ : sortedIndicesBuffer_;
+            {
+                auto* enc = cmdBuf2->computeCommandEncoder();
+                enc->setComputePipelineState(sortHistogramPipeline_);
+                trySetBuffer(enc, sortHistogramShader_, keysIn, 0);
+                trySetBuffer(enc, sortHistogramShader_, histogramBuffer_, 1);
+                SortPush hp = {numElements, bitOffset};
+                enc->setBytes(&hp, sizeof(hp), sortHistogramShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numWg, 1, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmdBuf2->computeCommandEncoder();
+                enc->setComputePipelineState(sortPrefixSumPipeline_);
+                trySetBuffer(enc, sortPrefixSumShader_, histogramBuffer_, 0);
+                trySetBuffer(enc, sortPrefixSumShader_, partitionSumsBuffer_, 1);
+                SortPush ps0 = {totalHistogram, 0};
+                enc->setBytes(&ps0, sizeof(ps0), sortPrefixSumShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numParts, 1, 1), MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmdBuf2->computeCommandEncoder();
+                enc->setComputePipelineState(sortPrefixSumPipeline_);
+                trySetBuffer(enc, sortPrefixSumShader_, histogramBuffer_, 0);
+                trySetBuffer(enc, sortPrefixSumShader_, partitionSumsBuffer_, 1);
+                SortPush ps1 = {numParts, 1};
+                enc->setBytes(&ps1, sizeof(ps1), sortPrefixSumShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmdBuf2->computeCommandEncoder();
+                enc->setComputePipelineState(sortPrefixSumPipeline_);
+                trySetBuffer(enc, sortPrefixSumShader_, histogramBuffer_, 0);
+                trySetBuffer(enc, sortPrefixSumShader_, partitionSumsBuffer_, 1);
+                SortPush ps2 = {totalHistogram, 2};
+                enc->setBytes(&ps2, sizeof(ps2), sortPrefixSumShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numParts, 1, 1), MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmdBuf2->computeCommandEncoder();
+                enc->setComputePipelineState(sortScatterPipeline_);
+                trySetBuffer(enc, sortScatterShader_, keysIn, 0);
+                trySetBuffer(enc, sortScatterShader_, keysOut, 1);
+                trySetBuffer(enc, sortScatterShader_, valsIn, 2);
+                trySetBuffer(enc, sortScatterShader_, valsOut, 3);
+                trySetBuffer(enc, sortScatterShader_, histogramBuffer_, 4);
+                SortPush sp = {numElements, bitOffset};
+                enc->setBytes(&sp, sizeof(sp), sortScatterShader_.pushConstantBufferIndex);
+                enc->dispatchThreadgroups(MTL::Size(numWg, 1, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+            }
+        }
+        cmdBuf2->commit();
+        cmdBuf2->waitUntilCompleted();
+        *sortGpuMs = (cmdBuf2->GPUEndTime() - cmdBuf2->GPUStartTime()) * 1000.0;
+    }
+
+    // --- Stage 3: draw (own command buffer) ---
+    MTL::CommandBuffer* cmdBuf3 = ctx.beginCommandBuffer();
+    auto* rpDesc = MTL::RenderPassDescriptor::alloc()->init();
+    auto* colorAtt = rpDesc->colorAttachments()->object(0);
+    colorAtt->setTexture(colorTarget_);
+    colorAtt->setLoadAction(MTL::LoadActionClear);
+    colorAtt->setStoreAction(MTL::StoreActionStore);
+    float clearA = (hasMotionVectors_ || hasExpectedDepth_) ? 0.0f : 1.0f;
+    colorAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, clearA));
+    uint32_t nextRpSlot = 1;
+    if (hasMotionVectors_ || hasExpectedDepth_) {
+        auto* auxAtt = rpDesc->colorAttachments()->object(nextRpSlot++);
+        auxAtt->setTexture(auxTarget_);
+        auxAtt->setLoadAction(MTL::LoadActionClear);
+        auxAtt->setStoreAction(MTL::StoreActionStore);
+        auxAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 0.0));
+    }
+    if (hasForegroundCoverage_) {
+        auto* fgAtt = rpDesc->colorAttachments()->object(nextRpSlot++);
+        fgAtt->setTexture(fgTarget_);
+        fgAtt->setLoadAction(MTL::LoadActionClear);
+        fgAtt->setStoreAction(MTL::StoreActionStore);
+        fgAtt->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 0.0));
+    }
+    auto* depthAtt = rpDesc->depthAttachment();
+    depthAtt->setTexture(depthTarget_);
+    depthAtt->setLoadAction(MTL::LoadActionClear);
+    depthAtt->setStoreAction(MTL::StoreActionDontCare);
+    depthAtt->setClearDepth(1.0);
+
+    auto* enc = cmdBuf3->renderCommandEncoder(rpDesc);
+    enc->setViewport(MTL::Viewport{0.0, static_cast<double>(height_),
+                                    static_cast<double>(width_), -static_cast<double>(height_), 0.0, 1.0});
+    enc->setScissorRect(MTL::ScissorRect{0, 0, width_, height_});
+    enc->setRenderPipelineState(renderPipeline_);
+    enc->setDepthStencilState(depthStencilState_);
+    trySetVertexBuffer(enc, vertShader_, projCenterBuffer_, 0);
+    trySetVertexBuffer(enc, vertShader_, projAxesBuffer_, 1);
+    trySetVertexBuffer(enc, vertShader_, projConicBuffer_, 2);
+    trySetVertexBuffer(enc, vertShader_, projColorBuffer_, 3);
+    trySetVertexBuffer(enc, vertShader_, sortedIndicesBuffer_, 4);
+    uint32_t vNext = 5;
+    if (hasMotionVectors_) trySetVertexBuffer(enc, vertShader_, projMvBuffer_, vNext++);
+    if (hasExpectedDepth_) trySetVertexBuffer(enc, vertShader_, projDepthBuffer_, vNext++);
+    if (hasForegroundCoverage_) trySetVertexBuffer(enc, vertShader_, projForegroundBuffer_, vNext++);
+    struct RenderPush { float screenW, screenH; uint32_t visibleCount; float alphaMin; } renderPush = {};
+    renderPush.screenW = static_cast<float>(width_);
+    renderPush.screenH = static_cast<float>(height_);
+    renderPush.visibleCount = numSplats_;
+    renderPush.alphaMin = 1.0f / 255.0f;
+    if (vertShader_.pushConstantBufferIndex != UINT32_MAX)
+        enc->setVertexBytes(&renderPush, sizeof(renderPush), vertShader_.pushConstantBufferIndex);
+    if (fragShader_.pushConstantBufferIndex != UINT32_MAX)
+        enc->setFragmentBytes(&renderPush, sizeof(renderPush), fragShader_.pushConstantBufferIndex);
+    enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(6), NS::UInteger(numSplats_));
+    enc->endEncoding();
+    rpDesc->release();
+    cmdBuf3->commit();
+    cmdBuf3->waitUntilCompleted();
+    *drawGpuMs = (cmdBuf3->GPUEndTime() - cmdBuf3->GPUStartTime()) * 1000.0;
+
+    *totalGpuMs = *preprocessGpuMs + *sortGpuMs + *drawGpuMs;
 }
 
 void MetalSplatLuxcRenderer::renderToDrawable(MetalContext&, CA::MetalDrawable*) {

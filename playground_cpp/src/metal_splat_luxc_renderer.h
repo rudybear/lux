@@ -262,12 +262,36 @@ public:
     // call always has framesSinceSort_==0 (never skips), so headless
     // one-shot renders, tests, and the mobiledlss parity checks are
     // unaffected. Opt in via setSortSchedule() for a continuous multi-frame
-    // caller (interactive/live rendering, or --bench) willing to trade
-    // briefly-stale blend order for amortized sort cost.
+    // caller (interactive/live rendering, or --bench below) willing to
+    // trade briefly-stale blend order for amortized sort cost.
     void setSortSchedule(uint32_t everyNFrames, float viewChangeThresholdDeg) {
         sortEveryNFrames_ = std::max<uint32_t>(1, everyNFrames);
         sortViewThresholdDeg_ = viewChangeThresholdDeg;
     }
+
+    // Real GPU-side timing of the most recent render() call, from
+    // MTLCommandBuffer::GPUStartTime()/GPUEndTime() (actual GPU busy time,
+    // not the CPU-side encode-and-wait wall clock that lastPreprocessMs_/
+    // lastSortMs_/lastRenderMs_ below approximate) -- see render()'s own
+    // comment for why those three are CPU encode-time estimates, not real
+    // per-stage GPU numbers, in the (default) fused-single-command-buffer
+    // path. This is the number directly comparable to MetalSplatter's own
+    // `commandBuffer.gpuStartTime/gpuEndTime` methodology
+    // (bench/lux_perf_ablation.md in mobiledlss).
+    double getLastGpuTotalMs() const { return lastGpuTotalMs_; }
+
+    // --bench-only stage-split GPU timing: encodes preprocess/sort/draw
+    // into THREE separate command buffers (instead of render()'s one
+    // fused buffer), waiting on each before starting the next, so
+    // GPUStartTime()/GPUEndTime() of each buffer gives a REAL per-stage GPU
+    // number instead of the fused path's CPU-encode-time estimate. This
+    // adds real CPU<->GPU round-trip sync overhead between stages that the
+    // fused production render() path does not pay -- use only for
+    // diagnostic stage-breakdown reporting, never for the headline
+    // total-vs-MetalSplatter comparison (use getLastGpuTotalMs() after a
+    // plain render() call for that).
+    void renderProfiled(MetalContext& ctx, double* preprocessGpuMs, double* sortGpuMs,
+                         double* drawGpuMs, double* totalGpuMs);
 
     MTL::Texture* getOutputTexture() const override { return colorTarget_; }
     uint32_t getWidth() const override { return width_; }
@@ -413,13 +437,9 @@ private:
     double lastPreprocessMs_ = 0.0;
     double lastSortMs_ = 0.0;
     double lastRenderMs_ = 0.0;
-
-    // Morph-reset scope (bench/lux_perf_ablation.md "Root cause #1", ported
-    // from splat_renderer.h/.cpp's dispatchMorph() -- see setMorphTime()'s
-    // updated comment for the full rationale). -1 = no segment applied yet
-    // (skip the reset entirely on the very first call: posBuffer_/
-    // rotBuffer_/shBuffer_ already hold base values from createBuffers()).
-    int lastAppliedSegment_ = -1;
+    // Real total GPU time (GPUEndTime-GPUStartTime) of the fused command
+    // buffer -- see getLastGpuTotalMs()'s header comment.
+    double lastGpuTotalMs_ = 0.0;
 
     // Sort scheduling state (see setSortSchedule() above) -- mirrors
     // splat_renderer.h's identical Vulkan fields exactly.
@@ -428,6 +448,13 @@ private:
     uint32_t framesSinceSort_ = 0;
     glm::vec3 lastSortedViewDir_{0.0f, 0.0f, -1.0f};
     bool hasLastSortedView_ = false;
+
+    // Morph-reset scope (bench/lux_perf_ablation.md "Root cause #1", ported
+    // from splat_renderer.h/.cpp's dispatchMorph() -- see setMorphTime()'s
+    // updated comment for the full rationale). -1 = no segment applied yet
+    // (skip the reset entirely on the very first call: posBuffer_/
+    // rotBuffer_/shBuffer_ already hold base values from createBuffers()).
+    int lastAppliedSegment_ = -1;
 
     // Helpers
     void createRenderTargets(MetalContext& ctx);
