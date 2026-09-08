@@ -457,6 +457,22 @@ void initRenderer(AppState* state) {
     }
     mkdir((base + "/dump").c_str(), 0755);  // Stage 2 validation dump target (dumpProxyDebugFrame)
 
+    // Task A bisect (on-device Reconstruction PSNR regression, ~29-30.5dB
+    // -> ~18.7-19.3dB with speckle): splat_renderer.cpp's GPU radix sort
+    // reads LUX_SORT_FORCE_32BIT via getenv() to fall back from the 2-pass
+    // 16-bit quantized-key sort to the pre-513ea9f 4-pass 32-bit sort, but
+    // a launched NativeActivity process doesn't inherit an adb shell's
+    // exported env vars -- so, same "cwd-relative marker file" convention
+    // as pruned_target.txt/psnr_rollout_frames.txt above, translate a
+    // pushed "force_sort_32bit.txt" marker into the env var this early
+    // (before initSplatRenderer()/proxyRenderer->init() read it).
+    if (FILE* sort32Marker = fopen("force_sort_32bit.txt", "r")) {
+        fclose(sort32Marker);
+        setenv("LUX_SORT_FORCE_32BIT", "1", 1);
+        LOGI("force_sort_32bit.txt marker present: forcing the pre-quantization "
+             "4-pass 32-bit GPU radix sort (Task A bisect)");
+    }
+
     // Task 3 (docs/rendering-engines.md, GPU-delegate correctness bisect):
     // runs before anything else (no Vulkan/scene dependency at all) and is
     // a no-op if files/probes doesn't exist -- see gpu_probe.h.

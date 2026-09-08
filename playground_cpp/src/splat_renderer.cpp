@@ -2199,12 +2199,30 @@ void SplatRenderer::encodeFrameCore(VulkanContext& ctx, VkCommandBuffer& cmd, bo
     // implicitly cleared). Splat VISIBILITY is unaffected either way (a
     // per-splat decision made in preprocess/fragment, not by sort
     // position) -- only back-to-front BLEND ORDER can be briefly stale.
+    //
+    // Debug/bisect toggle (Task A, on-device Mali speckle/PSNR regression):
+    // LUX_SORT_FORCE_32BIT=1 skips the reduce-range/quantize stages and
+    // runs the ping-pong pass loop over the full, un-quantized 32-bit
+    // sortable-depth key (4 passes of 8 bits, the pre-513ea9f behavior)
+    // instead of the quantized 16-bit key (2 passes). Lets an on-device
+    // A/B pin the regression to the 16-bit quantization path itself vs.
+    // something else in this same commit range. Checked once (static) --
+    // this is a debug knob, not a per-frame hot path.
+    static const bool kForceSort32Bit = [] {
+        const char* v = std::getenv("LUX_SORT_FORCE_32BIT");
+        return v && v[0] != '\0' && v[0] != '0';
+    }();
     if (needsSort) {
         static const uint32_t PREFIX_SUM_BLOCK_SIZE = 2048;
         uint32_t numElements = numSplats_;
         uint32_t numWg = sortNumWg_;
         uint32_t totalHistogram = 256 * numWg;
         uint32_t numParts = (totalHistogram + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE;
+        // 4 passes (32-bit key, quantization skipped) or 2 (16-bit key,
+        // quantized) -- both are even, so the ping-pong always ends back
+        // in buffer A regardless of which path runs (see the comment
+        // after the loop below).
+        const uint32_t numSortPasses = kForceSort32Bit ? 4 : 2;
 
         VkMemoryBarrier sortBarrier = {};
         sortBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -2218,7 +2236,7 @@ void SplatRenderer::encodeFrameCore(VulkanContext& ctx, VkCommandBuffer& cmd, bo
 
         // --- Range reduction + quantization (runs against buffer A,
         // sortKeysBuffer_, BEFORE the ping-pong pass loop) ---
-        {
+        if (!kForceSort32Bit) {
             // Clear key_range to (min=UINT_MAX, max=0). Both sentinel
             // values are byte-uniform (0xFFFFFFFF = all-0xFF bytes, 0 =
             // all-0x00 bytes) -- kept that way deliberately so the exact
@@ -2261,7 +2279,7 @@ void SplatRenderer::encodeFrameCore(VulkanContext& ctx, VkCommandBuffer& cmd, bo
                                  0, 1, &sortBarrier, 0, nullptr, 0, nullptr);
         }
 
-        for (uint32_t pass = 0; pass < 2; ++pass) {
+        for (uint32_t pass = 0; pass < numSortPasses; ++pass) {
             uint32_t bitOffset = pass * 8;
             uint32_t ping = pass % 2;  // 0 = A->B, 1 = B->A
 
@@ -2328,8 +2346,10 @@ void SplatRenderer::encodeFrameCore(VulkanContext& ctx, VkCommandBuffer& cmd, bo
         }
     }
 
-    // After 2 passes (even count), sorted results are in buffer A
-    // (sortKeysBuffer_, sortedIndicesBuffer_) which is what render reads.
+    // After numSortPasses passes (always even -- 2 for the 16-bit
+    // quantized key, 4 for LUX_SORT_FORCE_32BIT's un-quantized key),
+    // sorted results are in buffer A (sortKeysBuffer_,
+    // sortedIndicesBuffer_) which is what render reads.
 
     if (gpuTimingEnabled_) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampPool_, 2);
