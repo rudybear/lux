@@ -122,7 +122,15 @@ public:
     // completion handler fires in a multiple-frames-in-flight setup).
     // Skipping this leaks one command buffer object per frame; getting it
     // backwards (releasing before commit) is a use-after-free.
-    MTL::CommandBuffer* encodeFrame(MetalContext& ctx, MTL::CommandBuffer* cmdBuf, const FrameInputs& in);
+    //
+    // `frameInFlightIndex`: forwarded to MetalSplatLuxcRenderer::encodeFrame()
+    // -- see its header doc comment. Only matters to a caller that stops
+    // waiting on each frame's command buffer before starting the next one's
+    // encode (playground_ios's SplatView.mm Reconstruction path); pass 0 for
+    // any fully-serialized (commit+waitUntilCompleted before the next call)
+    // caller such as metal_main.cpp's --live-bench/--live-psnr.
+    MTL::CommandBuffer* encodeFrame(MetalContext& ctx, MTL::CommandBuffer* cmdBuf, const FrameInputs& in,
+                                     uint32_t frameInFlightIndex = 0);
 
     // Real total GPU busy time (ms) across a possible MPSGraph
     // commitAndContinue split: `before` is the command buffer the caller

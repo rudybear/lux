@@ -68,7 +68,7 @@ double MetalLiveReconstruct::gpuMsAcrossPossibleSplit(MTL::CommandBuffer* before
 }
 
 MTL::CommandBuffer* MetalLiveReconstruct::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* cmdBuf,
-                                                       const FrameInputs& in) {
+                                                       const FrameInputs& in, uint32_t frameInFlightIndex) {
     applyCameraAndJitter(in);
 
     if (splatRProxy_->hasMotion()) {
@@ -84,7 +84,7 @@ MTL::CommandBuffer* MetalLiveReconstruct::encodeFrame(MetalContext& ctx, MTL::Co
     }
 
     // Proxy render: preprocess + sort + draw, fused into `cmdBuf`.
-    splatRProxy_->encodeFrame(ctx, cmdBuf);
+    splatRProxy_->encodeFrame(ctx, cmdBuf, frameInFlightIndex);
 
     // Reconstruct step 0 (must run BEFORE net input assembly/UNet this
     // frame): warp+downsample last frame's raw hidden state into this

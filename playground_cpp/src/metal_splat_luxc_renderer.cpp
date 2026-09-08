@@ -333,7 +333,9 @@ void MetalSplatLuxcRenderer::createBuffers(MetalContext& ctx, const GaussianSpla
         projMvBuffer_ = ctx.newBuffer(numSplats_ * 2 * sizeof(float), MTL::ResourceStorageModeShared);
         prevPosBuffer_ = ctx.newBuffer(hostPositions_.data(), hostPositions_.size() * sizeof(float),
                                         MTL::ResourceStorageModeShared);
-        prevCameraBuffer_ = ctx.newBuffer(2 * sizeof(glm::mat4), MTL::ResourceStorageModeShared);
+        for (int i = 0; i < 2; i++) {
+            prevCameraBuffer_[i] = ctx.newBuffer(2 * sizeof(glm::mat4), MTL::ResourceStorageModeShared);
+        }
     } else {
         // Dummy 1-element buffers -- the compute stage only declares these
         // storage buffers when motion_vectors/expected_depth are enabled
@@ -341,7 +343,9 @@ void MetalSplatLuxcRenderer::createBuffers(MetalContext& ctx, const GaussianSpla
         // but keep pointers non-null for uniform code below.
         projMvBuffer_ = ctx.newBuffer(8, MTL::ResourceStorageModeShared);
         prevPosBuffer_ = ctx.newBuffer(16, MTL::ResourceStorageModeShared);
-        prevCameraBuffer_ = ctx.newBuffer(16, MTL::ResourceStorageModeShared);
+        for (int i = 0; i < 2; i++) {
+            prevCameraBuffer_[i] = ctx.newBuffer(16, MTL::ResourceStorageModeShared);
+        }
     }
     if (hasExpectedDepth_) {
         projDepthBuffer_ = ctx.newBuffer(numSplats_ * sizeof(float), MTL::ResourceStorageModeShared);
@@ -677,8 +681,10 @@ void MetalSplatLuxcRenderer::init(MetalContext& ctx, const GaussianSplatData& da
 // run inline, now factored into encodeFrame() so a continuous per-frame
 // caller can fuse it into its own command buffer. render() itself (below
 // encodeFrame()) is just begin+encodeFrame+commit+wait+GPU-timing-readback.
-void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* cmdBuf) {
+void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* cmdBuf,
+                                          uint32_t frameInFlightIndex) {
     if (numSplats_ == 0) return;
+    MTL::Buffer* prevCameraBuf = prevCameraBuffer_[frameInFlightIndex & 1];
 
     if (hasMotionVectors_ && firstMvFrame_) {
         prevViewMatrix_ = viewMatrix_;
@@ -719,14 +725,23 @@ void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* 
     if (hasMotionVectors_) {
         // prev_camera_mats[0]=proj_matrix_unjittered, [1]=prev_view_proj_unjittered.
         // Direct memcpy into the shared-storage buffer's contents (like
-        // prevPosBuffer_'s firstMvFrame_ seed above) -- no explicit barrier
-        // needed, Metal auto-tracks buffer hazards within a command buffer
-        // in submission order, and this write happens on the CPU well
-        // before the compute encoder below is even created.
+        // prevPosBuffer_'s firstMvFrame_ seed above) -- this write happens
+        // on the CPU well before the compute encoder below is even created,
+        // which is enough ordering within THIS frame's own encode call, but
+        // NOT enough once the caller can have more than one frame's command
+        // buffer outstanding on the GPU at a time (playground_ios's
+        // SplatView.mm Reconstruction path, once it stopped
+        // waitUntilCompleted()-ing every frame) -- Metal's automatic hazard
+        // tracking only orders GPU-side accesses to a resource, it has no
+        // visibility into a raw CPU memcpy, so a single shared buffer here
+        // would let this frame's CPU write race an still-in-flight earlier
+        // frame's GPU read of the same bytes. prevCameraBuf (picked by
+        // frameInFlightIndex, see encodeFrame()'s header doc comment) is
+        // this call's own private slot.
         glm::mat4 prevCameraMats[2];
         prevCameraMats[0] = projMatrixUnjittered_;
         prevCameraMats[1] = prevProjMatrixUnjittered_ * prevViewMatrix_;
-        std::memcpy(prevCameraBuffer_->contents(), prevCameraMats, sizeof(prevCameraMats));
+        std::memcpy(prevCameraBuf->contents(), prevCameraMats, sizeof(prevCameraMats));
     }
 
     auto t0 = std::chrono::steady_clock::now();
@@ -761,7 +776,7 @@ void MetalSplatLuxcRenderer::encodeFrame(MetalContext& ctx, MTL::CommandBuffer* 
         if (hasMotionVectors_) {
             trySetBuffer(enc, compShader_, prevPosBuffer_, nextBinding++);
             trySetBuffer(enc, compShader_, projMvBuffer_, nextBinding++);
-            trySetBuffer(enc, compShader_, prevCameraBuffer_, nextBinding++);
+            trySetBuffer(enc, compShader_, prevCameraBuf, nextBinding++);
         }
         if (hasExpectedDepth_) {
             trySetBuffer(enc, compShader_, projDepthBuffer_, nextBinding++);
@@ -1142,7 +1157,7 @@ void MetalSplatLuxcRenderer::renderProfiled(MetalContext& ctx, double* preproces
         glm::mat4 prevCameraMats[2];
         prevCameraMats[0] = projMatrixUnjittered_;
         prevCameraMats[1] = prevProjMatrixUnjittered_ * prevViewMatrix_;
-        std::memcpy(prevCameraBuffer_->contents(), prevCameraMats, sizeof(prevCameraMats));
+        std::memcpy(prevCameraBuffer_[0]->contents(), prevCameraMats, sizeof(prevCameraMats));
     }
 
     // --- Stage 1: preprocess (own command buffer) ---
@@ -1166,7 +1181,7 @@ void MetalSplatLuxcRenderer::renderProfiled(MetalContext& ctx, double* preproces
         if (hasMotionVectors_) {
             trySetBuffer(enc, compShader_, prevPosBuffer_, nextBinding++);
             trySetBuffer(enc, compShader_, projMvBuffer_, nextBinding++);
-            trySetBuffer(enc, compShader_, prevCameraBuffer_, nextBinding++);
+            trySetBuffer(enc, compShader_, prevCameraBuffer_[0], nextBinding++);
         }
         if (hasExpectedDepth_) {
             trySetBuffer(enc, compShader_, projDepthBuffer_, nextBinding++);

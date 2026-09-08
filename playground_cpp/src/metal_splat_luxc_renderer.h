@@ -130,7 +130,26 @@ public:
     // lastGpuTotalMs_ is NOT (it needs cmdBuf's post-commit GPUStartTime/
     // GPUEndTime, which only the buffer's actual committer can read) -- read
     // `cmdBuf->GPUStartTime()/GPUEndTime()` after your own commit instead.
-    void encodeFrame(MetalContext& ctx, MTL::CommandBuffer* cmdBuf);
+    //
+    // `frameInFlightIndex` (perf: multi-frame-in-flight, playground_ios's
+    // SplatView.mm Reconstruction path once it stopped waitUntilCompleted()-
+    // ing between frames): selects which of prevCameraBuffer_[2]'s slots
+    // this call's CPU-side memcpy writes into and this call's compute
+    // encoder reads from. That memcpy is a raw CPU write to a
+    // StorageModeShared buffer -- NOT covered by Metal's automatic
+    // cross-command-buffer hazard tracking (that only orders GPU-side
+    // reads/writes to a resource; it has no idea a CPU memcpy happened) --
+    // so with >1 frame's command buffer possibly still executing on the GPU
+    // when the NEXT frame's CPU thread reaches this memcpy, a single shared
+    // buffer would let frame N+1's CPU write stomp frame N's still-in-flight
+    // GPU read of the same bytes (silently wrong motion vectors -> wrong
+    // disocclusion/reconstruction, not a crash). Two slots, indexed by
+    // frame parity, is sufficient for the 2-deep in-flight semaphore
+    // SplatView.mm uses. render()/renderProfiled() (both always fully
+    // blocking -- commit()+waitUntilCompleted() before returning) never
+    // have more than one frame outstanding, so they always pass/default to
+    // index 0 -- reusing the same slot every call is safe for them.
+    void encodeFrame(MetalContext& ctx, MTL::CommandBuffer* cmdBuf, uint32_t frameInFlightIndex = 0);
     void renderToDrawable(MetalContext& ctx, CA::MetalDrawable* drawable) override;
     void updateCamera(glm::vec3 eye, glm::vec3 target, glm::vec3 up,
                       float fovY, float aspect,
@@ -476,7 +495,11 @@ private:
     // used to make; MoltenVK on Apple Silicon reports 4096, so this bug
     // never manifested on the Metal backend, but the fix is shared since
     // both backends transpile/consume the same compiled shader).
-    MTL::Buffer* prevCameraBuffer_ = nullptr;
+    //
+    // [2]: multi-frame-in-flight double buffer -- see encodeFrame()'s
+    // `frameInFlightIndex` doc comment above for why a single buffer isn't
+    // safe once more than one frame's command buffer can be outstanding.
+    MTL::Buffer* prevCameraBuffer_[2] = {nullptr, nullptr};
 
     // Camera state (identical to MetalSplatRenderer).
     glm::mat4 viewMatrix_{1.0f};

@@ -265,9 +265,22 @@ kernel void upscale_proxy(texture2d<float, access::read> src [[texture(0)]],
         float4 c11 = src.read(uint2(x1c, y1c));
         rgba = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
     }
-    float a = rgba.a;
-    float3 rgb = (a > 1e-6) ? rgba.rgb / a : float3(0.0);
-    dst.write(float4(rgb, 1.0), gid);
+    // Composite premultiplied colour over the (black) background the splat
+    // pass itself clears to -- color*alpha + black*(1-alpha) == color*alpha
+    // == rgba.rgb as-is, no division needed. The PREVIOUS version divided
+    // rgb by alpha ("un-premultiply") and forced alpha=1, discarding the
+    // background entirely -- harmless where alpha is near 1 (well-covered
+    // pixels: rgb/alpha == rgb there too), but on the pruned proxy scene's
+    // real low-coverage/near-zero-alpha gaps that division amplified
+    // whatever tiny premultiplied residue was left into wild, saturated
+    // colours -- the "colour speckle all over the dome" bug in Proxy/
+    // Bilinear mode (mobiledlss/reports/ios_modes_mac/live_shot/bilinear.png,
+    // reproduced headlessly via metal_main.cpp's --live-dump/--live-
+    // interactive, whose kLiveDumpUpscaleMSL got the identical fix).
+    // NetInputAssembly's own read of this same proxy texture is UNCHANGED --
+    // it still wants real un-premultiplied colour + alpha (net input, not
+    // display), see its own read site.
+    dst.write(float4(rgba.rgb, 1.0), gid);
 }
 )";
 
@@ -373,11 +386,41 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     double _gpuMsTarget, _gpuMsProxy, _gpuMsRecon, _gpuMsDisplay;
     int _cmdBufCountThisFrame;
     int _waitCountThisFrame;
+
+    // Perf (host-wait removal): Reconstruction mode's steady-state frames no
+    // longer commit+waitUntilCompleted() before starting the next frame's
+    // encode -- up to 2 frames' command buffers may be outstanding on the
+    // GPU at once. `_inFlightSemaphore` (count 2) is the backpressure: wait
+    // once per frame before encoding, signal once per frame once its GPU
+    // work is actually done (synchronously for the rare frames that still
+    // need a same-tick CPU readback -- see -tick:'s needSyncThisFrame --
+    // asynchronously, via addCompletedHandler, for every other frame).
+    // `_reconFrameCounter`'s low bit selects which of MetalSplatLuxcRenderer's
+    // prevCameraBuffer_[2] slots THIS frame's encodeFrame() call uses (its
+    // own frameInFlightIndex doc comment has the full "why" -- short version:
+    // that buffer is written by a raw CPU memcpy, not GPU-hazard-tracked, so
+    // 2 possibly-concurrently-outstanding frames need 2 separate slots or
+    // frame N+1's CPU write can race frame N's still-in-flight GPU read of
+    // the same bytes). Incremented every Reconstruction-mode frame
+    // (sync or async) so the alternation never skips a beat.
+    dispatch_semaphore_t _inFlightSemaphore;
+    uint32_t _reconFrameCounter;
+    // Set by the Reconstruction branch each frame: YES on the fused/async
+    // path (it already encoded its own display blit + presentDrawable into
+    // `cur` and committed once), NO on the sync path or any other mode --
+    // tells the shared Display block below whether to run at all.
+    BOOL _reconHandledDisplayThisFrame;
+
     DisplayMode _lastDisplayMode;  // for detecting a mode-switch INTO Reconstruction (history reset)
     int _frame;
     int _loopFrames;
     BOOL _ready;
     BOOL _wantScreenshot;
+    // Auto-captures one screenshot ~3s after every mode switch (in addition
+    // to -handleTap:'s own immediate capture of the transition frame) so
+    // there's always a settled, representative shot of each mode to pull.
+    CFTimeInterval _modeSwitchTime;
+    BOOL _modeSwitchShotPending;
     BOOL _proxyDumped;
     BOOL _proxyDumped2;  // frame kProxyDumpFrame+1 -- flicker/order-stability check (f7fde2c single-command-buffer change)
     BOOL _seqDumped[16];  // 16-frame orbit PSNR test: one-shot per-frame-index dump (Target run vs Reconstruction run, separate app launches)
@@ -417,6 +460,8 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
         // no history yet anyway -- but keeps the logic uniform).
         _lastDisplayMode = static_cast<DisplayMode>(-1);
         _lastTickTime = 0.0;
+        _inFlightSemaphore = dispatch_semaphore_create(2);
+        _reconFrameCounter = 0;
         NSLog(@"[SplatView] start mode: %s", kDisplayModeNames[_displayMode]);
 
         _psnrFrames = psnrFramesFromEnvironment();
@@ -705,8 +750,20 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     _msMorph = 0.0;
     _gpuMsTarget = 0.0;
     _gpuMsProxy = 0.0;
-    _gpuMsRecon = 0.0;
-    _gpuMsDisplay = 0.0;
+    // _gpuMsRecon/_gpuMsDisplay: NOT reset here while in Reconstruction mode
+    // -- its steady-state (async) frames below write these from a Metal
+    // completion handler that fires some time AFTER this method returns, so
+    // zeroing them every tick would flash the HUD/log to 0 on every frame
+    // that hasn't heard back from its handler yet instead of showing the
+    // last real value (typically ~1 frame stale, same as everything else
+    // about this async path). Every other mode still resets fresh each
+    // frame, same as before -- they always go through the synchronous
+    // shared Display block below, which recomputes _gpuMsDisplay itself
+    // every single frame regardless.
+    if (_displayMode != DisplayModeReconstruction) {
+        _gpuMsRecon = 0.0;
+        _gpuMsDisplay = 0.0;
+    }
     _cmdBufCountThisFrame = 0;
     _waitCountThisFrame = 0;
 
@@ -852,16 +909,132 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
             dumpPrevHiddenBuf = _live.reconstruct().getPrevHiddenBuffer();
         }
 
+        // Perf (host-wait removal): any frame that needs a same-tick CPU
+        // readback -- the frame-10/11 validation dumps, a 16-frame seq dump,
+        // an active LUX_PSNR_FRAMES capture window, or a screenshot -- keeps
+        // the exact old fully-synchronous behavior (commit + waitUntilCompleted
+        // right here, same as every build before this one). These are rare/
+        // one-shot (frames 0-15 and 10/11 once each per app launch, PSNR
+        // frames only under an opt-in env var, screenshots ~every 3s) and
+        // have no measurable effect on the steady-state fps this change is
+        // for. Every OTHER frame -- the overwhelming majority of any real
+        // run -- takes the fused/async path in the `else` below: the display
+        // blit is encoded into the SAME command buffer as the chain
+        // (`cur`, not a separate one -- see the shared Display block's own
+        // early-out for Reconstruction below), presented from it, and
+        // committed WITHOUT waiting -- GPU timing and the in-flight
+        // semaphore signal happen later, from a Metal completion handler.
+        BOOL wantSeqDump = (_frame < 16 && !_seqDumped[_frame]);
+        BOOL wantPsnrCapture =
+            (_psnrFrames > 0 && _frame >= _psnrStartFrame && _frame < _psnrStartFrame + _psnrFrames);
+        BOOL wantProxyDumpGroup = wantReconInputsDump || (_frame == kProxyDumpFrame + 1 && !_proxyDumped2);
+        BOOL needSyncThisFrame = wantSeqDump || wantPsnrCapture || wantProxyDumpGroup || _wantScreenshot;
+
+        // reconIdx: see _reconFrameCounter's own doc comment. Incremented
+        // every Reconstruction-mode frame (sync or async) so alternation
+        // never skips a beat; which slot a SYNC frame lands on doesn't
+        // matter for correctness (it fully drains before anything else can
+        // start), only that ASYNC frames strictly alternate.
+        uint32_t reconIdx = _reconFrameCounter++ & 1u;
+        // Bounds outstanding GPU work to 2 frames -- blocks the CPU here
+        // only once frame N-2's command buffer hasn't finished yet by the
+        // time frame N wants to start encoding. This is the ONE intended,
+        // expected wait Reconstruction mode still pays (task spec: "the
+        // semaphore wait is fine") -- NOT counted in _waitCountThisFrame,
+        // which only tracks waitUntilCompleted() calls.
+        dispatch_semaphore_wait(_inFlightSemaphore, DISPATCH_TIME_FOREVER);
+
         CFTimeInterval c0 = CACurrentMediaTime();
         MTL::CommandBuffer *cmdBuf = _ctx.beginCommandBuffer();
-        MTL::CommandBuffer *cur = _live.encodeFrame(_ctx, cmdBuf, frameInputs);
-        cur->commit();
-        cur->waitUntilCompleted();
-        _msRecon = (CACurrentMediaTime() - c0) * 1000.0;
-        _gpuMsRecon = MetalLiveReconstruct::gpuMsAcrossPossibleSplit(cmdBuf, cur);
-        _cmdBufCountThisFrame += (cur != cmdBuf) ? 2 : 1;
-        _waitCountThisFrame += 1;
-        cur->release();  // balances MPSGraphUNet::encode()'s extra retain (see its own doc comment).
+        MTL::CommandBuffer *cur = _live.encodeFrame(_ctx, cmdBuf, frameInputs, reconIdx);
+
+        BOOL reconHandledDisplay = NO;
+        if (needSyncThisFrame) {
+            cur->commit();
+            cur->waitUntilCompleted();
+            _msRecon = (CACurrentMediaTime() - c0) * 1000.0;
+            _gpuMsRecon = MetalLiveReconstruct::gpuMsAcrossPossibleSplit(cmdBuf, cur);
+            _cmdBufCountThisFrame += (cur != cmdBuf) ? 2 : 1;
+            _waitCountThisFrame += 1;
+            cur->release();  // balances MPSGraphUNet::encode()'s extra retain (see its own doc comment).
+            // This frame's GPU work is already done (we just waited on it
+            // above) -- release its in-flight permit immediately rather
+            // than leaving it held until some later async handler that will
+            // never come for this frame.
+            dispatch_semaphore_signal(_inFlightSemaphore);
+        } else {
+            // Own +1 on cmdBuf, released in the completion handler below --
+            // NOT optional. First cut of the equivalent Mac CLI path
+            // (metal_main.cpp's --live-bench-pipelined) omitted this and hit
+            // EXC_BAD_ACCESS reliably: committing a command buffer does NOT
+            // by itself keep it alive until every handler on it has run --
+            // only a handler registered ON THAT SPECIFIC object gets that
+            // guarantee. `cur` already gets it from MPSGraphUNet::encode()'s
+            // own __bridge_retained (see its doc comment); when MPSGraph
+            // internally commitAndContinue-splits the chain (`cur != cmdBuf`),
+            // `cmdBuf` gets none from anywhere, and ctx.beginCommandBuffer()
+            // itself returns an AUTORELEASED pointer, autoreleased into this
+            // tick's own autoreleasepool below, which drains long before this
+            // frame's completion handler can possibly fire.
+            cmdBuf->retain();
+
+            // Display blit fused into the SAME command buffer as the chain
+            // (`cur`, not a separate one) -- nextDrawable() is still
+            // acquired as late as possible (right here, after the whole
+            // chain is already encoded, immediately before the one encoder
+            // that actually needs it), it just no longer pays its own
+            // separate commit/wait. See the shared Display block below for
+            // why every OTHER mode still uses its own command buffer.
+            CA::MetalDrawable *drawable = _ctx.metalLayer->nextDrawable();
+            if (drawable) {
+                auto *blit = cur->blitCommandEncoder();
+                blit->copyFromTexture(_live.getReconOutputTexture(), 0, 0, MTL::Origin(0, 0, 0),
+                                       MTL::Size(kTargetW, kTargetH, 1), drawable->texture(), 0, 0,
+                                       MTL::Origin(0, 0, 0));
+                blit->endEncoding();
+                cur->presentDrawable(drawable);
+            }
+
+            // Completion handler: registered BEFORE commit() (required).
+            // Must NEVER itself wait on GPU work -- Metal runs every
+            // command buffer's completion handlers one at a time on ONE
+            // serial dispatch queue, so a handler that calls
+            // waitUntilCompleted() (even on a DIFFERENT command buffer, e.g.
+            // via a helper like MetalScreenshot::readTextureRaw) deadlocks
+            // that whole queue forever: the new command buffer's own
+            // completion could only ever run on the very thread that's
+            // blocked waiting for it. (Found and fixed on the Mac CLI
+            // equivalent of this code, metal_main.cpp's
+            // --live-bench-pipelined, via lldb -- confirmed live in a
+            // thread backtrace before this comment was written.) This
+            // handler only writes plain doubles/signals a semaphore, never
+            // touches a texture/buffer's contents or submits new GPU work.
+            dispatch_semaphore_t sem = _inFlightSemaphore;
+            double *gpuMsReconPtr = &_gpuMsRecon;
+            double *gpuMsDisplayPtr = &_gpuMsDisplay;
+            // A literal Objective-C block (not a bare C++ lambda) -- in this
+            // Objective-C++ file, a capturing lambda can implicitly convert
+            // to EITHER of metal-cpp's two addCompletedHandler overloads
+            // (std::function or a raw MTL::CommandBufferHandler block),
+            // which is an ambiguous call the compiler rejects outright.
+            MTL::CommandBufferHandler handler = ^(MTL::CommandBuffer *) {
+                *gpuMsReconPtr = MetalLiveReconstruct::gpuMsAcrossPossibleSplit(cmdBuf, cur);
+                *gpuMsDisplayPtr = 0.0;  // fused into recon's own command buffer now.
+                cmdBuf->release();       // balances the retain() above.
+                dispatch_semaphore_signal(sem);
+            };
+            cur->addCompletedHandler(handler);
+            cur->commit();
+            _msRecon = (CACurrentMediaTime() - c0) * 1000.0;
+            _cmdBufCountThisFrame += (cur != cmdBuf) ? 2 : 1;
+            // waits: 0 -- no waitUntilCompleted() on the render thread this
+            // frame (the semaphore wait above is deliberately not counted
+            // here, see its own comment).
+            cur->release();  // balances MPSGraphUNet::encode()'s extra retain -- safe pre-completion,
+                              // see the addCompletedHandler comment above (cur's own handler keeps IT alive).
+            reconHandledDisplay = YES;
+        }
+        _reconHandledDisplayThisFrame = reconHandledDisplay;
 
         if (wantReconInputsDump) {
             // proxy_f10_{color,mv,depth}.npy (dumpProxyFrame), netinput_f10.npy's
@@ -927,9 +1100,15 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     // buffer above: nextDrawable() should be acquired as late as possible
     // (a well-known Metal latency pitfall -- holding a drawable across a
     // heavy compute chain risks the compositor stalling), and this is the
-    // ONLY host wait Proxy/Bicubic/Target modes pay per frame (Reconstruction
-    // pays this plus its own chain wait above).
-    {
+    // ONLY host wait Proxy/Bicubic/Target modes pay per frame. Reconstruction
+    // mode's steady-state (async) frames skip this block entirely -- see
+    // _reconHandledDisplayThisFrame's own comment -- they already fused
+    // their own display blit + presentDrawable into the chain's own command
+    // buffer above and committed once, with no host wait at all. A
+    // Reconstruction frame that took the rare synchronous path instead
+    // (one-shot dumps, an active PSNR capture window, a screenshot) still
+    // runs this block exactly as before.
+    if (!_reconHandledDisplayThisFrame) {
         CFTimeInterval td0 = CACurrentMediaTime();
         @autoreleasepool {
             NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
@@ -1005,6 +1184,10 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     if (!psnrWindowActive && _frame % (int)(kSimFps * 3.0f) == 0) {
         _wantScreenshot = YES;
     }
+    if (_modeSwitchShotPending && !psnrWindowActive && (CACurrentMediaTime() - _modeSwitchTime) >= 3.0) {
+        _modeSwitchShotPending = NO;
+        _wantScreenshot = YES;
+    }
 
     self.fpsFrameCount += 1;
     CFTimeInterval now = CACurrentMediaTime();
@@ -1045,6 +1228,8 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     _displayMode = static_cast<DisplayMode>((_displayMode + 1) % DisplayModeCount);
     NSLog(@"[SplatView] display mode -> %s", kDisplayModeNames[_displayMode]);
     _wantScreenshot = YES;
+    _modeSwitchTime = CACurrentMediaTime();
+    _modeSwitchShotPending = YES;
 }
 
 // B1 validation dump: replicates metal_main.cpp's `--output-aux` aux-dump
@@ -1450,18 +1635,60 @@ static float psnrRgb(const std::vector<float> &pred, const std::vector<float> &t
     });
 }
 
+// Filename carries the mode name + orbit frame index (shot_<Mode>_f<frame>.png)
+// so a USB pull (afcclient --documents, now that Info.plist's
+// UIFileSharingEnabled/LSSupportsOpeningDocumentsInPlace expose Documents --
+// the CoreDevice tunnel itself is stuck) can tell captures apart without
+// relying on mtime/order, and -pruneScreenshotsForMode:inDir:keep: below
+// keeps only the newest 2 per mode so a long-running app doesn't slowly
+// fill Documents with one PNG per capture forever.
 - (void)saveScreenshotFromTexture:(MTL::Texture *)texture {
     NSArray<NSString *> *docPaths =
         NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *outPath = [docPaths.firstObject stringByAppendingPathComponent:@"screenshot.png"];
+    NSString *docDir = docPaths.firstObject;
+    NSString *modeName = [NSString stringWithUTF8String:kDisplayModeNames[_displayMode]];
+    NSString *fileName = [NSString stringWithFormat:@"shot_%@_f%d.png", modeName, _frame];
+    NSString *outPath = [docDir stringByAppendingPathComponent:fileName];
     try {
         MetalScreenshot::saveTextureToPNG(_ctx, texture, kTargetW, kTargetH, std::string(outPath.UTF8String));
         NSLog(@"[SplatView] screenshot saved: %@", outPath);
+        [self pruneScreenshotsForMode:modeName inDir:docDir keep:2];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.hudLabel.text = [self.hudLabel.text stringByAppendingString:@"\n[screenshot saved]"];
         });
     } catch (const std::exception &e) {
         NSLog(@"[SplatView] screenshot failed: %s", e.what());
+    }
+}
+
+// Deletes the oldest (by file modification date) shot_<modeName>_*.png
+// files in `dir` beyond the newest `keep`. Best-effort -- a failed listing
+// or delete just leaves extra files around, never crashes/throws.
+- (void)pruneScreenshotsForMode:(NSString *)modeName inDir:(NSString *)dir keep:(NSUInteger)keep {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *prefix = [NSString stringWithFormat:@"shot_%@_", modeName];
+    NSError *listErr = nil;
+    NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:dir error:&listErr];
+    if (!names) return;
+    NSMutableArray<NSString *> *matching = [NSMutableArray array];
+    for (NSString *n in names) {
+        if ([n hasPrefix:prefix] && [n hasSuffix:@".png"]) [matching addObject:n];
+    }
+    if (matching.count <= keep) return;
+    NSMutableArray<NSDictionary *> *withDates = [NSMutableArray arrayWithCapacity:matching.count];
+    for (NSString *n in matching) {
+        NSString *full = [dir stringByAppendingPathComponent:n];
+        NSDictionary<NSFileAttributeKey, id> *attrs = [fm attributesOfItemAtPath:full error:nil];
+        NSDate *modDate = attrs[NSFileModificationDate] ?: [NSDate distantPast];
+        [withDates addObject:@{@"name" : n, @"date" : modDate}];
+    }
+    [withDates sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [(NSDate *)a[@"date"] compare:(NSDate *)b[@"date"]];
+    }];
+    NSUInteger toDelete = withDates.count - keep;
+    for (NSUInteger i = 0; i < toDelete; i++) {
+        NSString *full = [dir stringByAppendingPathComponent:withDates[i][@"name"]];
+        [fm removeItemAtPath:full error:nil];
     }
 }
 

@@ -1218,10 +1218,45 @@ static int runLiveBenchMetal(const CLIOptions& opts) {
         // (not just noisy) frame's motion vectors, i.e. a localized spike in
         // recon_rgba_max_abs_diff, not a small uniform rmse.
         {
+            // NOTE on a first cut of this check: it read back reconOutputTex_
+            // from INSIDE the addCompletedHandler via MetalScreenshot::
+            // readTextureRaw(), which itself submits a command buffer and
+            // calls waitUntilCompleted() -- and hung forever (confirmed via
+            // lldb: the handler thread was blocked inside submitAndWait(),
+            // but Metal only ever runs completion handlers one at a time on
+            // its own single serial dispatch queue -- so that new command
+            // buffer's OWN completion handler could never run, because the
+            // very thread that would run it was the one blocked waiting for
+            // it). Lesson carried into SplatView.mm below: a completion
+            // handler may only touch already-computed CPU state and signal
+            // things -- it must never itself wait on GPU work. Fixed here by
+            // moving the readback out of the handler entirely: each frame's
+            // reconOutputTex_ is snapshotted into its OWN slot of a
+            // kCheckFrames-deep texture array via a blit encoded into that
+            // SAME command buffer (GPU-side, ordered by submission like any
+            // other hazard-tracked resource access -- safe regardless of how
+            // many frames are in flight), and every slot is read back from
+            // the calling (non-completion-queue) thread only after the whole
+            // batch has drained.
             const int kCheckFrames = 12;
             MetalLiveReconstruct liveSeq, livePipe;
             liveSeq.init(ctx, scene.getSplatData(), params);
             livePipe.init(ctx, scene.getSplatData(), params);
+            uint32_t checkTw = livePipe.getTargetW(), checkTh = livePipe.getTargetH();
+
+            auto makeSnapshotTex = [&]() {
+                auto* desc = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA16Float, checkTw,
+                                                                          checkTh, false);
+                desc->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
+                desc->setStorageMode(MTL::StorageModePrivate);
+                MTL::Texture* tex = ctx.newTexture(desc);
+                desc->release();
+                return tex;
+            };
+            std::vector<MTL::Texture*> pipeSnapshots(static_cast<size_t>(kCheckFrames));
+            for (int i = 0; i < kCheckFrames; ++i) {
+                pipeSnapshots[static_cast<size_t>(i)] = makeSnapshotTex();
+            }
 
             std::vector<std::vector<float>> seqColor(static_cast<size_t>(kCheckFrames));
             for (int i = 0; i < kCheckFrames; ++i) {
@@ -1241,9 +1276,7 @@ static int runLiveBenchMetal(const CLIOptions& opts) {
             }
 
             dispatch_semaphore_t semC = dispatch_semaphore_create(2);
-            std::vector<std::vector<float>> pipeColor(static_cast<size_t>(kCheckFrames));
             std::atomic<int> pipeCompleted{0};
-            uint32_t checkTw = livePipe.getTargetW(), checkTh = livePipe.getTargetH();
             for (int i = 0; i < kCheckFrames; ++i) {
                 NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
                 dispatch_semaphore_wait(semC, DISPATCH_TIME_FOREVER);
@@ -1251,17 +1284,16 @@ static int runLiveBenchMetal(const CLIOptions& opts) {
                 auto* cmdBuf = ctx.beginCommandBuffer();
                 cmdBuf->retain();  // see the cmdBuf use-after-free comment above.
                 auto* cur = livePipe.encodeFrame(ctx, cmdBuf, in, static_cast<uint32_t>(i & 1));
-                MTL::Texture* reconTex = livePipe.getReconOutputTexture();
-                cur->addCompletedHandler([&pipeColor, &pipeCompleted, &semC, &ctx, cmdBuf, reconTex, checkTw,
-                                           checkTh, i](MTL::CommandBuffer*) {
-                    NS::AutoreleasePool* hpool = NS::AutoreleasePool::alloc()->init();
-                    std::vector<uint8_t> unusedRgba8;
-                    auto raw = MetalScreenshot::readTextureRaw(ctx, reconTex, checkTw, checkTh, 8);
-                    pipeColor[static_cast<size_t>(i)] =
-                        DlssIO::convertRgba16fColorAttachment(raw, checkTw, checkTh, unusedRgba8);
+                // GPU-side snapshot, encoded into `cur` BEFORE commit -- see
+                // the NOTE above for why this replaces a readback-in-handler.
+                auto* blit = cur->blitCommandEncoder();
+                blit->copyFromTexture(livePipe.getReconOutputTexture(), 0, 0, MTL::Origin(0, 0, 0),
+                                       MTL::Size(checkTw, checkTh, 1), pipeSnapshots[static_cast<size_t>(i)], 0, 0,
+                                       MTL::Origin(0, 0, 0));
+                blit->endEncoding();
+                cur->addCompletedHandler([&pipeCompleted, &semC, cmdBuf](MTL::CommandBuffer*) {
                     pipeCompleted.fetch_add(1, std::memory_order_relaxed);
                     cmdBuf->release();
-                    hpool->release();
                     dispatch_semaphore_signal(semC);
                 });
                 cur->commit();
@@ -1270,6 +1302,21 @@ static int runLiveBenchMetal(const CLIOptions& opts) {
             }
             dispatch_semaphore_wait(semC, DISPATCH_TIME_FOREVER);
             dispatch_semaphore_wait(semC, DISPATCH_TIME_FOREVER);
+
+            // Safe to read back now -- off the completion queue, and every
+            // frame's snapshot blit is guaranteed complete (both semaphore
+            // drains above only return after every completion handler,
+            // which runs after its command buffer -- and hence its blit --
+            // has finished).
+            std::vector<std::vector<float>> pipeColor(static_cast<size_t>(kCheckFrames));
+            for (int i = 0; i < kCheckFrames; ++i) {
+                std::vector<uint8_t> unusedRgba8;
+                auto raw = MetalScreenshot::readTextureRaw(ctx, pipeSnapshots[static_cast<size_t>(i)], checkTw,
+                                                             checkTh, 8);
+                pipeColor[static_cast<size_t>(i)] = DlssIO::convertRgba16fColorAttachment(raw, checkTw, checkTh,
+                                                                                            unusedRgba8);
+                pipeSnapshots[static_cast<size_t>(i)]->release();
+            }
 
             double maxAbsDiff = 0.0, sumSqDiff = 0.0;
             size_t n = 0;
@@ -1358,9 +1405,20 @@ kernel void upscale_proxy(texture2d<float, access::read> src [[texture(0)]],
         float4 c11 = src.read(uint2(x1c, y1c));
         rgba = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
     }
-    float a = rgba.a;
-    float3 rgb = (a > 1e-6) ? rgba.rgb / a : float3(0.0);
-    dst.write(float4(rgb, 1.0), gid);
+    // Composite premultiplied colour over the (black) background the splat
+    // pass itself clears to -- color*alpha + black*(1-alpha) == color*alpha
+    // == rgba.rgb as-is, no division needed. The PREVIOUS version divided
+    // rgb by alpha ("un-premultiply") and forced alpha=1, discarding the
+    // background entirely -- harmless where alpha is near 1 (well-covered
+    // pixels: rgb/alpha == rgb there too), but on the pruned proxy scene's
+    // real low-coverage/near-zero-alpha gaps that division amplified
+    // whatever tiny premultiplied residue was left into wild, saturated
+    // colours -- the "colour speckle all over the dome" bug in Proxy/
+    // Bilinear mode (mobiledlss/reports/ios_modes_mac/live_shot/bilinear.png).
+    // NetInputAssembly's own read of this same proxy texture is UNCHANGED --
+    // it still wants real un-premultiplied colour + alpha (net input, not
+    // display), see its own read site.
+    dst.write(float4(rgba.rgb, 1.0), gid);
 }
 )";
 
