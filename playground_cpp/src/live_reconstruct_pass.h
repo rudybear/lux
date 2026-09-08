@@ -60,6 +60,16 @@ public:
     // unconditionally.
     MTL::Buffer* getBlendDebugBuffer() const { return blendDebugBuffer_; }
 
+    // Debug outputs (Task B chroma-fringe investigation): the three raw
+    // colour sources blend3 mixes together, half4 (rgb, 1.0) per target
+    // pixel, written by every run() call unconditionally -- same
+    // always-write precedent as getBlendDebugBuffer() above. Lets a caller
+    // isolate which of {spatial, warped/history, memory} carries a given
+    // pixel's error without re-deriving them from scratch.
+    MTL::Buffer* getSpatialDebugBuffer() const { return spatialDebugBuffer_; }
+    MTL::Buffer* getWarpedDebugBuffer() const { return warpedDebugBuffer_; }
+    MTL::Buffer* getMemoryDebugBuffer() const { return memoryDebugBuffer_; }
+
     // For a frame-N "everything reconstruct consumes" validation dump
     // (reproducing the step in PyTorch): the *history* this frame's run() is
     // about to read -- i.e. last frame's own composited output/hidden,
@@ -97,6 +107,9 @@ private:
     MTL::Buffer* hiddenInputBuffer_ = nullptr;  // fp16 NHWC, netW*netH*hiddenChannels
 
     MTL::Buffer* blendDebugBuffer_ = nullptr;  // half2 (wS, wM), targetW*targetH
+    MTL::Buffer* spatialDebugBuffer_ = nullptr;  // half4 (rgb, 1.0), targetW*targetH
+    MTL::Buffer* warpedDebugBuffer_ = nullptr;   // half4 (rgb, 1.0), targetW*targetH
+    MTL::Buffer* memoryDebugBuffer_ = nullptr;   // half4 (rgb, 1.0), targetW*targetH
 
     MTL::Buffer* bgTextureBuffer_ = nullptr;
     uint32_t texChannels_ = 0, texW_ = 0, texH_ = 0;

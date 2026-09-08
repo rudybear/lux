@@ -119,9 +119,21 @@ kernel void assemble_net_input(
             uint py = min(gid.y * u.paramStride + dy, u.proxyH - 1);
             uint2 pgid(px, py);
 
-            float4 colorRaw = colorTex.read(pgid);
-            float ca = colorRaw.a;
-            float3 rgb = (ca > 1e-6) ? (colorRaw.rgb / ca) : float3(0.0);
+            // proxy_color is fed to the UNet exactly as training sees it: premultiplied-
+            // over-black (mobiledlss/datagen/render_lux.py's FrameBuffers.color=rgb*alpha,
+            // stored verbatim by make_clips.py, loaded verbatim by ClipDataset -- see
+            // mobiledlss/train/data.py's `_to_nchw` (pure reshape, no colour math) and
+            // model.py::build_input's own docstring/body, neither of which ever divides by
+            // alpha; `proxy_alpha` is loaded into the dataset but never referenced downstream
+            // of it). PREVIOUSLY un-premultiplied here (`rgb/ca` for `ca>1e-6`, else 0) --
+            // exactly the same bug class SplatView.mm's/kLiveDumpUpscaleMSL's `upscale_proxy`
+            // had for DISPLAY (fixed in the "remove per-frame host waits" commit): dividing by
+            // a near-1-but-not-quite alpha at a partial-coverage proxy pixel (a hole from the
+            // pruned background scene, or true edge antialiasing) systematically shifts the
+            // UNet's own "colour" input channel away from the exact premultiplied signal it
+            // was trained on, most visibly at proxy holes/edges -- a real train/inference
+            // distribution mismatch, not merely a display-only issue.
+            float3 rgb = colorTex.read(pgid).rgb;
             colorSum += rgb;
 
             float fgVal = 0.0;

@@ -123,6 +123,9 @@ kernel void reconstruct_frame(
     device half* hiddenNewOut [[buffer(6)]],        // NHWC, targetW*targetH*hiddenChannels
     constant ReconUniforms& u [[buffer(7)]],
     device half* blendDebugOut [[buffer(8)]],       // half2 (wS, wM) per pixel -- rollout-PSNR diagnostics
+    device half4* spatialDebugOut [[buffer(9)]],    // half4 (rgb, 1.0) per pixel -- Task B chroma-source diagnostics
+    device half4* warpedDebugOut [[buffer(10)]],
+    device half4* memoryDebugOut [[buffer(11)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.targetW || gid.y >= u.targetH) return;
@@ -170,6 +173,16 @@ kernel void reconstruct_frame(
     for (uint c = 0; c < u.hiddenChannels; c++) hiddenNewOut[hbaseOut + c] = netPixel[hiddenBase + c];
 
     // --- apply_kernel: jitter-aware K-tap gather from proxy colour ---
+    // Reads proxy_color premultiplied-over-black, exactly like apply_kernel()'s Python
+    // reference (mobiledlss/train/reconstruct.py) does -- its signature has no alpha
+    // parameter at all, `proxy_color` is a per-tap F.grid_sample gather straight off the
+    // stored (premultiplied-for-real-capture) tensor. PREVIOUSLY un-premultiplied each tap
+    // here (`raw.rgb/a` for `a>1e-6`, else 0) before blending -- same train/inference
+    // distribution mismatch as net_input_assembly.mm's own colour channel (see its comment),
+    // here feeding the reconstruction's own "spatial" term directly, most visible at proxy
+    // holes/edges from the pruned background scene (Task A's residual whole-wall noise floor)
+    // and at partial-coverage geometry boundaries (Task B's persistent chroma fringe, which a
+    // dominant `spatial`/`warped` weight there then perpetuates frame-to-frame via history).
     float cxp = (float(X) + 0.5 + u.jitterX) / float(u.s) - 0.5;
     float cyp = (float(Y) + 0.5 + u.jitterY) / float(u.s) - 0.5;
     int anchorX = int(round(cxp)), anchorY = int(round(cyp));
@@ -179,9 +192,7 @@ kernel void reconstruct_frame(
         int tapY = clamp(anchorY + off0 + int(dyi), 0, int(u.proxyH) - 1);
         for (uint dxi = 0; dxi < u.k; dxi++) {
             int tapX = clamp(anchorX + off0 + int(dxi), 0, int(u.proxyW) - 1);
-            float4 raw = proxyColor.read(uint2(uint(tapX), uint(tapY)));
-            float a = raw.a;
-            float3 rgb = (a > 1e-6) ? raw.rgb / a : float3(0.0);
+            float3 rgb = proxyColor.read(uint2(uint(tapX), uint(tapY))).rgb;
             uint tapIdx = dyi * u.k + dxi;
             spatial += rgb * kernelW[tapIdx];
         }
@@ -253,6 +264,10 @@ kernel void reconstruct_frame(
     uint dbgBase = (Y * u.targetW + X) * 2;
     blendDebugOut[dbgBase + 0] = half(wS);
     blendDebugOut[dbgBase + 1] = half(wM);
+    uint pxIdx = Y * u.targetW + X;
+    spatialDebugOut[pxIdx] = half4(half3(spatial), half(1.0));
+    warpedDebugOut[pxIdx] = half4(half3(warped), half(1.0));
+    memoryDebugOut[pxIdx] = half4(half3(memory), half(1.0));
 }
 )";
 
@@ -282,6 +297,9 @@ LiveReconstructPass::~LiveReconstructPass() {
     if (hiddenPipeline_) hiddenPipeline_->release();
     if (bgTextureBuffer_) bgTextureBuffer_->release();
     if (blendDebugBuffer_) blendDebugBuffer_->release();
+    if (spatialDebugBuffer_) spatialDebugBuffer_->release();
+    if (warpedDebugBuffer_) warpedDebugBuffer_->release();
+    if (memoryDebugBuffer_) memoryDebugBuffer_->release();
     if (fc1w_) fc1w_->release();
     if (fc1b_) fc1b_->release();
     if (fc2w_) fc2w_->release();
@@ -336,6 +354,12 @@ void LiveReconstructPass::init(MetalContext& ctx, const std::string& textureNpyP
                                         MTL::ResourceStorageModeShared);
     blendDebugBuffer_ = ctx.newBuffer(static_cast<size_t>(targetW) * targetH * 2 * sizeof(uint16_t),
                                        MTL::ResourceStorageModeShared);
+    spatialDebugBuffer_ = ctx.newBuffer(static_cast<size_t>(targetW) * targetH * 4 * sizeof(uint16_t),
+                                         MTL::ResourceStorageModeShared);
+    warpedDebugBuffer_ = ctx.newBuffer(static_cast<size_t>(targetW) * targetH * 4 * sizeof(uint16_t),
+                                        MTL::ResourceStorageModeShared);
+    memoryDebugBuffer_ = ctx.newBuffer(static_cast<size_t>(targetW) * targetH * 4 * sizeof(uint16_t),
+                                        MTL::ResourceStorageModeShared);
     pingIndex_ = 0;
     firstRun_ = true;
 }
@@ -410,6 +434,9 @@ void LiveReconstructPass::run(MetalContext& ctx, MTL::CommandBuffer* cmdBuf, MTL
     enc->setBuffer(prevHidden_[nextIndex], 0, 6);
     enc->setBytes(&u, sizeof(u), 7);
     enc->setBuffer(blendDebugBuffer_, 0, 8);
+    enc->setBuffer(spatialDebugBuffer_, 0, 9);
+    enc->setBuffer(warpedDebugBuffer_, 0, 10);
+    enc->setBuffer(memoryDebugBuffer_, 0, 11);
     MTL::Size grid(targetW_, targetH_, 1);
     NS::UInteger tew = pipeline_->threadExecutionWidth();
     NS::UInteger th = pipeline_->maxTotalThreadsPerThreadgroup() / tew;

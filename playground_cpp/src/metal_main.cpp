@@ -1680,6 +1680,14 @@ static int runLivePsnrMetal(const CLIOptions& opts) {
             auto proxyF32 = readRgba16fAsFloat(ctx, live.proxyRenderer().getOutputTexture(), live.getProxyW(),
                                                 live.getProxyH());
             writeFloatRgbaPng(base + "proxy_f" + suffix + ".png", proxyF32, live.getProxyW(), live.getProxyH());
+            // Task B: proxyF32's un-premultiplied rgb + REAL alpha (proxy_fFF.png
+            // discards alpha, forcing opaque for display) -- lets the
+            // un-premultiply-at-near-saturated-alpha hypothesis be checked
+            // directly against the actual per-pixel alpha value.
+            if (std::getenv("LUX_RECON_DEBUG_DUMP")) {
+                DlssIO::writeNpyFloat32(base + "debug_proxy_f" + suffix + ".npy", proxyF32,
+                                         {live.getProxyH(), live.getProxyW(), 4});
+            }
 
             // bilinear_fFF.png: actual GPU dispatch of the same kernel/params
             // (bilinear=1, scale=target/proxy) SplatView.mm's Bicubic
@@ -1719,6 +1727,37 @@ static int runLivePsnrMetal(const CLIOptions& opts) {
             writeFloatRgbaPng(base + "target_f" + suffix + ".png", targetF32, live.getTargetW(), live.getTargetH());
             writeAbsDiffPng(base + "absdiff_recon_target_f" + suffix + ".png", reconF32, targetF32,
                              live.getTargetW(), live.getTargetH(), /*gain=*/4.0f);
+
+            // Task B chroma-fringe investigation: dump the 3 raw blend
+            // sources (spatial/warped/memory, half4 rgb+1.0) + the blend
+            // weights (half2 wS/wM) as float32 .npy, [h,w,4]/[h,w,2] --
+            // LiveReconstructPass::run() already wrote all of these
+            // unconditionally this frame, no extra GPU work needed, just a
+            // CPU-side half->float readback (all 4 buffers are
+            // ResourceStorageModeShared, directly CPU-readable).
+            if (std::getenv("LUX_RECON_DEBUG_DUMP")) {
+                auto dumpHalf4Buffer = [&](MTL::Buffer* buf, const std::string& name) {
+                    const uint16_t* h = static_cast<const uint16_t*>(buf->contents());
+                    size_t n = static_cast<size_t>(live.getTargetW()) * live.getTargetH() * 4;
+                    std::vector<float> f32(n);
+                    for (size_t i = 0; i < n; ++i) f32[i] = DlssIO::halfToFloat(h[i]);
+                    DlssIO::writeNpyFloat32(base + name + "_f" + suffix + ".npy", f32,
+                                             {live.getTargetH(), live.getTargetW(), 4});
+                };
+                dumpHalf4Buffer(live.reconstruct().getSpatialDebugBuffer(), "debug_spatial");
+                dumpHalf4Buffer(live.reconstruct().getWarpedDebugBuffer(), "debug_warped");
+                dumpHalf4Buffer(live.reconstruct().getMemoryDebugBuffer(), "debug_memory");
+                {
+                    const uint16_t* h =
+                        static_cast<const uint16_t*>(live.reconstruct().getBlendDebugBuffer()->contents());
+                    size_t n = static_cast<size_t>(live.getTargetW()) * live.getTargetH() * 2;
+                    std::vector<float> f32(n);
+                    for (size_t i = 0; i < n; ++i) f32[i] = DlssIO::halfToFloat(h[i]);
+                    DlssIO::writeNpyFloat32(base + "debug_blend_f" + suffix + ".npy", f32,
+                                             {live.getTargetH(), live.getTargetW(), 2});
+                }
+                std::cout << "[live-dump] frame=" << frame << " wrote LUX_RECON_DEBUG_DUMP npys" << std::endl;
+            }
 
             std::cout << "[live-dump] frame=" << frame << " wrote 5 PNGs" << std::endl;
         }

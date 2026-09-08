@@ -54,8 +54,12 @@ public:
     //
     // `currAuxTex`: MetalSplatLuxcRenderer::getAuxTexture() -- ONE RGBA32Float
     // texture packing (mv.x*alpha, mv.y*alpha, depth*alpha, alpha). `.w` is
-    // this attachment's OWN genuine alpha -- un-premultiply mv/depth by it,
-    // same convention as color's own `.a`.
+    // this attachment's OWN genuine alpha -- un-premultiply mv/depth by it
+    // (motion.py/reconstruct.py's own convention for these channels).
+    // `currColorTex`'s `.rgb` is read premultiplied-over-black, UNLIKE mv/
+    // depth above -- matches training exactly (mobiledlss/train/{data,
+    // model,reconstruct}.py's `proxy_color` is used precisely as stored, no
+    // alpha division anywhere in that pipeline; `.a` is unused here).
     // `currFgTex`: MetalSplatLuxcRenderer::getFgTexture() (RGBA16Float:
     // fg*alpha, 0, 0, alpha) -- a SEPARATE attachment, valid whenever
     // hasForegroundCoverage(); may be null when !hasForegroundCoverage() (fg
