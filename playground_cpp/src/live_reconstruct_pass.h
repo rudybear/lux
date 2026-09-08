@@ -54,6 +54,35 @@ public:
 
     MTL::Buffer* getHiddenInputBuffer() const { return hiddenInputBuffer_; }
 
+    // Warm start (Task A cold-start investigation): bilinear-upsamples
+    // `proxyColorTex` (premultiplied-over-black, same convention run()'s own
+    // apply_kernel gather now reads it in -- see that comment) into BOTH
+    // prevColor_ ping-pong slots, composited exactly like the app's own
+    // Bilinear display mode (SplatView.mm's upscale_proxy, bilinear==1
+    // branch, post its own premultiply fix -- no un-premultiply division).
+    // Call once, right after this frame's proxy render, whenever this frame
+    // is about to run as `firstFrame` (i.e. right after a resetHistory()) --
+    // MetalLiveReconstruct::encodeFrame() does this.
+    //
+    // NOTE on why this does NOT change the very first frame's own output:
+    // `run()`'s `firstFrame` branch forces `disocc=1` for that frame (which
+    // it must -- see mobiledlss.train.train.rollout's own `t==0:
+    // disocc_t=torch.ones(...)`, the exact convention this mirrors), and
+    // `renormalized_blend_weights`/blend3's disocclusion gate zeroes the
+    // *history* blend weight whenever disocc>0.5 -- so `wH * warped` is 0
+    // regardless of what `warped` (sourced from prevColor_) equals, on
+    // BOTH the very first frame (matching PyTorch's own `prev_color =
+    // torch.zeros(...)` at t==0, equally inert there for the same reason)
+    // and every frame after until prevColor_ is naturally overwritten by
+    // this frame's own real output anyway. This call exists to replace
+    // what was previously an implicitly-relied-on-but-never-actually-
+    // written GPU texture (prevColor_ ping-pong slots are
+    // StorageModePrivate and were never cleared/initialized before this)
+    // with well-defined content, and to keep parity with `warm start`
+    // wording -- not because it measurably changes --live-psnr's frame-0
+    // PSNR under the current (training-matching) disocclusion gating.
+    void seedHistoryFromProxy(MetalContext& ctx, MTL::CommandBuffer* cmdBuf, MTL::Texture* proxyColorTex);
+
     // Debug output (rollout-PSNR capture): per target-pixel
     // post-disocclusion-renormalization blend weights, half2 (wS spatial, wM
     // memory -- wH omitted, it's `1 - wS - wM`), written by every run() call
@@ -104,6 +133,7 @@ public:
 private:
     MTL::ComputePipelineState* pipeline_ = nullptr;
     MTL::ComputePipelineState* hiddenPipeline_ = nullptr;
+    MTL::ComputePipelineState* warmStartPipeline_ = nullptr;
     MTL::Buffer* hiddenInputBuffer_ = nullptr;  // fp16 NHWC, netW*netH*hiddenChannels
 
     MTL::Buffer* blendDebugBuffer_ = nullptr;  // half2 (wS, wM), targetW*targetH

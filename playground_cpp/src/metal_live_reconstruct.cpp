@@ -91,6 +91,18 @@ MTL::CommandBuffer* MetalLiveReconstruct::encodeFrame(MetalContext& ctx, MTL::Co
     // frame's net-res hidden_in, using THIS frame's just-rendered aux/motion
     // texture (backward warp from last frame -> this frame).
     bool isFirstReconFrame = netInput_.isNextFrameFirst();
+    if (isFirstReconFrame) {
+        // Task A warm start: right after a resetHistory() (or on this
+        // instance's very first frame ever), seed prevColor_'s ping-pong
+        // slots from THIS frame's own just-rendered proxy colour rather
+        // than leaving them undefined GPU memory -- see
+        // LiveReconstructPass::seedHistoryFromProxy()'s own doc comment for
+        // why this does NOT change this particular frame's own output
+        // (disocc is forced to 1 here regardless, matching
+        // mobiledlss.train.train.rollout's own t==0 convention, which zeroes
+        // the history blend weight either way).
+        reconstruct_.seedHistoryFromProxy(ctx, cmdBuf, splatRProxy_->getOutputTexture());
+    }
     reconstruct_.prepareHiddenInput(ctx, cmdBuf, splatRProxy_->getAuxTexture(), isFirstReconFrame,
                                      reconstruct_.getHiddenInputBuffer());
 

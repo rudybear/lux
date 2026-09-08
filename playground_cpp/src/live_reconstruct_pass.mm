@@ -2,6 +2,7 @@
 #include "metal_context.h"
 #include "dlss_io.h"
 
+#include <array>
 #include <stdexcept>
 #include <cstring>
 #include <vector>
@@ -271,6 +272,39 @@ kernel void reconstruct_frame(
 }
 )";
 
+// Task A warm start: bilinear-upsample the just-rendered proxy colour
+// (premultiplied-over-black, per net_input_assembly.mm's/apply_kernel's own
+// fixed convention -- see live_reconstruct_pass.mm's apply_kernel comment)
+// into a target-res prevColor_ slot. Manual 4-tap clamp-to-edge bilinear +
+// direct premultiplied composite (no un-premultiply division), matching
+// SplatView.mm's/kLiveDumpUpscaleMSL's own `upscale_proxy` (bilinear==1
+// branch) tap-for-tap, rather than the hardware sampler, so this is
+// bit-exact with the app's own Bilinear display mode's geometry -- not just
+// "close".
+static const char* kWarmStartMSL = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void warm_start_history(texture2d<float, access::read> src [[texture(0)]],
+                                texture2d<float, access::write> dst [[texture(1)]],
+                                constant float2& scale [[buffer(0)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+    uint srcW = src.get_width(), srcH = src.get_height();
+    float fx = (float(gid.x) + 0.5) / scale.x - 0.5;
+    float fy = (float(gid.y) + 0.5) / scale.y - 0.5;
+    int x0 = int(floor(fx)); int y0 = int(floor(fy));
+    float tx = fx - float(x0); float ty = fy - float(y0);
+    int x0c = clamp(x0, 0, int(srcW) - 1); int x1c = clamp(x0 + 1, 0, int(srcW) - 1);
+    int y0c = clamp(y0, 0, int(srcH) - 1); int y1c = clamp(y0 + 1, 0, int(srcH) - 1);
+    float4 c00 = src.read(uint2(x0c, y0c));
+    float4 c10 = src.read(uint2(x1c, y0c));
+    float4 c01 = src.read(uint2(x0c, y1c));
+    float4 c11 = src.read(uint2(x1c, y1c));
+    float4 rgba = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+    dst.write(float4(rgba.rgb, 1.0), gid);
+}
+)";
+
 static MTL::ComputePipelineState* buildPipeline(MetalContext& ctx, const char* src, const char* fnName) {
     NS::Error* error = nullptr;
     auto* nsSrc = NS::String::string(src, NS::UTF8StringEncoding);
@@ -295,6 +329,7 @@ static MTL::ComputePipelineState* buildPipeline(MetalContext& ctx, const char* s
 LiveReconstructPass::~LiveReconstructPass() {
     if (pipeline_) pipeline_->release();
     if (hiddenPipeline_) hiddenPipeline_->release();
+    if (warmStartPipeline_) warmStartPipeline_->release();
     if (bgTextureBuffer_) bgTextureBuffer_->release();
     if (blendDebugBuffer_) blendDebugBuffer_->release();
     if (spatialDebugBuffer_) spatialDebugBuffer_->release();
@@ -321,6 +356,7 @@ void LiveReconstructPass::init(MetalContext& ctx, const std::string& textureNpyP
 
     pipeline_ = buildPipeline(ctx, kReconstructMSL, "reconstruct_frame");
     hiddenPipeline_ = buildPipeline(ctx, kHiddenWarpMSL, "warp_downsample_hidden");
+    warmStartPipeline_ = buildPipeline(ctx, kWarmStartMSL, "warm_start_history");
 
     DlssIO::NpyArray texArr = DlssIO::readNpyFloat32(textureNpyPath);
     texChannels_ = static_cast<uint32_t>(texArr.shape[0]);
@@ -362,6 +398,31 @@ void LiveReconstructPass::init(MetalContext& ctx, const std::string& textureNpyP
                                         MTL::ResourceStorageModeShared);
     pingIndex_ = 0;
     firstRun_ = true;
+}
+
+void LiveReconstructPass::seedHistoryFromProxy(MetalContext& ctx, MTL::CommandBuffer* cmdBuf,
+                                                MTL::Texture* proxyColorTex) {
+    (void)ctx;
+    std::array<float, 2> scale = {static_cast<float>(targetW_) / static_cast<float>(proxyW_),
+                                   static_cast<float>(targetH_) / static_cast<float>(proxyH_)};
+    // Seed BOTH ping-pong slots -- reset() always sets pingIndex_ = 0, so
+    // only prevColor_[0] is the one this frame's own (bypassed, see the
+    // header comment) `run()` would read, but writing both keeps
+    // prevColor_ fully well-defined regardless of pingIndex_ at call time,
+    // for a trivial extra dispatch.
+    for (int i = 0; i < 2; i++) {
+        auto* enc = cmdBuf->computeCommandEncoder();
+        enc->setComputePipelineState(warmStartPipeline_);
+        enc->setTexture(proxyColorTex, 0);
+        enc->setTexture(prevColor_[i], 1);
+        enc->setBytes(scale.data(), sizeof(float) * 2, 0);
+        MTL::Size grid(targetW_, targetH_, 1);
+        NS::UInteger tew = warmStartPipeline_->threadExecutionWidth();
+        NS::UInteger th = warmStartPipeline_->maxTotalThreadsPerThreadgroup() / tew;
+        if (th == 0) th = 1;
+        enc->dispatchThreads(grid, MTL::Size(tew, th, 1));
+        enc->endEncoding();
+    }
 }
 
 void LiveReconstructPass::prepareHiddenInput(MetalContext& ctx, MTL::CommandBuffer* cmdBuf,
