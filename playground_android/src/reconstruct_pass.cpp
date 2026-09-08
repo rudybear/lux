@@ -581,6 +581,11 @@ int runReconstructDump(VulkanContext& ctx, const std::string& dumpDir, const std
                        << " disocc=" << disocc.data.size() << "/" << targetScalarN << ")" << std::endl;
             return 1;
         }
+        // Training convention (mobiledlss train.py::rollout) and the Mac chain: the first
+        // frame of a rollout has no history, so disocclusion is forced to 1 everywhere.
+        // Without this, frame 0 blends a zero history into ~98% of pixels and the error
+        // decays through the recurrence for ~90 frames (reports/android_vs_mac_chain.md).
+        if (t == 0) std::fill(disocc.data.begin(), disocc.data.end(), 1.0f);
 
         std::vector<float> kParams, camToWorld;
         if (hasMemory) {

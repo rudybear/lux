@@ -357,6 +357,20 @@ struct AppState {
     // runReconstructDump (unchanged) -- this is ONLY for the live display.
     ReconstructLive reconstructLive;
     bool reconstructLiveReady = false;
+    // Training convention (mobiledlss train.py::rollout: `t==0: disocc_t =
+    // torch.ones(...)`) and the Mac LiveReconstructPass firstFrame branch:
+    // the first live-display frame after a history reset has no valid
+    // warped history, so disocclusion must be forced to 1 for that one
+    // frame (see reports/android_vs_mac_chain.md; the file-replay
+    // runReconstructDump() path already does this for its own t==0). This
+    // starts true (app cold start / first-ever call has zero history from
+    // ReconstructLive::init()'s own zeroBuffer(aPrevColor)) and is set true
+    // again on every mode entry into Reconstruction below, since aPrevColor
+    // otherwise keeps stale content across a Bicubic/Proxy/Target detour
+    // (ReconstructLive::run() is only invoked while state->mode ==
+    // Reconstruction, so that content is frozen -- not continuously
+    // warped -- while the mode is switched away).
+    bool reconLiveNeedsHistoryReset = true;
 
     // Stage 5 (docs/rendering-engines.md): live reconstruct-with-memory
     // validation against the REAL juggle scene (not the synthetic clip
@@ -1365,6 +1379,19 @@ std::vector<float> runReconstructionModeFrame(AppState* state, VulkanContext& ct
             disoccTarget[static_cast<size_t>(y) * targetW + x] = netTensor[(static_cast<size_t>(gy) * netW + gx) * ch26 + 6];
         }
     }
+    if (state->reconLiveNeedsHistoryReset) {
+        // Training/Mac convention for a rollout's first frame (see the
+        // AppState::reconLiveNeedsHistoryReset field comment above): force
+        // disocc=1 everywhere so blend3 ignores warp(prevColor) and falls
+        // back to spatial+memory only, instead of blending in whatever
+        // stale/zero history currently sits in aPrevColor. Also zero
+        // aPrevColor itself to match `prev_color = torch.zeros(...)`
+        // exactly, though the disocc override alone already makes its
+        // content irrelevant for this one frame.
+        std::fill(disoccTarget.begin(), disoccTarget.end(), 1.0f);
+        state->reconstructLive.reset(ctx);
+        state->reconLiveNeedsHistoryReset = false;
+    }
 
     OrbitFrame reconTargetFrame = computeOrbitFrame(static_cast<float>(state->frameCounter), targetW, targetH);
     std::vector<float> kParams = {reconTargetFrame.fx, reconTargetFrame.fy, targetW * 0.5f, targetH * 0.5f};
@@ -1431,6 +1458,12 @@ void renderFrame(AppState* state) {
     if (state->pendingModeAdvance) {
         state->pendingModeAdvance = false;
         state->mode = nextDemoMode(state->mode);
+        if (state->mode == DemoMode::Reconstruction) {
+            // Re-entering Reconstruction: aPrevColor is stale (frozen since
+            // the mode was last active, see the AppState field comment),
+            // so treat this like a fresh rollout start.
+            state->reconLiveNeedsHistoryReset = true;
+        }
         // Don't mix a partial window's samples across the mode switch --
         // different modes use different renderers/resolutions/code paths.
         state->timingFrameCount = 0;
