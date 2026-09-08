@@ -321,6 +321,14 @@ struct AppState {
     // KEY_RANGE log lines and SplatRenderer::getKeyRangeDebug()'s comment.
     bool debugDumpKeyRange = false;
 
+    // Root-cause follow-up (16-bit GPU radix sort Mali PSNR regression):
+    // arm SplatRenderer::armSortDebugDump() for one Proxy frame and write
+    // the result to "sort_debug.txt" -- see SplatRenderer::SortDebugDump's
+    // header comment. Gated by "dump_sort_debug.txt", same marker-file
+    // convention as dump_key_range.txt.
+    bool debugDumpSortDebug = false;
+    static constexpr int kSortDebugTargetFrame = 10;  // let a few frames warm up first
+
     // Stage 3: assembles ParamPredUNet's 26-channel input tensor from the
     // proxy renderer's per-frame attachments (docs/rendering-engines.md).
     // param_stride=2, hidden=8 match the checkpoint this demo targets
@@ -483,6 +491,13 @@ void initRenderer(AppState* state) {
         state->debugDumpKeyRange = true;
         LOGI("dump_key_range.txt marker present: logging KEY_RANGE for the "
              "first 20 proxy frames (Task A bisect)");
+    }
+    if (FILE* sortDebugMarker = fopen("dump_sort_debug.txt", "r")) {
+        fclose(sortDebugMarker);
+        state->debugDumpSortDebug = true;
+        LOGI("dump_sort_debug.txt marker present: will arm SplatRenderer::"
+             "armSortDebugDump() for proxy frame %d and write sort_debug.txt "
+             "(root-cause bisect follow-up)", AppState::kSortDebugTargetFrame);
     }
     // Task B (Mali reconstruct-pass profiling): force the initial demo mode
     // to Reconstruction instead of the default Proxy -- same marker-file
@@ -1444,6 +1459,9 @@ void renderFrame(AppState* state) {
     if (isProxy) {
         float cx = static_cast<float>(kProxyWidth) * 0.5f, cy = static_cast<float>(kProxyHeight) * 0.5f;
         VkCommandBuffer fusedCmd = ctx.beginSingleTimeCommands();
+        if (state->debugDumpSortDebug && state->frameCounter == AppState::kSortDebugTargetFrame) {
+            splatR->armSortDebugDump();
+        }
         splatR->encodeFrame(ctx, fusedCmd);
         renderMs = msSince(tRender);  // CPU cost of RECORDING splatR's compute+draw commands only -- not
                                        // blocking on them; the GPU/submit cost is proxyIaSubmitWaitMs below
@@ -1496,6 +1514,47 @@ void renderFrame(AppState* state) {
                      state->frameCounter, lo, hi, span);
             } else {
                 LOGI("KEY_RANGE frame=%d readback failed", state->frameCounter);
+            }
+        }
+
+        // Root-cause follow-up: read back the sort debug dump armed above
+        // (if this was the target frame) and write it to sort_debug.txt
+        // (cwd == getFilesDir(), see basePath()/chdir() in initRenderer())
+        // for `adb pull`. See SplatRenderer::SortDebugDump's header comment
+        // for what each field means and armSortDebugDump()'s comment for
+        // why this is strictly more diagnostic than KEY_RANGE above.
+        if (state->debugDumpSortDebug && state->frameCounter == AppState::kSortDebugTargetFrame) {
+            SplatRenderer::SortDebugDump dump;
+            if (splatR->readSortDebugDump(ctx, dump) && dump.valid) {
+                FILE* f = fopen("sort_debug.txt", "w");
+                if (f) {
+                    fprintf(f, "mid_frame_lo %u\n", dump.midFrameLo);
+                    fprintf(f, "mid_frame_hi %u\n", dump.midFrameHi);
+                    fprintf(f, "sample_count %zu\n", dump.rawKeysSample.size());
+                    fprintf(f, "raw_keys");
+                    for (uint32_t v : dump.rawKeysSample) fprintf(f, " %u", v);
+                    fprintf(f, "\n");
+                    fprintf(f, "quant_keys");
+                    for (uint32_t v : dump.quantKeysSample) fprintf(f, " %u", v);
+                    fprintf(f, "\n");
+                    fprintf(f, "final_keys");
+                    for (uint32_t v : dump.finalKeys) fprintf(f, " %u", v);
+                    fprintf(f, "\n");
+                    fprintf(f, "final_indices");
+                    for (uint32_t v : dump.finalIndices) fprintf(f, " %u", v);
+                    fprintf(f, "\n");
+                    fprintf(f, "pass0_keys");
+                    for (uint32_t v : dump.pass0Keys) fprintf(f, " %u", v);
+                    fprintf(f, "\n");
+                    fclose(f);
+                    LOGI("SORT_DEBUG frame=%d written to sort_debug.txt (mid_lo=%u mid_hi=%u "
+                         "sample_count=%zu total=%zu)", state->frameCounter, dump.midFrameLo,
+                         dump.midFrameHi, dump.rawKeysSample.size(), dump.finalKeys.size());
+                } else {
+                    LOGE("SORT_DEBUG frame=%d: failed to open sort_debug.txt for write", state->frameCounter);
+                }
+            } else {
+                LOGI("SORT_DEBUG frame=%d: readSortDebugDump failed/not captured", state->frameCounter);
             }
         }
     } else {

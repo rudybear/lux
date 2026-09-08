@@ -37,7 +37,24 @@ echo "=== staging dir ==="
 "$ADB" shell mkdir -p "$TMP_STAGE"
 
 echo "=== pushing radix sort shaders ==="
-for f in histogram prefix_sum scatter; do
+# reduce_range/quantize (16-bit key quantization, commit 513ea9f) MUST be
+# in this list alongside the original three-shader sort's files -- their
+# absence here was the actual root cause of a Reconstruction-mode PSNR
+# regression (~29-30dB -> ~18.5dB, on-device only) chased across several
+# earlier sessions (74d4f7d/bfe3843) as a suspected Mali GPU/driver bug:
+# with these two missing, a device that had them staged via an earlier
+# one-off manual `adb push` (not this script) silently kept running
+# whatever version happened to be pushed that way, and quantize.comp.spv's
+# b76cfbe retile (1-item/thread global_invocation_id addressing -> tiled
+# 3840-elements/workgroup, 32-workgroup dispatch) was never re-pushed to
+# the already-provisioned test device -- the stale 1-item/thread shader
+# combined with the NEW 32-workgroup dispatch count only quantized the
+# first 32*256=8192 of 119,826 splats, leaving the rest of sortKeysBuffer_
+# holding un-quantized raw ~32-bit depth keys that the subsequent 2-pass
+# 16-bit radix sort then digit-sorted as if they were valid 16-bit keys,
+# corrupting back-to-front order for ~93% of the scene. Always push ALL
+# five radix-sort shader stages together so this can't happen again.
+for f in histogram prefix_sum scatter reduce_range quantize; do
     push_one "$LUX_ROOT/shaders/radix_sort/$f.comp.spv" "shaders/radix_sort/$f.comp.spv"
 done
 

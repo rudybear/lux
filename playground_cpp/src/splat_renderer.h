@@ -216,6 +216,43 @@ public:
     // index-order instead of depth-order.
     bool getKeyRangeDebug(VulkanContext& ctx, uint32_t& outLo, uint32_t& outHi) const;
 
+    // Root-cause follow-up to getKeyRangeDebug() (bisect step recommended
+    // by bfe3843's writeup): getKeyRangeDebug() above only reads
+    // keyRangeBuffer_ AFTER the entire frame (render pass included) has
+    // completed, which cannot distinguish "reduce_range's atomic result is
+    // correct by the time quantize's compute dispatch actually reads it"
+    // from "it becomes correct only later, and quantize raced ahead on a
+    // stale/sentinel value". armSortDebugDump() arms a one-shot capture
+    // (cleared after the next render() that has needsSort==true) that
+    // additionally snapshots, via extra vkCmdCopyBuffer calls inserted at
+    // precise points in the SAME command buffer:
+    //   - key_range immediately after the reduce_range->quantize barrier
+    //     (i.e. the exact value quantize's dispatch is meant to read),
+    //   - keys[0..sampleCount) both before reduce_range (raw,
+    //     pre-quantization) and after quantize (quantized, same indices),
+    //   - the full final sortKeysBuffer_/sortedIndicesBuffer_ once the
+    //     ping-pong pass loop completes, to check the sort's own
+    //     non-decreasing-key invariant.
+    // No-op (only the ordinary sort runs) if LUX_SORT_FORCE_32BIT is set,
+    // since none of reduce_range/quantize/key_range exist on that path.
+    void armSortDebugDump();
+
+    struct SortDebugDump {
+        bool valid = false;
+        uint32_t midFrameLo = 0, midFrameHi = 0;  // key_range as quantize will see it
+        std::vector<uint32_t> rawKeysSample;      // keys[0..sampleCount) before reduce_range
+        std::vector<uint32_t> quantKeysSample;    // keys[0..sampleCount) after quantize (same indices)
+        std::vector<uint32_t> finalKeys;          // full sortKeysBuffer_ after the sort completes
+        std::vector<uint32_t> finalIndices;       // full sortedIndicesBuffer_ after the sort completes
+        std::vector<uint32_t> pass0Keys;          // full sortKeysBBuffer_ right after pass 0's scatter
+    };
+    // Reads back the buffers armSortDebugDump() captured. Same
+    // after-the-fence-wait requirement as getKeyRangeDebug(). Returns
+    // dump.valid == false if no dump was captured (dump wasn't armed
+    // before the last render(), or LUX_SORT_FORCE_32BIT was active, or
+    // needsSort was false that frame).
+    bool readSortDebugDump(VulkanContext& ctx, SortDebugDump& dump) const;
+
     // --- Sort scheduling (perf; bench/lux_perf_ablation.md in mobiledlss:
     // the GPU radix sort is a flat ~5.7-7.1ms/frame cost regardless of
     // scene, independent of whether the view actually changed enough to
@@ -469,6 +506,28 @@ private:
     // remap sortKeysBuffer_ in place to a 16-bit-precision key -- letting
     // the main pass loop below run 2 passes of 8 bits instead of 4.
     VkBuffer keyRangeBuffer_ = VK_NULL_HANDLE;  VmaAllocation keyRangeAlloc_ = VK_NULL_HANDLE;
+
+    // Sort debug dump (see armSortDebugDump()/readSortDebugDump()): all
+    // host-visible (CPU_TO_GPU), allocated unconditionally in
+    // createBuffers() (numSplats_ * 4 bytes each -- a few hundred KB,
+    // noise next to the rest of this renderer's GPU memory). Pure
+    // vkCmdCopyBuffer destinations -- never written by a compute shader --
+    // so unlike keyRangeBuffer_ they cannot be affected by any driver
+    // quirk specific to a compute shader's atomics targeting host-visible
+    // memory; they isolate that variable.
+    static constexpr uint32_t kSortDebugSampleCount = 4096;
+    bool sortDebugArmed_ = false;
+    VkBuffer keyRangeMidFrameBuffer_ = VK_NULL_HANDLE;  VmaAllocation keyRangeMidFrameAlloc_ = VK_NULL_HANDLE;
+    VkBuffer sortDebugRawKeysBuffer_ = VK_NULL_HANDLE;  VmaAllocation sortDebugRawKeysAlloc_ = VK_NULL_HANDLE;
+    VkBuffer sortDebugQuantKeysBuffer_ = VK_NULL_HANDLE;  VmaAllocation sortDebugQuantKeysAlloc_ = VK_NULL_HANDLE;
+    VkBuffer sortDebugFinalKeysBuffer_ = VK_NULL_HANDLE;  VmaAllocation sortDebugFinalKeysAlloc_ = VK_NULL_HANDLE;
+    VkBuffer sortDebugFinalIndicesBuffer_ = VK_NULL_HANDLE;  VmaAllocation sortDebugFinalIndicesAlloc_ = VK_NULL_HANDLE;
+    // Extra bisect point (Mali investigation): buffer B (sortKeysBBuffer_)
+    // right after PASS 0's scatter completes, i.e. before pass 1 reads it
+    // -- narrows "corruption is somewhere in the 2-pass loop" down to
+    // "pass 0's histogram/scatter" vs "pass 1's".
+    VkBuffer sortDebugPass0KeysBuffer_ = VK_NULL_HANDLE;  VmaAllocation sortDebugPass0KeysAlloc_ = VK_NULL_HANDLE;
+    bool sortDebugDumpCaptured_ = false;  // set by render() when armed capture actually ran this frame
 
     // Sort pipelines (3 core compute stages + 2 range-quantization stages)
     VkPipeline sortHistogramPipeline_ = VK_NULL_HANDLE;

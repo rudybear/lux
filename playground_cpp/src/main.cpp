@@ -171,6 +171,12 @@ struct CLIOptions {
     std::string unetManifest;  // --unet-manifest <manifest.json>
     std::string unetOutput;    // --unet-output <out.npy>
     std::string unetKernelDir = "examples"; // --unet-kernel-dir <dir> (compiled unet_*.comp.spv location)
+
+    // Root-cause bisect (16-bit GPU radix sort, Mali PSNR regression): arms
+    // SplatRenderer::armSortDebugDump() before the splat render and dumps
+    // the result to <prefix>_sort_debug.txt afterward. See
+    // SplatRenderer::SortDebugDump's header comment.
+    std::string sortDebugDumpPrefix;   // --sort-debug-dump <prefix>
 };
 
 static void printUsage(const char* program) {
@@ -318,6 +324,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.unetOutput = argv[++i];
         } else if (arg == "--unet-kernel-dir" && i + 1 < argc) {
             opts.unetKernelDir = argv[++i];
+        } else if (arg == "--sort-debug-dump" && i + 1 < argc) {
+            opts.sortDebugDumpPrefix = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
         } else {
@@ -853,7 +861,40 @@ static int runHeadless(const CLIOptions& opts) {
                 std::cout << "[info] Hybrid render complete (mesh shader + splat)" << std::endl;
             } else {
                 // Splat-only rendering
+                if (!opts.sortDebugDumpPrefix.empty()) splatR->armSortDebugDump();
                 splatR->render(ctx);
+            }
+
+            if (!opts.sortDebugDumpPrefix.empty()) {
+                SplatRenderer::SortDebugDump dump;
+                if (splatR->readSortDebugDump(ctx, dump) && dump.valid) {
+                    std::string path = opts.sortDebugDumpPrefix + "_sort_debug.txt";
+                    std::ofstream f(path);
+                    f << "mid_frame_lo " << dump.midFrameLo << "\n";
+                    f << "mid_frame_hi " << dump.midFrameHi << "\n";
+                    f << "sample_count " << dump.rawKeysSample.size() << "\n";
+                    f << "raw_keys";
+                    for (auto v : dump.rawKeysSample) f << " " << v;
+                    f << "\n";
+                    f << "quant_keys";
+                    for (auto v : dump.quantKeysSample) f << " " << v;
+                    f << "\n";
+                    f << "final_keys";
+                    for (auto v : dump.finalKeys) f << " " << v;
+                    f << "\n";
+                    f << "final_indices";
+                    for (auto v : dump.finalIndices) f << " " << v;
+                    f << "\n";
+                    f << "pass0_keys";
+                    for (auto v : dump.pass0Keys) f << " " << v;
+                    f << "\n";
+                    f.close();
+                    std::cout << "[info] Sort debug dump written: " << path << std::endl;
+                } else {
+                    std::cerr << "[warn] --sort-debug-dump requested but dump wasn't captured "
+                                 "(needs !LUX_SORT_FORCE_32BIT and a splat-only render path)"
+                              << std::endl;
+                }
             }
 
             Screenshot::saveImageToPNG(ctx, splatR->getOutputImage(), splatR->getOutputFormat(),

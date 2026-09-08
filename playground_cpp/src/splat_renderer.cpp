@@ -144,6 +144,35 @@ static void uploadVmaBuffer(VmaAllocator allocator, VmaAllocation allocation,
     vmaUnmapMemory(allocator, allocation);
 }
 
+// Sort debug dump helper (SplatRenderer::armSortDebugDump()): copies
+// `size` bytes from `src` (offset 0) into `dst`, sandwiched between
+// deliberately maximally-conservative barriers (ALL_COMMANDS_BIT /
+// MEMORY_WRITE_BIT on both sides) so this diagnostic-only copy cannot
+// itself introduce a race regardless of exactly which earlier command
+// wrote the data being sampled -- correctness here matters far more than
+// the (already debug-gated) perf cost of a full pipeline stall.
+static void debugCopySSBO(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, VkDeviceSize size) {
+    VkMemoryBarrier pre = {};
+    pre.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    pre.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    pre.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &pre, 0, nullptr, 0, nullptr);
+
+    VkBufferCopy copy = {};
+    copy.srcOffset = 0;
+    copy.dstOffset = 0;
+    copy.size = size;
+    vkCmdCopyBuffer(cmd, src, dst, 1, &copy);
+
+    VkMemoryBarrier post = {};
+    post.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    post.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    post.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 1, &post, 0, nullptr, 0, nullptr);
+}
+
 static void destroyVmaBuffer(VmaAllocator allocator, VkBuffer& buffer, VmaAllocation& alloc) {
     if (buffer != VK_NULL_HANDLE) {
         vmaDestroyBuffer(allocator, buffer, alloc);
@@ -1136,6 +1165,30 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     createVmaBuffer(ctx.allocator, 2 * sizeof(uint32_t),
                     ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                     VMA_MEMORY_USAGE_CPU_TO_GPU, keyRangeBuffer_, keyRangeAlloc_);
+
+    // Sort debug dump buffers (see armSortDebugDump()/readSortDebugDump()
+    // in the header) -- plain host-visible vkCmdCopyBuffer destinations,
+    // never bound to any pipeline/descriptor set. Always allocated (cheap)
+    // so armSortDebugDump() can be called at any time without an extra
+    // buffer-creation path.
+    {
+        uint32_t sampleCount = std::min(numSplats_, kSortDebugSampleCount);
+        VkDeviceSize sampleBytes = std::max<VkDeviceSize>(sampleCount * sizeof(uint32_t), 4);
+        VkDeviceSize fullBytes = std::max<VkDeviceSize>(numSplats_ * sizeof(uint32_t), 4);
+        VkBufferUsageFlags dstOnly = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        createVmaBuffer(ctx.allocator, 2 * sizeof(uint32_t), dstOnly,
+                        VMA_MEMORY_USAGE_CPU_TO_GPU, keyRangeMidFrameBuffer_, keyRangeMidFrameAlloc_);
+        createVmaBuffer(ctx.allocator, sampleBytes, dstOnly,
+                        VMA_MEMORY_USAGE_CPU_TO_GPU, sortDebugRawKeysBuffer_, sortDebugRawKeysAlloc_);
+        createVmaBuffer(ctx.allocator, sampleBytes, dstOnly,
+                        VMA_MEMORY_USAGE_CPU_TO_GPU, sortDebugQuantKeysBuffer_, sortDebugQuantKeysAlloc_);
+        createVmaBuffer(ctx.allocator, fullBytes, dstOnly,
+                        VMA_MEMORY_USAGE_CPU_TO_GPU, sortDebugFinalKeysBuffer_, sortDebugFinalKeysAlloc_);
+        createVmaBuffer(ctx.allocator, fullBytes, dstOnly,
+                        VMA_MEMORY_USAGE_CPU_TO_GPU, sortDebugFinalIndicesBuffer_, sortDebugFinalIndicesAlloc_);
+        createVmaBuffer(ctx.allocator, fullBytes, dstOnly,
+                        VMA_MEMORY_USAGE_CPU_TO_GPU, sortDebugPass0KeysBuffer_, sortDebugPass0KeysAlloc_);
+    }
 
     std::cout << "[info] GPU radix sort: " << numSplats_ << " splats, "
               << sortNumWg_ << " workgroups, " << totalHistEntries << " histogram entries, "
@@ -2244,6 +2297,16 @@ void SplatRenderer::encodeFrameCore(VulkanContext& ctx, VkCommandBuffer& cmd, bo
             uint32_t bitOffset;
         };
 
+        // Sort debug dump (see armSortDebugDump()): capture the RAW,
+        // pre-quantization keys for the first kSortDebugSampleCount
+        // splats before reduce_range/quantize touch them at all.
+        bool sortDebugActive = sortDebugArmed_ && !kForceSort32Bit;
+        if (sortDebugActive) {
+            uint32_t sampleCount = std::min(numElements, kSortDebugSampleCount);
+            debugCopySSBO(cmd, sortKeysBuffer_, sortDebugRawKeysBuffer_,
+                         sampleCount * sizeof(uint32_t));
+        }
+
         // --- Range reduction + quantization (runs against buffer A,
         // sortKeysBuffer_, BEFORE the ping-pong pass loop) ---
         if (!kForceSort32Bit) {
@@ -2276,6 +2339,18 @@ void SplatRenderer::encodeFrameCore(VulkanContext& ctx, VkCommandBuffer& cmd, bo
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  0, 1, &sortBarrier, 0, nullptr, 0, nullptr);
 
+            // Sort debug dump: snapshot key_range RIGHT HERE, i.e. exactly
+            // the value quantize's dispatch (issued immediately below) is
+            // meant to read -- as opposed to getKeyRangeDebug(), which
+            // only reads keyRangeBuffer_ after the ENTIRE frame (render
+            // pass included) has completed and so cannot tell "correct by
+            // the time quantize reads it" apart from "only becomes correct
+            // later" (e.g. a missing/insufficient cross-dispatch barrier
+            // on this driver letting quantize race ahead of reduce_range).
+            if (sortDebugActive) {
+                debugCopySSBO(cmd, keyRangeBuffer_, keyRangeMidFrameBuffer_, 2 * sizeof(uint32_t));
+            }
+
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortQuantizePipeline_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sortRangeLayout_,
                                     0, 1, &sortRangeDescSet_, 0, nullptr);
@@ -2287,6 +2362,14 @@ void SplatRenderer::encodeFrameCore(VulkanContext& ctx, VkCommandBuffer& cmd, bo
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  0, 1, &sortBarrier, 0, nullptr, 0, nullptr);
+
+            // Sort debug dump: quantized keys for the SAME indices sampled
+            // above, now overwritten in place by quantize.
+            if (sortDebugActive) {
+                uint32_t sampleCount = std::min(numElements, kSortDebugSampleCount);
+                debugCopySSBO(cmd, sortKeysBuffer_, sortDebugQuantKeysBuffer_,
+                             sampleCount * sizeof(uint32_t));
+            }
         }
 
         for (uint32_t pass = 0; pass < numSortPasses; ++pass) {
@@ -2353,6 +2436,25 @@ void SplatRenderer::encodeFrameCore(VulkanContext& ctx, VkCommandBuffer& cmd, bo
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  0, 1, &sortBarrier, 0, nullptr, 0, nullptr);
+
+            // Sort debug dump bisect point: buffer B (sortKeysBBuffer_)
+            // right after pass 0's scatter -- narrows "corruption
+            // somewhere in the 2-pass loop" to "pass 0" vs "pass 1".
+            if (sortDebugActive && pass == 0) {
+                debugCopySSBO(cmd, sortKeysBBuffer_, sortDebugPass0KeysBuffer_,
+                             numElements * sizeof(uint32_t));
+            }
+        }
+
+        // Sort debug dump: the final sorted result (buffer A, both keys
+        // and the index permutation) once the whole sort has completed.
+        if (sortDebugActive) {
+            debugCopySSBO(cmd, sortKeysBuffer_, sortDebugFinalKeysBuffer_,
+                         numElements * sizeof(uint32_t));
+            debugCopySSBO(cmd, sortedIndicesBuffer_, sortDebugFinalIndicesBuffer_,
+                         numElements * sizeof(uint32_t));
+            sortDebugDumpCaptured_ = true;
+            sortDebugArmed_ = false;  // one-shot
         }
     }
 
@@ -2562,6 +2664,41 @@ bool SplatRenderer::getKeyRangeDebug(VulkanContext& ctx, uint32_t& outLo, uint32
     outLo = vals[0];
     outHi = vals[1];
     vmaUnmapMemory(ctx.allocator, keyRangeAlloc_);
+    return true;
+}
+
+void SplatRenderer::armSortDebugDump() {
+    sortDebugArmed_ = true;
+    sortDebugDumpCaptured_ = false;
+}
+
+bool SplatRenderer::readSortDebugDump(VulkanContext& ctx, SortDebugDump& dump) const {
+    dump = SortDebugDump{};
+    if (!sortDebugDumpCaptured_) return false;
+    if (keyRangeMidFrameAlloc_ == VK_NULL_HANDLE) return false;
+
+    uint32_t sampleCount = std::min(numSplats_, kSortDebugSampleCount);
+
+    auto readU32 = [&](VmaAllocation alloc, uint32_t count, std::vector<uint32_t>& out) -> bool {
+        void* mapped = nullptr;
+        if (vmaMapMemory(ctx.allocator, alloc, &mapped) != VK_SUCCESS || !mapped) return false;
+        out.assign(static_cast<const uint32_t*>(mapped), static_cast<const uint32_t*>(mapped) + count);
+        vmaUnmapMemory(ctx.allocator, alloc);
+        return true;
+    };
+
+    std::vector<uint32_t> midRange;
+    if (!readU32(keyRangeMidFrameAlloc_, 2, midRange)) return false;
+    dump.midFrameLo = midRange[0];
+    dump.midFrameHi = midRange[1];
+
+    if (!readU32(sortDebugRawKeysAlloc_, sampleCount, dump.rawKeysSample)) return false;
+    if (!readU32(sortDebugQuantKeysAlloc_, sampleCount, dump.quantKeysSample)) return false;
+    if (!readU32(sortDebugFinalKeysAlloc_, numSplats_, dump.finalKeys)) return false;
+    if (!readU32(sortDebugFinalIndicesAlloc_, numSplats_, dump.finalIndices)) return false;
+    if (!readU32(sortDebugPass0KeysAlloc_, numSplats_, dump.pass0Keys)) return false;
+
+    dump.valid = true;
     return true;
 }
 
@@ -2939,6 +3076,12 @@ void SplatRenderer::cleanup(VulkanContext& ctx) {
     destroyVmaBuffer(ctx.allocator, histogramBuffer_, histogramAlloc_);
     destroyVmaBuffer(ctx.allocator, partitionSumsBuffer_, partitionSumsAlloc_);
     destroyVmaBuffer(ctx.allocator, keyRangeBuffer_, keyRangeAlloc_);
+    destroyVmaBuffer(ctx.allocator, keyRangeMidFrameBuffer_, keyRangeMidFrameAlloc_);
+    destroyVmaBuffer(ctx.allocator, sortDebugRawKeysBuffer_, sortDebugRawKeysAlloc_);
+    destroyVmaBuffer(ctx.allocator, sortDebugQuantKeysBuffer_, sortDebugQuantKeysAlloc_);
+    destroyVmaBuffer(ctx.allocator, sortDebugFinalKeysBuffer_, sortDebugFinalKeysAlloc_);
+    destroyVmaBuffer(ctx.allocator, sortDebugFinalIndicesBuffer_, sortDebugFinalIndicesAlloc_);
+    destroyVmaBuffer(ctx.allocator, sortDebugPass0KeysBuffer_, sortDebugPass0KeysAlloc_);
 
     for (size_t i = 0; i < shBuffers_.size(); ++i) {
         destroyVmaBuffer(ctx.allocator, shBuffers_[i], shAllocs_[i]);
