@@ -36,6 +36,8 @@
 #include <memory>
 #include <filesystem>
 #include <algorithm>
+#include <atomic>
+#include <dispatch/dispatch.h>
 #include <type_traits>
 #include <cstring>
 #include <stdexcept>
@@ -278,6 +280,22 @@ struct CLIOptions {
     // default) liveProxyW/H and liveTargetW/H below apply unchanged, byte-
     // identical to before --width/--height were wired in here.
     int liveBenchFrames = 0;
+    // --live-bench-pipelined (perf; playground_ios/Source/SplatView.mm's
+    // Reconstruction-mode host-wait removal, mobiledlss task): when combined
+    // with --live-bench <N>, runs an ADDITIONAL pass through the SAME N
+    // frames using the 2-deep-in-flight submission pattern the iOS app now
+    // uses (dispatch_semaphore_t, addCompletedHandler instead of
+    // waitUntilCompleted, MetalSplatLuxcRenderer::encodeFrame's
+    // frameInFlightIndex ping-ponging prevCameraBuffer_) -- reports
+    // cmdbufs/waits per frame, CPU encode ms, real GPU ms and wall-clock fps
+    // next to the existing always-wait baseline block, on the SAME machine/
+    // scene/history continuation, so the two numbers are directly
+    // comparable. Mac stand-in for the on-device A/B this task originally
+    // wanted from the iPad (disconnected) -- this class (metal_live_
+    // reconstruct.*) is unchanged between the two hosts, so a real overlap
+    // win here is strong evidence the same win holds on-device. Default
+    // false = unchanged (baseline-only) --live-bench behavior.
+    bool liveBenchPipelined = false;
     // Sibling-repo asset bundle (mobiledlss/demo/ios_assets/, playground_ios's
     // own bundled resources -- see the Xcode project's ../../mobiledlss/
     // demo/ios_assets/... file references): texture.npy/unet_weights.*/
@@ -350,6 +368,23 @@ struct CLIOptions {
     // frames get PNGs written to --live-dump's directory. Empty (default)
     // = dump every frame in the run.
     std::string liveDumpFramesSpec;
+
+    // --live-interactive: opens a real GLFW/Metal window and runs the same
+    // shared MetalLiveReconstruct chain live, so the 4 SplatView.mm display
+    // modes can be inspected on a Mac with no iPad attached -- see
+    // runLiveInteractiveMetal()'s comment. Independent of the generic
+    // --interactive path (which needs --scene/--pipeline; this is
+    // self-contained like --live-bench/--live-psnr, own --live-* asset
+    // flags).
+    bool liveInteractive = false;
+    // --live-shot <DIR>: with --live-interactive, auto-cycle all 4 modes
+    // (Proxy/Bilinear/Reconstruction/Target -- 2s each so the recurrent
+    // chain has real time to settle), write one PNG of the actual
+    // on-screen drawable content per mode, then exit -- for reviewing the
+    // interactive path's real display output without sitting at the
+    // window. Empty (default) = disabled (normal interactive session,
+    // runs until the window is closed/ESC).
+    std::string liveShotDir;
 };
 
 static void printUsage(const char* program) {
@@ -391,6 +426,11 @@ static void printUsage(const char* program) {
               << "                         target (output) size instead -- the proxy becomes half that\n"
               << "                         (net res is derived automatically). --live-psnr honors the\n"
               << "                         same --width/--height override.\n"
+              << "  --live-bench-pipelined With --live-bench <N>: also runs the same N frames through a\n"
+              << "                         2-deep-in-flight submission (semaphore + addCompletedHandler,\n"
+              << "                         no waitUntilCompleted) instead of the baseline's wait-every-\n"
+              << "                         frame loop, and prints cmdbufs/waits, CPU encode ms, GPU ms and\n"
+              << "                         wall-clock fps for both so they can be compared directly.\n"
               << "  --live-assets-dir <DIR> exported/{texture.npy,unet_weights.*,memory_head.npz} +\n"
               << "                         bg_sphere.npy + the scene .glb (default: ../mobiledlss/demo/ios_assets)\n"
               << "  --live-scene <PATH>    Override the --live-bench scene .glb (default: <assets-dir>/juggle_p0.8_stride4.glb)\n"
@@ -414,6 +454,14 @@ static void printUsage(const char* program) {
               << "  --live-dump-frames <SPEC>  Comma-separated frame indices/ranges to write with\n"
               << "                         --live-dump, e.g. \"0-11,60-71\" (default: every frame in\n"
               << "                         the --live-psnr run)\n"
+              << "  --live-interactive     Open a real GLFW/Metal window running the live-inference\n"
+              << "                         chain (same shared MetalLiveReconstruct as the iPad app), with\n"
+              << "                         the SAME 4 display modes SplatView.mm has -- keys 1-4 select\n"
+              << "                         Proxy/Bilinear/Reconstruction/Target directly, space cycles.\n"
+              << "                         Title bar shows mode/fps/GPU ms. ESC or close the window to quit.\n"
+              << "  --live-shot <DIR>      With --live-interactive: auto-cycle all 4 modes (2s each),\n"
+              << "                         write one PNG of the actual on-screen drawable per mode to\n"
+              << "                         <DIR>/{proxy,bilinear,recon,target}.png, then exit.\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -541,6 +589,8 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.unetKernelDir = argv[++i];
         } else if (arg == "--live-bench" && i + 1 < argc) {
             opts.liveBenchFrames = std::stoi(argv[++i]);
+        } else if (arg == "--live-bench-pipelined") {
+            opts.liveBenchPipelined = true;
         } else if (arg == "--live-assets-dir" && i + 1 < argc) {
             opts.liveAssetsDir = argv[++i];
         } else if (arg == "--live-scene" && i + 1 < argc) {
@@ -559,6 +609,10 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.liveDumpDir = argv[++i];
         } else if (arg == "--live-dump-frames" && i + 1 < argc) {
             opts.liveDumpFramesSpec = argv[++i];
+        } else if (arg == "--live-interactive") {
+            opts.liveInteractive = true;
+        } else if (arg == "--live-shot" && i + 1 < argc) {
+            opts.liveShotDir = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
             opts.shaderBaseExplicit = true;
@@ -570,7 +624,7 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
     }
 
     if (!opts.reconstructDumpDir.empty() || !opts.unetInput.empty() || !opts.dumpBgFeaturesDir.empty() ||
-        opts.liveBenchFrames > 0 || opts.livePsnrFrames > 0) {
+        opts.liveBenchFrames > 0 || opts.livePsnrFrames > 0 || opts.liveInteractive) {
         return opts;
     }
 
@@ -1040,6 +1094,209 @@ static int runLiveBenchMetal(const CLIOptions& opts) {
     std::cout << "[live-bench]   recon_gpu_ms       median=" << reconMed << " p90=" << reconP90 << std::endl;
     std::cout << "[live-bench]   split_total_gpu_ms median=" << splitMed << " p90=" << splitP90 << std::endl;
 
+    // --live-bench-pipelined: SAME live/scene/history (continues on from the
+    // frame index the two blocks above already consumed -- no resetHistory()
+    // -- so this is a like-for-like continuation of the same run, not a
+    // fresh warm-up), but submitted the way playground_ios/Source/
+    // SplatView.mm's Reconstruction mode now does: 2 frames' command buffers
+    // may be outstanding on the GPU at once (dispatch_semaphore_t, count 2),
+    // no waitUntilCompleted anywhere in the loop, GPU timing read back
+    // asynchronously via addCompletedHandler, and MetalSplatLuxcRenderer's
+    // prevCameraBuffer_ ping-ponged via frameInFlightIndex=i&1 (see its own
+    // doc comment for why a single shared buffer would race under overlap).
+    // Real per-frame throughput under overlap isn't "time for one iteration
+    // of this loop" (that's just CPU encode time now, not GPU-bound) -- it's
+    // wall-clock across the WHOLE batch, N frames / total_seconds.
+    if (opts.liveBenchPipelined) {
+        const int N = opts.liveBenchFrames;
+        const int frameBase = kWarmup + opts.liveBenchFrames + kProfiledFrames;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(2);
+        std::vector<double> gpuTotalMsP(static_cast<size_t>(N), 0.0);
+        std::vector<double> cpuEncodeMsP(static_cast<size_t>(N), 0.0);
+        std::vector<int> cmdbufCountP(static_cast<size_t>(N), 0);
+        std::atomic<int> completedCount{0};
+
+        auto tBatch0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < N; ++i) {
+            NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+            // Bounds outstanding GPU work to 2 frames -- blocks here only
+            // once frame i-2's command buffer hasn't completed yet by the
+            // time frame i wants to start encoding (the intended, expected
+            // "semaphore wait is fine" throttle -- NOT counted as a
+            // waitUntilCompleted-style host wait in the per-frame stats
+            // below, matching SplatView.mm's own accounting).
+            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+            auto in = buildFrameInputs(frameBase + i);
+            auto t0 = std::chrono::steady_clock::now();
+            auto* cmdBuf = ctx.beginCommandBuffer();
+            // Own +1 on cmdBuf -- see the crash this fixed, below. `cur`
+            // already carries its own extra +1 from MPSGraphUNet::encode()'s
+            // __bridge_retained (balanced by cur->release() below); cmdBuf
+            // gets none from anywhere, and ctx.beginCommandBuffer() itself
+            // returns an AUTORELEASED pointer (MTLCommandQueue::commandBuffer
+            // semantics), autoreleased into THIS iteration's own pool, which
+            // drains (pool->release()) before this frame's completion
+            // handler can possibly fire.
+            cmdBuf->retain();
+            auto* cur = live.encodeFrame(ctx, cmdBuf, in, static_cast<uint32_t>(i & 1));
+            cmdbufCountP[static_cast<size_t>(i)] = (cur != cmdBuf) ? 2 : 1;
+            // Registered BEFORE commit() (required -- see MTLCommandBuffer's
+            // addCompletedHandler docs).
+            //
+            // First cut of this got EXC_BAD_ACCESS (objc_msgSend) here on
+            // the SPLIT path (MPSGraph's commitAndContinue, `cur != cmdBuf`):
+            // committing a command buffer does NOT, on its own, keep it
+            // alive until every handler on it has run -- only a handler
+            // registered ON THAT SPECIFIC BUFFER gets that guarantee (from
+            // the runtime holding it live for ITS OWN dispatch). Nothing
+            // else held a strong ref to `cmdBuf` past this iteration's own
+            // NS::AutoreleasePool draining a few lines down (pool->release()),
+            // so by the time `cur`'s completion handler ran -- after cmdBuf
+            // had ALREADY completed and this loop had moved on several
+            // frames -- cmdBuf was a dangling pointer. Passed the same crash
+            // to playground_ios/Source/SplatView.mm's real device
+            // implementation before it ever got the chance to run there --
+            // this class of bug is exactly what MPSGraphUNet::encode()'s own
+            // __bridge_retained fix (see its doc comment) already covers for
+            // `cur`; cmdBuf just needed the same treatment.
+            cur->addCompletedHandler([&gpuTotalMsP, &completedCount, &sem, cmdBuf, cur, i](MTL::CommandBuffer*) {
+                gpuTotalMsP[static_cast<size_t>(i)] = MetalLiveReconstruct::gpuMsAcrossPossibleSplit(cmdBuf, cur);
+                completedCount.fetch_add(1, std::memory_order_relaxed);
+                cmdBuf->release();  // balances the retain() above.
+                dispatch_semaphore_signal(sem);
+            });
+            cur->commit();
+            auto t1 = std::chrono::steady_clock::now();
+            cpuEncodeMsP[static_cast<size_t>(i)] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            cur->release();  // balances MPSGraphUNet::encode()'s extra retain -- see its own doc comment.
+            pool->release();
+        }
+        // Drain the up-to-2 frames still in flight after the loop -- once
+        // both have signalled, completedCount==N and gpuTotalMsP/cmdbufCountP
+        // are fully populated.
+        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        auto tBatch1 = std::chrono::steady_clock::now();
+        double batchSeconds = std::chrono::duration<double>(tBatch1 - tBatch0).count();
+        double wallFps = batchSeconds > 0.0 ? static_cast<double>(N) / batchSeconds : 0.0;
+
+        double gpuMedianP, gpuP90P, cpuMedianP, cpuP90P;
+        computeMedianP90(gpuTotalMsP, gpuMedianP, gpuP90P);
+        computeMedianP90(cpuEncodeMsP, cpuMedianP, cpuP90P);
+        double cmdbufMean = 0.0;
+        for (int c : cmdbufCountP) cmdbufMean += c;
+        cmdbufMean /= std::max(1, N);
+
+        std::cout << "[live-bench] ===== PIPELINED (2 frames in flight, " << N << " frames, completed="
+                  << completedCount.load() << "/" << N << ") =====" << std::endl;
+        std::cout << "[live-bench] wall_fps            " << wallFps << "  (" << batchSeconds * 1000.0
+                  << "ms / " << N << " frames, real overlapped throughput)" << std::endl;
+        std::cout << "[live-bench] fused_total_gpu_ms   median=" << gpuMedianP << " p90=" << gpuP90P
+                  << "  (vs. baseline median=" << gpuMedian << ")" << std::endl;
+        std::cout << "[live-bench] cpu_encode_ms        median=" << cpuMedianP << " p90=" << cpuP90P
+                  << "  (vs. baseline cpu_wall_ms median=" << cpuMedian << " -- baseline's cpu_wall_ms"
+                  << " includes its waitUntilCompleted(), this doesn't)" << std::endl;
+        std::cout << "[live-bench] cmdbufs/frame        mean=" << cmdbufMean
+                  << "  waits/frame=0 (host waitUntilCompleted count; the 2-deep semaphore wait above"
+                  << " is intentional backpressure, not counted)" << std::endl;
+
+        // Correctness cross-check (the thing that actually matters here --
+        // a broken prevCameraBuffer_ double-buffer, or the cmdBuf
+        // use-after-free this file's own comment above describes hitting
+        // first, would show up as WRONG pixels on some frames, not
+        // necessarily a crash). Two brand-new MetalLiveReconstruct
+        // instances, each with its own fresh from-frame-0 history (not the
+        // benchmark runs' already-warmed-up state above) -- one driven
+        // sequentially (wait-every-frame, frameInFlightIndex always 0, i.e.
+        // today's already-shipped behavior), one driven the new pipelined
+        // way (2 in flight, index alternating) -- over the IDENTICAL frame
+        // range and camera/morph schedule. Metal compute is deterministic
+        // for identical inputs and identical per-queue submission order (the
+        // only thing overlap changes is how far ahead the CPU encodes, not
+        // command execution order), so these should match closely; any real
+        // desync between prevCameraBuffer_[0]/[1] would show up as a wrong
+        // (not just noisy) frame's motion vectors, i.e. a localized spike in
+        // recon_rgba_max_abs_diff, not a small uniform rmse.
+        {
+            const int kCheckFrames = 12;
+            MetalLiveReconstruct liveSeq, livePipe;
+            liveSeq.init(ctx, scene.getSplatData(), params);
+            livePipe.init(ctx, scene.getSplatData(), params);
+
+            std::vector<std::vector<float>> seqColor(static_cast<size_t>(kCheckFrames));
+            for (int i = 0; i < kCheckFrames; ++i) {
+                NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+                auto in = buildFrameInputs(i);
+                auto* cmdBuf = ctx.beginCommandBuffer();
+                auto* cur = liveSeq.encodeFrame(ctx, cmdBuf, in, 0);
+                cur->commit();
+                cur->waitUntilCompleted();
+                std::vector<uint8_t> unusedRgba8;
+                auto raw = MetalScreenshot::readTextureRaw(ctx, liveSeq.getReconOutputTexture(), liveSeq.getTargetW(),
+                                                             liveSeq.getTargetH(), 8);
+                seqColor[static_cast<size_t>(i)] =
+                    DlssIO::convertRgba16fColorAttachment(raw, liveSeq.getTargetW(), liveSeq.getTargetH(), unusedRgba8);
+                cur->release();
+                pool->release();
+            }
+
+            dispatch_semaphore_t semC = dispatch_semaphore_create(2);
+            std::vector<std::vector<float>> pipeColor(static_cast<size_t>(kCheckFrames));
+            std::atomic<int> pipeCompleted{0};
+            uint32_t checkTw = livePipe.getTargetW(), checkTh = livePipe.getTargetH();
+            for (int i = 0; i < kCheckFrames; ++i) {
+                NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+                dispatch_semaphore_wait(semC, DISPATCH_TIME_FOREVER);
+                auto in = buildFrameInputs(i);
+                auto* cmdBuf = ctx.beginCommandBuffer();
+                cmdBuf->retain();  // see the cmdBuf use-after-free comment above.
+                auto* cur = livePipe.encodeFrame(ctx, cmdBuf, in, static_cast<uint32_t>(i & 1));
+                MTL::Texture* reconTex = livePipe.getReconOutputTexture();
+                cur->addCompletedHandler([&pipeColor, &pipeCompleted, &semC, &ctx, cmdBuf, reconTex, checkTw,
+                                           checkTh, i](MTL::CommandBuffer*) {
+                    NS::AutoreleasePool* hpool = NS::AutoreleasePool::alloc()->init();
+                    std::vector<uint8_t> unusedRgba8;
+                    auto raw = MetalScreenshot::readTextureRaw(ctx, reconTex, checkTw, checkTh, 8);
+                    pipeColor[static_cast<size_t>(i)] =
+                        DlssIO::convertRgba16fColorAttachment(raw, checkTw, checkTh, unusedRgba8);
+                    pipeCompleted.fetch_add(1, std::memory_order_relaxed);
+                    cmdBuf->release();
+                    hpool->release();
+                    dispatch_semaphore_signal(semC);
+                });
+                cur->commit();
+                cur->release();
+                pool->release();
+            }
+            dispatch_semaphore_wait(semC, DISPATCH_TIME_FOREVER);
+            dispatch_semaphore_wait(semC, DISPATCH_TIME_FOREVER);
+
+            double maxAbsDiff = 0.0, sumSqDiff = 0.0;
+            size_t n = 0;
+            for (int i = 0; i < kCheckFrames; ++i) {
+                if (seqColor[static_cast<size_t>(i)].size() != pipeColor[static_cast<size_t>(i)].size() ||
+                    seqColor[static_cast<size_t>(i)].empty()) {
+                    continue;
+                }
+                for (size_t k = 0; k < seqColor[static_cast<size_t>(i)].size(); ++k) {
+                    double d = static_cast<double>(seqColor[static_cast<size_t>(i)][k]) -
+                               static_cast<double>(pipeColor[static_cast<size_t>(i)][k]);
+                    maxAbsDiff = std::max(maxAbsDiff, std::abs(d));
+                    sumSqDiff += d * d;
+                    n++;
+                }
+            }
+            double rmse = n > 0 ? std::sqrt(sumSqDiff / static_cast<double>(n)) : -1.0;
+            std::cout << "[live-bench] ===== CORRECTNESS CROSS-CHECK (sequential vs pipelined, " << kCheckFrames
+                      << " frames, fresh history each) =====" << std::endl;
+            std::cout << "[live-bench] recon_rgba max_abs_diff=" << maxAbsDiff << " rmse=" << rmse
+                      << " (pipeCompleted=" << pipeCompleted.load() << "/" << kCheckFrames << ", compared "
+                      << n << " values)" << std::endl;
+        }
+
+        return 0;
+    }
+
     return 0;
 }
 
@@ -1422,6 +1679,374 @@ static int runLivePsnrMetal(const CLIOptions& opts) {
                   << "dB (" << psnrLog.size() << " frames)" << std::endl;
     }
 
+    return 0;
+}
+
+// --------------------------------------------------------------------------
+// --live-interactive: a real GLFW/Metal window running the SAME shared
+// MetalLiveReconstruct chain --live-bench/--live-psnr do, live, with the
+// exact 4 display modes playground_ios/Source/SplatView.mm's DisplayMode
+// enum has (Proxy/Bilinear("Bicubic")/Reconstruction/Target) -- keys 1-4
+// select a mode directly, space cycles, so the visual bugs a device would
+// show can be inspected on a Mac with nobody's iPad attached. Self-contained
+// (own GLFW window/MetalContext), like runLiveBenchMetal/runLivePsnrMetal.
+//
+// Display-mode parity with the app: Reconstruction blits
+// live.getReconOutputTexture() straight to the drawable (SplatView.mm's own
+// "already target-res, already straight non-premultiplied RGB" shortcut);
+// Proxy/Bilinear/Target all go through kLiveDumpUpscaleMSL (byte-identical
+// to SplatView.mm's kUpscaleMSL -- see its own comment above), same
+// scale/bilinear-flag convention (scale=1 nearest for Target's identity
+// un-premultiply "copy", scale=target/proxy for Proxy(nearest)/
+// Bilinear(bilinear=1)).
+//
+// --live-shot <DIR>: auto-cycles all 4 modes (2s each) and captures one PNG
+// of the ACTUAL drawable content per mode (not an offline re-render --
+// exercises the identical blit/upscale-kernel dispatch a human sitting at
+// the window would see), then exits -- see the capture block below.
+// --------------------------------------------------------------------------
+
+static const char* kLiveInteractiveModeNames[4] = {"Proxy", "Bilinear", "Reconstruction", "Target"};
+static const char* kLiveInteractiveModeFiles[4] = {"proxy", "bilinear", "recon", "target"};
+
+static int runLiveInteractiveMetal(CLIOptions opts) {
+    uint32_t proxyW, proxyH, targetW, targetH;
+    resolveLiveResolutions(opts, proxyW, proxyH, targetW, targetH);
+
+    std::string proxySceneSource =
+        opts.liveSceneSource.empty() ? (opts.liveAssetsDir + "/juggle_p0.8_stride4.glb") : opts.liveSceneSource;
+    std::string targetSceneSource = opts.liveTargetSceneSource.empty()
+                                         ? (opts.liveAssetsDir + "/juggle_full_stride4.glb")
+                                         : opts.liveTargetSceneSource;
+
+    MetalSceneManager sceneProxy, sceneTarget;
+    sceneProxy.loadScene(proxySceneSource);
+    sceneTarget.loadScene(targetSceneSource);
+    if (!sceneProxy.hasSplatData() || !sceneTarget.hasSplatData()) {
+        std::cerr << "[live-interactive] scene has no KHR_gaussian_splatting data" << std::endl;
+        return 1;
+    }
+
+    if (!glfwInit()) {
+        std::cerr << "[error] Failed to initialize GLFW" << std::endl;
+        return 1;
+    }
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+    // Keep glfwGetFramebufferSize() == the window's point size (no implicit
+    // 2x on Retina): the live chain's textures (recon/proxy/target) are all
+    // fixed at proxyW/H x targetW/H from init() below, and the Reconstruction
+    // display path is a raw size-matched blit -- a HiDPI-scaled framebuffer
+    // would silently only fill the drawable's top-left corner.
+    glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, GLFW_FALSE);
+
+    GLFWwindow* window = glfwCreateWindow(static_cast<int>(targetW), static_cast<int>(targetH),
+                                           "Lux Live (Metal)", nullptr, nullptr);
+    if (!window) {
+        std::cerr << "[error] Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        return 1;
+    }
+
+    MetalContext ctx;
+    try {
+        ctx.init(window);
+    } catch (const std::exception& e) {
+        std::cerr << "[error] Failed to initialize Metal: " << e.what() << std::endl;
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return 1;
+    }
+    // Required for the Proxy/Bilinear/Target display path below (a compute
+    // kernel WRITES directly into drawable->texture(), and --live-shot
+    // blit-reads it back) -- CAMetalLayer.framebufferOnly defaults to true,
+    // which restricts its drawables to framebuffer-only (render-pass) use;
+    // a compute-kernel access::write (or a blit read) into that texture is
+    // silently invalid without this. Exactly the same requirement/fix
+    // SplatView.mm's own metalLayer.framebufferOnly = NO already documents
+    // for the identical reason.
+    ctx.metalLayer->setFramebufferOnly(false);
+    // Required for Reconstruction mode's display path: MetalContext::init()
+    // leaves the GLFW window's CAMetalLayer at its default BGRA8Unorm
+    // (8-bit) pixel format, but live.getReconOutputTexture() is
+    // RGBA16Float (16-bit/channel) -- a raw blitCommandEncoder copy between
+    // mismatched-bit-depth pixel formats reinterprets bytes rather than
+    // converting them, producing corrupted/tiled garbage (reproduced:
+    // without this line, recon.png came out as scrambled magenta noise).
+    // SplatView.mm sets `metalLayer.pixelFormat = MTLPixelFormatRGBA16Float`
+    // for exactly this reason (its own "already target-res RGBA16Float --
+    // straight blit into the (same-format) drawable" comment) -- match it
+    // here so the blit is actually same-format, like the app's.
+    ctx.metalLayer->setPixelFormat(MTL::PixelFormatRGBA16Float);
+
+    MetalLiveReconstruct live;
+    MetalLiveReconstruct::InitParams params;
+    params.shaderBase = opts.livePipeline;
+    params.proxyW = proxyW;
+    params.proxyH = proxyH;
+    params.targetW = targetW;
+    params.targetH = targetH;
+    params.paramStride = opts.liveParamStride;
+    params.hiddenChannels = 8;
+    const std::string liveExportedDir =
+        opts.liveExportedDir.empty() ? (opts.liveAssetsDir + "/exported") : opts.liveExportedDir;
+    params.textureNpyPath = liveExportedDir + "/texture.npy";
+    params.bgSphereNpyPath = opts.liveAssetsDir + "/bg_sphere.npy";
+    params.unetWeightsBinPath = liveExportedDir + "/unet_weights.fp16.bin";
+    params.unetLayersTxtPath = liveExportedDir + "/unet_weights.layers.txt";
+    params.memoryHeadNpzPath = liveExportedDir + "/memory_head.npz";
+    params.sortEveryNFrames = 4;  // (perf) -- see runLiveBenchMetal's identical comment.
+    params.sortViewThresholdDeg = 2.0f;
+    live.init(ctx, sceneProxy.getSplatData(), params);
+
+    // Target mode: its own second luxc renderer against the unpruned scene,
+    // full target resolution, no jitter -- mirrors SplatView.mm's
+    // _splatRTarget exactly.
+    MetalSplatLuxcRenderer target;
+    target.init(ctx, sceneTarget.getSplatData(), opts.livePipeline, targetW, targetH);
+
+    int loopFrames = 480;  // SplatView.mm's own fallback before hasMotion() is known.
+    if (target.hasMotion()) {
+        loopFrames = std::max(1, static_cast<int>(std::round(target.animationDuration() * 30.0f)));  // kSimFps
+    }
+
+    // upscale_proxy compute pipeline (Proxy/Bilinear/Target display path) --
+    // see kLiveDumpUpscaleMSL's own comment.
+    MTL::ComputePipelineState* upscalePipeline = nullptr;
+    {
+        NS::Error* shaderErr = nullptr;
+        auto* src = NS::String::string(kLiveDumpUpscaleMSL, NS::UTF8StringEncoding);
+        auto* compileOpts = MTL::CompileOptions::alloc()->init();
+        auto* lib = ctx.device->newLibrary(src, compileOpts, &shaderErr);
+        compileOpts->release();
+        if (!lib) {
+            std::cerr << "[live-interactive] upscale shader compile failed: "
+                      << (shaderErr ? shaderErr->localizedDescription()->utf8String() : "?") << std::endl;
+            return 1;
+        }
+        auto* fn = lib->newFunction(NS::String::string("upscale_proxy", NS::UTF8StringEncoding));
+        upscalePipeline = ctx.device->newComputePipelineState(fn, &shaderErr);
+        fn->release();
+        lib->release();
+        if (!upscalePipeline) {
+            std::cerr << "[live-interactive] failed to create upscale pipeline" << std::endl;
+            return 1;
+        }
+    }
+
+    const bool autoShot = !opts.liveShotDir.empty();
+    if (autoShot) {
+        std::error_code ec;
+        fs::create_directories(opts.liveShotDir, ec);
+    }
+
+    // Mode indices match SplatView.mm's DisplayMode enum: 0=Proxy,
+    // 1=Bilinear("Bicubic"), 2=Reconstruction, 3=Target. App default is
+    // Reconstruction; --live-shot always starts at Proxy (mode 0) so the
+    // 4-shot cycle below is deterministic regardless.
+    int mode = autoShot ? 0 : 2;
+    int lastMode = mode;
+    int frame = 0;
+    bool key1Prev = false, key2Prev = false, key3Prev = false, key4Prev = false, spacePrev = false;
+    double modeStartTime = glfwGetTime();
+    bool capturedThisMode = false;
+
+    double fpsWindowStart = glfwGetTime();
+    int fpsFrameCount = 0;
+    double fps = 0.0;
+    double lastGpuMs = 0.0;
+    double lastTitleUpdate = 0.0;
+
+    std::cout << "[live-interactive] ready: proxy=" << proxyW << "x" << proxyH << " target=" << targetW << "x"
+              << targetH << " netRes=" << live.getNetW() << "x" << live.getNetH() << " loopFrames=" << loopFrames
+              << (autoShot ? "  (--live-shot: auto-cycling, will exit after 4 modes)" : "") << std::endl;
+    std::cout << "[live-interactive] keys: 1=Proxy 2=Bilinear 3=Reconstruction 4=Target space=cycle ESC=quit"
+              << std::endl;
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+            glfwSetWindowShouldClose(window, GLFW_TRUE);
+            continue;
+        }
+
+        if (!autoShot) {
+            bool k1 = glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS;
+            bool k2 = glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS;
+            bool k3 = glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS;
+            bool k4 = glfwGetKey(window, GLFW_KEY_4) == GLFW_PRESS;
+            bool sp = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+            if (k1 && !key1Prev) mode = 0;
+            if (k2 && !key2Prev) mode = 1;
+            if (k3 && !key3Prev) mode = 2;
+            if (k4 && !key4Prev) mode = 3;
+            if (sp && !spacePrev) mode = (mode + 1) % 4;
+            key1Prev = k1;
+            key2Prev = k2;
+            key3Prev = k3;
+            key4Prev = k4;
+            spacePrev = sp;
+        }
+
+        int fbW, fbH;
+        glfwGetFramebufferSize(window, &fbW, &fbH);
+        if (fbW == 0 || fbH == 0) {
+            glfwWaitEvents();
+            continue;
+        }
+        updateDrawableSize(ctx.metalLayer, window);
+
+        // Mirrors SplatView.mm's tick: -- entering Reconstruction from any
+        // other mode resets the recurrent history (stale otherwise, by
+        // however many frames were spent displaying a mode that doesn't run
+        // the chain).
+        bool enteringRecon = (mode == 2 && lastMode != 2);
+        if (enteringRecon) live.resetHistory();
+        lastMode = mode;
+
+        int prevFrame = frame > 0 ? frame - 1 : 0;
+        bool hasMotion = live.proxyRenderer().hasMotion();
+        float tCur = hasMotion ? live.proxyRenderer().frameToTime(frame) : 0.0f;
+        float tPrev = hasMotion ? live.proxyRenderer().frameToTime(prevFrame) : 0.0f;
+        float jxTarget, jyTarget;
+        LiveOrbitCamera::taaJitterTargetPx(frame, /*period=*/16, jxTarget, jyTarget);
+        float scaleP = static_cast<float>(proxyW) / static_cast<float>(targetW);
+        float jxProxy = jxTarget * scaleP, jyProxy = jyTarget * scaleP;
+
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+
+        MTL::Texture* displaySrc = nullptr;  // Proxy/Bilinear/Target path
+        bool useReconBlit = false;           // Reconstruction path
+        double gpuMs = 0.0;
+
+        if (mode == 3) {  // Target
+            LiveOrbitCamera::Result cam =
+                LiveOrbitCamera::compute(frame, targetW, targetH, MetalSplatLuxcRenderer::kMetalYConvention);
+            target.updateCameraExplicit(cam.eye, cam.viewGl, cam.proj, cam.fx, cam.fy);
+            target.setJitter(0.0f, 0.0f);
+            if (target.hasMotion()) target.setMorphTime(tCur);
+            target.render(ctx);
+            gpuMs = target.getLastGpuTotalMs();
+            displaySrc = target.getOutputTexture();
+        } else if (mode == 0 || mode == 1) {  // Proxy / Bilinear
+            LiveOrbitCamera::Result cam =
+                LiveOrbitCamera::compute(frame, proxyW, proxyH, MetalSplatLuxcRenderer::kMetalYConvention);
+            live.proxyRenderer().updateCameraExplicit(cam.eye, cam.viewGl, cam.proj, cam.fx, cam.fy);
+            live.proxyRenderer().setJitter(jxProxy, jyProxy);
+            if (hasMotion) live.proxyRenderer().setMorphTime(tCur);
+            live.proxyRenderer().render(ctx);
+            gpuMs = live.proxyRenderer().getLastGpuTotalMs();
+            displaySrc = live.proxyRenderer().getOutputTexture();
+        } else {  // Reconstruction
+            auto toCamFrame = [](const LiveOrbitCamera::Result& r) {
+                return MetalLiveReconstruct::CameraFrame{r.eye, r.r, r.u, r.f, r.viewGl, r.proj, r.fx, r.fy};
+            };
+            MetalLiveReconstruct::FrameInputs in;
+            in.proxyCur = toCamFrame(
+                LiveOrbitCamera::compute(frame, proxyW, proxyH, MetalSplatLuxcRenderer::kMetalYConvention));
+            in.proxyPrev = toCamFrame(
+                LiveOrbitCamera::compute(prevFrame, proxyW, proxyH, MetalSplatLuxcRenderer::kMetalYConvention));
+            in.targetCur = toCamFrame(
+                LiveOrbitCamera::compute(frame, targetW, targetH, MetalSplatLuxcRenderer::kMetalYConvention));
+            in.morphTimeCur = tCur;
+            in.morphTimePrev = tPrev;
+            in.jitterProxyX = jxProxy;
+            in.jitterProxyY = jyProxy;
+            in.jitterTargetX = jxTarget;
+            in.jitterTargetY = jyTarget;
+
+            auto* cmdBuf = ctx.beginCommandBuffer();
+            auto* cur = live.encodeFrame(ctx, cmdBuf, in);
+            cur->commit();
+            cur->waitUntilCompleted();
+            gpuMs = MetalLiveReconstruct::gpuMsAcrossPossibleSplit(cmdBuf, cur);
+            cur->release();
+            useReconBlit = true;
+        }
+
+        CA::MetalDrawable* drawable = ctx.metalLayer->nextDrawable();
+        if (drawable) {
+            auto* dcmd = ctx.beginCommandBuffer();
+            if (useReconBlit) {
+                auto* blit = dcmd->blitCommandEncoder();
+                blit->copyFromTexture(live.getReconOutputTexture(), 0, 0, MTL::Origin(0, 0, 0),
+                                       MTL::Size(targetW, targetH, 1), drawable->texture(), 0, 0,
+                                       MTL::Origin(0, 0, 0));
+                blit->endEncoding();
+            } else {
+                float scaleXY =
+                    (mode == 3) ? 1.0f : static_cast<float>(targetW) / static_cast<float>(proxyW);
+                std::array<float, 2> scale = {scaleXY, scaleXY};
+                uint32_t bilinear = (mode == 1) ? 1 : 0;
+                auto* enc = dcmd->computeCommandEncoder();
+                enc->setComputePipelineState(upscalePipeline);
+                enc->setTexture(displaySrc, 0);
+                enc->setTexture(drawable->texture(), 1);
+                enc->setBytes(&bilinear, sizeof(bilinear), 0);
+                enc->setBytes(scale.data(), sizeof(float) * 2, 1);
+                MTL::Size grid(targetW, targetH, 1);
+                NS::UInteger tew = upscalePipeline->threadExecutionWidth();
+                NS::UInteger maxT = upscalePipeline->maxTotalThreadsPerThreadgroup();
+                NS::UInteger th = maxT / tew;
+                if (th == 0) th = 1;
+                MTL::Size tg(tew, th, 1);
+                enc->dispatchThreads(grid, tg);
+                enc->endEncoding();
+            }
+            dcmd->presentDrawable(drawable);
+            dcmd->commit();
+            dcmd->waitUntilCompleted();
+
+            fpsFrameCount++;
+            double now = glfwGetTime();
+            if (now - fpsWindowStart >= 0.5) {
+                fps = fpsFrameCount / (now - fpsWindowStart);
+                fpsFrameCount = 0;
+                fpsWindowStart = now;
+            }
+            lastGpuMs = gpuMs;
+            if (now - lastTitleUpdate >= 0.1) {
+                lastTitleUpdate = now;
+                char title[256];
+                std::snprintf(title, sizeof(title), "Lux Live [%s] fps=%.1f gpu=%.2fms frame=%d",
+                              kLiveInteractiveModeNames[mode], fps, lastGpuMs, frame);
+                glfwSetWindowTitle(window, title);
+            }
+
+            if (autoShot) {
+                double elapsedInMode = now - modeStartTime;
+                if (!capturedThisMode && elapsedInMode >= 1.9) {
+                    std::string path =
+                        opts.liveShotDir + "/" + kLiveInteractiveModeFiles[mode] + ".png";
+                    try {
+                        MetalScreenshot::saveTextureToPNG(ctx, drawable->texture(), targetW, targetH, path);
+                        std::cout << "[live-shot] mode=" << kLiveInteractiveModeNames[mode] << " -> " << path
+                                  << std::endl;
+                    } catch (const std::exception& e) {
+                        std::cerr << "[live-shot] capture failed for mode " << kLiveInteractiveModeNames[mode]
+                                  << ": " << e.what() << std::endl;
+                    }
+                    capturedThisMode = true;
+                }
+                if (elapsedInMode >= 2.0) {
+                    mode++;
+                    modeStartTime = now;
+                    capturedThisMode = false;
+                    if (mode >= 4) {
+                        glfwSetWindowShouldClose(window, GLFW_TRUE);
+                    }
+                }
+            }
+        }
+        pool->release();
+
+        frame = (frame + 1) % loopFrames;
+    }
+
+    ctx.cleanup();
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    std::cout << "[live-interactive] done." << std::endl;
     return 0;
 }
 
@@ -2450,6 +3075,10 @@ int main(int argc, char* argv[]) {
 
     if (opts.livePsnrFrames > 0) {
         return runLivePsnrMetal(opts);
+    }
+
+    if (opts.liveInteractive) {
+        return runLiveInteractiveMetal(opts);
     }
 
     if (opts.shaderBase.empty()) {
