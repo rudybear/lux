@@ -18,6 +18,12 @@
 #include "editor_panels.h"
 #include "material_ubo.h"
 
+// --live-dump's PNG writer (proxy/bilinear/recon/target/absdiff frames) --
+// implementation already lives in metal_screenshot.cpp's
+// STB_IMAGE_WRITE_IMPLEMENTATION translation unit; this is just the
+// declaration.
+#include "stb_image_write.h"
+
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_metal.h>
@@ -37,6 +43,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <sstream>
+#include <set>
 
 namespace fs = std::filesystem;
 
@@ -315,6 +323,33 @@ struct CLIOptions {
     // background). 0 (default) = disabled.
     int livePsnrFrames = 0;
     std::string liveTargetSceneSource;  // defaults to <assets-dir>/juggle_full_stride4.glb
+
+    // --live-dump <DIR>: reproduces playground_ios/Source/SplatView.mm's 4
+    // display modes as PNGs, headless, for visual bug-hunting without a
+    // device attached (mobiledlss/reports/ios_modes_mac/). Requires
+    // --live-psnr <N> (piggybacks on its already-continuous, no-history-
+    // reset Reconstruction-vs-Target rollout and per-frame Target render --
+    // this flag only adds PNG writes, no extra chain state). For each
+    // dumped frame `f`, writes proxy_fFF.png (native 480x270 proxy colour,
+    // un-premultiplied -- the pixels the Proxy display mode's 2x
+    // nearest-neighbor upscale reads from), bilinear_fFF.png (2x upscale
+    // via the SAME upscale_proxy GPU kernel SplatView.mm's Bicubic/
+    // "Bilinear" mode dispatches -- see kLiveDumpUpscaleMSL below, kept
+    // byte-identical to SplatView.mm's kUpscaleMSL since SplatView.mm
+    // itself is off-limits to edit here), recon_fFF.png (MetalLiveReconstruct's
+    // chain output, target-res, already straight non-premultiplied RGB --
+    // same texture Reconstruction mode blits to the drawable), target_fFF.png
+    // (the unpruned full-scene reference render), and
+    // absdiff_recon_target_fFF.png (|recon-target| RGB, gain-boosted --
+    // see writeAbsDiffPng()'s comment). 0/empty = disabled (default).
+    std::string liveDumpDir;
+    // Comma-separated frame indices/ranges to actually write (e.g.
+    // "0-11,60-71") -- the --live-psnr rollout itself still runs
+    // continuously from frame 0 through livePsnrFrames-1 regardless (real,
+    // uninterrupted recurrent history), this only controls which of those
+    // frames get PNGs written to --live-dump's directory. Empty (default)
+    // = dump every frame in the run.
+    std::string liveDumpFramesSpec;
 };
 
 static void printUsage(const char* program) {
@@ -372,6 +407,13 @@ static void printUsage(const char* program) {
               << "                         shared live-inference port numerically.\n"
               << "  --live-target-scene <PATH>  Override the --live-psnr Target-mode (unpruned) scene .glb\n"
               << "                         (default: <assets-dir>/juggle_full_stride4.glb)\n"
+              << "  --live-dump <DIR>      Requires --live-psnr <N>: dump PNGs of the 4 SplatView.mm\n"
+              << "                         display modes (proxy/bilinear/recon/target + an absdiff\n"
+              << "                         preview) for each captured frame, headless -- for visually\n"
+              << "                         diffing the app's display modes without a device.\n"
+              << "  --live-dump-frames <SPEC>  Comma-separated frame indices/ranges to write with\n"
+              << "                         --live-dump, e.g. \"0-11,60-71\" (default: every frame in\n"
+              << "                         the --live-psnr run)\n"
               << "  --help                 Show this help message\n"
               << std::endl;
 }
@@ -513,6 +555,10 @@ static CLIOptions parseArgs(int argc, char* argv[]) {
             opts.livePsnrFrames = std::stoi(argv[++i]);
         } else if (arg == "--live-target-scene" && i + 1 < argc) {
             opts.liveTargetSceneSource = argv[++i];
+        } else if (arg == "--live-dump" && i + 1 < argc) {
+            opts.liveDumpDir = argv[++i];
+        } else if (arg == "--live-dump-frames" && i + 1 < argc) {
+            opts.liveDumpFramesSpec = argv[++i];
         } else if (arg[0] != '-') {
             opts.shaderBase = arg;
             opts.shaderBaseExplicit = true;
@@ -1016,6 +1062,130 @@ static float psnrRgb(const std::vector<float>& pred, const std::vector<float>& t
 }
 
 // --------------------------------------------------------------------------
+// --live-dump support (runLivePsnrMetal only) -- see CLIOptions::liveDumpDir's
+// comment for the flag contract.
+// --------------------------------------------------------------------------
+
+// Verbatim copy of playground_ios/Source/SplatView.mm's kUpscaleMSL
+// upscale_proxy kernel -- SplatView.mm is READ-ONLY for this change (owned
+// by another agent editing the shared live-reconstruct chain), so this is
+// duplicated rather than shared, and MUST be kept byte-identical to that
+// copy for --live-dump's bilinear_fFF.png to be a faithful reproduction of
+// the app's own Bicubic/"Bilinear" display mode (same bilinear sampling +
+// alpha un-premultiply + forced-opaque-alpha convention).
+static const char* kLiveDumpUpscaleMSL = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void upscale_proxy(texture2d<float, access::read> src [[texture(0)]],
+                           texture2d<float, access::write> dst [[texture(1)]],
+                           constant uint& bilinear [[buffer(0)]],
+                           constant float2& scale [[buffer(1)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+    uint srcW = src.get_width(), srcH = src.get_height();
+    float4 rgba;
+    if (bilinear == 0) {
+        uint sx = min(uint(float(gid.x) / scale.x), srcW - 1);
+        uint sy = min(uint(float(gid.y) / scale.y), srcH - 1);
+        rgba = src.read(uint2(sx, sy));
+    } else {
+        float fx = (float(gid.x) + 0.5) / scale.x - 0.5;
+        float fy = (float(gid.y) + 0.5) / scale.y - 0.5;
+        int x0 = int(floor(fx)); int y0 = int(floor(fy));
+        float tx = fx - float(x0); float ty = fy - float(y0);
+        int x0c = clamp(x0, 0, int(srcW) - 1); int x1c = clamp(x0 + 1, 0, int(srcW) - 1);
+        int y0c = clamp(y0, 0, int(srcH) - 1); int y1c = clamp(y0 + 1, 0, int(srcH) - 1);
+        float4 c00 = src.read(uint2(x0c, y0c));
+        float4 c10 = src.read(uint2(x1c, y0c));
+        float4 c01 = src.read(uint2(x0c, y1c));
+        float4 c11 = src.read(uint2(x1c, y1c));
+        rgba = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+    }
+    float a = rgba.a;
+    float3 rgb = (a > 1e-6) ? rgba.rgb / a : float3(0.0);
+    dst.write(float4(rgb, 1.0), gid);
+}
+)";
+
+// Parses a --live-dump-frames spec ("0-11,60-71") into the set of frame
+// indices to dump. Empty spec = every frame in [0, totalFrames).
+static std::set<int> parseFrameSpec(const std::string& spec, int totalFrames) {
+    std::set<int> out;
+    if (spec.empty()) {
+        for (int i = 0; i < totalFrames; ++i) out.insert(i);
+        return out;
+    }
+    std::stringstream ss(spec);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        if (tok.empty()) continue;
+        auto dash = tok.find('-', 1);  // skip a leading '-' (not supported/expected, but avoid misparsing)
+        if (dash == std::string::npos) {
+            out.insert(std::stoi(tok));
+        } else {
+            int a = std::stoi(tok.substr(0, dash));
+            int b = std::stoi(tok.substr(dash + 1));
+            for (int i = a; i <= b; ++i) out.insert(i);
+        }
+    }
+    return out;
+}
+
+// Reads an RGBA16Float texture back and returns its un-premultiplied
+// float32 [h,w,4] RGBA (DlssIO::convertRgba16fColorAttachment's convention
+// -- alpha itself is NOT forced/altered here, just rgb divided out of it).
+static std::vector<float> readRgba16fAsFloat(MetalContext& ctx, MTL::Texture* tex, uint32_t w, uint32_t h) {
+    auto raw = MetalScreenshot::readTextureRaw(ctx, tex, w, h, 8);
+    std::vector<uint8_t> unusedRgba8;
+    return DlssIO::convertRgba16fColorAttachment(raw, w, h, unusedRgba8);
+}
+
+// Writes un-premultiplied [h,w,4] float RGBA data as an 8-bit PNG with
+// alpha FORCED to opaque (255) -- matches kLiveDumpUpscaleMSL's/SplatView.mm's
+// own "force alpha=1.0 for opaque display" convention (the drawable is
+// always shown opaque; a background pixel with true alpha~0 has
+// rgb already zeroed by the un-premultiply's a>1e-6 branch, so forcing
+// alpha=255 here reproduces exactly what the app puts on screen, not a
+// half-transparent PNG that would misrepresent it).
+static void writeFloatRgbaPng(const std::string& path, const std::vector<float>& rgba, uint32_t w, uint32_t h) {
+    std::vector<uint8_t> out(static_cast<size_t>(w) * h * 4);
+    size_t n = static_cast<size_t>(w) * h;
+    for (size_t i = 0; i < n; ++i) {
+        out[i * 4 + 0] = DlssIO::floatToUnorm8Rounded(rgba[i * 4 + 0]);
+        out[i * 4 + 1] = DlssIO::floatToUnorm8Rounded(rgba[i * 4 + 1]);
+        out[i * 4 + 2] = DlssIO::floatToUnorm8Rounded(rgba[i * 4 + 2]);
+        out[i * 4 + 3] = 255;
+    }
+    if (!stbi_write_png(path.c_str(), static_cast<int>(w), static_cast<int>(h), 4, out.data(),
+                         static_cast<int>(w) * 4)) {
+        std::cerr << "[live-dump] failed to write " << path << std::endl;
+    }
+}
+
+// |a-b| RGB preview, gain-boosted (default 4x) for visibility -- a
+// well-converged reconstruction's raw per-pixel diff is small and would
+// otherwise look almost entirely black; alpha forced opaque like
+// writeFloatRgbaPng() above. `a`/`b` are both un-premultiplied [h,w,4]
+// float RGBA (e.g. reconF32/targetF32, already computed for the PSNR math
+// below -- this reuses them rather than re-reading the textures).
+static void writeAbsDiffPng(const std::string& path, const std::vector<float>& a, const std::vector<float>& b,
+                             uint32_t w, uint32_t h, float gain) {
+    std::vector<uint8_t> out(static_cast<size_t>(w) * h * 4);
+    size_t n = static_cast<size_t>(w) * h;
+    for (size_t i = 0; i < n; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            float d = std::fabs(a[i * 4 + c] - b[i * 4 + c]) * gain;
+            out[i * 4 + c] = DlssIO::floatToUnorm8Rounded(d);
+        }
+        out[i * 4 + 3] = 255;
+    }
+    if (!stbi_write_png(path.c_str(), static_cast<int>(w), static_cast<int>(h), 4, out.data(),
+                         static_cast<int>(w) * 4)) {
+        std::cerr << "[live-dump] failed to write " << path << std::endl;
+    }
+}
+
+// --------------------------------------------------------------------------
 // --live-psnr N: N-frame continuous Reconstruction-vs-Target PSNR gate --
 // the Mac-side counterpart of playground_ios/Source/SplatView.mm's
 // LUX_PSNR_FRAMES on-device capture. Runs the SAME MetalLiveReconstruct
@@ -1093,6 +1263,48 @@ static int runLivePsnrMetal(const CLIOptions& opts) {
               << " target splats=" << sceneTarget.getSplatData().num_splats
               << " netRes=" << live.getNetW() << "x" << live.getNetH() << std::endl;
 
+    // --live-dump setup: own upscale_proxy compute pipeline (kLiveDumpUpscaleMSL)
+    // + a scratch target-res RGBA16Float texture for the bilinear preview.
+    // Built once, up front, so the per-frame loop below only pays for a
+    // dispatch + readback on the actually-selected dump frames.
+    const bool dumping = !opts.liveDumpDir.empty();
+    std::set<int> dumpFrameSet;
+    MTL::ComputePipelineState* dumpUpscalePipeline = nullptr;
+    MTL::Texture* dumpBilinearTex = nullptr;
+    if (dumping) {
+        std::error_code ec;
+        fs::create_directories(opts.liveDumpDir, ec);
+        dumpFrameSet = parseFrameSpec(opts.liveDumpFramesSpec, opts.livePsnrFrames);
+
+        NS::Error* shaderErr = nullptr;
+        auto* src = NS::String::string(kLiveDumpUpscaleMSL, NS::UTF8StringEncoding);
+        auto* compileOpts = MTL::CompileOptions::alloc()->init();
+        auto* lib = ctx.device->newLibrary(src, compileOpts, &shaderErr);
+        compileOpts->release();
+        if (!lib) {
+            std::cerr << "[live-dump] upscale shader compile failed: "
+                      << (shaderErr ? shaderErr->localizedDescription()->utf8String() : "?") << std::endl;
+            return 1;
+        }
+        auto* fn = lib->newFunction(NS::String::string("upscale_proxy", NS::UTF8StringEncoding));
+        dumpUpscalePipeline = ctx.device->newComputePipelineState(fn, &shaderErr);
+        fn->release();
+        lib->release();
+        if (!dumpUpscalePipeline) {
+            std::cerr << "[live-dump] failed to create upscale pipeline" << std::endl;
+            return 1;
+        }
+
+        auto* texDesc =
+            MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA16Float, targetW, targetH, false);
+        texDesc->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
+        texDesc->setStorageMode(MTL::StorageModePrivate);
+        dumpBilinearTex = ctx.newTexture(texDesc);
+
+        std::cout << "[live-dump] enabled, dir=" << opts.liveDumpDir << " frames=" << dumpFrameSet.size()
+                  << std::endl;
+    }
+
     std::vector<float> psnrLog;
     for (int frame = 0; frame < opts.livePsnrFrames; ++frame) {
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
@@ -1139,6 +1351,62 @@ static int runLivePsnrMetal(const CLIOptions& opts) {
         auto targetRaw =
             MetalScreenshot::readTextureRaw(ctx, target.getOutputTexture(), live.getTargetW(), live.getTargetH(), 8);
         auto targetF32 = DlssIO::convertRgba16fColorAttachment(targetRaw, live.getTargetW(), live.getTargetH(), unusedRgba8);
+
+        if (dumping && dumpFrameSet.count(frame)) {
+            char suffix[8];
+            std::snprintf(suffix, sizeof(suffix), "%02d", frame);
+            const std::string base = opts.liveDumpDir + "/";
+
+            // proxy_fFF.png: native 480x270 proxy colour, un-premultiplied --
+            // the Proxy display mode just nearest-neighbor-upscales these
+            // same pixels 2x to the drawable (kLiveDumpUpscaleMSL's
+            // bilinear==0 branch), so this is what that mode's content
+            // actually is before that upscale.
+            auto proxyF32 = readRgba16fAsFloat(ctx, live.proxyRenderer().getOutputTexture(), live.getProxyW(),
+                                                live.getProxyH());
+            writeFloatRgbaPng(base + "proxy_f" + suffix + ".png", proxyF32, live.getProxyW(), live.getProxyH());
+
+            // bilinear_fFF.png: actual GPU dispatch of the same kernel/params
+            // (bilinear=1, scale=target/proxy) SplatView.mm's Bicubic
+            // ("Bilinear") display mode uses -- bit-exact with the app, not
+            // a CPU approximation.
+            {
+                auto* dcmd = ctx.beginCommandBuffer();
+                auto* enc = dcmd->computeCommandEncoder();
+                enc->setComputePipelineState(dumpUpscalePipeline);
+                enc->setTexture(live.proxyRenderer().getOutputTexture(), 0);
+                enc->setTexture(dumpBilinearTex, 1);
+                uint32_t bilinear = 1;
+                std::array<float, 2> scale = {
+                    static_cast<float>(live.getTargetW()) / static_cast<float>(live.getProxyW()),
+                    static_cast<float>(live.getTargetH()) / static_cast<float>(live.getProxyH())};
+                enc->setBytes(&bilinear, sizeof(bilinear), 0);
+                enc->setBytes(scale.data(), sizeof(float) * 2, 1);
+                MTL::Size grid(live.getTargetW(), live.getTargetH(), 1);
+                NS::UInteger tew = dumpUpscalePipeline->threadExecutionWidth();
+                NS::UInteger maxT = dumpUpscalePipeline->maxTotalThreadsPerThreadgroup();
+                NS::UInteger th = maxT / tew;
+                if (th == 0) th = 1;
+                MTL::Size tg(tew, th, 1);
+                enc->dispatchThreads(grid, tg);
+                enc->endEncoding();
+                ctx.submitAndWait(dcmd);
+            }
+            auto bilinearF32 = readRgba16fAsFloat(ctx, dumpBilinearTex, live.getTargetW(), live.getTargetH());
+            writeFloatRgbaPng(base + "bilinear_f" + suffix + ".png", bilinearF32, live.getTargetW(),
+                               live.getTargetH());
+
+            // recon_fFF.png / target_fFF.png: reuse the PSNR math's own
+            // readbacks (reconF32/targetF32) -- already exactly what
+            // Reconstruction mode blits to the drawable / what Target mode
+            // (unpruned scene) renders.
+            writeFloatRgbaPng(base + "recon_f" + suffix + ".png", reconF32, live.getTargetW(), live.getTargetH());
+            writeFloatRgbaPng(base + "target_f" + suffix + ".png", targetF32, live.getTargetW(), live.getTargetH());
+            writeAbsDiffPng(base + "absdiff_recon_target_f" + suffix + ".png", reconF32, targetF32,
+                             live.getTargetW(), live.getTargetH(), /*gain=*/4.0f);
+
+            std::cout << "[live-dump] frame=" << frame << " wrote 5 PNGs" << std::endl;
+        }
 
         float psnr = psnrRgb(reconF32, targetF32, live.getTargetW(), live.getTargetH());
         psnrLog.push_back(psnr);
