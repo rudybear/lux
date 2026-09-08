@@ -315,6 +315,12 @@ struct AppState {
     std::unique_ptr<SplatRenderer> fullSceneTargetRenderer;
     bool useFullSceneTarget = false;
 
+    // Task A bisect (Reconstruction PSNR regression): log the GPU sort's
+    // key_range readback for the first 20 proxy frames when
+    // "dump_key_range.txt" is pushed -- see initRenderer()/renderFrame()'s
+    // KEY_RANGE log lines and SplatRenderer::getKeyRangeDebug()'s comment.
+    bool debugDumpKeyRange = false;
+
     // Stage 3: assembles ParamPredUNet's 26-channel input tensor from the
     // proxy renderer's per-frame attachments (docs/rendering-engines.md).
     // param_stride=2, hidden=8 match the checkpoint this demo targets
@@ -471,6 +477,12 @@ void initRenderer(AppState* state) {
         setenv("LUX_SORT_FORCE_32BIT", "1", 1);
         LOGI("force_sort_32bit.txt marker present: forcing the pre-quantization "
              "4-pass 32-bit GPU radix sort (Task A bisect)");
+    }
+    if (FILE* keyRangeMarker = fopen("dump_key_range.txt", "r")) {
+        fclose(keyRangeMarker);
+        state->debugDumpKeyRange = true;
+        LOGI("dump_key_range.txt marker present: logging KEY_RANGE for the "
+             "first 20 proxy frames (Task A bisect)");
     }
 
     // Task 3 (docs/rendering-engines.md, GPU-delegate correctness bisect):
@@ -1460,6 +1472,21 @@ void renderFrame(AppState* state) {
         splatR->fetchGpuTimingsAfterFence(ctx);
         proxyGpuT = splatR->lastGpuTimingsMs();
         state->inputAssembly.fetchGpuTimingsAfterFence(ctx, &iaTimings.gpuMs);
+
+        // Task A bisect: log the 16-bit sort's actual (min, max) key_range
+        // for the first few frames -- see SplatRenderer::getKeyRangeDebug()'s
+        // comment. Gated by a marker file (same convention as
+        // force_sort_32bit.txt above) since this is a debug-only readback.
+        if (state->debugDumpKeyRange && state->frameCounter < 20) {
+            uint32_t lo = 0, hi = 0;
+            if (splatR->getKeyRangeDebug(ctx, lo, hi)) {
+                uint32_t span = hi - lo;  // uint wraparound if lo > hi -- deliberate, see below
+                LOGI("KEY_RANGE frame=%d lo=%u hi=%u span=%u (lo>hi would underflow span to ~4e9)",
+                     state->frameCounter, lo, hi, span);
+            } else {
+                LOGI("KEY_RANGE frame=%d readback failed", state->frameCounter);
+            }
+        }
     } else {
         splatR->render(ctx);
         renderMs = msSince(tRender);

@@ -200,6 +200,22 @@ public:
     // that command buffer's completion. No-op if GPU timing isn't enabled.
     void fetchGpuTimingsAfterFence(VulkanContext& ctx);
 
+    // Task A bisect (on-device Reconstruction PSNR regression): reads back
+    // keyRangeBuffer_'s current (min, max) -- the 16-bit key quantization
+    // range radix_sort_reduce_range.lux's atomic_min/atomic_max wrote for
+    // the LAST completed sort. Caller must only call this after having
+    // waited (fence/vkQueueWaitIdle) for that sort's command buffer, same
+    // requirement as fetchGpuTimingsAfterFence(). Returns false (leaving
+    // outLo/outHi unchanged) if this renderer's sort was never dispatched
+    // (numSplats_ == 0 or the buffer wasn't created). If outLo/outHi come
+    // back stuck at the vkCmdFillBuffer sentinels (0xFFFFFFFF, 0) instead
+    // of a real (small, min<max) range, the atomic reduction never wrote a
+    // real value on this device/driver -- radix_sort_quantize.lux's
+    // `span = hi - lo` then underflows and every non-culled key quantizes
+    // to the same bucket, i.e. the sort silently degenerates to
+    // index-order instead of depth-order.
+    bool getKeyRangeDebug(VulkanContext& ctx, uint32_t& outLo, uint32_t& outHi) const;
+
     // --- Sort scheduling (perf; bench/lux_perf_ablation.md in mobiledlss:
     // the GPU radix sort is a flat ~5.7-7.1ms/frame cost regardless of
     // scene, independent of whether the view actually changed enough to

@@ -1123,9 +1123,19 @@ void SplatRenderer::createBuffers(VulkanContext& ctx, const GaussianSplatData& d
     // header comment in splat_renderer.h). Needs VK_BUFFER_USAGE_TRANSFER_DST_BIT
     // (not in the plain `ssbo` flags above) because it's cleared every
     // sorted frame via vkCmdFillBuffer.
+    //
+    // CPU_TO_GPU (host-visible+coherent), not GPU_ONLY -- deliberately, for
+    // Task A's regression bisect (getKeyRangeDebug()): lets android_main.cpp
+    // read back the atomic_min/atomic_max reduction's actual result after
+    // each frame's fence wait, with no extra staging-buffer readback
+    // plumbing, to check whether it's landing real values on this device
+    // (vs. staying at the vkCmdFillBuffer sentinels, which would silently
+    // collapse every quantized key to the same bucket -- see that method's
+    // comment). 8 bytes; the host-visibility cost here is noise next to
+    // the sort's own bandwidth.
     createVmaBuffer(ctx.allocator, 2 * sizeof(uint32_t),
                     ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                    VMA_MEMORY_USAGE_GPU_ONLY, keyRangeBuffer_, keyRangeAlloc_);
+                    VMA_MEMORY_USAGE_CPU_TO_GPU, keyRangeBuffer_, keyRangeAlloc_);
 
     std::cout << "[info] GPU radix sort: " << numSplats_ << " splats, "
               << sortNumWg_ << " workgroups, " << totalHistEntries << " histogram entries, "
@@ -2538,6 +2548,21 @@ void SplatRenderer::fetchGpuTimingsAfterFence(VulkanContext& ctx) {
     } else {
         lastGpuTimings_.valid = false;
     }
+}
+
+bool SplatRenderer::getKeyRangeDebug(VulkanContext& ctx, uint32_t& outLo, uint32_t& outHi) const {
+    if (keyRangeBuffer_ == VK_NULL_HANDLE || keyRangeAlloc_ == VK_NULL_HANDLE) return false;
+    // keyRangeAlloc_ is CPU_TO_GPU (host-visible+coherent, see its creation
+    // comment) specifically so this can map/read it directly -- no staging
+    // buffer, no additional GPU sync beyond what the caller already did.
+    void* mapped = nullptr;
+    VkResult mr = vmaMapMemory(ctx.allocator, keyRangeAlloc_, &mapped);
+    if (mr != VK_SUCCESS || !mapped) return false;
+    auto* vals = static_cast<const uint32_t*>(mapped);
+    outLo = vals[0];
+    outHi = vals[1];
+    vmaUnmapMemory(ctx.allocator, keyRangeAlloc_);
+    return true;
 }
 
 // --------------------------------------------------------------------------
