@@ -79,14 +79,29 @@ layout(push_constant) uniform PC {
 
 const float PI = 3.14159265358979323846;
 
-vec3 unpremulColor(uint idx) {
+// lux-4dgs bb26ddc ("Reconstruction: fix un-premultiply of proxy colour vs
+// PyTorch training", ported here from playground_cpp/src/
+// net_input_assembly.mm's `assemble_net_input` MSL kernel): mobiledlss.
+// train.model.build_input's `proxy_color` has NO alpha parameter at all --
+// traced the full data path (datagen/render_lux.py's FrameBuffers.color=
+// rgb*alpha -> make_clips.py stores it verbatim -> data.py's ClipDataset
+// loads it verbatim, pure reshape, no colour math) and confirmed training
+// always consumes proxy_color exactly as stored: PREMULTIPLIED-over-black,
+// never divided by alpha. PREVIOUSLY divided by alpha here (`rgb/alpha` for
+// `alpha>1e-6`, else 0) before feeding the UNet's own "colour" input
+// channel -- a real train/inference distribution mismatch, most visible at
+// proxy holes/edges (partial-coverage pixels from the pruned background
+// scene). Returns the raw premultiplied rgb unchanged, matching training
+// exactly; `alpha` itself is unused here (unlike depth/mv below, whose OWN
+// un-premultiply by this same attachment's alpha is correct and unchanged
+// -- see readAux()/unpremulMotion() and input_assembly_unpremul_depth.comp,
+// motion.py/reconstruct.py's own convention for those channels).
+vec3 readPremulColor(uint idx) {
     uint a0 = colorRaw.data[idx * 2u + 0u];
     uint a1 = colorRaw.data[idx * 2u + 1u];
     vec2 rg = unpackHalf2x16(a0);
     vec2 ba = unpackHalf2x16(a1);
-    float alpha = ba.y;
-    vec3 rgb = vec3(rg.x, rg.y, ba.x);
-    return (alpha > 1e-6) ? (rgb / alpha) : vec3(0.0);
+    return vec3(rg.x, rg.y, ba.x);
 }
 
 vec4 readAux(uint idx) {
@@ -180,7 +195,7 @@ void main() {
             uint py = min(gid.y * paramStride + dy, proxyH - 1u);
             uint pidx = py * proxyW + px;
 
-            vec3 rgb = unpremulColor(pidx);
+            vec3 rgb = readPremulColor(pidx);
             colorSum += rgb;
 
             // fg: real per-pixel foreground_coverage (see input_assembly.h's

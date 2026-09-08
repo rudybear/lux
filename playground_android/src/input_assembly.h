@@ -175,7 +175,7 @@ public:
     // copyImageToBuffer + vkQueueWaitIdle round trip) can read them
     // straight out of run()'s own already-completed readback instead of
     // paying for a second GPU copy of the identical image -- see
-    // android_main.cpp's unpremultiplyColorAndMvFromInputAssembly().
+    // android_main.cpp's readPremulColorAndUnpremulMvFromInputAssembly().
     // getRawColorHostPtr(): RGBA16_SFLOAT, 8 bytes/texel (SplatRenderer's
     // color attachment format is always RGBA16F). getRawAuxHostPtr():
     // RGBA32F (16B/texel) or RGBA16F (8B/texel) per isAuxHalf() -- matches

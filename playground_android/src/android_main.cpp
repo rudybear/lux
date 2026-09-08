@@ -865,7 +865,7 @@ StagingBuf& getOrCreateStaging(VulkanContext& ctx, VkImage image, VkDeviceSize i
 // image reads into ONE beginSingleTimeCommands/endSingleTimeCommands pair
 // (used by dumpProxyDebugFrame's multi-attachment dump below; the
 // Reconstruction-mode live per-frame path no longer needs a readback of
-// its own at all -- see unpremultiplyColorAndMvFromInputAssembly), since
+// its own at all -- see readPremulColorAndUnpremulMvFromInputAssembly), since
 // endSingleTimeCommands is a full vkQueueWaitIdle (see
 // android_vulkan_context.cpp) that's otherwise paid once per image read.
 void recordImageToStagingCopy(VkCommandBuffer cmd, VkImage image, uint32_t width, uint32_t height,
@@ -1021,11 +1021,14 @@ void dumpProxyDebugFrame(VulkanContext& ctx, SplatRenderer* splatR, const std::s
 }
 
 // Stage 5: un-premultiplied RGB color only, at whatever resolution splatR
-// currently renders (used both for proxy_color_f{t}.npy at proxy res and
-// the Target-render ground truth at target res -- see the header comment
-// above writeMetaJson()). DlssIO::convertRgba16fColorAttachment already
-// returns un-premultiplied RGBA (see dumpProxyDebugFrame's identical call),
-// so only the alpha channel needs dropping here.
+// currently renders -- used for the Target-render ground truth at target
+// res (a real displayed/comparison image, not proxy_color, so training's
+// premultiplied-storage convention doesn't apply -- see the header comment
+// above writeMetaJson()) and for Bicubic mode's own DISPLAY upscale.
+// DlssIO::convertRgba16fColorAttachment already returns un-premultiplied
+// RGBA (see dumpProxyDebugFrame's identical call), so only the alpha
+// channel needs dropping here. NOT used for proxy_color_f{t}.npy any more
+// -- see readColorRgbPremul() below (lux-4dgs bb26ddc).
 std::vector<float> readColorRgb(VulkanContext& ctx, SplatRenderer* splatR) {
     uint32_t w = splatR->getWidth(), h = splatR->getHeight();
     auto rawColor = readImageRawAndroid(ctx, splatR->getOutputImage(), w, h, 8, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -1036,6 +1039,34 @@ std::vector<float> readColorRgb(VulkanContext& ctx, SplatRenderer* splatR) {
         rgb[i * 3 + 0] = colorF32[i * 4 + 0];
         rgb[i * 3 + 1] = colorF32[i * 4 + 1];
         rgb[i * 3 + 2] = colorF32[i * 4 + 2];
+    }
+    return rgb;
+}
+
+// Stage 5 (lux-4dgs bb26ddc, "Reconstruction: fix un-premultiply of proxy
+// colour vs PyTorch training"): premultiplied-over-black RGB color, same
+// resolution/source as readColorRgb() above but WITHOUT its un-premultiply
+// -- for proxy_color_f{t}.npy (the Stage 5 live-dump-driven runReconstructDump
+// validation pass, playground_android/src/reconstruct_pass.cpp) and
+// ReconstructLive's own live per-frame path (see
+// readPremulColorAndUnpremulMvFromInputAssembly's identical fix), both of
+// which feed the AXIOM reconstruct_mem_ps2.apply.comp.spv pipeline's
+// spatial-kernel gather -- the Android equivalent of playground_cpp/src/
+// live_reconstruct_pass.mm's `apply_kernel`. mobiledlss.train.reconstruct.
+// apply_kernel()/reconstruct() take `proxy_color` with no alpha parameter
+// at all, consuming it exactly as datagen/render_lux.py's FrameBuffers.
+// color=rgb*alpha stored it: PREMULTIPLIED-over-black, never divided by
+// alpha. Reads the raw premultiplied r/g/b half lanes directly (alpha,
+// half-lane 3, is intentionally never read here).
+std::vector<float> readColorRgbPremul(VulkanContext& ctx, SplatRenderer* splatR) {
+    uint32_t w = splatR->getWidth(), h = splatR->getHeight();
+    auto rawColor = readImageRawAndroid(ctx, splatR->getOutputImage(), w, h, 8, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    const uint16_t* half = reinterpret_cast<const uint16_t*>(rawColor.data());
+    std::vector<float> rgb(static_cast<size_t>(w) * h * 3);
+    for (size_t i = 0; i < static_cast<size_t>(w) * h; i++) {
+        rgb[i * 3 + 0] = DlssIO::halfToFloat(half[i * 4 + 0]);
+        rgb[i * 3 + 1] = DlssIO::halfToFloat(half[i * 4 + 1]);
+        rgb[i * 3 + 2] = DlssIO::halfToFloat(half[i * 4 + 2]);
     }
     return rgb;
 }
@@ -1071,9 +1102,14 @@ std::vector<float> readMvProxy(VulkanContext& ctx, SplatRenderer* splatR) {
 // getRawAuxHostPtr() are the persistently-mapped, already-host-coherent
 // destination buffers of that run()'s own copyImageToBuffer work, so
 // reading them here costs no extra GPU work/submit/wait. Conversion math
-// below is copied verbatim from the old function (same DlssIO::
-// convertRgba16fColorAttachment/unpremultiplyByAlpha calls, same channel
-// layout) -- only the byte SOURCE changed, so output is unchanged.
+// below started as a verbatim copy of the old function's (same DlssIO::
+// unpremultiplyByAlpha calls for mv, same channel layout) -- only the byte
+// SOURCE changed there, so mv's output is unchanged. Color's own math
+// later diverged from that copy (lux-4dgs bb26ddc, see its own comment
+// below): it now reads the raw premultiplied r/g/b half lanes directly
+// instead of calling DlssIO::convertRgba16fColorAttachment, which
+// un-premultiplies -- correct for a DISPLAY surface, wrong for this
+// caller's actual consumer (the reconstruct pass's inference math).
 //
 // IMPORTANT (measured regression, fixed here): bColorRaw/bAuxRaw are
 // VMA_MEMORY_USAGE_CPU_TO_GPU (input_assembly.cpp's createBuffer -- sized
@@ -1094,23 +1130,46 @@ std::vector<float> readMvProxy(VulkanContext& ctx, SplatRenderer* splatR) {
 // rawColorVec below and the old code's own staging-buffer->std::vector
 // memcpy), then do all the tight per-pixel conversion work against that
 // cached copy instead of the raw pointer.
-void unpremultiplyColorAndMvFromInputAssembly(InputAssembly& ia, uint32_t w, uint32_t h,
-                                               std::vector<float>* outColorRgb, std::vector<float>* outMv) {
+void readPremulColorAndUnpremulMvFromInputAssembly(InputAssembly& ia, uint32_t w, uint32_t h,
+                                                     std::vector<float>* outColorRgb, std::vector<float>* outMv) {
     bool auxIsHalf = ia.isAuxHalf();
     VkDeviceSize colorSize = static_cast<VkDeviceSize>(w) * h * 8;  // color attachment is always RGBA16F
     VkDeviceSize auxSize = static_cast<VkDeviceSize>(w) * h * (auxIsHalf ? 8 : 16);
     const uint8_t* rawColor = static_cast<const uint8_t*>(ia.getRawColorHostPtr());
     const uint8_t* rawAux = static_cast<const uint8_t*>(ia.getRawAuxHostPtr());
 
-    // Color: same conversion as readColorRgb().
+    // Color: lux-4dgs bb26ddc ("Reconstruction: fix un-premultiply of proxy
+    // colour vs PyTorch training", ported here from playground_cpp/src/
+    // live_reconstruct_pass.mm's `apply_kernel` gather -- this Android
+    // build's own equivalent gather runs inside the AXIOM-compiled
+    // reconstruct_mem_ps2.apply.comp.spv pipeline ReconstructLive::run()
+    // dispatches, which receives `in.proxyColor` as plain RGB with NO alpha
+    // channel at all, see reconstruct_pass.h's FrameInputs comment) --
+    // mobiledlss.train.reconstruct.apply_kernel()/reconstruct() and
+    // model.py::build_input() take `proxy_color` with no alpha parameter,
+    // consuming it exactly as datagen/render_lux.py's FrameBuffers.color=
+    // rgb*alpha stored it: PREMULTIPLIED-over-black, never divided by
+    // alpha. PREVIOUSLY used DlssIO::convertRgba16fColorAttachment here,
+    // same as readColorRgb()'s DISPLAY-only un-premultiply (correct for
+    // Bicubic-mode display and the Target/proxy debug dumps -- see that
+    // function's own comment) -- but wrong for THIS caller, whose output
+    // feeds the reconstruct pass's inference math, not a display surface.
+    // Reads the raw premultiplied r/g/b half lanes directly (alpha, at
+    // half-lane 3, is intentionally never read here). Bulk sequential copy
+    // off the (possibly uncached-for-CPU) IA buffer first -- same
+    // uncached-memory perf concern as rawAuxVec below (see that comment):
+    // a tight per-pixel read straight off rawColor measured 3-4x slower on
+    // this UMA device's VMA allocator than one bulk memcpy into a normal
+    // heap vector followed by cached per-pixel reads.
     std::vector<uint8_t> rawColorVec(rawColor, rawColor + colorSize);
-    std::vector<uint8_t> unusedRgba8;
-    auto colorF32 = DlssIO::convertRgba16fColorAttachment(rawColorVec, w, h, unusedRgba8);
     outColorRgb->resize(static_cast<size_t>(w) * h * 3);
-    for (size_t i = 0; i < static_cast<size_t>(w) * h; i++) {
-        (*outColorRgb)[i * 3 + 0] = colorF32[i * 4 + 0];
-        (*outColorRgb)[i * 3 + 1] = colorF32[i * 4 + 1];
-        (*outColorRgb)[i * 3 + 2] = colorF32[i * 4 + 2];
+    {
+        const uint16_t* half = reinterpret_cast<const uint16_t*>(rawColorVec.data());
+        for (size_t i = 0; i < static_cast<size_t>(w) * h; i++) {
+            (*outColorRgb)[i * 3 + 0] = DlssIO::halfToFloat(half[i * 4 + 0]);
+            (*outColorRgb)[i * 3 + 1] = DlssIO::halfToFloat(half[i * 4 + 1]);
+            (*outColorRgb)[i * 3 + 2] = DlssIO::halfToFloat(half[i * 4 + 2]);
+        }
     }
 
     // One bulk sequential copy off the (possibly uncached-for-CPU) IA
@@ -1288,10 +1347,10 @@ std::vector<float> runReconstructionModeFrame(AppState* state, VulkanContext& ct
     // run()'s (already executed this frame, above the caller's Stage 3
     // block) own raw color/aux buffers instead of paying for a second GPU
     // copyImageToBuffer + vkQueueWaitIdle round trip of the same image
-    // data -- see unpremultiplyColorAndMvFromInputAssembly's comment.
+    // data -- see readPremulColorAndUnpremulMvFromInputAssembly's comment.
     std::vector<float> colorProxy, mvProxy;
-    unpremultiplyColorAndMvFromInputAssembly(state->inputAssembly, splatR->getWidth(), splatR->getHeight(),
-                                              &colorProxy, &mvProxy);
+    readPremulColorAndUnpremulMvFromInputAssembly(state->inputAssembly, splatR->getWidth(), splatR->getHeight(),
+                                                   &colorProxy, &mvProxy);
     auto colorPadded = padRowsReplicate(colorProxy, kProxyHeight, kProxyWidth, 3, paddedProxyH);
     auto mvPadded = padRowsReplicate(mvProxy, kProxyHeight, kProxyWidth, 2, paddedProxyH);
 
@@ -1628,7 +1687,9 @@ void renderFrame(AppState* state) {
             std::string suf = "_f" + std::to_string(idx) + ".npy";
 
             uint32_t paddedProxyH = netH * AppState::kParamStride;
-            auto colorProxy = readColorRgb(ctx, splatR);  // [proxyH,proxyW,3] @ true 270 rows
+            // Premultiplied-over-black, matching training's proxy_color storage
+            // exactly (lux-4dgs bb26ddc) -- see readColorRgbPremul()'s comment.
+            auto colorProxy = readColorRgbPremul(ctx, splatR);  // [proxyH,proxyW,3] @ true 270 rows
             auto colorPadded = padRowsReplicate(colorProxy, kProxyHeight, kProxyWidth, 3, paddedProxyH);
             DlssIO::writeNpyFloat32(dumpDir + "/proxy_color" + suf, colorPadded, {paddedProxyH, kProxyWidth, 3});
 
