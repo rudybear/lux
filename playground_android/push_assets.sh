@@ -49,6 +49,9 @@ done
 echo "=== pushing pruned scene (juggle_p0.8_stride4.glb, ~136MB) ==="
 push_one "$MOBILEDLSS_ROOT/demo/ios_assets/juggle_p0.8_stride4.glb" "scene/juggle_p0.8_stride4.glb"
 
+echo "=== pushing FULL (unpruned) scene for Target (juggle_full_stride4.glb, 336,568 splats, ~149MB) -- default since the GPU-pipelining task's goal 1: Target renders this unbiased reference by default (android_main.cpp's initRenderer(), AppState::useFullSceneTarget), the pruned scene above is opt-out only (pruned_target.txt marker, see push_full_scene.sh --pruned). This is the single biggest asset this script pushes; it will take a while. ==="
+push_one "$MOBILEDLSS_ROOT/demo/ios_assets/juggle_full_stride4.glb" "scene/juggle_full_stride4.glb"
+
 echo "=== pushing Stage 3 input-assembly GLSL shaders (glslc-compiled by build.sh step [0/7]) ==="
 for f in input_assembly_unpremul_depth input_assembly_assemble; do
     push_one "$LUX_ROOT/playground_android/build/shaders_ia/$f.comp.spv" "shaders_ia/$f.comp.spv"

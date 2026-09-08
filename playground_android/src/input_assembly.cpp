@@ -403,24 +403,30 @@ void InputAssembly::init(VulkanContext& ctx, const std::string& textureNpyPath,
                          impl_->bTexture, impl_->bZeroHidden, impl_->bFgCur, impl_->bOutput});
 }
 
-void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage, VkImage fgImage,
-                         uint32_t proxyW, uint32_t proxyH, const float* hiddenIn,
-                         float eyeX, float eyeY, float eyeZ,
-                         float rX, float rY, float rZ, float uX, float uY, float uZ,
-                         float fX, float fY, float fZ,
-                         float fx, float fy, float cx, float cy,
-                         float jitterProxyX, float jitterProxyY, Timings* outTimings) {
-    // GPU-pipelining task: everything below used to be 5 separate
-    // beginSingleTimeCommands()/endSingleTimeCommands() round trips (3x
-    // copyImageToBuffer + 2x dispatchOne, each its own vkQueueSubmit +
-    // vkQueueWaitIdle) -- now ONE command buffer (3 copies -> barrier ->
-    // unpremul -> barrier -> assemble), one submit, one wait, with a GPU
-    // timestamp pair bracketing the whole thing (same pattern
-    // reconstruct_pass.cpp's ReconstructLive::run() already proved out for
-    // its own 5-dispatch chain). Same copies, same descriptor sets, same
-    // push constants, same dispatches, same ordering -- only the
-    // submission granularity changed, so output is unchanged (frame dumps
-    // diff to fp16 noise vs. the pre-merge baseline).
+// --------------------------------------------------------------------------
+// Shared encode core (GPU-pipelining task, docs/rendering-engines.md goal
+// 2): everything run()/encode() do -- 3 copies -> barrier -> unpremul ->
+// barrier -> assemble -- recorded into `cmd`. `cmd` is ALREADY begun by the
+// caller (run() begins its own single-time buffer; encode() is handed one
+// the app's frame loop began, alongside e.g. a proxy SplatRenderer's own
+// encodeFrame() recording, so the two fuse into one submit). Never
+// submits/waits/ends `cmd` itself -- see each public entry point below for
+// who does. Was originally 5 separate beginSingleTimeCommands()/
+// endSingleTimeCommands() round trips (3x copyImageToBuffer + 2x
+// dispatchOne, each its own vkQueueSubmit+vkQueueWaitIdle); merging them
+// into one command buffer (this function) first, then later letting a
+// caller fuse that ONE buffer with other GPU work via encode(), changed
+// only submission granularity both times -- same copies, same descriptor
+// sets, same push constants, same dispatches, same ordering, so output is
+// unchanged (frame dumps diff to fp16 noise vs. the pre-merge baseline).
+// --------------------------------------------------------------------------
+void InputAssembly::encodeCore(VulkanContext& ctx, VkCommandBuffer cmd, VkImage colorImage, VkImage auxImage, VkImage fgImage,
+                                uint32_t proxyW, uint32_t proxyH, const float* hiddenIn,
+                                float eyeX, float eyeY, float eyeZ,
+                                float rX, float rY, float rZ, float uX, float uY, float uZ,
+                                float fX, float fY, float fZ,
+                                float fx, float fy, float cx, float cy,
+                                float jitterProxyX, float jitterProxyY, Timings* outTimings) {
     int curIdx = impl_->depthPingIndex;
     int prevIdx = 1 - curIdx;
 
@@ -442,7 +448,6 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage
                          impl_->bTexture, hiddenBuf, impl_->bFgCur, impl_->bOutput});
 
     auto tReadback = std::chrono::high_resolution_clock::now();
-    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
     vkCmdResetQueryPool(cmd, impl_->gpuTimestampPool, 0, 2);
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, impl_->gpuTimestampPool, 0);
 
@@ -454,6 +459,15 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage
     // dispatch reads bAuxRaw/bFgRaw) barrier -- one VkMemoryBarrier for all
     // 3 destination buffers, same "not worth per-buffer scoping at this
     // count" reasoning as recordDispatch's own compute-to-compute barrier.
+    // NOTE: this does NOT need to cover colorImage/auxImage/fgImage's own
+    // preceding writes (the proxy SplatRenderer's render pass, whether
+    // recorded via its own render() -- a separate, already-drained command
+    // buffer -- or fused into THIS SAME command buffer via encode() ahead
+    // of this call) -- those images' render pass already carries an
+    // explicit VkSubpassDependency (splat_renderer.cpp's createRenderPass,
+    // deps[1]: COLOR_ATTACHMENT_OUTPUT/COLOR_ATTACHMENT_WRITE ->
+    // TRANSFER/TRANSFER_READ) that covers exactly this transfer read,
+    // whether it lands in the same command buffer or a separate one.
     VkMemoryBarrier toCompute{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     toCompute.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toCompute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -487,22 +501,15 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage
 
     uint32_t ngx = (netW_ + 15) / 16, ngy = (netH_ + 15) / 16;
     recordDispatch(cmd, impl_->assemblePipe, impl_->assemblePL, impl_->assembleSet, &push, sizeof(push),
-                    ngx, ngy, /*barrierAfter=*/false);  // no barrier needed: the fence wait below (inside
-                                                         // endSingleTimeCommands) already guarantees bOutput
-                                                         // is complete-and-host-visible before getOutputHostPtr()
-                                                         // is read, same as reconstruct_pass.cpp's last dispatch.
+                    ngx, ngy, /*barrierAfter=*/false);  // no barrier needed: whoever submits+waits on `cmd`
+                                                         // (run()'s own endSingleTimeCommands, or the caller's
+                                                         // fence wait when fused via encode()) already
+                                                         // guarantees bOutput is complete-and-host-visible
+                                                         // before getOutputHostPtr() is read, same as
+                                                         // reconstruct_pass.cpp's last dispatch.
 
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->gpuTimestampPool, 1);
-    ctx.endSingleTimeCommands(cmd);  // ONE submit + vkQueueWaitIdle for the whole merged chain
     double computeMs = msSince(tCompute);
-
-    double gpuMs = 0.0;
-    {
-        uint64_t ts[2] = {0, 0};
-        VkResult qr = vkGetQueryPoolResults(ctx.device, impl_->gpuTimestampPool, 0, 2, sizeof(ts), ts,
-                                             sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        if (qr == VK_SUCCESS) gpuMs = static_cast<double>(ts[1] - ts[0]) * impl_->timestampPeriodNs * 1e-6;
-    }
 
     wasFirstFrame_ = firstFrame_;
     impl_->depthPingIndex = prevIdx;
@@ -511,7 +518,49 @@ void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage
     if (outTimings != nullptr) {
         outTimings->readbackMs = readbackMs;
         outTimings->computeMs = computeMs;
-        outTimings->gpuMs = gpuMs;
+        outTimings->gpuMs = 0.0;  // filled in by fetchGpuTimingsAfterFence() once `cmd` has been waited on
+    }
+}
+
+void InputAssembly::run(VulkanContext& ctx, VkImage colorImage, VkImage auxImage, VkImage fgImage,
+                         uint32_t proxyW, uint32_t proxyH, const float* hiddenIn,
+                         float eyeX, float eyeY, float eyeZ,
+                         float rX, float rY, float rZ, float uX, float uY, float uZ,
+                         float fX, float fY, float fZ,
+                         float fx, float fy, float cx, float cy,
+                         float jitterProxyX, float jitterProxyY, Timings* outTimings) {
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    encodeCore(ctx, cmd, colorImage, auxImage, fgImage, proxyW, proxyH, hiddenIn,
+               eyeX, eyeY, eyeZ, rX, rY, rZ, uX, uY, uZ, fX, fY, fZ,
+               fx, fy, cx, cy, jitterProxyX, jitterProxyY, outTimings);
+    ctx.endSingleTimeCommands(cmd);  // ONE submit + vkQueueWaitIdle for the whole merged chain
+
+    double gpuMs = 0.0;
+    fetchGpuTimingsAfterFence(ctx, &gpuMs);
+    if (outTimings != nullptr) outTimings->gpuMs = gpuMs;
+}
+
+void InputAssembly::encode(VulkanContext& ctx, VkCommandBuffer cmd, VkImage colorImage, VkImage auxImage, VkImage fgImage,
+                            uint32_t proxyW, uint32_t proxyH, const float* hiddenIn,
+                            float eyeX, float eyeY, float eyeZ,
+                            float rX, float rY, float rZ, float uX, float uY, float uZ,
+                            float fX, float fY, float fZ,
+                            float fx, float fy, float cx, float cy,
+                            float jitterProxyX, float jitterProxyY, Timings* outTimings) {
+    encodeCore(ctx, cmd, colorImage, auxImage, fgImage, proxyW, proxyH, hiddenIn,
+               eyeX, eyeY, eyeZ, rX, rY, rZ, uX, uY, uZ, fX, fY, fZ,
+               fx, fy, cx, cy, jitterProxyX, jitterProxyY, outTimings);
+    // No submit/wait here -- caller (android_main.cpp's fused proxy+IA
+    // frame path) submits `cmd` itself, once, alongside whatever else it
+    // recorded into the same buffer, then calls fetchGpuTimingsAfterFence().
+}
+
+void InputAssembly::fetchGpuTimingsAfterFence(VulkanContext& ctx, double* outGpuMs) {
+    uint64_t ts[2] = {0, 0};
+    VkResult qr = vkGetQueryPoolResults(ctx.device, impl_->gpuTimestampPool, 0, 2, sizeof(ts), ts,
+                                         sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (qr == VK_SUCCESS && outGpuMs != nullptr) {
+        *outGpuMs = static_cast<double>(ts[1] - ts[0]) * impl_->timestampPeriodNs * 1e-6;
     }
 }
 

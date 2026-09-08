@@ -128,6 +128,34 @@ public:
              float fx, float fy, float cx, float cy,
              float jitterProxyX, float jitterProxyY, Timings* outTimings = nullptr);
 
+    // GPU-pipelining task (docs/rendering-engines.md, "restructure the
+    // Reconstruction frame into a GPU-pipelined chain", goal 2): same work
+    // as run() (3 copies -> barrier -> unpremul -> barrier -> assemble),
+    // recorded into a command buffer the CALLER already began and owns --
+    // no vkQueueSubmit/vkQueueWaitIdle inside. Lets a caller fuse this with
+    // the proxy SplatRenderer's own encodeFrame() (whose colorImage/
+    // auxImage/fgImage this reads) into ONE submit with one fence, instead
+    // of each doing its own full queue drain. `outTimings->readbackMs`/
+    // `computeMs` (CPU record time for their respective sections) are
+    // filled in as usual; `gpuMs` is left at 0 -- call
+    // fetchGpuTimingsAfterFence() once the caller has waited for this
+    // command buffer's completion to fill it in.
+    void encode(VulkanContext& ctx, VkCommandBuffer cmd, VkImage colorImage, VkImage auxImage, VkImage fgImage,
+                uint32_t proxyW, uint32_t proxyH, const float* hiddenIn,
+                float eyeX, float eyeY, float eyeZ,
+                float rX, float rY, float rZ, float uX, float uY, float uZ,
+                float fX, float fY, float fZ,
+                float fx, float fy, float cx, float cy,
+                float jitterProxyX, float jitterProxyY, Timings* outTimings = nullptr);
+
+    // Reads back the GPU timestamp-query results written by the most
+    // recent encode() call and writes the elapsed ms into *outGpuMs (left
+    // untouched if outGpuMs is null). Caller must have already waited
+    // (fence/vkQueueWaitIdle) for that command buffer's completion. run()
+    // does this internally (it's already GPU-synchronous via its own
+    // endSingleTimeCommands); encode() callers must call this themselves.
+    void fetchGpuTimingsAfterFence(VulkanContext& ctx, double* outGpuMs);
+
     // Host-visible pointer to this frame's packed NHWC fp32 output
     // (netW*netH*getChannels() floats) -- valid immediately after run()
     // returns (all buffers are VMA_MEMORY_USAGE_CPU_TO_GPU / coherent, and
@@ -171,6 +199,18 @@ public:
     uint32_t getTexChannels() const { return texChannels_; }
 
 private:
+    // Shared body of run()/encode() -- see input_assembly.cpp's comment on
+    // the definition. Records the 3 copies + barrier + unpremul + barrier +
+    // assemble into `cmd` (no begin/end/submit); does the host-side
+    // descriptor rewrites/hiddenIn upload first (independent of `cmd`).
+    void encodeCore(VulkanContext& ctx, VkCommandBuffer cmd, VkImage colorImage, VkImage auxImage, VkImage fgImage,
+                     uint32_t proxyW, uint32_t proxyH, const float* hiddenIn,
+                     float eyeX, float eyeY, float eyeZ,
+                     float rX, float rY, float rZ, float uX, float uY, float uZ,
+                     float fX, float fY, float fZ,
+                     float fx, float fy, float cx, float cy,
+                     float jitterProxyX, float jitterProxyY, Timings* outTimings);
+
     struct Impl;
     Impl* impl_ = nullptr;
 

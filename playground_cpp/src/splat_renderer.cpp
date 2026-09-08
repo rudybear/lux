@@ -1887,10 +1887,30 @@ void SplatRenderer::seedPreviousMorphTime(VulkanContext& ctx, float prevTimeSeco
 // Render
 // --------------------------------------------------------------------------
 
-void SplatRenderer::render(VulkanContext& ctx) {
-    if (numSplats_ == 0) return;
+// --------------------------------------------------------------------------
+// Fused-frame encode core (mobile-DLSS Android live demo, GPU-pipelining
+// task): the exact preprocess -> sort -> draw body render() has always run,
+// factored out so it can be recorded either into render()'s own
+// single-time command buffer (submitted+waited on return, as before) or
+// into a caller-owned command buffer via the public encodeFrame() entry
+// point below (no submit/wait -- the caller fuses this recording with
+// other work and submits/waits once itself). `cmd` is taken by reference
+// because render()'s own two debug/desktop-only escape hatches -- the
+// LUX_DEBUG_SPLAT_DUMP env-var dump and the __APPLE__-only MoltenVK
+// mid-frame queue drain for hasMotionVectors_ (see its own comment below)
+// -- each end and restart the command buffer; render() needs to see that
+// substitution to submit/wait on the right (final) command buffer.
+// `allowDebugDumpSubmit` gates ONLY the LUX_DEBUG_SPLAT_DUMP escape hatch:
+// false (used by encodeFrame()) skips it unconditionally, since issuing an
+// extra submit+wait there would silently violate encodeFrame()'s "no
+// submit/wait inside" contract if that env var happened to be set. The
+// __APPLE__ block needs no such guard: it is already compiled out entirely
+// on any non-Apple build (Android included), which is the only platform
+// encodeFrame() is used from.
+// --------------------------------------------------------------------------
 
-    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+void SplatRenderer::encodeFrameCore(VulkanContext& ctx, VkCommandBuffer& cmd, bool allowDebugDumpSubmit) {
+    if (numSplats_ == 0) return;
 
     if (gpuTimingEnabled_) {
         vkCmdResetQueryPool(cmd, timestampPool_, 0, 4);
@@ -1920,6 +1940,7 @@ void SplatRenderer::render(VulkanContext& ctx) {
     // diagnostic readback -- posBuffer_/rotBuffer_/shBuffers_[0] are
     // VMA_MEMORY_USAGE_CPU_TO_GPU (host-visible), and dispatchMorph()
     // writes them in place.
+    if (allowDebugDumpSubmit) {
     if (const char* dumpPath = std::getenv("LUX_DEBUG_SPLAT_DUMP")) {
         ctx.endSingleTimeCommands(cmd);
         cmd = ctx.beginSingleTimeCommands();
@@ -1961,6 +1982,7 @@ void SplatRenderer::render(VulkanContext& ctx) {
             vmaUnmapMemory(ctx.allocator, shAllocs_[0]);
         }
         std::cout << "[debug-splat] dumped " << n << " splats to " << dumpPath << std::endl;
+    }
     }
 
     // --- Motion vectors: seed splat_prev_pos on the very first frame ---
@@ -2431,6 +2453,14 @@ void SplatRenderer::render(VulkanContext& ctx) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool_, 3);
     }
 
+}
+
+void SplatRenderer::render(VulkanContext& ctx) {
+    if (numSplats_ == 0) return;
+
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    encodeFrameCore(ctx, cmd, /*allowDebugDumpSubmit=*/true);
+
     // Submit and wait
     ctx.endSingleTimeCommands(cmd);
 
@@ -2446,6 +2476,47 @@ void SplatRenderer::render(VulkanContext& ctx) {
         } else {
             lastGpuTimings_.valid = false;
         }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Fused-frame encode (public entry point -- see encodeFrameCore()'s comment
+// above for the shared body and what it deliberately omits). Records THIS
+// SplatRenderer's preprocess/sort/draw work, with the same barriers
+// render() uses, into `cmd` -- a command buffer the CALLER already began
+// and owns. Does NOT submit or wait: the caller is expected to record
+// further work into the same command buffer (or not) and submit/wait on
+// it itself, exactly once, as part of fusing multiple GPU passes into one
+// submit. If GPU timestamp queries are enabled (setGpuTimingEnabled()),
+// this writes the same 4 timestamps render() does into the shared query
+// pool -- call fetchGpuTimingsAfterFence() once the caller's own
+// submit has been waited on (fence or vkQueueWaitIdle) to convert them;
+// lastGpuTimingsMs() is stale until then.
+// --------------------------------------------------------------------------
+
+void SplatRenderer::encodeFrame(VulkanContext& ctx, VkCommandBuffer cmd) {
+    encodeFrameCore(ctx, cmd, /*allowDebugDumpSubmit=*/false);
+}
+
+// Reads back the GPU timestamp-query results written by the most recent
+// encodeFrame() call. Unlike render() (which does this internally right
+// after its own synchronous endSingleTimeCommands() wait), encodeFrame()
+// cannot do this itself since it never submits/waits -- the caller must
+// call this only after it has itself waited (fence/vkQueueWaitIdle) for
+// the command buffer encodeFrame() recorded into. No-op if GPU timing
+// isn't enabled (setGpuTimingEnabled()).
+void SplatRenderer::fetchGpuTimingsAfterFence(VulkanContext& ctx) {
+    if (!gpuTimingEnabled_) return;
+    uint64_t ts[4] = {};
+    VkResult qr = vkGetQueryPoolResults(ctx.device, timestampPool_, 0, 4, sizeof(ts), ts, sizeof(uint64_t),
+                                        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (qr == VK_SUCCESS) {
+        lastGpuTimings_.preprocessMs = static_cast<double>(ts[1] - ts[0]) * timestampPeriodNs_ * 1e-6;
+        lastGpuTimings_.sortMs = static_cast<double>(ts[2] - ts[1]) * timestampPeriodNs_ * 1e-6;
+        lastGpuTimings_.drawMs = static_cast<double>(ts[3] - ts[2]) * timestampPeriodNs_ * 1e-6;
+        lastGpuTimings_.valid = true;
+    } else {
+        lastGpuTimings_.valid = false;
     }
 }
 

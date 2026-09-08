@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# Full-scene Target switch (prep, docs/rendering-engines.md): pushes
-# juggle_full_stride4.glb (336,568 gaussians, unpruned, 149MB) to
-# files/scene/juggle_full_stride4.glb and drops the full_scene_target.txt
-# marker android_main.cpp's initRenderer() checks for -- see AppState's
-# fullSceneTargetRenderer/useFullSceneTarget field comment. Deliberately a
-# SEPARATE script from push_assets.sh (not folded into its default run):
-# this asset is 149MB, an order of magnitude bigger than everything else
-# push_assets.sh pushes combined, and the marker flips real, currently-
-# unvalidated-on-device behavior (Target switches scenes) -- both should
-# only happen on purpose, not on every routine asset sync.
+# Full-scene Target switch (docs/rendering-engines.md, GPU-pipelining task
+# goal 1): juggle_full_stride4.glb (336,568 gaussians, unpruned, 149MB) is
+# now pushed by push_assets.sh's DEFAULT run (files/scene/
+# juggle_full_stride4.glb) and android_main.cpp's initRenderer() loads it
+# for Target unconditionally unless the "pruned_target.txt" OPT-OUT marker
+# is present -- see AppState's fullSceneTargetRenderer/useFullSceneTarget
+# field comment. This script is now just a convenience for two things that
+# don't need a full push_assets.sh run:
 #
-# Usage: ./push_full_scene.sh          (push + drop the marker, i.e. "go")
-#        ./push_full_scene.sh --off    (remove the marker only, revert to
-#                                        the pruned scene for Target --
-#                                        does NOT delete the now-pushed glb,
-#                                        harmless to leave staged)
+#   ./push_full_scene.sh            re-push just the 149MB glb (e.g. after
+#                                    a corrupted/interrupted transfer)
+#   ./push_full_scene.sh --pruned   drop the pruned_target.txt marker,
+#                                    OPTING OUT back to the old pruned-scene
+#                                    Target (e.g. for a quick A/B) without
+#                                    touching the already-pushed glb
+#   ./push_full_scene.sh --full     remove the pruned_target.txt marker,
+#                                    opting back IN to the full-scene Target
+#                                    (the default -- undoes --pruned)
+#
+# Either flag needs a force-stop + relaunch of the app to take effect
+# (initRenderer() only checks the marker at startup).
 set -euo pipefail
 
 ADB="${ADB:-/opt/homebrew/bin/adb}"
@@ -22,9 +27,16 @@ PKG=com.lux.playgroundandroid
 MOBILEDLSS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../mobiledlss" && pwd)"
 TMP_STAGE="/data/local/tmp/lux_stage"
 
-if [[ "${1:-}" == "--off" ]]; then
-    echo "=== removing full_scene_target.txt marker (reverting Target to the pruned scene) ==="
-    "$ADB" shell run-as "$PKG" rm -f files/full_scene_target.txt
+if [[ "${1:-}" == "--pruned" ]]; then
+    echo "=== dropping pruned_target.txt marker (opting OUT of the full-scene Target) ==="
+    "$ADB" shell "run-as $PKG sh -c 'echo 1 > files/pruned_target.txt'"
+    echo "done -- force-stop + relaunch the app for this to take effect."
+    exit 0
+fi
+
+if [[ "${1:-}" == "--full" ]]; then
+    echo "=== removing pruned_target.txt marker (opting back IN to the full-scene Target, the default) ==="
+    "$ADB" shell run-as "$PKG" rm -f files/pruned_target.txt
     echo "done -- force-stop + relaunch the app for this to take effect."
     exit 0
 fi
@@ -45,7 +57,4 @@ echo "=== staging dir ==="
 echo "=== pushing full (unpruned) scene: juggle_full_stride4.glb (149MB -- this will take a while) ==="
 push_one "$MOBILEDLSS_ROOT/demo/ios_assets/juggle_full_stride4.glb" "scene/juggle_full_stride4.glb"
 
-echo "=== dropping full_scene_target.txt marker ==="
-"$ADB" shell "run-as $PKG sh -c 'echo 1 > files/full_scene_target.txt'"
-
-echo "done -- force-stop + relaunch the app for this to take effect (initRenderer() only checks the marker at startup)."
+echo "done -- this is now the DEFAULT Target scene (push_assets.sh pushes it routinely too); no marker needed."

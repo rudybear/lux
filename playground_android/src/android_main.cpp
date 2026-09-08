@@ -274,31 +274,44 @@ struct AppState {
     // gaussians, unpruned, stride 4, has _FOREGROUND, 149MB) is loaded HERE
     // instead, ONLY for Target's own SplatRenderer and the PSNR reference --
     // the proxy path (`proxyRenderer`, input assembly, net, reconstruct)
-    // keeps the pruned scene throughout, unchanged. Gated by a
-    // full_scene_target.txt marker file (cwd-relative, same convention as
-    // force_gpu_net/gpu_net_config.txt) so it stays OFF (old single-pruned-
-    // scene behavior, fullSceneTargetRenderer left null) until the 149MB
-    // asset is pushed and the marker deliberately dropped (push_full_scene.sh).
+    // keeps the pruned scene throughout, unchanged.
     //
     // VALIDATED on-device (task 2): this selection logic (here and at its
     // sibling in the Stage 5 capture block below) was already correct when
     // written -- the bug was operational, not a code bug: an earlier session
-    // pushed juggle_full_stride4.glb but never dropped the marker, so
-    // useFullSceneTarget silently stayed false and the reported 28.6dB
-    // Reconstruction PSNR was against the wrong (pruned) reference the whole
-    // time. Dropping the marker (no rebuild needed) and re-running the
-    // 16-frame capture confirmed: target_color_f{t}.npy now differs from the
-    // pruned-scene capture (md5 mismatch on every frame; mean abs diff
-    // ~0.024-0.025 over the whole [0,1] RGB frame, consistent with restoring
-    // the ~80% background juggle_p0.8_stride4.glb prunes away) and the
-    // corrected PSNR sequence is Bicubic 23.62dB mean (matches the ~24dB
-    // expectation) and Reconstruction climbing 13.34dB (frame 0, cold from
-    // only 16 warmup frames) to 29.37dB (frame 15) -- still short of the
-    // ~33dB full-ceiling expectation because 16 frames of warmup isn't
-    // enough for the scene-memory background to converge from zero; task 3's
-    // 96-frame rollout (AppState::reconWindowFrames) shows it keeps
-    // climbing smoothly past 30dB with no ceiling reached by frame 145 (the
-    // longest window run so far), not a still-biased reference.
+    // pushed juggle_full_stride4.glb but never dropped the (then-required)
+    // opt-IN marker file, so useFullSceneTarget silently stayed false and
+    // the reported 28.6dB Reconstruction PSNR was against the wrong
+    // (pruned) reference the whole time. Dropping the marker (no rebuild
+    // needed) and re-running the 16-frame capture confirmed:
+    // target_color_f{t}.npy now differs from the pruned-scene capture (md5
+    // mismatch on every frame; mean abs diff ~0.024-0.025 over the whole
+    // [0,1] RGB frame, consistent with restoring the ~80% background
+    // juggle_p0.8_stride4.glb prunes away) and the corrected PSNR sequence
+    // is Bicubic 23.62dB mean (matches the ~24dB expectation) and
+    // Reconstruction climbing 13.34dB (frame 0, cold from only 16 warmup
+    // frames) to 29.37dB (frame 15) -- still short of the ~33dB
+    // full-ceiling expectation because 16 frames of warmup isn't enough for
+    // the scene-memory background to converge from zero; task 3's 96-frame
+    // rollout (AppState::reconWindowFrames) shows it keeps climbing
+    // smoothly past 30dB with no ceiling reached by frame 145 (the longest
+    // window run so far), not a still-biased reference.
+    //
+    // GPU-pipelining task, goal 1 ("make the full-scene Target the build
+    // default"): given the above, shipping with the biased pruned reference
+    // as the DEFAULT was never correct behavior to begin with -- it silently
+    // produces inflated/wrong PSNR numbers unless someone remembers a manual
+    // opt-in step. juggle_full_stride4.glb is now part of push_assets.sh's
+    // routine push (no separate push_full_scene.sh step, no device marker
+    // file needed to opt IN) and initRenderer() below tries to load it
+    // unconditionally. The pruned scene is now the OPT-OUT, via a
+    // "pruned_target.txt" marker file (same cwd-relative convention as
+    // force_gpu_net/gpu_net_config.txt) -- for quick A/B comparisons without
+    // re-pushing/dropping the 149MB asset, or as a safety net on a device
+    // that hasn't had the new push_assets.sh run yet (the full-scene load is
+    // wrapped in its own try/catch specifically so a missing/stale asset
+    // degrades to the pruned scene instead of failing renderer init
+    // entirely -- see initRenderer()).
     std::unique_ptr<SplatRenderer> fullSceneTargetRenderer;
     bool useFullSceneTarget = false;
 
@@ -382,6 +395,17 @@ struct AppState {
     VkSemaphore renderFinishedSem = VK_NULL_HANDLE;
     VkFence inFlightFence = VK_NULL_HANDLE;
     VkCommandBuffer blitCmd = VK_NULL_HANDLE;
+
+    // GPU-pipelining task (docs/rendering-engines.md goal 2): dedicated
+    // fence for the fused proxy-render + input-assembly command buffer
+    // (see renderFrame()'s isProxy block) -- one vkQueueSubmit +
+    // vkWaitForFences per proxy-mode frame instead of two separate
+    // beginSingleTimeCommands()/endSingleTimeCommands() round trips (each
+    // its own vkQueueSubmit + vkQueueWaitIdle). Created unsignaled (unlike
+    // inFlightFence, which starts signaled for the very first frame's wait)
+    // since it's only ever submitted-then-waited-then-reset within the
+    // same renderFrame() call, never carried across frames.
+    VkFence proxyIaFence = VK_NULL_HANDLE;
 
     int frameCounter = 0;
 
@@ -469,7 +493,7 @@ void initRenderer(AppState* state) {
                                     shaderBase, kProxyWidth, kProxyHeight);
         state->proxyRenderer->setGpuTimingEnabled(state->ctx, true);
 
-        // Full-scene Target switch (prep only -- see the AppState field
+        // Full-scene Target switch (default ON -- see the AppState field
         // comment above): loads a SECOND, independent GltfScene from
         // juggle_full_stride4.glb (via the same free loadGltf() gltf_loader.h
         // exposes -- SceneManager::loadScene is a thin wrapper around it plus
@@ -479,21 +503,42 @@ void initRenderer(AppState* state) {
         // dedicated full-res SplatRenderer from it, entirely independent of
         // `state->scene`'s pruned data -- `proxyRenderer` above is already
         // built and stays on the pruned scene regardless of this block.
-        if (FILE* fullSceneMarker = fopen("full_scene_target.txt", "r")) {
-            fclose(fullSceneMarker);
+        //
+        // "pruned_target.txt" is the OPT-OUT (inverted from the old opt-IN
+        // "full_scene_target.txt" marker): when present, skip the full-scene
+        // load entirely and keep the old single-pruned-scene behavior for
+        // Target. Absent (the default on a fresh device/push_assets.sh run)
+        // means try the full scene -- wrapped in ITS OWN try/catch (unlike
+        // everything else in this function's outer try/catch) so a device
+        // that hasn't had push_assets.sh's routine juggle_full_stride4.glb
+        // push run yet degrades gracefully to the pruned scene instead of
+        // failing renderer init (and therefore the whole app) entirely.
+        bool wantFullSceneTarget = true;
+        if (FILE* prunedMarker = fopen("pruned_target.txt", "r")) {
+            fclose(prunedMarker);
+            wantFullSceneTarget = false;
+            LOGI("pruned_target.txt marker present: opting OUT of the full-scene Target, "
+                 "keeping the pruned scene for Target instead");
+        }
+        if (wantFullSceneTarget) {
             std::string fullScenePath = base + "/scene/juggle_full_stride4.glb";
-            LOGI("full_scene_target.txt marker present: loading full scene for Target: %s", fullScenePath.c_str());
-            GltfScene fullGltfScene = loadGltf(fullScenePath);
-            if (fullGltfScene.splat_data.has_splats) {
-                state->fullSceneTargetRenderer = std::make_unique<SplatRenderer>();
-                state->fullSceneTargetRenderer->init(state->ctx, fullGltfScene.splat_data, shaderBase, kWidth, kHeight);
-                state->fullSceneTargetRenderer->setGpuTimingEnabled(state->ctx, true);
-                state->useFullSceneTarget = true;
-                LOGI("Full-scene Target renderer initialized (%u splats) -- Target now uses the FULL scene, "
-                     "proxy/net/reconstruct still use the pruned one",
-                     fullGltfScene.splat_data.num_splats);
-            } else {
-                LOGE("juggle_full_stride4.glb has no splat data; keeping the pruned scene for Target");
+            try {
+                LOGI("Loading full scene for Target (default): %s", fullScenePath.c_str());
+                GltfScene fullGltfScene = loadGltf(fullScenePath);
+                if (fullGltfScene.splat_data.has_splats) {
+                    state->fullSceneTargetRenderer = std::make_unique<SplatRenderer>();
+                    state->fullSceneTargetRenderer->init(state->ctx, fullGltfScene.splat_data, shaderBase, kWidth, kHeight);
+                    state->fullSceneTargetRenderer->setGpuTimingEnabled(state->ctx, true);
+                    state->useFullSceneTarget = true;
+                    LOGI("Full-scene Target renderer initialized (%u splats) -- Target now uses the FULL scene, "
+                         "proxy/net/reconstruct still use the pruned one",
+                         fullGltfScene.splat_data.num_splats);
+                } else {
+                    LOGE("juggle_full_stride4.glb has no splat data; keeping the pruned scene for Target");
+                }
+            } catch (const std::exception& e) {
+                LOGE("Full-scene Target load failed (%s) -- has push_assets.sh's full-scene push run on this "
+                     "device? Falling back to the pruned scene for Target.", e.what());
             }
         }
 
@@ -617,6 +662,8 @@ void initRenderer(AppState* state) {
         VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         vkCreateFence(state->ctx.device, &fenceInfo, nullptr, &state->inFlightFence);
+        VkFenceCreateInfo proxyIaFenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};  // unsignaled -- see field comment
+        vkCreateFence(state->ctx.device, &proxyIaFenceInfo, nullptr, &state->proxyIaFence);
 
         state->fpsWindowStart = std::chrono::high_resolution_clock::now();
         state->vulkanReady = true;
@@ -1318,40 +1365,89 @@ void renderFrame(AppState* state) {
         splatR->setMorphTime(morphT);
     }
 
+    // GPU-pipelining task (docs/rendering-engines.md goal 2, "fuse the
+    // proxy render into the frame's command buffer"): proxy-mode frames
+    // (Proxy/Bicubic/Reconstruction -- isProxy) used to pay for TWO
+    // separate full command-buffer round trips back to back -- splatR->
+    // render()'s own beginSingleTimeCommands()/endSingleTimeCommands()
+    // (submit + vkQueueWaitIdle), immediately followed by input_assembly.
+    // run()'s own separate one (which reads splatR's just-produced color/
+    // aux/fg images). Both are now recorded into ONE command buffer
+    // (splatR->encodeFrame() then state->inputAssembly.encode(), same
+    // barriers/ordering each already used internally) and submitted ONCE,
+    // waited on via a dedicated fence (state->proxyIaFence) rather than
+    // vkQueueWaitIdle -- no correctness gap doing so: the proxy render
+    // pass's own VkSubpassDependency (splat_renderer.cpp's createRenderPass,
+    // COLOR_ATTACHMENT_OUTPUT/WRITE -> TRANSFER/READ) already covers
+    // InputAssembly's copyImageToBuffer reads of those images regardless of
+    // which command buffer they land in, so no extra barrier is needed
+    // between the two encode() calls below. Target mode (isProxy false)
+    // has no InputAssembly work to fuse with, so it keeps calling
+    // splatR->render() (== targetSplatR->render()) standalone, unchanged.
+    // Net effect on this path: 1 vkQueueSubmit+vkWaitForFences (was 2
+    // separate vkQueueSubmit+vkQueueWaitIdle round trips) -- 0
+    // vkQueueWaitIdle left on this path.
     auto tRender = std::chrono::high_resolution_clock::now();
-    splatR->render(ctx);
-    double renderMs = msSince(tRender);
-    // GPU-pipelining task (goal 1, "per-stage GPU timestamps for every
-    // stage next to CPU wall"): splatR's own GPU timestamp query pool is
-    // already enabled unconditionally (setGpuTimingEnabled() at init, see
-    // AppState setup) and already reports preprocess/sort/draw -- just read
-    // it here too so Reconstruction mode's RECON_TIMING line below carries
-    // real proxy-stage GPU ms alongside its CPU wall (renderMs), the same
-    // way the Proxy/Target-mode TIMING line below already does.
-    SplatRenderer::GpuTimingsMs proxyGpuT = splatR->lastGpuTimingsMs();
-
+    double renderMs = 0.0;
+    SplatRenderer::GpuTimingsMs proxyGpuT{};
     // Task 2 (Reconstruction-mode time budget, docs/rendering-engines.md):
-    // filled in by the input_assembly.run() call just below when isProxy
-    // (always true in Reconstruction mode), left zero otherwise. Declared
-    // here (not inside the `if (isProxy)` block) so it's still in scope for
-    // the RECON_TIMING log after the Stage 6 dispatch below.
+    // filled in by the fused encode() call below when isProxy (always true
+    // in Reconstruction mode), left zero otherwise. Declared here (not
+    // inside the `if (isProxy)` block) so it's still in scope for the
+    // RECON_TIMING log after the Stage 6 dispatch below.
     InputAssembly::Timings iaTimings;
+    // CPU wall time blocked on the fused proxy+IA submit's fence
+    // (isProxy only; 0 for Target mode, which has nothing to fuse) --
+    // reported alongside renderMs (now just the CPU cost of RECORDING
+    // splatR->encodeFrame(), not blocking on it) in the timing tables below.
+    double proxyIaSubmitWaitMs = 0.0;
 
-    // --- Stage 3: input assembly, proxy-mode frames only (Target mode has
-    // no jitter/history contract to feed the network -- it exists purely
-    // as this demo's ground-truth comparison target, per DemoMode's
-    // comment). hiddenIn=nullptr until Stage 5 wires the real recurrent
-    // state through; every frame still runs the full pass (not just the
-    // dump frame) so its own timing shows up in profiling passes later.
     if (isProxy) {
         float cx = static_cast<float>(kProxyWidth) * 0.5f, cy = static_cast<float>(kProxyHeight) * 0.5f;
-        state->inputAssembly.run(ctx, splatR->getOutputImage(), splatR->getAuxImage(),
-                                  splatR->getFgImage(), kProxyWidth, kProxyHeight, nullptr,
-                                  frame.eye.x, frame.eye.y, frame.eye.z,
-                                  frame.rAxis.x, frame.rAxis.y, frame.rAxis.z,
-                                  frame.uAxis.x, frame.uAxis.y, frame.uAxis.z,
-                                  frame.fAxis.x, frame.fAxis.y, frame.fAxis.z,
-                                  frame.fx, frame.fy, cx, cy, jitterPxX, jitterPxY, &iaTimings);
+        VkCommandBuffer fusedCmd = ctx.beginSingleTimeCommands();
+        splatR->encodeFrame(ctx, fusedCmd);
+        renderMs = msSince(tRender);  // CPU cost of RECORDING splatR's compute+draw commands only -- not
+                                       // blocking on them; the GPU/submit cost is proxyIaSubmitWaitMs below
+
+        // --- Stage 3: input assembly, fused into the SAME command buffer
+        // as the proxy render above (Target mode has no jitter/history
+        // contract to feed the network -- it exists purely as this demo's
+        // ground-truth comparison target, per DemoMode's comment).
+        // hiddenIn=nullptr until Stage 5 wires the real recurrent state
+        // through; every frame still runs the full pass (not just the
+        // dump frame) so its own timing shows up in profiling passes later.
+        state->inputAssembly.encode(ctx, fusedCmd, splatR->getOutputImage(), splatR->getAuxImage(),
+                                     splatR->getFgImage(), kProxyWidth, kProxyHeight, nullptr,
+                                     frame.eye.x, frame.eye.y, frame.eye.z,
+                                     frame.rAxis.x, frame.rAxis.y, frame.rAxis.z,
+                                     frame.uAxis.x, frame.uAxis.y, frame.uAxis.z,
+                                     frame.fAxis.x, frame.fAxis.y, frame.fAxis.z,
+                                     frame.fx, frame.fy, cx, cy, jitterPxX, jitterPxY, &iaTimings);
+
+        auto tSubmit = std::chrono::high_resolution_clock::now();
+        vkEndCommandBuffer(fusedCmd);
+        VkSubmitInfo fusedSubmit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        fusedSubmit.commandBufferCount = 1;
+        fusedSubmit.pCommandBuffers = &fusedCmd;
+        vkQueueSubmit(ctx.graphicsQueue, 1, &fusedSubmit, state->proxyIaFence);
+        vkWaitForFences(ctx.device, 1, &state->proxyIaFence, VK_TRUE, UINT64_MAX);
+        vkResetFences(ctx.device, 1, &state->proxyIaFence);
+        vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &fusedCmd);
+        proxyIaSubmitWaitMs = msSince(tSubmit);
+
+        // GPU-pipelining task (goal 1, "per-stage GPU timestamps for every
+        // stage next to CPU wall"): both query pools are already enabled/
+        // written unconditionally -- fetch them now that the fence above
+        // guarantees the shared submit has completed (see each class's
+        // fetchGpuTimingsAfterFence() comment for why this couldn't happen
+        // any earlier).
+        splatR->fetchGpuTimingsAfterFence(ctx);
+        proxyGpuT = splatR->lastGpuTimingsMs();
+        state->inputAssembly.fetchGpuTimingsAfterFence(ctx, &iaTimings.gpuMs);
+    } else {
+        splatR->render(ctx);
+        renderMs = msSince(tRender);
+        proxyGpuT = splatR->lastGpuTimingsMs();
     }
 
     // --- Stage 5: net inference with recurrent hidden feedback + live
@@ -1596,53 +1692,65 @@ void renderFrame(AppState* state) {
         uploadRgbToDisplayImage(ctx, state->displayImage, reconColor, kWidth, kHeight);
         stage6Ms = msSince(tS6);
         // Task 2 (docs/rendering-engines.md, Reconstruction-mode time
-        // budget): proxy render is `renderMs` (above); input assembly is
-        // `iaTimings` (readback = 3x vkCmdCopyImageToBuffer, compute = the
-        // 2 GLSL dispatches); net is `reconT.net` (adapter=CPU repack,
-        // upload/infer/download=TFLite); the rest is runReconstructionModeFrame's
-        // own file-based round trip through reconstruct_pass.cpp's
-        // runReconstructDump (dumpWrite=write dump npys, reconstruct.*=its
-        // internal setup/read/upload/dispatch[cpu+gpu]/download/write/
-        // teardown breakdown, outputRead=read the final out_f0.npy back).
+        // budget): proxy render is `renderMs` (above, now CPU record time
+        // ONLY -- see below); input assembly is `iaTimings` (readback = 3x
+        // vkCmdCopyImageToBuffer, compute = the 2 GLSL dispatches); net is
+        // `reconT.net` (adapter=CPU repack, upload/infer/download=TFLite);
+        // the rest is runReconstructionModeFrame's own file-based round
+        // trip through reconstruct_pass.cpp's runReconstructDump
+        // (dumpWrite=write dump npys, reconstruct.*=its internal setup/
+        // read/upload/dispatch[cpu+gpu]/download/write/teardown breakdown,
+        // outputRead=read the final out_f0.npy back).
         //
-        // GPU-pipelining task (goal 1): proxy_gpu_* (splatR's own
-        // preprocess/sort/draw VkQueryPool, read above into proxyGpuT) and
-        // ia_gpu (input_assembly.cpp's own 2-slot bracket around its
-        // now-merged copy+dispatch command buffer, iaTimings.gpuMs) sit
-        // next to their CPU-wall counterparts; recon_dispatch_gpu already
-        // existed (ReconstructLive::run()'s own bracket). submits/waits is
-        // a hand-derived per-frame count of this function's own
-        // vkQueueSubmit/vkQueueWaitIdle/vkWaitForFences round trips (same
-        // "manually accounted, not auto-instrumented" convention the
-        // Proxy/Target-mode TIMING line below already uses for splat_
-        // renderer.cpp's inner_vkQueueWaitIdle count) -- proxy_render=1
-        // (splatR->render()'s own endSingleTimeCommands, unchanged/
-        // untouched this pass -- see the commit message for why),
-        // ia_merged=1 (was 5 pre-merge: 3x copyImageToBuffer + 2x
-        // dispatchOne), recon=1 (already merged pre-existing:
-        // ReconstructLive::run()'s own vkQueueSubmit+vkWaitForFences),
-        // display_upload=1 (uploadRgbToDisplayImage's own
-        // beginSingleTimeCommands/endSingleTimeCommands), blit_submit=1
-        // (submitted with state->inFlightFence, waited by the NEXT frame's
-        // outer vkWaitForFences, not counted again here) -- was 9 Vulkan
-        // submit+wait round trips pre-merge (1+5+1[readColorAndMvProxyCombined,
-        // now removed]+1+1), now 4 (down from 9), plus the net stage's own
+        // GPU-pipelining task (goal 2, "fuse the proxy render into the
+        // frame's command buffer"): proxy_render and ia_readback/ia_compute
+        // are now pure CPU RECORDING time (renderMs / iaTimings.*Ms) --
+        // splatR->encodeFrame() and inputAssembly.encode() both record into
+        // the SAME command buffer with no submit/wait of their own; the
+        // blocking cost of actually running that fused work on the GPU is
+        // proxy_ia_submit_wait (one vkQueueSubmit + vkWaitForFences, NOT
+        // vkQueueWaitIdle). proxy_gpu_*/ia_gpu (each renderer's own
+        // VkQueryPool, fetched via fetchGpuTimingsAfterFence() once that
+        // fence is signaled) and recon_dispatch_gpu (ReconstructLive::run()'s
+        // own bracket, unchanged) sit next to their CPU-wall counterparts.
+        // submits/waits is a hand-derived per-frame count of this
+        // function's own vkQueueSubmit/vkQueueWaitIdle/vkWaitForFences
+        // round trips (same "manually accounted, not auto-instrumented"
+        // convention the Proxy/Target-mode TIMING line below already uses
+        // for splat_renderer.cpp's inner_vkQueueWaitIdle count) --
+        // proxy_ia_fused=1 (was 2: proxy_render=1 + ia_merged=1, each its
+        // own vkQueueSubmit+vkQueueWaitIdle -- now ONE vkQueueSubmit +
+        // vkWaitForFences on state->proxyIaFence, ZERO vkQueueWaitIdle),
+        // recon=1 (already merged pre-existing: ReconstructLive::run()'s
+        // own vkQueueSubmit+vkWaitForFences), display_upload=1
+        // (uploadRgbToDisplayImage's own beginSingleTimeCommands/
+        // endSingleTimeCommands -- still a vkQueueWaitIdle, NOT fused by
+        // this pass; see the commit message), blit_submit=1 (submitted with
+        // state->inFlightFence, waited by the NEXT frame's outer
+        // vkWaitForFences, not counted again here) -- was 9 Vulkan
+        // submit+wait round trips before the "restructure the
+        // Reconstruction frame into a GPU-pipelined chain" work started
+        // (1+5+1[readColorAndMvProxyCombined, since removed]+1+1), then 4
+        // after the input-assembly/readback merges, now 3 (proxy_ia_fused=1
+        // recon=1 display_upload=1) with only 1 remaining vkQueueWaitIdle
+        // (display_upload's) on this whole path, plus the net stage's own
         // non-Vulkan CPU Lock()+memcpy() upload/download (unavoidable with
         // today's LiteRT Next API -- no VkCommandBuffer to record into; see
         // the commit message's AHWB-interop assessment).
         const ReconstructTimingsMs& rt = reconT.reconstruct;
         double reconstructTotalMs = rt.setupMs + rt.fileReadMs + rt.uploadMs + rt.dispatchCpuMs +
                                      rt.downloadMs + rt.fileWriteMs + rt.teardownMs;
-        LOGI("RECON_TIMING (ms) proxy_render=%.1f proxy_gpu_preprocess=%.2f proxy_gpu_sort=%.2f "
-             "proxy_gpu_draw=%.2f | ia_readback=%.1f ia_compute=%.1f ia_gpu=%.2f | "
+        LOGI("RECON_TIMING (ms) proxy_render=%.2f proxy_ia_submit_wait=%.2f proxy_gpu_preprocess=%.2f proxy_gpu_sort=%.2f "
+             "proxy_gpu_draw=%.2f | ia_readback=%.2f ia_compute=%.2f ia_gpu=%.2f | "
              "net_adapter=%.1f net_upload=%.1f net_infer=%.1f net_download=%.1f | "
              "dump_write=%.1f | recon_setup=%.1f recon_read=%.1f recon_upload=%.1f "
              "recon_dispatch_cpu=%.1f recon_dispatch_gpu=%.1f recon_download=%.1f "
              "recon_write=%.1f recon_teardown=%.1f recon_total=%.1f | output_read=%.1f | "
-             "stage6_total=%.1f | submits=4 vulkan_waits=4 (proxy_render=1 ia_merged=1 recon=1 "
-             "display_upload=1; blit_submit pipelined via inFlightFence, waited next frame) "
+             "stage6_total=%.1f | submits=3 vulkan_waits=3 (proxy_ia_fused=1[vkWaitForFences, no "
+             "vkQueueWaitIdle] recon=1[vkWaitForFences] display_upload=1[vkQueueWaitIdle]; "
+             "blit_submit pipelined via inFlightFence, waited next frame) "
              "net_cpu_roundtrips=2 (upload_lock_memcpy download_lock_memcpy, non-Vulkan/LiteRT-owned)",
-             renderMs, proxyGpuT.preprocessMs, proxyGpuT.sortMs, proxyGpuT.drawMs,
+             renderMs, proxyIaSubmitWaitMs, proxyGpuT.preprocessMs, proxyGpuT.sortMs, proxyGpuT.drawMs,
              iaTimings.readbackMs, iaTimings.computeMs, iaTimings.gpuMs,
              reconT.net.adapterMs, reconT.net.uploadMs, reconT.net.inferMs, reconT.net.downloadMs,
              reconT.dumpWriteMs, rt.setupMs, rt.fileReadMs, rt.uploadMs, rt.dispatchCpuMs, rt.dispatchGpuMs,
@@ -1734,17 +1842,28 @@ void renderFrame(AppState* state) {
     if (state->timingFrameCount >= AppState::kTimingWindowFrames) {
         int n = state->timingFrameCount;
         int gn = std::max(state->gpuTimingValidFrames, 1);
-        LOGI("TIMING mode=%s %ux%u avg-over-%d-frames (ms): cpu_wait_fence=%.2f cpu_render(preprocess+sort+draw)=%.2f "
+        // GPU-pipelining task (goal 2): isProxy modes (Proxy/Bicubic/
+        // Reconstruction) no longer call splatR->render() at all -- they
+        // use encodeFrame() fused with InputAssembly into one
+        // vkQueueSubmit+vkWaitForFences (0 inner vkQueueWaitIdle -- see
+        // renderFrame()'s isProxy block and RECON_TIMING's comment). Target
+        // mode is unchanged: splatR->render() still does its own
+        // endSingleTimeCommands (1 vkQueueSubmit+vkQueueWaitIdle); the
+        // __APPLE__-only MoltenVK mid-frame drain this comment used to also
+        // count never compiles on Android (this file), so it was always 1,
+        // never conditionally 2, regardless of hasMotionVectors_.
+        LOGI("TIMING mode=%s %ux%u avg-over-%d-frames (ms): cpu_wait_fence=%.2f cpu_render(record-only if fused)=%.2f "
              "cpu_blit_present=%.2f cpu_frame_total=%.2f | gpu_preprocess=%.2f gpu_sort=%.2f gpu_draw=%.2f "
              "gpu_valid_frames=%d/%d | sync_stalls_per_frame: outer_vkWaitForFences=1 "
-             "inner_vkQueueWaitIdle=%d (splat_renderer.cpp render(): 1 after preprocess [MV drain, "
-             "hasMotionVectors=%d] + 1 final submit)",
+             "inner_vkQueueWaitIdle=%d (%s)",
              demoModeName(state->mode), activeW, activeH,
              n, state->sumCpuWaitFenceMs / n, state->sumCpuRenderMs / n,
              state->sumCpuBlitPresentMs / n, state->sumCpuFrameMs / n,
              state->sumGpuPreprocessMs / gn, state->sumGpuSortMs / gn, state->sumGpuDrawMs / gn,
              state->gpuTimingValidFrames, n,
-             splatR->hasMotionVectors() ? 2 : 1, splatR->hasMotionVectors() ? 1 : 0);
+             isProxy ? 0 : 1,
+             isProxy ? "fused proxy+InputAssembly submit uses vkWaitForFences, not vkQueueWaitIdle"
+                     : "splat_renderer.cpp render()'s own endSingleTimeCommands final submit");
         state->timingFrameCount = 0;
         state->sumCpuWaitFenceMs = state->sumCpuRenderMs = state->sumCpuBlitPresentMs = state->sumCpuFrameMs = 0.0;
         state->sumGpuPreprocessMs = state->sumGpuSortMs = state->sumGpuDrawMs = 0.0;
@@ -1770,6 +1889,7 @@ void cleanupRenderer(AppState* state) {
     if (state->imageAvailableSem) vkDestroySemaphore(state->ctx.device, state->imageAvailableSem, nullptr);
     if (state->renderFinishedSem) vkDestroySemaphore(state->ctx.device, state->renderFinishedSem, nullptr);
     if (state->inFlightFence) vkDestroyFence(state->ctx.device, state->inFlightFence, nullptr);
+    if (state->proxyIaFence) vkDestroyFence(state->ctx.device, state->proxyIaFence, nullptr);
     if (state->scene.getSplatRenderer()) state->scene.getSplatRenderer()->cleanup(state->ctx);
     if (state->proxyRenderer) { state->proxyRenderer->cleanup(state->ctx); state->proxyRenderer.reset(); }
     if (state->fullSceneTargetRenderer) {

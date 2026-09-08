@@ -153,17 +153,38 @@ public:
 
     void render(VulkanContext& ctx);
 
+    // --- Fused-frame encode (mobile-DLSS Android live demo, GPU-pipelining
+    // task): records the SAME preprocess -> sort -> draw work render() does,
+    // with the same barriers, into a command buffer the CALLER already
+    // began and owns -- no vkQueueSubmit/vkQueueWaitIdle inside. Lets a
+    // caller fuse this SplatRenderer's work with other passes (e.g. an
+    // InputAssembly compute dispatch reading its outputs) into ONE submit
+    // with one fence instead of one submit+wait per pass. Two render()
+    // escape hatches are deliberately NOT available here: the
+    // LUX_DEBUG_SPLAT_DUMP env-var dump (desktop debug tooling only, needs
+    // its own extra submit) and the __APPLE__-only MoltenVK mid-frame queue
+    // drain for hasMotionVectors_ (already compiled out on any non-Apple
+    // build, which is the only kind this entry point is used from -- see
+    // splat_renderer.cpp's encodeFrameCore() comment). If GPU timestamp
+    // queries are enabled (setGpuTimingEnabled()), this records the same 4
+    // timestamps render() does -- call fetchGpuTimingsAfterFence() once the
+    // caller has waited for this command buffer's completion to convert
+    // them (lastGpuTimingsMs() is stale before that).
+    void encodeFrame(VulkanContext& ctx, VkCommandBuffer cmd);
+
     // --- Optional GPU timestamp-query profiling (mobile-DLSS Android live
     // demo, Stage 1 "timing breakdown" -- docs/rendering-engines.md). Off by
     // default (zero query-pool overhead when disabled, so desktop CLI /
-    // existing callers are unaffected). When enabled, render() writes 4
-    // timestamps into an internal VkQueryPool: [0] frame start (top of
-    // pipe), [1] end of the preprocess compute dispatch (before the radix
-    // sort), [2] end of the radix sort (before the render pass), [3] end of
-    // the draw (after vkCmdEndRenderPass) -- and lastGpuTimingsMs() converts
-    // the deltas to milliseconds once render() returns (already
-    // GPU-synchronous via endSingleTimeCommands, so results are always
-    // ready by then). Call setGpuTimingEnabled() once after init().
+    // existing callers are unaffected). When enabled, render()/encodeFrame()
+    // write 4 timestamps into an internal VkQueryPool: [0] frame start (top
+    // of pipe), [1] end of the preprocess compute dispatch (before the
+    // radix sort), [2] end of the radix sort (before the render pass), [3]
+    // end of the draw (after vkCmdEndRenderPass). render() converts the
+    // deltas to milliseconds internally (already GPU-synchronous via
+    // endSingleTimeCommands, so results are always ready by then);
+    // encodeFrame() callers must call fetchGpuTimingsAfterFence() themselves
+    // once they've waited on their own submit. Call setGpuTimingEnabled()
+    // once after init().
     struct GpuTimingsMs {
         double preprocessMs = 0.0;  // [0]->[1]
         double sortMs = 0.0;        // [1]->[2] (includes the MoltenVK-only MV
@@ -173,6 +194,11 @@ public:
     };
     void setGpuTimingEnabled(VulkanContext& ctx, bool enabled);
     GpuTimingsMs lastGpuTimingsMs() const { return lastGpuTimings_; }
+    // Converts the timestamp-query results written by the most recent
+    // encodeFrame() call into lastGpuTimingsMs() -- see encodeFrame()'s
+    // comment. Caller must have already waited (fence/vkQueueWaitIdle) for
+    // that command buffer's completion. No-op if GPU timing isn't enabled.
+    void fetchGpuTimingsAfterFence(VulkanContext& ctx);
 
     // --- Sort scheduling (perf; bench/lux_perf_ablation.md in mobiledlss:
     // the GPU radix sort is a flat ~5.7-7.1ms/frame cost regardless of
@@ -285,6 +311,13 @@ public:
     uint32_t getHeight() const { return height_; }
 
 private:
+    // Shared body of render()/encodeFrame() -- see splat_renderer.cpp's
+    // comment on the definition. `cmd` is by reference because render()'s
+    // debug/desktop-only escape hatches can end and restart the command
+    // buffer; encodeFrame() passes a local copy that (on the only platform
+    // it's used from) is never reassigned.
+    void encodeFrameCore(VulkanContext& ctx, VkCommandBuffer& cmd, bool allowDebugDumpSubmit);
+
     uint32_t width_ = 0, height_ = 0;
     uint32_t numSplats_ = 0;
 
