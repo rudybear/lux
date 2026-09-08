@@ -18,6 +18,24 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// Task B (Mali reconstruct-pass profiling, docs/rendering-engines.md): MUST
+// match luxc/expansion/reconstruct_expander.py's `_compute_main()`
+// workgroup_size(...) attribute exactly -- unlike Metal's dispatchThreadgroups
+// (host-controlled threadgroup size, independent of the compiled kernel),
+// Vulkan/SPIR-V bakes the local workgroup size into the shader itself (the
+// `workgroup_size(N)` attribute becomes a LocalSize execution-mode
+// decoration), so the host's `ceil(totalThreads / N)` dispatch-group count
+// below must use the SAME N or the dispatch launches the wrong total thread
+// count -- found the hard way: bumping the shader to workgroup_size(64)
+// without updating this constant left the trailing ~3/4 of every image
+// unwritten (max|out_lux - out_ref| ~0.8 in tests/test_lux_reconstruct.py,
+// not a numerical-precision-sized error). 64 was then measured on-device
+// (Pixel 9 Pro XL / Mali-G715) to make no difference vs. 256 for any of
+// the five reconstruct stages, so both sides reverted to 256 -- kept as a
+// named constant instead of the old bare literal so this coupling stays
+// explicit for whoever revisits workgroup size on different hardware.
+constexpr uint32_t kReconWorkgroupSize = 256;
+
 inline double msSince(std::chrono::high_resolution_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
 }
@@ -40,7 +58,12 @@ struct GpuTimestampBracket {
         periodNs = props.limits.timestampPeriod > 0.0 ? props.limits.timestampPeriod : 1.0;
         VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qpci.queryCount = 2;
+        // 8, not 2 -- Task B per-dispatch profiling needs up to 6 slots
+        // (TOP + bguv + memory + warp + apply + blend/BOTTOM) from
+        // ReconstructLive::run()'s single fused command buffer below;
+        // runReconstructDump's own writeStart()/writeEnd() bracket still
+        // only ever touches indices 0/1, unaffected by the larger pool.
+        qpci.queryCount = 8;
         vkCreateQueryPool(ctx.device, &qpci, nullptr, &pool);
     }
     void destroy(VkDevice device) {
@@ -48,7 +71,7 @@ struct GpuTimestampBracket {
     }
     void writeStart(VulkanContext& ctx) {
         VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
-        vkCmdResetQueryPool(cmd, pool, 0, 2);
+        vkCmdResetQueryPool(cmd, pool, 0, 8);
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
         ctx.endSingleTimeCommands(cmd);
     }
@@ -63,6 +86,20 @@ struct GpuTimestampBracket {
                                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
         if (qr != VK_SUCCESS) return 0.0;
         return static_cast<double>(ts[1] - ts[0]) * periodNs * 1e-6;
+    }
+    // Task B: reads up to `count` raw timestamps (indices 0..count-1) and
+    // converts adjacent deltas ts[i+1]-ts[i] into `outDeltasMs[0..count-2]`.
+    // Returns false (leaving outDeltasMs untouched) on query failure.
+    bool readDeltasMs(VkDevice device, uint32_t count, double* outDeltasMs) {
+        uint64_t ts[8] = {};
+        if (count > 8) count = 8;
+        VkResult qr = vkGetQueryPoolResults(device, pool, 0, count, sizeof(ts), ts, sizeof(uint64_t),
+                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (qr != VK_SUCCESS) return false;
+        for (uint32_t i = 0; i + 1 < count; ++i) {
+            outDeltasMs[i] = static_cast<double>(ts[i + 1] - ts[i]) * periodNs * 1e-6;
+        }
+        return true;
     }
 };
 
@@ -214,7 +251,7 @@ void dispatchOne(VulkanContext& ctx, VkPipeline pipeline, VkPipelineLayout layou
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, pushData);
-    uint32_t groups = (totalThreads + 255) / 256;
+    uint32_t groups = (totalThreads + kReconWorkgroupSize - 1) / kReconWorkgroupSize;
     vkCmdDispatch(cmd, groups, 1, 1);
     // Each dispatch is its own fully-synchronous submission (full queue
     // drain via endSingleTimeCommands' vkQueueWaitIdle) -- deliberately
@@ -242,7 +279,7 @@ void recordDispatchBarriered(VkCommandBuffer cmd, VkPipeline pipeline, VkPipelin
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, pushData);
-    uint32_t groups = (totalThreads + 255) / 256;
+    uint32_t groups = (totalThreads + kReconWorkgroupSize - 1) / kReconWorkgroupSize;
     vkCmdDispatch(cmd, groups, 1, 1);
     if (!barrierAfter) return;
     // One VkMemoryBarrier (all buffers), not a per-buffer scoped barrier:
@@ -1086,9 +1123,17 @@ ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const Fra
     cmdBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(I.reconCmd, &cmdBeginInfo);
 
+    // Task B per-dispatch profiling: qi walks 0..5 across however many of
+    // the up-to-6 timestamp slots this frame actually uses (fewer when
+    // !I.hasMemory, since bguv/memory don't run) -- see
+    // ReconstructTimingsMs::bguvMs..blendMs's comment. Kept as plain
+    // sequential vkCmdWriteTimestamp calls (not GpuTimestampBracket's
+    // writeStart/writeEnd helpers, which are single-time-command-based and
+    // don't fit inside this already-open, fused command buffer).
+    uint32_t qi = 0;
     if (outTimings != nullptr) {
-        vkCmdResetQueryPool(I.reconCmd, I.gpuBracket.pool, 0, 2);
-        vkCmdWriteTimestamp(I.reconCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, I.gpuBracket.pool, 0);
+        vkCmdResetQueryPool(I.reconCmd, I.gpuBracket.pool, 0, 8);
+        vkCmdWriteTimestamp(I.reconCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, I.gpuBracket.pool, qi++);
     }
 
     if (I.hasMemory) {
@@ -1102,11 +1147,17 @@ ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const Fra
         std::copy(I.bgSphere.begin(), I.bgSphere.end(), bguvPush.bg_sphere);
         recordDispatchBarriered(I.reconCmd, I.bguvPipe, I.bguvPL, I.bguvSet, &bguvPush, sizeof(bguvPush),
                                  static_cast<uint32_t>(I.targetScalarN), /*barrierAfter=*/true);
+        if (outTimings != nullptr) {
+            vkCmdWriteTimestamp(I.reconCmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, I.gpuBracket.pool, qi++);
+        }
 
         MemoryPush memPush = {static_cast<uint32_t>(I.meta.target_w), static_cast<uint32_t>(I.meta.target_h),
                                static_cast<uint32_t>(I.meta.tex_w), static_cast<uint32_t>(I.meta.tex_h)};
         recordDispatchBarriered(I.reconCmd, I.memoryPipe, I.memoryPL, I.memorySet, &memPush, sizeof(memPush),
                                  static_cast<uint32_t>(I.targetScalarN), /*barrierAfter=*/true);
+        if (outTimings != nullptr) {
+            vkCmdWriteTimestamp(I.reconCmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, I.gpuBracket.pool, qi++);
+        }
     }
 
     struct WarpPush { uint32_t target_w, target_h, proxy_w, proxy_h; };
@@ -1114,6 +1165,9 @@ ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const Fra
                           static_cast<uint32_t>(I.meta.proxy_w), static_cast<uint32_t>(I.meta.proxy_h)};
     recordDispatchBarriered(I.reconCmd, I.warpPipe, I.warpPL, I.warpSet, &warpPush, sizeof(warpPush),
                              static_cast<uint32_t>(I.targetScalarN), /*barrierAfter=*/true);
+    if (outTimings != nullptr) {
+        vkCmdWriteTimestamp(I.reconCmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, I.gpuBracket.pool, qi++);
+    }
 
     struct ApplyPush {
         uint32_t target_w, target_h, proxy_w, proxy_h, net_w, net_h;
@@ -1125,6 +1179,9 @@ ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const Fra
                             in.jitterX, in.jitterY};
     recordDispatchBarriered(I.reconCmd, I.applyPipe, I.applyPL, I.applySet, &applyPush, sizeof(applyPush),
                              static_cast<uint32_t>(I.targetScalarN), /*barrierAfter=*/true);
+    if (outTimings != nullptr) {
+        vkCmdWriteTimestamp(I.reconCmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, I.gpuBracket.pool, qi++);
+    }
 
     struct BlendPush { uint32_t target_w, target_h, _pad0, _pad1; };
     BlendPush blendPush = {static_cast<uint32_t>(I.meta.target_w), static_cast<uint32_t>(I.meta.target_h), 0, 0};
@@ -1138,8 +1195,9 @@ ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const Fra
     recordDispatchBarriered(I.reconCmd, I.blendPipe, I.blendPL, I.blendSet, &blendPush, sizeof(blendPush),
                              static_cast<uint32_t>(I.targetScalarN), /*barrierAfter=*/false);
 
+    uint32_t blendQi = qi;
     if (outTimings != nullptr) {
-        vkCmdWriteTimestamp(I.reconCmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, I.gpuBracket.pool, 1);
+        vkCmdWriteTimestamp(I.reconCmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, I.gpuBracket.pool, blendQi);
     }
     vkEndCommandBuffer(I.reconCmd);
 
@@ -1151,7 +1209,23 @@ ReconstructLive::FrameOutputs ReconstructLive::run(VulkanContext& ctx, const Fra
     vkWaitForFences(ctx.device, 1, &I.reconFence, VK_TRUE, UINT64_MAX);
 
     if (outTimings != nullptr) {
-        outTimings->dispatchGpuMs += I.gpuBracket.readDeltaMs(ctx.device);
+        // blendQi+1 raw timestamps -> blendQi adjacent deltas. Index
+        // layout (see the qi walk above): [TOP, (bguv, memory,)? warp,
+        // apply, BOTTOM] -- hasMemory shifts warp/apply/blend by 2.
+        double deltas[7] = {};
+        if (I.gpuBracket.readDeltasMs(ctx.device, blendQi + 1, deltas)) {
+            double total = 0.0;
+            uint32_t di = 0;
+            if (I.hasMemory) {
+                outTimings->bguvMs += deltas[di++];
+                outTimings->memoryMs += deltas[di++];
+            }
+            outTimings->warpMs += deltas[di++];
+            outTimings->applyMs += deltas[di++];
+            outTimings->blendMs += deltas[di++];
+            for (uint32_t i = 0; i < blendQi; ++i) total += deltas[i];
+            outTimings->dispatchGpuMs += total;
+        }
         outTimings->dispatchCpuMs += msSince(tDispatch);
     }
 

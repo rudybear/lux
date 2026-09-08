@@ -484,6 +484,17 @@ void initRenderer(AppState* state) {
         LOGI("dump_key_range.txt marker present: logging KEY_RANGE for the "
              "first 20 proxy frames (Task A bisect)");
     }
+    // Task B (Mali reconstruct-pass profiling): force the initial demo mode
+    // to Reconstruction instead of the default Proxy -- same marker-file
+    // convention as the others above, added because `adb shell input tap`
+    // wasn't reliably reaching this NativeActivity's onInputEvent()
+    // tap-to-cycle during automated device testing.
+    if (FILE* modeMarker = fopen("start_mode_reconstruction.txt", "r")) {
+        fclose(modeMarker);
+        state->mode = DemoMode::Reconstruction;
+        LOGI("start_mode_reconstruction.txt marker present: starting in "
+             "Reconstruction mode (Task B bisect)");
+    }
 
     // Task 3 (docs/rendering-engines.md, GPU-delegate correctness bisect):
     // runs before anything else (no Vulkan/scene dependency at all) and is
@@ -1798,6 +1809,11 @@ void renderFrame(AppState* state) {
              reconT.net.adapterMs, reconT.net.uploadMs, reconT.net.inferMs, reconT.net.downloadMs,
              reconT.dumpWriteMs, rt.setupMs, rt.fileReadMs, rt.uploadMs, rt.dispatchCpuMs, rt.dispatchGpuMs,
              rt.downloadMs, rt.fileWriteMs, rt.teardownMs, reconstructTotalMs, reconT.outputReadMs, stage6Ms);
+        // Task B (Mali reconstruct-pass profiling): per-dispatch GPU
+        // breakdown within recon_dispatch_gpu above -- see
+        // ReconstructTimingsMs::bguvMs..blendMs's comment.
+        LOGI("RECON_TIMING_STAGES (ms) bguv=%.3f memory=%.3f warp=%.3f apply=%.3f blend=%.3f",
+             rt.bguvMs, rt.memoryMs, rt.warpMs, rt.applyMs, rt.blendMs);
     }
     if (stage6Ms > 0.0) {
         LOGI("Stage6 %s frame render: %.1fms", demoModeName(state->mode), stage6Ms);

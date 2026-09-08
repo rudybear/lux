@@ -15,6 +15,16 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// Task B (Mali reconstruct-pass profiling, docs/rendering-engines.md): MUST
+// match luxc/expansion/reconstruct_expander.py's `_compute_main()`
+// workgroup_size(...) attribute exactly -- see
+// playground_android/src/reconstruct_pass.cpp's copy of this same constant
+// for why (Vulkan/SPIR-V bakes the local workgroup size into the compiled
+// shader, unlike Metal's host-controlled dispatchThreadgroups) and for the
+// on-device measurement that settled this back on 256 (workgroup_size(64)
+// measured no faster on Mali-G715 for these five stages).
+constexpr uint32_t kReconWorkgroupSize = 256;
+
 // --- Small local helpers (same conventions as splat_renderer.cpp) ---------
 
 VkBuffer createHostVisibleBuffer(VmaAllocator allocator, VkDeviceSize sizeBytes,
@@ -145,7 +155,7 @@ void dispatchOne(VulkanContext& ctx, VkPipeline pipeline, VkPipelineLayout layou
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, pushData);
-    uint32_t groups = (totalThreads + 255) / 256;
+    uint32_t groups = (totalThreads + kReconWorkgroupSize - 1) / kReconWorkgroupSize;
     vkCmdDispatch(cmd, groups, 1, 1);
     // Each dispatch is its own fully-synchronous submission (full queue
     // drain via endSingleTimeCommands' vkQueueWaitIdle) -- deliberately

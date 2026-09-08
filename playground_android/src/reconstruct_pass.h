@@ -58,6 +58,20 @@ struct ReconstructTimingsMs {
     double downloadMs = 0.0;   // per-frame downloadFloats() calls (out_color/hidden[/bguv_target])
     double fileWriteMs = 0.0;  // per-frame npy writes (out_f{t}/hidden_f{t}[/bguv_target_f{t}])
     double teardownMs = 0.0;   // pipeline/descriptor-set/buffer destruction
+
+    // Task B (docs/rendering-engines.md, Mali reconstruct-pass profiling):
+    // per-dispatch GPU timestamp deltas within the same dispatchGpuMs span
+    // above -- ReconstructLive::run() only (runReconstructDump's dump-tool
+    // path doesn't fill these in; they stay 0 there). bguvMs/memoryMs stay
+    // 0 when the compiled pipeline has no scene-memory sub-block (see
+    // hasMemory). Sums to (approximately) dispatchGpuMs, modulo the
+    // inter-dispatch pipeline-barrier time each timestamp is also
+    // straddling.
+    double bguvMs = 0.0;
+    double memoryMs = 0.0;
+    double warpMs = 0.0;
+    double applyMs = 0.0;
+    double blendMs = 0.0;
 };
 
 // Returns 0 on success, non-zero on error (message on stderr). `outTimings`

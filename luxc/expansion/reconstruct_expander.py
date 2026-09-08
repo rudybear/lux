@@ -252,6 +252,34 @@ def _build_warp_stage(config: dict) -> StageBlock:
 
 def _compute_main(body: list) -> FunctionDef:
     fn = FunctionDef("main", [], None, body)
+    # Task B (Mali reconstruct-pass profiling, docs/rendering-engines.md):
+    # tried workgroup_size(64) (Arm's own Mali best-practices guidance
+    # favors 64-128-thread compute workgroups over Desktop-GPU-sized 256
+    # for kernels like these five -- simple, uniform per-pixel work, no
+    # shared-memory cross-thread communication, no barriers -- reasoning
+    # being Mali's fixed per-core register file is partitioned across
+    # concurrently resident warps/workgroups, and a 256-thread workgroup
+    # for a register-heavy kernel like apply's fully-unrolled K*K=16-tap
+    # softmax+gather, ~50+ live temporaries per thread, could force lower
+    # occupancy or spilling that 64 threads would avoid).
+    #
+    # MEASURED on device (Pixel 9 Pro XL / Mali-G715, 960x540,
+    # RECON_TIMING_STAGES over ~15 live frames): workgroup_size(64) vs.
+    # (256) is a no-op within noise for all five stages (apply
+    # 3.4-4.0ms @256 vs. 3.7-4.6ms @64; bguv/memory/warp/blend equally
+    # flat) -- occupancy/register pressure isn't this reconstruct pass's
+    # bottleneck at this resolution on this GPU, so reverted to 256 rather
+    # than carry the change's real cost for no benefit: the host's dispatch
+    # group count (kReconWorkgroupSize in reconstruct_pass.cpp/
+    # reconstruct_runner.cpp) MUST exactly match this attribute -- Vulkan
+    # bakes local workgroup size into the compiled SPIR-V (unlike Metal's
+    # host-controlled dispatchThreadgroups), so a mismatch here silently
+    # under/over-dispatches instead of erroring (caught by
+    # tests/test_lux_reconstruct.py: max|out_lux-out_ref| ~0.8 instead of
+    # <1e-5 with workgroup_size(64) and the host still assuming 256).
+    # Left the named kReconWorkgroupSize constant (now =256) in both host
+    # files rather than reverting to a bare literal, so this coupling is
+    # explicit for whoever revisits workgroup size on different hardware.
     fn.attributes = ["workgroup_size(256)"]
     return fn
 
@@ -771,7 +799,7 @@ def expand_reconstruct_pipeline(reconstruct, pipeline, module) -> list:
     memory_config = _get_memory_config(reconstruct)
 
     module._defines = getattr(module, "_defines", {})
-    module._defines["workgroup_size_x"] = 256
+    module._defines["workgroup_size_x"] = 256  # see _compute_main()'s comment
     module._defines["workgroup_size_y"] = 1
     module._defines["workgroup_size_z"] = 1
 
