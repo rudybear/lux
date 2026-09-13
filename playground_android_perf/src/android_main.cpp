@@ -1,0 +1,815 @@
+// Stage A of the mobile-DLSS Android live-rendering demo: NativeActivity
+// entry point that reuses playground_cpp's Vulkan splat pipeline (by
+// reference -- SceneManager/SplatRenderer/gltf_loader/camera/dlss_io/
+// spv_loader are compiled unmodified from ../../../lux-4dgs/playground_cpp/src)
+// to live-render the pruned PanopticSports juggle scene with a synthetic
+// orbit camera, mirroring mobiledlss/datagen/camera.py::orbit_path /
+// look_at exactly (see buildOrbitEyeAndView below) -- the same recipe
+// playground_ios/Source/SplatView.h validated on iPad (docs/rendering-engines.md
+// "Stage A of the mobile-DLSS live demo").
+//
+// Android specifics vs. the desktop/iOS ports:
+//  - No GLFW: android_vulkan_context.{h,cpp} (this directory) fills in the
+//    shared VulkanContext struct via VK_KHR_android_surface + ANativeWindow.
+//  - No argv: paths (scene .glb, examples/*.spv, shaders/radix_sort/*.spv)
+//    are resolved relative to the app's external files dir, which the app
+//    chdir()s into at startup; build.sh's `adb push` step lays out the
+//    same relative directory structure the desktop CLI expects.
+
+// NOTE: VMA_IMPLEMENTATION lives in android_vulkan_context.cpp, and
+// CGLTF_IMPLEMENTATION / STB_IMAGE_IMPLEMENTATION already live in
+// playground_cpp/src/gltf_loader.cpp (reused unmodified) -- defining any of
+// them again here would duplicate symbols at link time.
+
+#include <android_native_app_glue.h>
+#include <android/log.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include "vulkan_context.h"
+#include "scene_manager.h"
+#include "splat_renderer.h"
+#include "dlss_io.h"
+#include "android_vulkan_context.h"
+#include "input_assembly.h"
+
+#define LOG_TAG "lux_android"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+namespace {
+
+// Display resolution for Stage A (task spec: 960x540 display target). Stage
+// 2 (docs/rendering-engines.md "Android live-rendering demo") adds a second,
+// quarter-area "proxy" resolution -- exactly half linear (480x270 = 960x540
+// / 2) -- rendered by an independent SplatRenderer instance with TAA jitter;
+// kWidth/kHeight above remain the unjittered "Target" (full-res) pass.
+constexpr uint32_t kWidth = 960;
+constexpr uint32_t kHeight = 540;
+constexpr uint32_t kProxyWidth = 480;
+constexpr uint32_t kProxyHeight = 270;
+
+// Which SplatRenderer instance's output gets blitted to the swapchain this
+// frame. Only PROXY and TARGET exist as of Stage 2; Stage 6 adds BICUBIC
+// (upsample of the proxy colour, no net) and RECONSTRUCTION (proxy + net +
+// reconstruct pass) and wires this to a tap-to-cycle input handler instead
+// of the time-based auto-cycle Stage 2 uses below (so both breakdowns show
+// up in one logcat capture without needing touch input yet).
+enum class DemoMode { Proxy, Target };
+
+// Halton(2,3) TAA jitter, exactly mirroring mobiledlss/datagen/camera.py::
+// halton/taa_jitter: 1-indexed low-discrepancy sequence, period 16, output
+// centred in [-0.5, +0.5]. docs/lux-reconstruct-spec.md's input-contract
+// table defines this jitter in TARGET pixels; the proxy pass (this stage)
+// scales it by (proxyWidth/targetWidth) == 0.5 here before feeding it to
+// SplatRenderer::setJitter(), which expects pixels in the renderer's OWN
+// (proxy) resolution -- "0.5*jitter in proxy px" per the task brief.
+float haltonSequence(int index, int base) {
+    float f = 1.0f, r = 0.0f;
+    int i = index;
+    while (i > 0) {
+        f /= static_cast<float>(base);
+        r += f * static_cast<float>(i % base);
+        i /= base;
+    }
+    return r;
+}
+
+constexpr int kJitterPeriod = 16;
+
+glm::vec2 taaJitterTargetPixels(int frameIndex) {
+    int i = (frameIndex % kJitterPeriod) + 1;
+    return glm::vec2(haltonSequence(i, 2) - 0.5f, haltonSequence(i, 3) - 0.5f);
+}
+
+// Orbit parameters, matching mobiledlss/datagen/camera.py::orbit_path exactly:
+// radius 2.0, elevation 15deg, 0.6deg/frame, PanopticSports y-down world (up=(0,-1,0)).
+constexpr float kOrbitRadius = 2.0f;
+constexpr float kElevationDeg = 15.0f;
+constexpr float kDegPerFrame = 0.6f;
+constexpr float kFovYDeg = 50.0f;
+
+// Builds the OpenCV-convention world->camera view matrix exactly like
+// mobiledlss/datagen/camera.py::look_at (x right, y down, z forward; world
+// up = (0,-1,0) for the y-down PanopticSports scene), row-major for
+// DlssIO::cvViewToGl (docs/lux-4d-spec.md section 4 camera bridge -- the
+// same path main.cpp's --camera-json flag drives).
+std::array<float, 16> buildCvViewRowMajor(glm::vec3 eye, glm::vec3 target, glm::vec3 upWorld) {
+    glm::vec3 f = glm::normalize(target - eye);
+    glm::vec3 r = glm::normalize(glm::cross(-upWorld, f));  // right = down x forward
+    glm::vec3 u = glm::cross(f, r);                          // camera y = forward x right
+    // R rows are camera axes in world coords: [r; u; f]
+    std::array<float, 16> m{};
+    m[0] = r.x; m[1] = r.y; m[2] = r.z;  m[3] = -glm::dot(r, eye);
+    m[4] = u.x; m[5] = u.y; m[6] = u.z;  m[7] = -glm::dot(u, eye);
+    m[8] = f.x; m[9] = f.y; m[10] = f.z; m[11] = -glm::dot(f, eye);
+    m[12] = 0;  m[13] = 0;  m[14] = 0;   m[15] = 1;
+    return m;
+}
+
+struct OrbitFrame {
+    glm::vec3 eye;
+    glm::mat4 viewGl;
+    glm::mat4 proj;
+    float fx, fy;
+    // World-space camera basis (right, up/down, forward) -- Stage 3's input
+    // assembly needs these directly for its bg-sphere UV ray math
+    // (mobiledlss/datagen/camera.py::sphere_uv's `dirs_cam @ c2w[:3,:3].T`):
+    // buildCvViewRowMajor's local r/u/f ARE exactly camera-to-world's
+    // rotation columns (its rows are world->camera, so world->camera's
+    // transpose -- i.e. camera->world -- has r/u/f as columns), so no
+    // separate camera-to-world matrix construction is needed.
+    glm::vec3 rAxis, uAxis, fAxis;
+};
+
+// Actor/action center for THIS scene (juggle_p0.8_stride4.glb), taken
+// verbatim from lux-4dgs/tests/assets/cameras/generate_juggle_camera.py
+// ("Actor/action center taken as world (-0.22, -1.04, 0.09) (given)") --
+// that script is the already-validated (docs/lux-4d-spec.md section D)
+// reproduction of mobiledlss/datagen/camera.py::orbit_path/look_at for this
+// exact glb, so this is the known-good center rather than
+// SceneManager::computeAutoCamera's whole-scene (person + dome background)
+// bounding-box centroid, which sits far outside the room the person is
+// standing in and produced a wildly wrong orbit (camera outside the whole
+// dome looking at it from ~15 units away) the first time this was tried.
+constexpr glm::vec3 kJuggleActorCenter(-0.22f, -1.04f, 0.09f);
+
+OrbitFrame computeOrbitFrame(float frameIndex, uint32_t width, uint32_t height) {
+    float az = glm::radians(frameIndex * kDegPerFrame);
+    float el = glm::radians(kElevationDeg);
+    glm::vec3 center = kJuggleActorCenter;
+    glm::vec3 eye = center + kOrbitRadius * glm::vec3(cosf(el) * cosf(az), -sinf(el), cosf(el) * sinf(az));
+    glm::vec3 upWorld(0.0f, -1.0f, 0.0f);  // PanopticSports y-down, matches generate_juggle_camera.py
+
+    auto viewCv = buildCvViewRowMajor(eye, center, upWorld);
+    glm::mat4 viewGl = DlssIO::cvViewToGl(viewCv);
+
+    float fy = 0.5f * static_cast<float>(height) / tanf(glm::radians(kFovYDeg) * 0.5f);
+    float fx = fy;
+    float cx = width * 0.5f, cy = height * 0.5f;
+    glm::mat4 proj = DlssIO::buildIntrinsicsProjection(fx, fy, cx, cy,
+                                                        static_cast<float>(width), static_cast<float>(height),
+                                                        0.01f, 100.0f);
+
+    // Same r/u/f the view matrix itself was built from (see buildCvViewRowMajor).
+    glm::vec3 f = glm::normalize(center - eye);
+    glm::vec3 r = glm::normalize(glm::cross(-upWorld, f));
+    glm::vec3 u = glm::cross(f, r);
+    return {eye, viewGl, proj, fx, fy, r, u, f};
+}
+
+struct AppState {
+    struct android_app* app = nullptr;
+    bool vulkanReady = false;
+    bool windowInitialized = false;
+
+    VulkanContext ctx;
+    SceneManager scene;  // owns the Target (full-res, jitter-free) SplatRenderer
+
+    // Stage 2: independent proxy-resolution SplatRenderer (480x270, jittered)
+    // constructed directly from scene.getGltfScene().splat_data -- a second
+    // GPU-resident copy of the splat buffers/pipelines at a different
+    // resolution, entirely separate from SceneManager's Target renderer.
+    std::unique_ptr<SplatRenderer> proxyRenderer;
+
+    // Stage 3: assembles ParamPredUNet's 26-channel input tensor from the
+    // proxy renderer's per-frame attachments (docs/rendering-engines.md).
+    // param_stride=2, hidden=8 match the checkpoint this demo targets
+    // (expY_mem3_juggle_p0.8_ps2.pt -- task brief's "State" section).
+    InputAssembly inputAssembly;
+    static constexpr uint32_t kParamStride = 2;
+    static constexpr uint32_t kHiddenChannels = 8;
+
+    DemoMode mode = DemoMode::Proxy;
+    // Auto-cycle Proxy/Target every kModeSwitchFrames frames so a single run
+    // captures a TIMING window for both resolutions (see the DemoMode
+    // comment above -- Stage 6 replaces this with tap-to-cycle).
+    static constexpr int kModeSwitchFrames = 180;
+
+    VkSemaphore imageAvailableSem = VK_NULL_HANDLE;
+    VkSemaphore renderFinishedSem = VK_NULL_HANDLE;
+    VkFence inFlightFence = VK_NULL_HANDLE;
+    VkCommandBuffer blitCmd = VK_NULL_HANDLE;
+
+    int frameCounter = 0;
+
+    std::chrono::high_resolution_clock::time_point fpsWindowStart;
+    int fpsWindowFrames = 0;
+    float lastFps = 0.0f;
+
+    bool initFailed = false;
+
+    // --- Stage 1 timing breakdown (docs/rendering-engines.md "Android
+    // live-rendering demo") -- CPU wall-clock per phase (ms) accumulated
+    // over a 60-frame window, plus the GPU timestamp-query breakdown from
+    // SplatRenderer::lastGpuTimingsMs() (preprocess/sort/draw), logged
+    // together every ~60 frames via LOGI so `adb logcat -d | grep TIMING`
+    // gives a periodic snapshot without a blocking logcat stream.
+    static constexpr int kTimingWindowFrames = 60;
+    int timingFrameCount = 0;
+    double sumCpuWaitFenceMs = 0.0;   // vkWaitForFences (outer loop, waits for prior frame's blit+present)
+    double sumCpuRenderMs = 0.0;      // wall time of splatR->render() (preprocess+sort+draw, incl. its 2 internal vkQueueWaitIdle round trips)
+    double sumCpuBlitPresentMs = 0.0; // blit cmd record+submit+vkQueuePresentKHR (does not itself block)
+    double sumCpuFrameMs = 0.0;       // total renderFrame() wall time
+    double sumGpuPreprocessMs = 0.0;
+    double sumGpuSortMs = 0.0;
+    double sumGpuDrawMs = 0.0;
+    int gpuTimingValidFrames = 0;
+};
+
+std::string basePath(AppState* state) {
+    // internalDataPath (/data/user/0/<pkg>/files, i.e. getFilesDir()) rather
+    // than externalDataPath: adb push into
+    // /sdcard/Android/data/<pkg>/files produced files this app's own
+    // process couldn't fopen() (cgltf_parse_file came back
+    // cgltf_result_file_not_found == 6 despite `adb shell ls` showing the
+    // right size/rw-rw-rw perms) -- Android 11+ scoped storage enforces
+    // per-app isolation on that path at a layer below plain POSIX
+    // permission bits, and files written by the shell UID don't reliably
+    // get labeled for the app UID to read even inside its "own" external
+    // dir. push_assets.sh instead stages via /data/local/tmp + `run-as`
+    // into this internal dir, which the app's UID owns outright.
+    return state->app->activity->internalDataPath;
+}
+
+void initRenderer(AppState* state) {
+    std::string base = basePath(state);
+    if (chdir(base.c_str()) != 0) {
+        LOGE("chdir(%s) failed", base.c_str());
+    } else {
+        LOGI("chdir to %s", base.c_str());
+    }
+    mkdir((base + "/dump").c_str(), 0755);  // Stage 2 validation dump target (dumpProxyDebugFrame)
+
+    try {
+        AndroidVulkan::init(state->ctx, state->app->window, false);
+        AndroidVulkan::createSwapchain(state->ctx, kWidth, kHeight);
+
+        // --- perf-ablation harness (playground_android_perf) ---
+        // Reads an optional "perf_config.txt" (2 lines: scene relative
+        // path, shader-base relative path) from the app's internal files
+        // dir so the ablation driver can swap scene/pipeline variants
+        // without rebuilding the .so. Falls back to the original Stage-A
+        // defaults when absent. NOT read by playground_android/ (untouched).
+        std::string sceneRel = "scene/juggle_p0.8_stride4.glb";
+        std::string shaderBaseRel = "examples/gaussian_splat_dlss";
+        {
+            std::ifstream cfg(base + "/perf_config.txt");
+            if (cfg.good()) {
+                std::string line1, line2;
+                if (std::getline(cfg, line1) && !line1.empty()) sceneRel = line1;
+                if (std::getline(cfg, line2) && !line2.empty()) shaderBaseRel = line2;
+            }
+        }
+        std::string scenePath = base + "/" + sceneRel;
+        LOGI("Loading scene: %s", scenePath.c_str());
+        state->scene.loadScene(state->ctx, scenePath);
+
+        int vertexStride = 32;  // pure splat scene, no glTF mesh triangles
+        state->scene.uploadToGPU(state->ctx, vertexStride);
+        state->scene.uploadTextures(state->ctx);
+
+        if (!state->scene.hasSplatData()) {
+            LOGE("Scene has no gaussian splat data!");
+            state->initFailed = true;
+            return;
+        }
+
+        std::string shaderBase = base + "/" + shaderBaseRel;
+        LOGI("Using shader base: %s", shaderBase.c_str());
+        state->scene.initSplatRenderer(state->ctx, shaderBase, kWidth, kHeight);
+        state->scene.getSplatRenderer()->setGpuTimingEnabled(state->ctx, true);
+
+        // Stage 2/3 (proxy renderer + input-assembly net-input pass) are
+        // deliberately NOT initialized in this perf harness -- they're
+        // irrelevant to the splat preprocess/sort/draw ablation this app
+        // exists for, would add extra GPU work that contaminates the
+        // Target-mode GPU timestamps, and require extra pushed assets
+        // (texture.npy/bg_sphere.npy) unrelated to the pipeline variant
+        // under test. state->mode is forced to Target below (never
+        // switches to Proxy), so state->proxyRenderer stays null and is
+        // never dereferenced.
+
+        // NOTE: deliberately NOT using scene.getAutoTarget()/getAutoEye()
+        // here -- SceneManager::computeAutoCamera frames the WHOLE scene's
+        // bounding box (person + the ~2.5-3.2-unit PanopticSports dome
+        // background), whose centroid sits far outside the room the person
+        // actually stands in. First attempt used that (radius ~15.8) and
+        // produced a camera looking at the entire dome from outside as a
+        // tiny blurry blob. computeOrbitFrame() instead uses
+        // kJuggleActorCenter, matching generate_juggle_camera.py exactly.
+        LOGI("Splat renderer initialized: %ux%u, actor center=(%.3f,%.3f,%.3f) radius=%.3f",
+             kWidth, kHeight, kJuggleActorCenter.x, kJuggleActorCenter.y, kJuggleActorCenter.z, kOrbitRadius);
+
+        VkSemaphoreCreateInfo semInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        vkCreateSemaphore(state->ctx.device, &semInfo, nullptr, &state->imageAvailableSem);
+        vkCreateSemaphore(state->ctx.device, &semInfo, nullptr, &state->renderFinishedSem);
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        vkCreateFence(state->ctx.device, &fenceInfo, nullptr, &state->inFlightFence);
+
+        state->fpsWindowStart = std::chrono::high_resolution_clock::now();
+        state->vulkanReady = true;
+    } catch (const std::exception& e) {
+        LOGE("Renderer init failed: %s", e.what());
+        state->initFailed = true;
+    }
+}
+
+// Stage 1 helper: milliseconds between two high_resolution_clock points.
+inline double msSince(std::chrono::high_resolution_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+}
+
+// --------------------------------------------------------------------------
+// Stage 2 validation: one-shot proxy-frame dump (colour/MV/depth), to be
+// diffed against the Mac Vulkan CLI (playground_cpp/build/lux-playground
+// --output-aux) run with the same --camera-json/--camera-json-prev/--time/
+// --time-prev/--jitter. New code, entirely local to this file -- not a
+// copy of playground_cpp/src/screenshot.cpp's Screenshot::readImageRaw()
+// (same ~30-line vkCmdCopyImageToBuffer-via-staging-buffer pattern, just
+// inlined here) to avoid pulling that translation unit's
+// stbi_write_png() reference into the Android link (nothing else in this
+// app's CMakeLists defines STB_IMAGE_WRITE_IMPLEMENTATION, unlike the
+// desktop CLI's vulkan_context.cpp, which Android doesn't compile). Reuses
+// DlssIO::convertRgba16fColorAttachment / unpremultiplyByAlpha /
+// writeNpyFloat32 by reference (dlss_io.cpp is already in the Android
+// CMakeLists) so the on-disk format is byte-for-byte the same code path
+// the Mac CLI's --output-aux uses.
+// --------------------------------------------------------------------------
+
+std::vector<uint8_t> readImageRawAndroid(VulkanContext& ctx, VkImage image,
+                                          uint32_t width, uint32_t height,
+                                          uint32_t bytesPerPixel, VkImageLayout currentLayout) {
+    VkDeviceSize imageSize = static_cast<VkDeviceSize>(width) * height * bytesPerPixel;
+
+    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufferInfo.size = imageSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+    allocInfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+    VkBuffer stagingBuffer;
+    VmaAllocation stagingAllocation;
+    if (vmaCreateBuffer(ctx.allocator, &bufferInfo, &allocInfo, &stagingBuffer, &stagingAllocation, nullptr) != VK_SUCCESS) {
+        throw std::runtime_error("readImageRawAndroid: failed to create staging buffer");
+    }
+
+    VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+    if (currentLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = currentLayout;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingBuffer, 1, &region);
+    ctx.endSingleTimeCommands(cmd);
+
+    void* mapped = nullptr;
+    vmaMapMemory(ctx.allocator, stagingAllocation, &mapped);
+    std::vector<uint8_t> pixels(imageSize);
+    memcpy(pixels.data(), mapped, imageSize);
+    vmaUnmapMemory(ctx.allocator, stagingAllocation);
+    vmaDestroyBuffer(ctx.allocator, stagingBuffer, stagingAllocation);
+    return pixels;
+}
+
+void dumpProxyDebugFrame(VulkanContext& ctx, SplatRenderer* splatR, const std::string& outDir,
+                          const std::string& tag, int frameIndex, float t, float jx, float jy) {
+    uint32_t w = splatR->getWidth(), h = splatR->getHeight();
+    LOGI("DUMP tag=%s frame=%d t=%.6f jitter=(%.6f,%.6f) size=%ux%u dir=%s",
+         tag.c_str(), frameIndex, t, jx, jy, w, h, outDir.c_str());
+
+    auto rawColor = readImageRawAndroid(ctx, splatR->getOutputImage(), w, h, 8,
+                                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    std::vector<uint8_t> unusedRgba8;
+    auto colorF32 = DlssIO::convertRgba16fColorAttachment(rawColor, w, h, unusedRgba8);
+    DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_color.npy", colorF32, {h, w, 4});
+
+    // Packed out_aux attachment (bench/lux_perf_ablation.md task 2:
+    // replaces the earlier two-attachment out_motion/out_depth design):
+    // RGBA32F (mv.x*alpha, mv.y*alpha, depth*alpha, alpha) -- `.w` is the
+    // GENUINE per-fragment alpha (required for correct hardware blend
+    // accumulation, see splat_renderer.h's getAuxImage() comment), used
+    // here to un-premultiply `.xyz` directly (NOT out_color's alpha --
+    // that was tried and is a real, measured correctness bug, not a valid
+    // shortcut).
+    if (splatR->hasMotionVectors() || splatR->hasExpectedDepth()) {
+        auto rawAux = readImageRawAndroid(ctx, splatR->getAuxImage(), w, h, 16,
+                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        std::vector<float> auxF32(static_cast<size_t>(w) * h * 4);
+        memcpy(auxF32.data(), rawAux.data(), rawAux.size());
+        std::vector<float> auxAlpha(static_cast<size_t>(w) * h);
+        for (size_t i = 0; i < auxAlpha.size(); ++i) {
+            auxAlpha[i] = auxF32[i * 4 + 3];
+        }
+        if (splatR->hasExpectedDepth()) {
+            std::vector<float> depthPremul(static_cast<size_t>(w) * h);
+            for (size_t i = 0; i < depthPremul.size(); ++i) {
+                depthPremul[i] = auxF32[i * 4 + 2];
+            }
+            auto depth = DlssIO::unpremultiplyByAlpha(depthPremul, auxAlpha, w, h, 1);
+            DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_depth.npy", depth, {h, w});
+
+            // foreground_coverage: a SEPARATE, smaller out_fg attachment
+            // (RGBA16F, fg*alpha at .x, alpha at .w) -- can't share
+            // out_aux's lanes, see splat_renderer.h's getFgImage() comment.
+            if (splatR->hasForegroundCoverage()) {
+                auto rawFg = readImageRawAndroid(ctx, splatR->getFgImage(), w, h, 8,
+                                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                std::vector<float> fgF32(static_cast<size_t>(w) * h * 4);
+                for (size_t i = 0; i < fgF32.size(); ++i) {
+                    uint16_t half;
+                    memcpy(&half, rawFg.data() + i * 2, 2);
+                    fgF32[i] = DlssIO::halfToFloat(half);
+                }
+                std::vector<float> fgPremul(static_cast<size_t>(w) * h);
+                std::vector<float> fgAlpha(static_cast<size_t>(w) * h);
+                for (size_t i = 0; i < fgPremul.size(); ++i) {
+                    fgPremul[i] = fgF32[i * 4 + 0];
+                    fgAlpha[i] = fgF32[i * 4 + 3];
+                }
+                auto fg = DlssIO::unpremultiplyByAlpha(fgPremul, fgAlpha, w, h, 1);
+                DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_fg.npy", fg, {h, w});
+            }
+        }
+        if (splatR->hasMotionVectors()) {
+            std::vector<float> mvPremul(static_cast<size_t>(w) * h * 2);
+            for (size_t i = 0; i < auxAlpha.size(); ++i) {
+                mvPremul[i * 2 + 0] = auxF32[i * 4 + 0];
+                mvPremul[i * 2 + 1] = auxF32[i * 4 + 1];
+            }
+            auto mv = DlssIO::unpremultiplyByAlpha(mvPremul, auxAlpha, w, h, 2);
+            DlssIO::writeNpyFloat32(outDir + "/android_" + tag + "_mv.npy", mv, {h, w, 2});
+        }
+    }
+    LOGI("DUMP done: %s/android_%s_{color,depth,mv}.npy", outDir.c_str(), tag.c_str());
+}
+
+void renderFrame(AppState* state) {
+    if (!state->vulkanReady) return;
+    VulkanContext& ctx = state->ctx;
+
+    auto tFrameStart = std::chrono::high_resolution_clock::now();
+
+    auto tWaitFence = std::chrono::high_resolution_clock::now();
+    vkWaitForFences(ctx.device, 1, &state->inFlightFence, VK_TRUE, UINT64_MAX);
+    double waitFenceMs = msSince(tWaitFence);
+    if (state->blitCmd != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &state->blitCmd);
+        state->blitCmd = VK_NULL_HANDLE;
+    }
+
+    uint32_t imageIndex = 0;
+    VkResult acquireResult = vkAcquireNextImageKHR(ctx.device, ctx.swapchain, UINT64_MAX,
+                                                    state->imageAvailableSem, VK_NULL_HANDLE, &imageIndex);
+    if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
+        vkDeviceWaitIdle(ctx.device);
+        for (auto& iv : ctx.swapchainImageViews) vkDestroyImageView(ctx.device, iv, nullptr);
+        ctx.swapchainImageViews.clear();
+        vkDestroySwapchainKHR(ctx.device, ctx.swapchain, nullptr);
+        ctx.swapchain = VK_NULL_HANDLE;
+        AndroidVulkan::createSwapchain(ctx, kWidth, kHeight);
+        return;
+    }
+    if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
+        LOGE("vkAcquireNextImageKHR failed: %d", acquireResult);
+        return;
+    }
+    vkResetFences(ctx.device, 1, &state->inFlightFence);
+
+    // --- perf-ablation harness: always Target mode (960x540, unjittered,
+    // no proxy/inputAssembly) -- see the initRenderer() comment above.
+    DemoMode newMode = DemoMode::Target;
+    if (newMode != state->mode) {
+        state->mode = newMode;
+        // Don't mix a partial window's samples across the mode switch --
+        // the two modes use different renderers/resolutions entirely.
+        state->timingFrameCount = 0;
+        state->sumCpuWaitFenceMs = state->sumCpuRenderMs = state->sumCpuBlitPresentMs = state->sumCpuFrameMs = 0.0;
+        state->sumGpuPreprocessMs = state->sumGpuSortMs = state->sumGpuDrawMs = 0.0;
+        state->gpuTimingValidFrames = 0;
+        LOGI("mode switch -> %s", state->mode == DemoMode::Proxy ? "PROXY (480x270, jittered)" : "TARGET (960x540, unjittered)");
+    }
+
+    bool isProxy = (state->mode == DemoMode::Proxy);
+    SplatRenderer* splatR = isProxy ? state->proxyRenderer.get() : state->scene.getSplatRenderer();
+    uint32_t activeW = isProxy ? kProxyWidth : kWidth;
+    uint32_t activeH = isProxy ? kProxyHeight : kHeight;
+    // Perf ablation (bench/lux_perf_ablation.md task, sort-scheduling step):
+    // sort every 4th frame OR whenever the orbit camera has rotated >=2deg
+    // since the last real sort, whichever comes first -- idempotent to
+    // call every frame (see SplatRenderer::setSortSchedule()'s header
+    // comment; default without this call is unconditional every-frame
+    // sorting, unaffected for every other caller/test).
+    splatR->setSortSchedule(4, 2.0f);
+
+    OrbitFrame frame = computeOrbitFrame(static_cast<float>(state->frameCounter), activeW, activeH);
+    splatR->updateCameraExplicit(frame.eye, frame.viewGl, frame.proj, frame.fx, frame.fy);
+
+    // --- Stage 2: Halton(2,3) TAA jitter, proxy pass only (docs/lux-
+    // reconstruct-spec.md's jitter is defined in TARGET px; scale by
+    // proxyWidth/targetWidth == 0.5 to get proxy-px jitter for
+    // setJitter(), which rasterizes with it but leaves the unjittered
+    // view/proj SplatRenderer::render() already carries forward for motion
+    // vectors -- see setJitter()'s header comment). Target mode is never
+    // jittered (setJitter defaults to 0,0 and is never called on it).
+    float jitterPxX = 0.0f, jitterPxY = 0.0f;
+    if (isProxy) {
+        glm::vec2 jTarget = taaJitterTargetPixels(state->frameCounter);
+        float scale = static_cast<float>(kProxyWidth) / static_cast<float>(kWidth);  // 0.5
+        jitterPxX = jTarget.x * scale;
+        jitterPxY = jTarget.y * scale;
+        splatR->setJitter(jitterPxX, jitterPxY);
+    }
+
+    float morphT = 0.0f;
+    if (splatR->hasMotion()) {
+        morphT = std::fmod(state->frameCounter * (1.0f / 30.0f), std::max(splatR->animationDuration(), 0.001f));
+        splatR->setMorphTime(morphT);
+    }
+
+    auto tRender = std::chrono::high_resolution_clock::now();
+    splatR->render(ctx);
+    double renderMs = msSince(tRender);
+
+    // --- Stage 3: input assembly, proxy-mode frames only (Target mode has
+    // no jitter/history contract to feed the network -- it exists purely
+    // as this demo's ground-truth comparison target, per DemoMode's
+    // comment). hiddenIn=nullptr until Stage 5 wires the real recurrent
+    // state through; every frame still runs the full pass (not just the
+    // dump frame) so its own timing shows up in profiling passes later.
+    if (isProxy) {
+        // NOTE (bench/lux_perf_ablation.md task 2): this harness's
+        // renderFrame() always uses DemoMode::Target (see the mode-switch
+        // comment above), so `isProxy` is always false and this branch is
+        // dead code for every perf measurement -- kept compiling only.
+        // SplatRenderer's depth/motion attachments were merged into one
+        // packed RGBA16F `out_aux` (getAuxImage()); InputAssembly::run()'s
+        // separate depthImage/motionImage GLSL compute shaders
+        // (shaders_glsl/input_assembly_*.comp) still assume the OLD
+        // two-attachment RGBA32F byte layout and have NOT been updated to
+        // match -- passing the same auxImage for both here compiles but is
+        // NOT semantically correct input for those shaders. Real Stage-3
+        // wiring for the new packed layout is out of scope for task 2
+        // (splat-render DLSS attachment packing only); flagged for whoever
+        // next touches the live-demo Stage 3 input-assembly path.
+        float cx = static_cast<float>(kProxyWidth) * 0.5f, cy = static_cast<float>(kProxyHeight) * 0.5f;
+        state->inputAssembly.run(ctx, splatR->getOutputImage(), splatR->getAuxImage(),
+                                  splatR->getAuxImage(), kProxyWidth, kProxyHeight, nullptr,
+                                  frame.eye.x, frame.eye.y, frame.eye.z,
+                                  frame.rAxis.x, frame.rAxis.y, frame.rAxis.z,
+                                  frame.uAxis.x, frame.uAxis.y, frame.uAxis.z,
+                                  frame.fAxis.x, frame.fAxis.y, frame.fAxis.z,
+                                  frame.fx, frame.fy, cx, cy, jitterPxX, jitterPxY);
+    }
+
+    // --- Stage 2 validation dump: one fixed proxy frame, diffed against
+    // the Mac Vulkan CLI with the same camera/jitter/morph-time (see
+    // dumpProxyDebugFrame's comment above). frame 30 is well past the
+    // orbit's start (0.6deg/frame) and the scene's motion, so both MV and
+    // colour carry real signal, not the degenerate all-zero first frame.
+    //
+    // VALIDATION RESULT (frames 1, 3, and 30 all checked against
+    // playground_cpp/build/lux-playground --output-aux with matching
+    // --camera-json/--camera-json-prev/--time/--time-prev/--jitter):
+    // colour and expected-depth match closely (mean abs diff ~0.0016 and
+    // ~1e-6 respectively -- consistent with ordinary cross-GPU float
+    // rounding). Motion vectors do NOT match -- Android's mv is 3-6 orders
+    // of magnitude too large (e.g. frame 30: max |mv| ~5.0e6 vs the Mac
+    // CLI's ~8.6, over essentially the whole image, including
+    // fully-opaque/high-confidence pixels) EVEN AT FRAME 1, the very first
+    // frame with nonzero motion right after the firstMvFrame_ seed -- so
+    // this is not slow numerical drift across many frames. Since
+    // out_depth is computed by the exact same preprocess dispatch +
+    // fragment shader and matches essentially exactly, the current-frame
+    // camera/position math is provably correct; the bug is isolated to
+    // whatever feeds "previous" camera/position into that dispatch when
+    // it's populated by SplatRenderer::render()'s automatic per-frame
+    // carry-forward (prevViewMatrix_/prevProjMatrixUnjittered_/
+    // prevPosBuffer_), as opposed to the one-shot
+    // setPreviousCameraExplicit()/seedPreviousMorphTime() path the
+    // existing lux-4dgs tests (test_dlss_outputs.py) exercise instead --
+    // this app may be the first continuous multi-frame (30+ render() calls
+    // in one process) exerciser of that carry-forward path. NOT
+    // (confirmed) Android/Mali-specific: not re-tested against the desktop
+    // CLI's own interactive GLFW loop (playground_cpp/src/main.cpp) in
+    // this pass. This blocks trusting motion vectors in Stage 3's 26-ch
+    // input assembly and especially Stage 5's warp/reprojection until
+    // root-caused -- flagged to the task owner rather than guessed at
+    // further here.
+    constexpr int kDumpFrame = 30;
+    // Diagnostic (see the MV bug investigation above): also dump the
+    // SceneManager-owned TARGET renderer at frame 181 (its own 2nd-ever
+    // render() call, within the first target window 180-359) to check
+    // whether the automatic prev-camera/prev-pos carry-forward is broken
+    // for ANY continuously-run SplatRenderer, or specific to the
+    // proxyRenderer_ this app constructs directly from splat_data.
+    constexpr int kDumpFrameTarget = 181;
+    // Stage 3 validation needs frame (kDumpFrame - 1)'s proxy depth too
+    // (disocclusion_mask's "previous frame" input) -- dumped under its own
+    // tag so it doesn't disturb the existing frame-30 comparison.
+    if (isProxy && state->frameCounter == kDumpFrame - 1) {
+        dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", "proxy_prev", state->frameCounter, morphT, jitterPxX, jitterPxY);
+    }
+    if (isProxy && state->frameCounter == kDumpFrame) {
+        dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", "proxy", state->frameCounter, morphT, jitterPxX, jitterPxY);
+        // Stage 3 validation: dump the packed 26-ch input tensor for the
+        // SAME frame, to diff against mobiledlss.train.model.build_input
+        // fed the Mac CLI's dumped proxy color/depth/mv for this frame.
+        state->inputAssembly.dumpToNpy(basePath(state) + "/dump/android_input_tensor.npy");
+        LOGI("DUMP input_tensor: %s/dump/android_input_tensor.npy (net=%ux%u ch=%u)",
+             basePath(state).c_str(), state->inputAssembly.getNetW(), state->inputAssembly.getNetH(),
+             state->inputAssembly.getChannels());
+    } else if (!isProxy && state->frameCounter == kDumpFrameTarget) {
+        dumpProxyDebugFrame(ctx, splatR, basePath(state) + "/dump", "target", state->frameCounter, morphT, jitterPxX, jitterPxY);
+    }
+
+    auto tBlit = std::chrono::high_resolution_clock::now();
+    state->blitCmd = ctx.beginSingleTimeCommands();
+    splatR->blitToSwapchain(ctx, state->blitCmd, ctx.swapchainImages[imageIndex], ctx.swapchainExtent);
+    vkEndCommandBuffer(state->blitCmd);
+
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = &state->imageAvailableSem;
+    submitInfo.pWaitDstStageMask = &waitStage;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &state->blitCmd;
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = &state->renderFinishedSem;
+    vkQueueSubmit(ctx.graphicsQueue, 1, &submitInfo, state->inFlightFence);
+
+    VkPresentInfoKHR presentInfo{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    presentInfo.waitSemaphoreCount = 1;
+    presentInfo.pWaitSemaphores = &state->renderFinishedSem;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &ctx.swapchain;
+    presentInfo.pImageIndices = &imageIndex;
+    VkResult presentResult = vkQueuePresentKHR(ctx.graphicsQueue, &presentInfo);
+    // NOTE: only recreate on OUT_OF_DATE, not SUBOPTIMAL -- this app
+    // deliberately forces preTransform=IDENTITY at swapchain-creation time
+    // (AndroidVulkan::createSwapchain, see the c1539ff pre-rotation fix)
+    // while the device's surface capabilities report currentTransform=0x2
+    // (ROTATE_90) for this orientation, so vkQueuePresentKHR legitimately
+    // returns VK_SUBOPTIMAL_KHR on every single frame forever (the spec's
+    // definition of "suboptimal" is exactly this: presentation still
+    // succeeds correctly, just not through the ideal/most-efficient
+    // compositor path). Treating that as "must recreate" like OUT_OF_DATE
+    // caused a full vkDeviceWaitIdle + imageview/swapchain
+    // destroy-and-recreate cycle EVERY frame -- confirmed via the Stage 1
+    // timing breakdown (docs/rendering-engines.md) to cost ~30ms/frame
+    // (~25% of the ~120ms frame budget) for zero benefit, since the very
+    // next present is suboptimal again regardless. Real resizes/rotations
+    // still get caught by the VK_ERROR_OUT_OF_DATE_KHR paths (both here and
+    // in the vkAcquireNextImageKHR check above).
+    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR) {
+        vkDeviceWaitIdle(ctx.device);
+        for (auto& iv : ctx.swapchainImageViews) vkDestroyImageView(ctx.device, iv, nullptr);
+        ctx.swapchainImageViews.clear();
+        vkDestroySwapchainKHR(ctx.device, ctx.swapchain, nullptr);
+        ctx.swapchain = VK_NULL_HANDLE;
+        AndroidVulkan::createSwapchain(ctx, kWidth, kHeight);
+    }
+
+    double blitPresentMs = msSince(tBlit) - 0.0;  // encode+submit+present call (non-blocking; actual GPU blit cost is hidden behind next frame's wait-fence)
+    double frameMs = msSince(tFrameStart);
+
+    // --- Stage 1 timing breakdown accounting ---
+    state->sumCpuWaitFenceMs += waitFenceMs;
+    state->sumCpuRenderMs += renderMs;
+    state->sumCpuBlitPresentMs += blitPresentMs;
+    state->sumCpuFrameMs += frameMs;
+    SplatRenderer::GpuTimingsMs gt = splatR->lastGpuTimingsMs();
+    if (gt.valid) {
+        state->sumGpuPreprocessMs += gt.preprocessMs;
+        state->sumGpuSortMs += gt.sortMs;
+        state->sumGpuDrawMs += gt.drawMs;
+        state->gpuTimingValidFrames++;
+    }
+    state->timingFrameCount++;
+    if (state->timingFrameCount >= AppState::kTimingWindowFrames) {
+        int n = state->timingFrameCount;
+        int gn = std::max(state->gpuTimingValidFrames, 1);
+        LOGI("TIMING mode=%s %ux%u avg-over-%d-frames (ms): cpu_wait_fence=%.2f cpu_render(preprocess+sort+draw)=%.2f "
+             "cpu_blit_present=%.2f cpu_frame_total=%.2f | gpu_preprocess=%.2f gpu_sort=%.2f gpu_draw=%.2f "
+             "gpu_valid_frames=%d/%d | sync_stalls_per_frame: outer_vkWaitForFences=1 "
+             "inner_vkQueueWaitIdle=%d (splat_renderer.cpp render(): 1 after preprocess [MV drain, "
+             "hasMotionVectors=%d] + 1 final submit)",
+             state->mode == DemoMode::Proxy ? "PROXY" : "TARGET",
+             state->mode == DemoMode::Proxy ? kProxyWidth : kWidth,
+             state->mode == DemoMode::Proxy ? kProxyHeight : kHeight,
+             n, state->sumCpuWaitFenceMs / n, state->sumCpuRenderMs / n,
+             state->sumCpuBlitPresentMs / n, state->sumCpuFrameMs / n,
+             state->sumGpuPreprocessMs / gn, state->sumGpuSortMs / gn, state->sumGpuDrawMs / gn,
+             state->gpuTimingValidFrames, n,
+             splatR->hasMotionVectors() ? 2 : 1, splatR->hasMotionVectors() ? 1 : 0);
+        state->timingFrameCount = 0;
+        state->sumCpuWaitFenceMs = state->sumCpuRenderMs = state->sumCpuBlitPresentMs = state->sumCpuFrameMs = 0.0;
+        state->sumGpuPreprocessMs = state->sumGpuSortMs = state->sumGpuDrawMs = 0.0;
+        state->gpuTimingValidFrames = 0;
+    }
+
+    state->frameCounter++;
+    state->fpsWindowFrames++;
+    auto now = std::chrono::high_resolution_clock::now();
+    float elapsed = std::chrono::duration<float>(now - state->fpsWindowStart).count();
+    if (elapsed >= 1.0f) {
+        state->lastFps = state->fpsWindowFrames / elapsed;
+        LOGI("FPS: %.1f (frame %d)", state->lastFps, state->frameCounter);
+        state->fpsWindowFrames = 0;
+        state->fpsWindowStart = now;
+    }
+}
+
+void cleanupRenderer(AppState* state) {
+    if (!state->vulkanReady) return;
+    vkDeviceWaitIdle(state->ctx.device);
+    if (state->blitCmd) vkFreeCommandBuffers(state->ctx.device, state->ctx.commandPool, 1, &state->blitCmd);
+    if (state->imageAvailableSem) vkDestroySemaphore(state->ctx.device, state->imageAvailableSem, nullptr);
+    if (state->renderFinishedSem) vkDestroySemaphore(state->ctx.device, state->renderFinishedSem, nullptr);
+    if (state->inFlightFence) vkDestroyFence(state->ctx.device, state->inFlightFence, nullptr);
+    if (state->scene.getSplatRenderer()) state->scene.getSplatRenderer()->cleanup(state->ctx);
+    if (state->proxyRenderer) { state->proxyRenderer->cleanup(state->ctx); state->proxyRenderer.reset(); }
+    AndroidVulkan::cleanup(state->ctx);
+    state->vulkanReady = false;
+}
+
+void onAppCmd(struct android_app* app, int32_t cmd) {
+    AppState* state = static_cast<AppState*>(app->userData);
+    switch (cmd) {
+        case APP_CMD_INIT_WINDOW:
+            if (app->window != nullptr && !state->windowInitialized) {
+                state->windowInitialized = true;
+                initRenderer(state);
+            }
+            break;
+        case APP_CMD_TERM_WINDOW:
+            cleanupRenderer(state);
+            state->windowInitialized = false;
+            break;
+        default:
+            break;
+    }
+}
+
+}  // namespace
+
+void android_main(struct android_app* app) {
+    AppState state;
+    state.app = app;
+    app->userData = &state;
+    app->onAppCmd = onAppCmd;
+
+    while (true) {
+        int events;
+        struct android_poll_source* source;
+        // Non-blocking poll while rendering, blocking poll while paused (no
+        // window / renderer not ready yet). Recomputed on EVERY inner-loop
+        // iteration (not hoisted above the loop) -- vulkanReady can flip
+        // from false to true mid-loop (inside source->process() ->
+        // onAppCmd() -> initRenderer()), and a stale -1 timeout captured
+        // before that would block on ALooper_pollOnce() forever afterward
+        // since no further input/window events arrive without user
+        // interaction, silently starving renderFrame() below.
+        while (ALooper_pollOnce(state.vulkanReady ? 0 : -1, nullptr, &events,
+                                 reinterpret_cast<void**>(&source)) >= 0) {
+            if (source != nullptr) source->process(app, source);
+            if (app->destroyRequested != 0) {
+                cleanupRenderer(&state);
+                return;
+            }
+        }
+        if (state.initFailed) {
+            LOGE("Renderer failed to initialize; idling.");
+            state.initFailed = false;  // log once
+        }
+        renderFrame(&state);
+    }
+}

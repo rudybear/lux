@@ -1,0 +1,242 @@
+#version 450
+// Stage 3 (mobile-DLSS Android live demo): GLSL port of playground_ios/
+// Source/NetInputAssembly.mm's `assemble_net_input` MSL kernel --
+// mobiledlss/train/model.py::build_input, with mobiledlss/datagen/
+// camera.py::sphere_uv and mobiledlss/datagen/motion.py::disocclusion_mask
+// folded in exactly as the Metal reference does (see that file's header
+// comment for the derivation of the two sampling conventions ported below
+// as plain buffer math instead of hardware texture units -- Vulkan/Android
+// here operates on raw storage buffers copied off the proxy SplatRenderer's
+// attachments via vkCmdCopyImageToBuffer, not sampled images, so every tap
+// below is manual bilinear/wrap arithmetic rather than a sampler object;
+// see input_assembly.cpp's header comment for why).
+//
+// Channel order (NetInputAssembly.h's exact `parts` concat order):
+//   color(3), depth_n(1), mv_n(2), disocc(1), fg(1), jitter(2),
+//   texture_feat(8), hidden(hiddenChannels) = 18 + hiddenChannels total.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Proxy-resolution raw attachments (packed straight off the GPU via
+// vkCmdCopyImageToBuffer -- see input_assembly.cpp's copyImageToStorageBuffer).
+layout(std430, binding = 0) readonly buffer ColorRaw {
+    // RGBA16_SFLOAT texels, 2 uint32 per texel (each packs 2 fp16 lanes via
+    // the standard little-endian bit-reinterpretation unpackHalf2x16 expects
+    // -- R,G in data[idx*2+0], B,A in data[idx*2+1]). Premultiplied by alpha.
+    uint data[];
+} colorRaw;
+
+layout(std430, binding = 1) readonly buffer MotionRaw {
+    vec4 data[];  // xy = mv*alpha (backward, proxy px), w = alpha
+} motionRaw;
+
+layout(std430, binding = 2) readonly buffer CurDepth {
+    float data[];  // this frame's un-premultiplied proxy depth (pass 1 output)
+} curDepth;
+
+layout(std430, binding = 3) readonly buffer PrevDepth {
+    float data[];  // previous frame's un-premultiplied proxy depth (ping-pong)
+} prevDepth;
+
+layout(std430, binding = 4) readonly buffer BgTexture {
+    float data[];  // [texChannels, texH, texW], row-major per channel plane
+} bgTexture;
+
+layout(std430, binding = 5) readonly buffer HiddenIn {
+    float data[];  // NHWC, netW*netH*hiddenChannels (may be all-zero)
+} hiddenIn;
+
+layout(std430, binding = 6) writeonly buffer OutBuf {
+    float data[];  // NHWC, netW*netH*(18+hiddenChannels)
+} outBuf;
+
+layout(push_constant) uniform PC {
+    vec4 eye;       // xyz used
+    vec4 rAxis;     // xyz used
+    vec4 uAxis;     // xyz used
+    vec4 fAxis;     // xyz used
+    vec4 bgCenter;  // xyz used
+    vec4 camParams; // fx, fy, cx, cy
+    vec4 extra;     // bgRadius, mvScale, jitterX, jitterY
+    uvec4 dims1;    // proxyW, proxyH, netW, netH
+    uvec4 dims2;    // paramStride, hiddenChannels, texW, texH
+    uvec4 flags;    // firstFrame, texChannels, fgSource, _pad
+} pc;
+
+const float PI = 3.14159265358979323846;
+
+vec3 unpremulColor(uint idx) {
+    uint a0 = colorRaw.data[idx * 2u + 0u];
+    uint a1 = colorRaw.data[idx * 2u + 1u];
+    vec2 rg = unpackHalf2x16(a0);
+    vec2 ba = unpackHalf2x16(a1);
+    float alpha = ba.y;
+    vec3 rgb = vec3(rg.x, rg.y, ba.x);
+    return (alpha > 1e-6) ? (rgb / alpha) : vec3(0.0);
+}
+
+vec2 unpremulMotion(uint idx) {
+    vec4 raw = motionRaw.data[idx];
+    float a = raw.w;
+    return (a > 1e-6) ? (raw.xy / a) : vec2(0.0);
+}
+
+// mobiledlss.train.scene_texture.SceneTexture.forward's exact sampling
+// convention: u wraps (repeat), v clamps (border), texel centres at integer
+// pixel coordinates -- see NetInputAssembly.mm's sampleBgTexture.
+void sampleBgTexture(float u, float v, uint texW, uint texH, uint texC, out float outFeat[8]) {
+    float px = u * float(texW) - 0.5;
+    float py = v * float(texH) - 0.5;
+    int x0 = int(floor(px));
+    int y0 = int(floor(py));
+    float fx = px - float(x0);
+    float fy = py - float(y0);
+    int iw = int(texW);
+    int ih = int(texH);
+    int x0w = ((x0 % iw) + iw) % iw;
+    int x1w = (((x0 + 1) % iw) + iw) % iw;
+    int y0c = clamp(y0, 0, ih - 1);
+    int y1c = clamp(y0 + 1, 0, ih - 1);
+    for (uint c = 0u; c < texC; c++) {
+        uint plane = c * texH * texW;
+        float t00 = bgTexture.data[plane + uint(y0c) * texW + uint(x0w)];
+        float t10 = bgTexture.data[plane + uint(y0c) * texW + uint(x1w)];
+        float t01 = bgTexture.data[plane + uint(y1c) * texW + uint(x0w)];
+        float t11 = bgTexture.data[plane + uint(y1c) * texW + uint(x1w)];
+        outFeat[c] = mix(mix(t00, t10, fx), mix(t01, t11, fx), fy);
+    }
+}
+
+float tapOrZero(int x, int y, int w, int h) {
+    if (x < 0 || x >= w || y < 0 || y >= h) return 0.0;
+    return prevDepth.data[uint(y) * uint(w) + uint(x)];
+}
+
+// mobiledlss.datagen.motion.reproject_depth's exact sampling convention
+// (grid_sample(padding_mode='zeros', align_corners=False)); cxx/cyy already
+// in the "integer == texel centre" continuous-coordinate convention (see
+// the disocclusion block below, and NetInputAssembly.mm's derivation).
+float sampleDepthZeroPad(float cxx, float cyy, int w, int h) {
+    int x0 = int(floor(cxx));
+    int y0 = int(floor(cyy));
+    float fx = cxx - float(x0);
+    float fy = cyy - float(y0);
+    float v00 = tapOrZero(x0, y0, w, h);
+    float v10 = tapOrZero(x0 + 1, y0, w, h);
+    float v01 = tapOrZero(x0, y0 + 1, w, h);
+    float v11 = tapOrZero(x0 + 1, y0 + 1, w, h);
+    return mix(mix(v00, v10, fx), mix(v01, v11, fx), fy);
+}
+
+void main() {
+    uint netW = pc.dims1.z, netH = pc.dims1.w;
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= netW || gid.y >= netH) return;
+
+    uint proxyW = pc.dims1.x, proxyH = pc.dims1.y;
+    uint paramStride = pc.dims2.x, hiddenChannels = pc.dims2.y;
+    uint texW = pc.dims2.z, texH = pc.dims2.w;
+    uint firstFrame = pc.flags.x, texChannels = pc.flags.y, fgSource = pc.flags.z;
+
+    vec3 colorSum = vec3(0.0);
+    float depthSum = 0.0;
+    vec2 mvSum = vec2(0.0);
+    float fgSum = 0.0;
+    float disoccSum = 0.0;
+    float texFeatSum[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+
+    float invN = 1.0 / float(paramStride * paramStride);
+    const float relTol = 0.05;
+
+    for (uint dy = 0u; dy < paramStride; dy++) {
+        for (uint dx = 0u; dx < paramStride; dx++) {
+            uint px = min(gid.x * paramStride + dx, proxyW - 1u);
+            uint py = min(gid.y * paramStride + dy, proxyH - 1u);
+            uint pidx = py * proxyW + px;
+
+            vec3 rgb = unpremulColor(pidx);
+            colorSum += rgb;
+
+            // fg: constant 0 until lux's foreground_coverage output lands
+            // (see input_assembly.h) -- fgSource is always 0 in this build.
+            float fgVal = (fgSource == 1u) ? 0.0 : 0.0;
+            fgSum += fgVal;
+
+            float depthVal = curDepth.data[pidx];
+            depthSum += depthVal;
+
+            vec2 mv = unpremulMotion(pidx);
+            mvSum += mv;
+
+            // --- disocclusion_mask (motion.py) ---
+            float d;
+            if (firstFrame != 0u) {
+                d = 1.0;
+            } else {
+                float pxCode = float(px) + 0.5 - mv.x;
+                float pyCode = float(py) + 0.5 - mv.y;
+                bool inside = pxCode >= 0.0 && pxCode <= float(proxyW) &&
+                              pyCode >= 0.0 && pyCode <= float(proxyH);
+                if (inside) {
+                    float cxx = float(px) - mv.x;  // continuous coord = pxCode - 0.5
+                    float cyy = float(py) - mv.y;
+                    float prevD = sampleDepthZeroPad(cxx, cyy, int(proxyW), int(proxyH));
+                    d = (prevD < depthVal * (1.0 - relTol)) ? 1.0 : 0.0;
+                } else {
+                    d = 1.0;
+                }
+            }
+            disoccSum += d;
+
+            // --- bg-sphere UV (camera.py::sphere_uv) + texture sample ---
+            float fx = pc.camParams.x, fy = pc.camParams.y, cx = pc.camParams.z, cy = pc.camParams.w;
+            vec3 dirCam = vec3((float(px) + 0.5 - cx) / fx, (float(py) + 0.5 - cy) / fy, 1.0);
+            vec3 dirWorld = normalize(dirCam.x * pc.rAxis.xyz + dirCam.y * pc.uAxis.xyz + dirCam.z * pc.fAxis.xyz);
+            vec3 o = pc.eye.xyz;
+            vec3 oc = o - pc.bgCenter.xyz;
+            float b = dot(dirWorld, oc);
+            float bgRadius = pc.extra.x;
+            float disc = b * b - (dot(oc, oc) - bgRadius * bgRadius);
+            float t = -b + sqrt(max(disc, 0.0));
+            vec3 p = o + dirWorld * t - pc.bgCenter.xyz;
+            vec3 d3 = normalize(p);
+            float uu = atan(d3.z, d3.x) / (2.0 * PI) + 0.5;
+            float vv = acos(clamp(d3.y, -1.0, 1.0)) / PI;
+
+            float feat[8];
+            sampleBgTexture(uu, vv, texW, texH, texChannels, feat);
+            for (uint c = 0u; c < texChannels; c++) texFeatSum[c] += feat[c];
+        }
+    }
+
+    vec3 color = colorSum * invN;
+    float depthAvg = depthSum * invN;
+    vec2 mvAvg = mvSum * invN;
+    float fg = fgSum * invN;
+    float disocc = disoccSum * invN;
+
+    float depthN = depthAvg / (depthAvg + 1.0);  // normalize_depth, AFTER pooling
+    float mvScale = pc.extra.y;
+    vec2 mvN = mvAvg * mvScale;
+    float jitterX = pc.extra.z, jitterY = pc.extra.w;
+
+    uint channels = 18u + hiddenChannels;
+    uint base = (gid.y * netW + gid.x) * channels;
+    outBuf.data[base + 0u] = color.r;
+    outBuf.data[base + 1u] = color.g;
+    outBuf.data[base + 2u] = color.b;
+    outBuf.data[base + 3u] = depthN;
+    outBuf.data[base + 4u] = mvN.x;
+    outBuf.data[base + 5u] = mvN.y;
+    outBuf.data[base + 6u] = disocc;
+    outBuf.data[base + 7u] = fg;
+    outBuf.data[base + 8u] = jitterX;
+    outBuf.data[base + 9u] = jitterY;
+    for (uint c = 0u; c < texChannels; c++) {
+        outBuf.data[base + 10u + c] = texFeatSum[c] * invN;
+    }
+    uint hiddenBase = (gid.y * netW + gid.x) * hiddenChannels;
+    for (uint c = 0u; c < hiddenChannels; c++) {
+        outBuf.data[base + 10u + texChannels + c] = hiddenIn.data[hiddenBase + c];
+    }
+}
